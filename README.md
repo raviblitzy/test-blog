@@ -1,2 +1,0 @@
-# test-blog
-testing blog
