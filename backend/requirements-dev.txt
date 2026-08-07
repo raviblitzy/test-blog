@@ -1,0 +1,17 @@
+# Backend development dependencies - fully pinned for reproducible installs.
+# Installs the runtime set first so a single command prepares a dev environment:
+#   python -m pip install -r requirements-dev.txt
+# Sourced from the Agent Action Plan section 0.5.3; every pin verified on PyPI.
+
+-r requirements.txt
+
+# --- Test runner ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+httpx==0.28.1
+Faker==40.36.0
+
+# --- Static analysis ---
+ruff==0.16.1
+mypy==2.3.0

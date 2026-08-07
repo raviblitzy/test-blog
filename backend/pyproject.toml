@@ -1,0 +1,150 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blog-api"
+version = "0.1.0"
+description = "FastAPI service for the blog platform: posts, comments, likes, categories, profiles and administration over PostgreSQL"
+readme = "../README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "Blitzy Agent", email = "agent@blitzy.com" }]
+keywords = ["fastapi", "blog", "postgresql", "sqlalchemy", "jwt"]
+classifiers = [
+  "Framework :: FastAPI",
+  "Programming Language :: Python :: 3.14",
+  "Private :: Do Not Upload",
+]
+# Runtime pins live in requirements.txt (the reproducible install contract);
+# this table restates them as ranges for metadata completeness.
+dependencies = [
+  "fastapi==0.141.1",
+  "uvicorn[standard]==0.52.1",
+  "gunicorn==26.0.0",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.14.2",
+  "email-validator==2.3.0",
+  "python-multipart==0.0.32",
+  "SQLAlchemy==2.0.51",
+  "alembic==1.19.0",
+  "psycopg[binary]==3.3.4",
+  "greenlet==3.5.4",
+  "PyJWT==2.13.0",
+  "pwdlib[argon2]==0.3.0",
+  "slowapi==0.1.10",
+  "bleach==6.4.0",
+  "python-slugify==8.0.4",
+  "structlog==26.1.0",
+  "orjson==3.11.9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "pytest-cov==7.1.0",
+  "httpx==0.28.1",
+  "Faker==40.36.0",
+  "ruff==0.16.1",
+  "mypy==2.3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["tests*", "migrations*"]
+
+# --------------------------------------------------------------------------- #
+# Lint and format - ruff is the single source of both.
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+# Root that holds the first-party packages (`app`, `tests`), so import sorting
+# classifies them correctly. Pointing this at the packages themselves would make
+# ruff treat `app` as third-party.
+src = ["."]
+extend-exclude = [".venv", "migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "UP",  # pyupgrade
+  "N",   # pep8-naming
+  "S",   # flake8-bandit
+  "ASYNC",
+  "RUF",
+]
+ignore = [
+  "E501", # line length is enforced by the formatter
+  "B008", # FastAPI dependency defaults (Depends(...)) are intentional
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"] # asserts and dummy credentials are expected in tests
+"migrations/**" = ["N806", "S608"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# --------------------------------------------------------------------------- #
+# Static typing
+# --------------------------------------------------------------------------- #
+[tool.mypy]
+python_version = "3.14"
+files = ["app"]
+strict = true
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+warn_unused_ignores = true
+show_error_codes = true
+exclude = ["^\\.venv/", "^migrations/versions/"]
+
+[[tool.mypy.overrides]]
+module = ["slowapi.*", "bleach.*", "slugify.*"]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# --------------------------------------------------------------------------- #
+# Tests
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+  "unit: fast tests with no external dependencies",
+  "integration: tests that exercise the API and the database",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = ["app/__init__.py", "migrations/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@overload",
+]

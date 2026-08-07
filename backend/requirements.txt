@@ -1,0 +1,31 @@
+# Backend runtime dependencies - fully pinned for reproducible installs.
+# Target interpreter: CPython 3.14.7 (see .python-version)
+# Sourced from the Agent Action Plan section 0.5.2; every pin verified on PyPI.
+
+# --- Web framework and ASGI server ---
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+gunicorn==26.0.0
+
+# --- Schema / settings layer ---
+pydantic==2.13.4
+pydantic-settings==2.14.2
+email-validator==2.3.0
+python-multipart==0.0.32
+
+# --- Data layer (PostgreSQL 18 via psycopg 3; no second driver) ---
+SQLAlchemy==2.0.51
+alembic==1.19.0
+psycopg[binary]==3.3.4
+greenlet==3.5.4
+
+# --- Security ---
+PyJWT==2.13.0
+pwdlib[argon2]==0.3.0
+slowapi==0.1.10
+bleach==6.4.0
+
+# --- Utilities and observability ---
+python-slugify==8.0.4
+structlog==26.1.0
+orjson==3.11.9
