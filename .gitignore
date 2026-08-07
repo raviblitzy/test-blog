@@ -1,46 +1,138 @@
+# ===========================================================================
+# .gitignore - repository-wide ignore policy for the blog platform
+#
+# Two tiers live in this monorepo, so this file must cover both:
+#   backend/    FastAPI service on Python 3.14.7  (byte-code, venvs, caches)
+#   frontend/   Next.js 16 app on Node.js 24.19.0 (modules, build output)
+#
+# Restored after being deleted at commit f8b72d8, which removed 207 lines of
+# GitHub's standard Python template. This is deliberately NOT a byte-for-byte
+# restoration: several of that template's directory patterns were unanchored
+# and silently untrack real source in this repository. Every such pattern is
+# anchored or tier-scoped below - see section 2 for the specific hazard.
+#
+# Two invariants this file exists to guarantee. Verify both with
+# `git check-ignore -v <path>` before changing anything here; do not eyeball
+# it, because the failure mode of a bad pattern is invisible at commit time.
+#
+#   1. No secret is committable.  `.env` and every local variant is ignored,
+#      while `.env.example` - the documented configuration contract - stays
+#      tracked. The pairing IS the design: ignore both and developers have no
+#      contract; ignore neither and a real credential gets committed.
+#   2. Dependencies stay reproducible.  Every pin artefact remains trackable:
+#      backend/requirements.txt, backend/requirements-dev.txt,
+#      backend/pyproject.toml, backend/.python-version, frontend/package.json,
+#      frontend/package-lock.json, frontend/.nvmrc. No lockfile is ignored.
+#
+# Pattern conventions used throughout:
+#   /name/    anchored - matches only at the repository root
+#   name/     matches a directory of that name at ANY depth (use sparingly)
+#   name      matches a file, directory or symlink of that name at any depth
+#   !name     re-inclusion. gitignore is LAST-MATCH-WINS, so every negation
+#             must appear AFTER the patterns that would otherwise match it,
+#             and git cannot re-include a file whose parent DIRECTORY is
+#             excluded - restructure the pattern rather than negating into one.
+# ===========================================================================
+
+
 # ---------------------------------------------------------------------------
-# Python / backend
+# 1. Python byte-code and caches
 # ---------------------------------------------------------------------------
 __pycache__/
-*.py[cod]
+*.py[codz]
 *$py.class
+
+# Compiled C extensions - psycopg[binary] and greenlet ship or build these
 *.so
-.Python
-build/
-dist/
-develop-eggs/
-downloads/
-eggs/
+
+
+# ---------------------------------------------------------------------------
+# 2. Python packaging output - ANCHORED ON PURPOSE. DO NOT DROP THE SLASHES.
+#
+# The deleted template listed these unanchored: `build/`, `dist/`, `lib/`,
+# `lib64/`, `var/`, `target/` and friends. A pattern with a trailing slash but
+# NO LEADING slash matches a directory of that name at any depth, so the
+# template's `lib/` also matched `frontend/src/lib/` - silently untracking the
+# frontend's entire API client, contract-type, validation and utility layer
+# (frontend/src/lib/api/client.ts is the only module in the frontend that
+# performs HTTP). The result is a repository that still builds for whoever ran
+# it first and is unbuildable from a fresh clone, with nothing to see in
+# `git status`. Anchoring preserves the original intent - a root-level Python
+# build tree - without reaching into source directories.
+#
+# Never restore the unanchored form of any pattern in this section.
+# ---------------------------------------------------------------------------
+/build/
+/dist/
+/sdist/
+/downloads/
+/eggs/
+/lib/
+/lib64/
+/var/
+/target/
+/wheels/
 .eggs/
-sdist/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
-MANIFEST
+.Python
 
-# Virtual environments
-.venv/
+# PyPI upload credentials
+.pypirc
+
+# Cython debug symbols
+cython_debug/
+
+
+# ---------------------------------------------------------------------------
+# 3. Virtual environments
+#
+# The interpreter is pinned by backend/.python-version (3.14.7); the venv it
+# creates lives at backend/.venv and is always local, never committed.
+# ---------------------------------------------------------------------------
+.venv
 venv/
-ENV/
 env/
-.python-version.local
+ENV/
+env.bak/
+venv.bak/
 
-# Test / coverage / type-check caches
+
+# ---------------------------------------------------------------------------
+# 4. Test and coverage artefacts
+#    pytest + pytest-cov on the backend; vitest and playwright on the frontend
+# ---------------------------------------------------------------------------
 .pytest_cache/
-.ruff_cache/
-.mypy_cache/
 .coverage
 .coverage.*
 coverage.xml
 htmlcov/
-.cache/
-nosetests.xml
-*.cover
+coverage/
+.nyc_output/
+.hypothesis/
+
 
 # ---------------------------------------------------------------------------
-# Node / frontend
+# 5. Type-checker and linter caches
+# ---------------------------------------------------------------------------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.eslintcache
+.cache/
+
+
+# ---------------------------------------------------------------------------
+# 6. Node and package managers
+#
+# Lockfiles are deliberately NOT ignored. Reproducible installs require
+# frontend/package-lock.json to be tracked, and the same reasoning applies to
+# every Python lock format. The upstream template left these commented out;
+# they stay that way. Do not uncomment any of them:
+#   #package-lock.json   #yarn.lock     #pnpm-lock.yaml
+#   #Pipfile.lock        #poetry.lock   #poetry.toml
+#   #uv.lock             #pdm.lock      #pdm.toml
 # ---------------------------------------------------------------------------
 node_modules/
 .npm/
@@ -49,46 +141,144 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-.eslintcache
+pnpm-debug.log*
+.pnpm-debug.log*
 
-# Next.js build output
+
+# ---------------------------------------------------------------------------
+# 7. Next.js build output
+#
+# next-env.d.ts is regenerated by `next dev` and `next build` on every run and
+# is conventionally untracked even though tsconfig.json lists it in `include`.
+# tsconfig.json sets "incremental": true, which emits *.tsbuildinfo.
+# `frontend/build/` is tier-scoped rather than global, for the same reason
+# section 2 is anchored.
+# ---------------------------------------------------------------------------
 .next/
 out/
 next-env.d.ts
-.vercel/
 *.tsbuildinfo
+.swc/
+.turbo/
+.vercel
+frontend/build/
 
-# Test artifacts
-playwright-report/
-test-results/
-blob-report/
-playwright/.cache/
-coverage/
 
 # ---------------------------------------------------------------------------
-# Environment and secrets - NEVER commit real values; .env.example is the contract
+# 8. Frontend test artefacts
+#    playwright html/blob reporters and its browser cache; vitest coverage
+#    output is already covered by `coverage/` in section 4
+#
+# `playwright/.cache/` contains a slash, and git anchors any pattern containing
+# a slash to the directory holding this file - so it covers only a root-level
+# playwright cache. playwright.config.ts lives in frontend/, so the tier-scoped
+# line is the one that actually does the work here; both are listed so neither
+# location depends on the broad `.cache/` in section 5 to catch it.
+# ---------------------------------------------------------------------------
+playwright-report/
+blob-report/
+test-results/
+playwright/.cache/
+frontend/playwright/.cache/
+
+
+# ---------------------------------------------------------------------------
+# 9. Environment files - THE SECRET BOUNDARY
+#
+# Real values (DATABASE_URL, JWT_SECRET_KEY, SEED_ADMIN_PASSWORD and the rest)
+# belong only in untracked files. `.env.example` is the ONLY environment file
+# in version control and it carries placeholders exclusively.
+#
+# Because gitignore is last-match-wins, the `!.env.example` negation below
+# MUST remain after the `.env.*` catch-all. Moving it earlier makes it a no-op
+# and untracks the configuration contract the whole platform is documented by.
 # ---------------------------------------------------------------------------
 .env
+.env.local
+.env.development.local
+.env.production.local
+.env.test.local
+# Catch-all for any further per-environment file: .env.staging, .env.ci, ...
 .env.*
+# direnv
+.envrc
+
+# The committed contract, re-included LAST so the catch-all cannot untrack it.
 !.env.example
 
-# ---------------------------------------------------------------------------
-# Editors and OS
-# ---------------------------------------------------------------------------
-.idea/
-.vscode/
-*.swp
-*.swo
-.DS_Store
-Thumbs.db
 
 # ---------------------------------------------------------------------------
-# Local logs and scratch
+# 10. Editors and operating-system noise
+#
+# `.idea/` and `.vscode/` stay COMMENTED OUT on purpose - this project imposes
+# no editor policy. Ignore them for yourself instead:
+#   git config --global core.excludesFile ~/.gitignore_global
+# ---------------------------------------------------------------------------
+#.idea/
+# .vscode/
+*.swp
+*.swo
+*~
+
+# macOS and Windows
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ---------------------------------------------------------------------------
+# 11. Logs and local scratch
 # ---------------------------------------------------------------------------
 *.log
 logs/
 tmp/
 .tmp/
 
-# Blitzy agent artifacts (screenshots and recordings captured during validation)
+
+# ---------------------------------------------------------------------------
+# 12. Local database artefacts and dumps
+#
+# PostgreSQL 18 is the mandated system of record and the product has no SQLite
+# fallback anywhere. These patterns exist only so a developer's throwaway
+# local database or a `pg_dump` output cannot be committed by accident.
+# ---------------------------------------------------------------------------
+*.sqlite3
+*.sqlite3-journal
+*.db
+*.dump
+*.sql.gz
+
+
+# ---------------------------------------------------------------------------
+# 13. Automation artefacts
+#
+# Screenshots and screen recordings captured by tooling during validation.
+# ---------------------------------------------------------------------------
 blitzy/
+
+
+# ---------------------------------------------------------------------------
+# 14. Deliberately tracked - safeguards, kept last so nothing overrides them
+#
+# backend/.python-version pins the interpreter at 3.14.7 and is this project's
+# only Python version declaration, so it must stay in version control. The
+# upstream template listed `.python-version` commented out, which suits a
+# library that runs on many interpreters; this is a service pinned to exactly
+# one. No `.python-version` pattern appears anywhere above, and the negation
+# below is a belt-and-braces guard in case one is ever added.
+#
+# Also intentionally absent from this file, and required to stay tracked:
+#   docs/**                      architecture.md, api/, features/ - never add
+#                                a `docs/` or `docs/_build/` pattern here
+#   .github/workflows/ci.yml     pipeline definition
+#   .env.example                 environment contract (re-included in 9 above)
+#   frontend/.nvmrc              Node 24.19.0 pin
+#   frontend/package.json        dependency pins
+#   frontend/package-lock.json   resolved dependency tree
+#   backend/requirements.txt     runtime pins
+#   backend/requirements-dev.txt development pins
+#   backend/pyproject.toml       project metadata and tool configuration
+#   backend/alembic.ini          migration configuration
+#   frontend/public/*            favicon, icons and the default social card
+# ---------------------------------------------------------------------------
+!backend/.python-version

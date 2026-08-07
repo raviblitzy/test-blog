@@ -1,3 +1,10 @@
+# EditorConfig - shared indentation, newline and encoding conventions.
+# https://editorconfig.org
+#
+# Whitespace and encoding only; quote style, line wrapping and class ordering
+# belong to ruff (backend/pyproject.toml) and Prettier (frontend/.prettierrc.json).
+# Every value here is the one the owning formatter already produces, and `lf`
+# everywhere is what makes a checkout byte-identical across platforms.
 root = true
 
 [*]
@@ -8,18 +15,52 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 2
 
+# LOAD-BEARING - DO NOT RELAX. GNU make requires every recipe line to begin with
+# a hard TAB. An editor that converts those tabs to spaces makes make abort with
+# `*** missing separator.  Stop.` and then EVERY target fails - install, migrate,
+# seed, dev, test, lint, typecheck, build. `indent_size` is display width only;
+# the character written is still a tab. `*.mk` below covers included fragments.
+[{Makefile,makefile,GNUmakefile}]
+indent_style = tab
+indent_size = 4
+
+[*.mk]
+indent_style = tab
+indent_size = 4
+
+# PEP 8, and the values [tool.ruff] in backend/pyproject.toml cites by name.
 [*.py]
+indent_style = space
 indent_size = 4
 max_line_length = 100
 
-[*.{ts,tsx,js,jsx,mjs,cjs,json,jsonc,css,yml,yaml,md}]
+[*.{ts,tsx,mts,js,jsx,mjs,cjs}]
 indent_size = 2
 
-[*.md]
-trim_trailing_whitespace = false
+[*.{json,jsonc}]
+indent_size = 2
 
-[Makefile]
-indent_style = tab
+[*.css]
+indent_size = 2
+
+# YAML forbids tabs for indentation outright, so this must stay space-based.
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# Markdown keeps its trailing whitespace: two trailing spaces are a significant
+# hard line break, so trimming them would silently change how a document renders.
+[*.md]
+indent_size = 2
+trim_trailing_whitespace = false
 
 [*.{ini,cfg,toml}]
 indent_size = 4
+
+# backend/migrations/script.py.mako emits Python, so it is indented like Python.
+[*.mako]
+indent_size = 4
+
+# Plain KEY=value lines - indentation never applies, the trailing newline does.
+[{.env,.env.*}]
+insert_final_newline = true
