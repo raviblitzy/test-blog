@@ -1,31 +1,66 @@
-# Backend runtime dependencies - fully pinned for reproducible installs.
-# Target interpreter: CPython 3.14.7 (see .python-version)
-# Sourced from the Agent Action Plan section 0.5.2; every pin verified on PyPI.
+# ---------------------------------------------------------------------------
+# Backend RUNTIME dependencies for the FastAPI service tier.
+#
+# Every requirement is pinned to an exact version, so an install performed
+# today resolves to the same artifacts tomorrow. Install with one command:
+#
+#     python -m pip install -r requirements.txt
+#
+# Development and test tooling is pinned separately in requirements-dev.txt,
+# which includes this file. A production image therefore installs only the
+# runtime set, while a developer gets both sets from a single command.
+#
+# Target interpreter: CPython 3.14.7 (see .python-version). Every version
+# below was resolved from PyPI and then installed and exercised on that
+# interpreter per Agent Action Plan section 0.5.2: each is a verified release
+# rather than an assumed one.
+#
+# The pin order below matches the dependencies array in pyproject.toml, so the
+# two files can be cross-checked line by line.
+#
+# Invariants for anyone editing this file:
+#   1. Exact pins only. Never relax a specifier, never leave a bare name, and
+#      keep pydantic and greenlet listed even though they would arrive
+#      transitively: explicit pins are what stop silent resolution drift.
+#   2. Keep the extras; they are load-bearing. The uvicorn standard extra adds
+#      uvloop, httptools and the websockets stack; the psycopg binary extra
+#      ships prebuilt wheels so no image needs a C toolchain; the pwdlib
+#      argon2 extra is the only source of the argon2id hashing backend.
+#   3. alembic and gunicorn belong here rather than in the development set:
+#      the backend container applies migrations on start and serves under
+#      gunicorn, so both must be present in the runtime image.
+#   4. One PostgreSQL driver only. psycopg 3 covers the async application and
+#      synchronous Alembic alike, so a second driver is never added.
+# ---------------------------------------------------------------------------
 
-# --- Web framework and ASGI server ---
-fastapi==0.141.1
-uvicorn[standard]==0.52.1
-gunicorn==26.0.0
+# --- Framework and server ---
+fastapi==0.141.1           # ASGI web framework; continues the choice made in app.py
+uvicorn[standard]==0.52.1  # ASGI server; also the worker class gunicorn supervises
 
-# --- Schema / settings layer ---
-pydantic==2.13.4
-pydantic-settings==2.14.2
-email-validator==2.3.0
-python-multipart==0.0.32
+# --- Process management ---
+gunicorn==26.0.0           # production process manager for the uvicorn workers
 
-# --- Data layer (PostgreSQL 18 via psycopg 3; no second driver) ---
-SQLAlchemy==2.0.51
-alembic==1.19.0
-psycopg[binary]==3.3.4
-greenlet==3.5.4
+# --- Schemas and configuration ---
+pydantic==2.13.4           # request and response models; explicit, never transitive
+pydantic-settings==2.14.2  # typed environment contract behind app/core/config.py
+email-validator==2.3.0     # backs email field validation in the registration schema
+python-multipart==0.0.32   # form parsing for the password grant on the login route
 
-# --- Security ---
-PyJWT==2.13.0
-pwdlib[argon2]==0.3.0
-slowapi==0.1.10
-bleach==6.4.0
+# --- Data layer ---
+SQLAlchemy==2.0.51         # async ORM and query construction; publishes cp314 wheels
+alembic==1.19.0            # versioned, reversible migrations; applied on container start
+psycopg[binary]==3.3.4     # the single PostgreSQL driver: async app, synchronous Alembic
+greenlet==3.5.4            # bridge SQLAlchemy async execution needs; pinned, not implied
 
-# --- Utilities and observability ---
-python-slugify==8.0.4
-structlog==26.1.0
-orjson==3.11.9
+# --- Authentication and security ---
+PyJWT==2.13.0              # HS256 access token encoding and decoding
+pwdlib[argon2]==0.3.0      # argon2id password hashing and verification
+slowapi==0.1.10            # in-process rate limiting on the authentication routes
+
+# --- Content and text handling ---
+bleach==6.4.0              # write-side sanitisation of post bodies and comment bodies
+python-slugify==8.0.4      # URL-safe slugs for posts and categories; canonical URLs
+
+# --- Observability and serialisation ---
+structlog==26.1.0          # structured JSON logging with request correlation
+orjson==3.11.9             # fast JSON serialisation; the default response class

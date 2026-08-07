@@ -104,7 +104,7 @@ test-backend: ## Backend unit + integration tests with the coverage floor
 	cd $(BACKEND) && $(VENV_BIN)/python -m pytest --cov=app --cov-fail-under=80
 
 test-frontend: ## Frontend component tests (no watch mode)
-	cd $(FRONTEND) && npm run test
+	cd $(FRONTEND) && npm run test -- --run
 
 e2e: ## Playwright end-to-end suite across the three viewports
 	cd $(FRONTEND) && npm run e2e
@@ -121,7 +121,7 @@ lint-frontend: ## ESLint with zero tolerated warnings
 format: ## Apply formatters to both tiers
 	$(VENV_BIN)/ruff format $(BACKEND)
 	$(VENV_BIN)/ruff check --fix $(BACKEND)
-	cd $(FRONTEND) && npm run format
+	cd $(FRONTEND) && ./node_modules/.bin/prettier --write .
 
 typecheck: typecheck-backend typecheck-frontend ## Static typing for both tiers
 

@@ -1,17 +1,49 @@
-# Backend development dependencies - fully pinned for reproducible installs.
-# Installs the runtime set first so a single command prepares a dev environment:
+# Backend development and static-analysis dependencies.
+#
+# Fully pinned to exact versions so every workstation, container image and
+# continuous-integration run resolves an identical tool set. Provenance: Agent
+# Action Plan section 0.5.3. Each version was resolved from the live package
+# registry and then installed and exercised on CPython 3.14.7, the interpreter
+# recorded in .python-version.
+#
+# This file is the sole supplier of the tools behind the four blocking backend
+# quality gates. Omit any pin below and a gate becomes unrunnable, so the list
+# is complete by requirement rather than by convenience:
+#
+#   ruff check backend                      lint
+#   ruff format --check backend             format verification
+#   mypy app                                static typing
+#   pytest --cov=app --cov-fail-under=80    tests plus the 80 percent floor
+#
+# One command prepares a complete development environment, because the include
+# below also pulls in the runtime set:
+#
 #   python -m pip install -r requirements-dev.txt
-# Sourced from the Agent Action Plan section 0.5.3; every pin verified on PyPI.
+#
+# The dependency direction is one way. This file includes the runtime manifest;
+# the runtime manifest never includes this file. Production images therefore
+# install requirements.txt alone and carry no test or analysis tooling.
+#
+# Tool settings are deliberately absent here: pyproject.toml is the single
+# source of the ruff, mypy, pytest and coverage configuration.
 
 -r requirements.txt
 
-# --- Test runner ---
+# --- Test runner and async support ---
 pytest==9.1.1
 pytest-asyncio==1.4.0
+
+# --- Coverage measurement against the enforced floor ---
 pytest-cov==7.1.0
+
+# --- HTTP client for integration tests: in-process ASGI transport, no server ---
 httpx==0.28.1
+
+# --- Test data generation ---
 Faker==40.36.0
 
-# --- Static analysis ---
+# --- Lint and format ---
 ruff==0.16.1
+
+# --- Static typing ---
 mypy==2.3.0

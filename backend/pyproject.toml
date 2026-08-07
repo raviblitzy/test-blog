@@ -1,150 +1,474 @@
+# =============================================================================
+# blog-api-backend
+#
+# Two jobs, both load-bearing:
+#   1. PEP 621 metadata describing and pinning the FastAPI service distribution.
+#   2. The SINGLE SOURCE of the backend's ruff, mypy, pytest and coverage
+#      configuration.
+#
+# Nothing else in the repository configures those tools. There is deliberately
+# no pytest.ini, mypy.ini, .mypy.ini, ruff.toml, .ruff.toml, setup.cfg, tox.ini
+# or .coveragerc anywhere under backend/, and no pyproject.toml at the
+# repository root. Adding any of them would either shadow or compete with this
+# file and break the single-source design it exists to provide.
+#
+# Every blocking backend quality gate is driven from here:
+#
+#   ruff check backend                                   # lint     (from root)
+#   ruff format --check backend                          # format   (from root)
+#   cd backend && mypy                                   # types
+#   cd backend && pytest --cov=app --cov-fail-under=80   # tests + coverage
+#
+# The equivalent repository-root spellings used by the plan also work:
+#
+#   mypy --config-file backend/pyproject.toml backend/app
+#   pytest backend/tests --cov=backend/app --cov-fail-under=80
+#
+# These tools locate their configuration by three DIFFERENT mechanisms, which is
+# why a few settings below look redundant and are not:
+#   * ruff     walks up the directory tree from each linted file, so a
+#              repository-root invocation discovers this file automatically.
+#   * pytest   walks up from its command-line arguments, so `pytest backend/tests`
+#              discovers this file and sets rootdir to backend/.
+#   * mypy     reads configuration from the CURRENT WORKING DIRECTORY ONLY - see
+#              the note directly above [tool.mypy].
+#   * coverage behaves like mypy, not like pytest - see the note directly above
+#              [tool.coverage.run].
+#
+# Assuming they behave alike is the trap; each is handled explicitly below.
+#
+# Interpreter: CPython 3.14.7 (backend/.python-version).
+# Runtime pins: mirrored verbatim from backend/requirements.txt - see below.
+# =============================================================================
+
 [build-system]
-requires = ["setuptools>=80", "wheel"]
+# setuptools >= 77 is required for the PEP 639 SPDX `license` string used below;
+# 80 is the floor actually exercised in this repository. `wheel` is deliberately
+# absent - setuptools.build_meta requests it itself when one is needed.
+requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "blog-api"
-version = "0.1.0"
-description = "FastAPI service for the blog platform: posts, comments, likes, categories, profiles and administration over PostgreSQL"
-readme = "../README.md"
+name = "blog-api-backend"
+version = "1.0.0"
+description = "FastAPI service tier of the blog platform, persisted in PostgreSQL"
 requires-python = ">=3.14"
 license = "MIT"
 authors = [{ name = "Blitzy Agent", email = "agent@blitzy.com" }]
-keywords = ["fastapi", "blog", "postgresql", "sqlalchemy", "jwt"]
+keywords = ["blog", "fastapi", "postgresql", "rest-api", "sqlalchemy", "jwt"]
 classifiers = [
-  "Framework :: FastAPI",
-  "Programming Language :: Python :: 3.14",
-  "Private :: Do Not Upload",
-]
-# Runtime pins live in requirements.txt (the reproducible install contract);
-# this table restates them as ranges for metadata completeness.
-dependencies = [
-  "fastapi==0.141.1",
-  "uvicorn[standard]==0.52.1",
-  "gunicorn==26.0.0",
-  "pydantic==2.13.4",
-  "pydantic-settings==2.14.2",
-  "email-validator==2.3.0",
-  "python-multipart==0.0.32",
-  "SQLAlchemy==2.0.51",
-  "alembic==1.19.0",
-  "psycopg[binary]==3.3.4",
-  "greenlet==3.5.4",
-  "PyJWT==2.13.0",
-  "pwdlib[argon2]==0.3.0",
-  "slowapi==0.1.10",
-  "bleach==6.4.0",
-  "python-slugify==8.0.4",
-  "structlog==26.1.0",
-  "orjson==3.11.9",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
+    # This distribution is built and run in place; it is never published.
+    "Private :: Do Not Upload",
 ]
 
-[project.optional-dependencies]
-dev = [
-  "pytest==9.1.1",
-  "pytest-asyncio==1.4.0",
-  "pytest-cov==7.1.0",
-  "httpx==0.28.1",
-  "Faker==40.36.0",
-  "ruff==0.16.1",
-  "mypy==2.3.0",
+# `readme` is deliberately OMITTED.
+#
+# The project's canonical README is the repository-root README.md, one directory
+# above this file, and setuptools refuses to read a metadata file from outside
+# the project directory. Both spellings fail metadata generation identically:
+#
+#   readme = "../README.md"
+#   readme = {file = "../README.md", content-type = "text/markdown"}
+#
+#   distutils.errors.DistutilsOptionError:
+#       Cannot access '<repo>/backend/../README.md'
+#       (or anything outside '<repo>/backend')
+#
+# Duplicating the README into backend/ purely to satisfy the key would create a
+# second document to keep in sync, so the key is dropped instead. `description`
+# above carries the summary, and the root README remains the single narrative
+# source of truth.
+
+# Runtime dependencies - mirrored package-for-package and version-for-version
+# from backend/requirements.txt, with every extra intact and every pin exact.
+# `==` throughout, never a range: two manifests that disagree are worse than
+# one, and a loose specifier here would silently reintroduce the unpinned state
+# this project replaced. Change one file and you must change the other.
+dependencies = [
+    # Web framework and ASGI/WSGI servers
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.1",
+    "gunicorn==26.0.0",
+    # Schema and settings layer
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "email-validator==2.3.0",
+    "python-multipart==0.0.32",
+    # Data layer - PostgreSQL 18 through psycopg 3; deliberately no second driver
+    "SQLAlchemy==2.0.51",
+    "alembic==1.19.0",
+    "psycopg[binary]==3.3.4",
+    "greenlet==3.5.4",
+    # Security
+    "PyJWT==2.13.0",
+    "pwdlib[argon2]==0.3.0",
+    "slowapi==0.1.10",
+    "bleach==6.4.0",
+    # Utilities and observability
+    "python-slugify==8.0.4",
+    "structlog==26.1.0",
+    "orjson==3.11.9",
 ]
+
+# `[project.optional-dependencies]` is deliberately absent. The development set
+# (pytest, pytest-asyncio, pytest-cov, httpx, Faker, ruff, mypy) is declared in
+# backend/requirements-dev.txt and nowhere else, so there is exactly one place
+# to update and exactly one thing that can drift.
+#   python -m pip install -r requirements-dev.txt
+
+# -----------------------------------------------------------------------------
+# Packaging
+# -----------------------------------------------------------------------------
+# Package discovery is scoped EXPLICITLY rather than left to auto-discovery.
+# backend/ holds three sibling top-level directories - app/, migrations/ and
+# tests/ - which is exactly the shape that makes setuptools' flat-layout
+# heuristic give up:
+#
+#   error: Multiple top-level packages discovered in a flat-layout:
+#          ['app', 'tests', 'migrations'].
+#
+# `app` is the only importable distribution package; migrations are executed by
+# Alembic from the source tree and tests are never shipped.
+[tool.setuptools]
+zip-safe = false
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
 exclude = ["tests*", "migrations*"]
 
-# --------------------------------------------------------------------------- #
-# Lint and format - ruff is the single source of both.
-# --------------------------------------------------------------------------- #
+# =============================================================================
+# ruff - lint and format. Governs `ruff check backend` and
+# `ruff format --check backend`, both invoked from the repository root.
+# =============================================================================
 [tool.ruff]
-target-version = "py314"
+# 100 columns matches `max_line_length = 100` for *.py in the root
+# .editorconfig, and suits the long generic annotations that typed SQLAlchemy
+# 2.0 and FastAPI signatures produce.
 line-length = 100
-# Root that holds the first-party packages (`app`, `tests`), so import sorting
-# classifies them correctly. Pointing this at the packages themselves would make
-# ruff treat `app` as third-party.
-src = ["."]
-extend-exclude = [".venv", "migrations/versions"]
+indent-width = 4
+
+# Agrees with `requires-python = ">=3.14"` above; ruff would infer the same
+# value, but stating it keeps the target explicit if this table is ever read in
+# isolation. Verified accepted by the pinned ruff 0.16.1.
+target-version = "py314"
+
+# Roots for first-party import resolution. "." is the backend package root, so
+# `import app...` and `import tests...` resolve by path; "app" and "tests" are
+# listed as well so a module referenced from inside either tree still resolves.
+# `known-first-party` below makes the classification explicit regardless.
+src = [".", "app", "tests"]
+
+# ruff's default exclusions already cover .venv/, .git/, __pycache__/, build/
+# and dist/, so no extend-exclude is needed. In particular migrations/ is NOT
+# excluded: backend/alembic.ini runs `ruff format` and `ruff check --fix` as
+# post-write hooks on every generated revision, so revision modules are
+# expected to be lint-clean. Their fixed generated shape is accommodated with
+# targeted per-file ignores instead of a wholesale exclusion.
 
 [tool.ruff.lint]
+# Note for anyone writing generic code here: because `target-version` is py314,
+# the `UP` group activates UP046/UP047, which require PEP 695 type-parameter
+# syntax - `class Page[ItemT](BaseModel):` and `def build_page[ItemT](...)`,
+# not `Generic[ItemT]` with a module-level TypeVar. That form was verified
+# end to end against the pinned versions: it constructs and serialises
+# correctly under pydantic 2.13.4, generates the expected JSON schema, and
+# type-checks clean under strict mypy 2.3.0 with the pydantic plugin.
 select = [
-  "E",   # pycodestyle errors
-  "W",   # pycodestyle warnings
-  "F",   # pyflakes
-  "I",   # isort
-  "B",   # flake8-bugbear
-  "C4",  # flake8-comprehensions
-  "UP",  # pyupgrade
-  "N",   # pep8-naming
-  "S",   # flake8-bandit
-  "ASYNC",
-  "RUF",
+    "E",     # pycodestyle errors, including line-too-long
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort - deterministic import ordering
+    "N",     # pep8-naming
+    "UP",    # pyupgrade - keep syntax current with the pinned interpreter
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "SIM",   # flake8-simplify
+    "ASYNC", # flake8-async - blocking calls inside async def, and friends
+    "S",     # flake8-bandit - security smells
+    "PT",    # flake8-pytest-style
+    "TID",   # flake8-tidy-imports - absolute imports only
+    "PTH",   # flake8-use-pathlib
+    "T20",   # flake8-print - stray print(); this service logs through structlog
+    "ARG",   # flake8-unused-arguments
+    "RUF",   # ruff-specific rules
 ]
+
+# Exactly one rule is switched off globally, and only after seeing it misfire.
 ignore = [
-  "E501", # line length is enforced by the formatter
-  "B008", # FastAPI dependency defaults (Depends(...)) are intentional
+    # S105 keys off the *identifier*, not the value: any name containing "token"
+    # or "secret" assigned a string literal is reported. In a JWT service that
+    # means legitimate, non-sensitive constants such as `TOKEN_TYPE_ACCESS =
+    # "access"` and the OAuth2 `token_type: str = "bearer"` response field are
+    # all flagged, and suppressing each at its call site would litter the auth
+    # modules with noqa comments. The genuine hazards this rule is meant to
+    # catch remain covered: S106 (a credential passed as a function argument)
+    # and S107 (a credential as a parameter default) both stay ACTIVE, no
+    # credential has a literal default anywhere - app/core/config.py requires
+    # JWT_SECRET_KEY from the environment with no fallback - and .env files are
+    # gitignored, with .env.example carrying placeholders only.
+    "S105",
 ]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app", "tests"]
+combine-as-imports = true
+split-on-trailing-comma = false
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency and parameter markers are evaluated once at import time
+# and are safe as default arguments; B008 exists for genuinely mutable defaults.
+# Naming them precisely keeps B008 active everywhere else instead of switching
+# the rule off wholesale.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Cookie",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+    "fastapi.Security",
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+# Absolute imports everywhere. Layer boundaries between api/, services/,
+# repositories/ and models/ are only reviewable when every import states the
+# full path it crosses.
+ban-relative-imports = "all"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106"] # asserts and dummy credentials are expected in tests
-"migrations/**" = ["N806", "S608"]
+# Tests assert, fabricate credential-shaped strings, and request fixtures whose
+# value is their side effect rather than their return.
+"tests/**/*.py" = [
+    "S101", # `assert` is how a test states its expectation
+    "S106", # fixture credentials are fabricated, not real
+    "S107",
+    "S311", # non-cryptographic randomness is fine for fixture data
+    "ARG001",
+    "ARG002",
+    "ARG005",
+]
+# Alembic revisions have a fixed generated shape: module-level `revision` and
+# `down_revision` identifiers, long inline DDL literals the formatter cannot
+# split, and literal SQL in data migrations.
+"migrations/versions/*.py" = [
+    "E501", # generated DDL and index expressions exceed the column budget
+    "N806",
+    "S608", # literal SQL is the entire point of a data migration
+]
+# Starlette hands `request` to every exception handler positionally, whether or
+# not that handler has any use for it.
+"app/core/exceptions.py" = ["ARG001"]
 
 [tool.ruff.format]
+# Must not contradict the root .editorconfig, which sets `indent_style = space`
+# with `indent_size = 4` and `end_of_line = lf` for *.py. Never tab, never crlf.
 quote-style = "double"
 indent-style = "space"
 line-ending = "lf"
+docstring-code-format = true
+skip-magic-trailing-comma = false
 
-# --------------------------------------------------------------------------- #
-# Static typing
-# --------------------------------------------------------------------------- #
+# =============================================================================
+# mypy - static typing.
+#
+# CONFIG DISCOVERY: unlike ruff, mypy does NOT search upwards. It reads
+# mypy.ini, .mypy.ini, pyproject.toml, then setup.cfg from the CURRENT WORKING
+# DIRECTORY only. The three canonical, equivalent invocations - each verified to
+# exit 0 - are:
+#
+#   cd backend && mypy                                        # uses `files` below
+#   cd backend && mypy app                                    # identical scope
+#   mypy --config-file backend/pyproject.toml backend/app     # from the root
+#
+# A bare `mypy backend/app` from the repository root is NOT equivalent: it finds
+# no configuration, runs on mypy's permissive defaults, and fails on the one
+# untyped third-party import the overrides below account for
+# (`Library stubs not installed for "bleach"  [import-untyped]`). Use one of the
+# three forms above.
+#
+# `files` and `mypy_path` below make the first form completely self-sufficient,
+# which is what the root Makefile's `typecheck-backend` target relies on.
+# The fix is deliberately NOT a root-level mypy.ini: that would reintroduce the
+# competing configuration this file exists to prevent.
+#
+# Strictness is not decoration. Untyped function bodies and implicit `Any`
+# returns are exactly how a layering violation - a route handler reaching for a
+# session, a repository importing a service - slips through review unnoticed.
+# =============================================================================
 [tool.mypy]
 python_version = "3.14"
 files = ["app"]
-strict = true
-plugins = ["pydantic.mypy"]
-warn_unreachable = true
-warn_unused_ignores = true
-show_error_codes = true
-exclude = ["^\\.venv/", "^migrations/versions/"]
+mypy_path = ["."]
+exclude = ['^\.venv/']
 
+strict = true
+
+# Beyond `strict`, and each one earns its place:
+warn_unreachable = true    # a branch typing says can never run is a real defect
+show_error_codes = true    # every message carries the code needed to silence it
+enable_error_code = [
+    "ignore-without-code", # a bare `# type: ignore` must name the code it hides
+    "redundant-self",      # an explicit Self annotation that adds nothing
+]
+
+# The Pydantic v2 plugin. It teaches mypy how model `__init__` signatures are
+# synthesised, which is what makes `[tool.pydantic-mypy]` below effective.
+#
+# sqlalchemy.ext.mypy.plugin is deliberately NOT enabled. SQLAlchemy 2.0 types
+# its declarative API natively through Mapped[] / mapped_column(), and the
+# legacy plugin is deprecated - switching it on against 2.0.51 produces errors
+# rather than preventing them.
+plugins = ["pydantic.mypy"]
+
+# Third-party modules with no inline type information. Audited against the
+# pinned dependency set rather than guessed: of the packages application code
+# imports, only `bleach` ships no py.typed marker, and mypy reports
+# `Library stubs not installed for "bleach"  [import-untyped]` for it. The other
+# three are listed because they are the untyped-import candidates in this
+# dependency set and the entry is provably inert while they keep shipping
+# py.typed; it costs nothing and survives a future release dropping the marker.
+# greenlet, gunicorn and python-multipart also lack markers but are transitive -
+# no application module imports them - so they are not listed.
 [[tool.mypy.overrides]]
-module = ["slowapi.*", "bleach.*", "slugify.*"]
+module = ["bleach.*", "pwdlib.*", "slowapi.*", "slugify.*"]
 ignore_missing_imports = true
+
+# The gate is the application package, so `app/` carries full strictness. Test
+# and migration modules are held to a lower bar: fixtures and Alembic's
+# generated `upgrade()`/`downgrade()` bodies gain nothing from full annotation.
+[[tool.mypy.overrides]]
+module = ["tests.*", "migrations.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
+warn_return_any = false
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true
 warn_required_dynamic_aliases = true
+warn_untyped_fields = true
 
-# --------------------------------------------------------------------------- #
-# Tests
-# --------------------------------------------------------------------------- #
+# =============================================================================
+# pytest - unit and integration suites.
+#
+# pytest discovers its inifile by walking up from its arguments, so
+# `pytest backend/tests` from the repository root finds this file and reports
+# `rootdir: <repo>/backend, configfile: pyproject.toml`. Every path below is
+# resolved relative to that rootdir.
+# =============================================================================
 [tool.pytest.ini_options]
 minversion = "9.0"
+
+# LOAD-BEARING. rootdir is backend/, and under the default `prepend` import mode
+# nothing puts backend/ itself on sys.path. Without this entry the very first
+# `from app.main import app` in tests/conftest.py fails collection with
+# `ModuleNotFoundError: No module named 'app'` and the whole suite errors out
+# before a single assertion runs.
+pythonpath = ["."]
+
 testpaths = ["tests"]
+
+# `--strict-markers` rejects an unregistered marker (see `markers` below) and
+# `--strict-config` rejects an unknown or misspelt key in this very table, so a
+# typo here fails loudly instead of being silently ignored.
+#
+# `--cov` is deliberately ABSENT. Coverage is requested on the command line
+# (`--cov=app` locally, `--cov=backend/app` from the repository root); adding it
+# here as well would layer a second source specification over the first and
+# double-count measured lines. The coverage *settings* are centralised in
+# [tool.coverage.*] instead.
 addopts = "-ra --strict-markers --strict-config"
+
+# pytest-asyncio 1.4.0. `auto` treats every `async def test_*` as a coroutine
+# test without a per-test marker.
 asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
+
+# BOTH loop scopes are set, and both are required.
+#
+# tests/conftest.py builds a SESSION-scoped async engine and layers a
+# per-test transaction on top of it. Setting only the fixture scope leaves
+# function-scoped async tests on a DIFFERENT event loop from the session-scoped
+# fixture that created the engine - verified directly, by comparing
+# id(asyncio.get_running_loop()) across the two - and connections created on one
+# loop cannot be awaited on another. Raising the test loop scope to `session`
+# puts the engine, its connections and every test on one loop for the whole run.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
 markers = [
-  "unit: fast tests with no external dependencies",
-  "integration: tests that exercise the API and the database",
+    "unit: fast, isolated tests that touch neither the database nor the network",
+    "integration: tests that drive the API in-process against PostgreSQL",
 ]
 
+# Warnings are reported, not fatal: a deprecation emitted by a pinned
+# dependency must not turn a green suite red without an accompanying code
+# change. `default` prints the first occurrence per location.
+filterwarnings = ["default"]
+
+# =============================================================================
+# coverage.py - measurement settings for the `--cov-fail-under=80` gate.
+#
+# CONFIG DISCOVERY: coverage.py behaves like mypy, not like pytest. It reads
+# .coveragerc, setup.cfg, tox.ini and pyproject.toml from the CURRENT WORKING
+# DIRECTORY only, and does not walk upwards - so pytest can set rootdir to
+# backend/ and still hand coverage no configuration at all. Observed directly:
+#
+#   cd backend && pytest --cov=app --cov-fail-under=80
+#       -> reads this table: branch columns, Missing column, 2-dp percentages
+#   pytest backend/tests --cov=backend/app --cov-fail-under=80   (from root)
+#       -> still passes, but on coverage's own defaults; the tables below are
+#          never seen, because the repository root has no pyproject.toml
+#
+# The root-level form is made fully equivalent by naming the file explicitly:
+#
+#   pytest backend/tests --cov=backend/app \
+#          --cov-config=backend/pyproject.toml --cov-fail-under=80
+#
+# `--cov-config` is deliberately NOT added to `addopts` above: addopts is a
+# single string shared by every invocation, and a relative path in it would
+# resolve against whichever directory pytest was launched from - correct for one
+# caller and broken for the other. The Makefile's `test-backend` target runs
+# from backend/, which is the canonical path and needs no flag.
+# =============================================================================
 [tool.coverage.run]
 source = ["app"]
 branch = true
-omit = ["app/__init__.py", "migrations/*"]
+
+# The same run is invoked two ways - `--cov=app` from backend/ and
+# `--cov=backend/app` from the repository root - and relative paths are what let
+# the two spellings produce one comparable report instead of two disjoint ones.
+relative_files = true
+
+omit = ["tests/*", "migrations/*"]
+
+[tool.coverage.paths]
+# Collapse the two spellings of the same tree onto a single canonical name so a
+# report generated from either invocation names the same files.
+source = ["app", "backend/app", "*/backend/app"]
 
 [tool.coverage.report]
+# Mirrors the `--cov-fail-under=80` supplied on the command line, so the
+# threshold has one authoritative home even when the flag is omitted.
 fail_under = 80
 show_missing = true
-skip_covered = true
-exclude_also = [
-  "if TYPE_CHECKING:",
-  "raise NotImplementedError",
-  "@overload",
+skip_covered = false
+precision = 2
+exclude_lines = [
+    # `exclude_lines` REPLACES coverage's built-in list, so the default pragma
+    # has to be restated here.
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    'if __name__ == .__main__.:',
+    '^\s*\.\.\.$',
+    '@(?:typing\.)?overload',
 ]
