@@ -64,20 +64,39 @@ carries in its ``category`` query parameter, what the client writes into the URL
 picks a filter, and what the generated sitemap enumerates. Editing one below is a broken link
 and a lost ranking, not a rename.
 
-Idempotency belongs to seed.py, not to this revision
+Two writers, one taxonomy: both directions reconcile
 ----------------------------------------------------
-There is no ``ON CONFLICT DO NOTHING`` guard on the insert, and adding one would be a
-misreading of the contract rather than a safety improvement. Alembic already guarantees a
-revision runs at most once per database, through the ``alembic_version`` table, so this insert
-can never encounter a row it inserted itself.
+``app.db.seed.seed_categories`` writes the same eight categories, and either writer can arrive
+first. Both orderings therefore have to end at eight rows, and each side reaches that outcome by
+the same rule: **look the specification up by slug or by folded name, and insert only what is
+absent.**
 
-``app.db.seed`` is the file that has to be re-runnable, and it is: ``seed_categories`` looks
-each specification up by slug and then by name - both folded for case, because both columns are
-``citext`` - and skips whatever it finds. So when the backend container runs
-``alembic upgrade head`` on start and ``make seed`` afterwards, this revision inserts the eight
-rows and the seed script reports eight skips. Reverse the order and the seed script inserts
-them while this revision is simply never re-run. Whichever writer arrives first, the other
-writes nothing, and the row count after the second run equals the row count after the first.
+The seed side does it in Python - it selects the sixteen candidate values, skips whatever it
+finds, and inserts the rest. This side does it in SQL. Each of the eight statements in
+:func:`upgrade` is an ``INSERT ... SELECT ... WHERE NOT EXISTS`` naming that row's own slug and
+folded name, with ``ON CONFLICT DO NOTHING`` behind it, so a category the seed script already
+created is skipped by the guard rather than colliding with ``uq_categories_name``.
+
+That guard is **not** about this revision running twice. Alembic already guarantees a revision
+runs at most once per database through the ``alembic_version`` table, so the insert can never
+meet a row it inserted itself. It is about the *other* writer, and the case it fixes is real
+rather than hypothetical: a database left at ``0002`` and then seeded - a provisioning step that
+stopped short of ``head``, a developer who ran the seed early, an older deployment whose
+categories were populated by hand - would abort the next ``alembic upgrade head`` on a duplicate
+name, leaving an operator to reach for ``alembic stamp`` to get moving again. Measured before the
+guard existed: ``psycopg.errors.UniqueViolation ... "uq_categories_name"``, with the database
+correctly and atomically still at ``0002``.
+
+The guard is written *inside* the statement on purpose. A read-then-branch in Python - select the
+existing slugs, then decide what to insert - would need a live connection and would render
+nothing usable under ``alembic upgrade head --sql``, where there is no database to ask. A
+``WHERE NOT EXISTS`` is part of the SQL, so the offline script stays self-contained and stays
+conditional: hand it to somebody who applies it under change control and it is still safe against
+a database that already carries the taxonomy.
+
+So: migrate first and the seed script reports eight skips; seed first and these eight statements
+insert nothing. Whichever writer arrives first, the other writes nothing, and the row count after
+the second run equals the row count after the first.
 
 No application imports, and nothing resolved from live metadata
 --------------------------------------------------------------
@@ -243,21 +262,102 @@ REFERENCE_CATEGORIES: tuple[dict[str, str], ...] = (
 REFERENCE_SLUGS: tuple[str, ...] = tuple(row["slug"] for row in REFERENCE_CATEGORIES)
 
 
+def _guarded_insert(row: dict[str, str]) -> postgresql.Insert:
+    """Build the reconciling insert for one reference category.
+
+    The statement is ``INSERT INTO categories (name, slug, description) SELECT <literals>
+    WHERE NOT EXISTS (SELECT 1 FROM categories WHERE slug = <slug> OR lower(name) = <folded
+    name>) ON CONFLICT DO NOTHING`` - one round trip, no read-then-branch, and therefore
+    renderable offline. See the module docstring for why both writers need it.
+
+    The predicate mirrors ``app.db.seed.seed_categories`` value for value, which is the whole
+    point: two writers that disagree about what "already present" means would each skip a
+    different set.
+
+    * **slug.** ``categories.slug`` is ``citext``, so ``=`` folds case in the database and the
+      comparison resolves through ``ix_categories_slug``.
+    * **name.** ``categories.name`` is plain ``TEXT`` under the case-SENSITIVE
+      ``uq_categories_name``, so the fold is written out with ``lower()``. That is deliberately
+      *stricter* than the constraint: a stored ``ENGINEERING`` counts as satisfying the reference
+      ``Engineering`` even though inserting alongside it would not actually collide. Stricter is
+      the safe direction here - the cost is a skip, and what it buys is one taxonomy rather than
+      two spellings of the same category. ``seed.py`` documents the same trade at its query.
+
+    ``ON CONFLICT DO NOTHING`` sits behind the guard rather than replacing it, and it covers the
+    one case the guard cannot see: a writer that commits the same category *after* this
+    statement's snapshot was taken. The realistic instance is an overlapping ``make seed`` -
+    seeding is a separate process and nothing stops it running while an upgrade is in flight -
+    and applying the rendered ``--sql`` script alongside one has the same shape. Under
+    ``READ COMMITTED`` the guard evaluates against a snapshot that predates the other writer's
+    commit, finds nothing, and proceeds. Measured with the guard alone: the statement blocks on
+    the other writer's uncommitted index tuple and then raises ``UniqueViolation`` on
+    ``uq_categories_name`` the moment that writer commits. With this clause it is released,
+    inserts nothing, and the row count stays at one. Targetless, so it covers
+    ``uq_categories_name`` and ``ix_categories_slug`` alike.
+
+    Two *concurrent upgrades* are a different story and do not depend on this clause: Alembic's
+    own version-row check stops the loser first, with ``Online migration expected to match one
+    row when updating '0002' to '0003' in 'alembic_version'; 0 found``, and rolls its whole
+    transaction back. Measured as well - two simultaneous ``alembic upgrade head`` runs from
+    ``0002`` exit ``[255, 0]`` and leave exactly eight categories, no duplicates, at ``head``.
+
+    Args:
+        row: One entry of :data:`REFERENCE_CATEGORIES` - ``name``, ``slug`` and ``description``.
+
+    Returns:
+        The insert to execute, with every value bound as a literal of its column's own type so
+        that ``literal_binds`` renders it inline under ``--sql``.
+    """
+    already_present = (
+        sa.select(sa.literal(1))
+        .select_from(categories_table)
+        .where(
+            sa.or_(
+                categories_table.c.slug == sa.literal(row["slug"], postgresql.CITEXT()),
+                sa.func.lower(categories_table.c.name)
+                == sa.literal(row["name"].casefold(), sa.Text()),
+            )
+        )
+    )
+    # `id`, `created_at` and `updated_at` are absent from the column list, so 0001's server
+    # defaults - gen_random_uuid() and now() - supply all three. That omission is the reason this
+    # revision is not the source of identity for eight rows.
+    values = sa.select(
+        sa.literal(row["name"], sa.Text()).label("name"),
+        sa.literal(row["slug"], postgresql.CITEXT()).label("slug"),
+        sa.literal(row["description"], sa.Text()).label("description"),
+    ).where(~already_present.exists())
+
+    return (
+        postgresql.insert(categories_table)
+        .from_select(["name", "slug", "description"], values)
+        .on_conflict_do_nothing()
+    )
+
+
 def upgrade() -> None:
     # --- The rows ----------------------------------------------------------------------------
-    # One statement, and no DDL whatsoever.
+    # Eight statements, one per category, and no DDL whatsoever.
     #
-    # `bulk_insert` requires a list of dicts and rejects a tuple outright, so the module-level
-    # tuple is materialised here. Each row is copied rather than passed by reference, so the
-    # constant cannot be mutated through the list handed to alembic - REFERENCE_SLUGS is
-    # projected from the same objects, and a caller editing one in place would silently change
-    # what downgrade() removes.
+    # `op.bulk_insert` is deliberately not used. It emits an unguarded INSERT, which is correct
+    # only while this revision is the sole writer of the taxonomy - and it is not: app.db.seed
+    # writes the same eight rows, either order is reachable, and the unguarded form aborted the
+    # upgrade on `uq_categories_name` whenever the seed script got there first. `_guarded_insert`
+    # carries that reconciliation in SQL instead, so both orderings end at eight rows.
     #
-    # Offline (`alembic upgrade head --sql`) this renders as eight self-contained INSERT
-    # statements with the values inlined, because migrations/env.py configures
-    # `literal_binds=True`. Online it is one executemany. Both write the same eight rows, and
-    # both leave `id`, `created_at` and `updated_at` to the server defaults from 0001.
-    op.bulk_insert(categories_table, [dict(row) for row in REFERENCE_CATEGORIES])
+    # Per row rather than one statement over a VALUES list, for two reasons. Each guard then
+    # names only its own slug and folded name, which is what makes the skip decision independent
+    # per category - seven can insert while the eighth is adopted. And because the statements run
+    # in sequence inside one transaction, each guard also sees what its predecessors just wrote,
+    # so a duplicate accidentally introduced *within* REFERENCE_CATEGORIES self-skips rather than
+    # raising. seed.py achieves that same property by registering each new row in its lookup.
+    #
+    # Offline (`alembic upgrade head --sql`) each renders as a self-contained INSERT with its
+    # values inlined, because migrations/env.py configures `literal_binds=True`; online each is
+    # one execute. Both write the same eight rows, and both leave `id`, `created_at` and
+    # `updated_at` to the server defaults from 0001.
+    for row in REFERENCE_CATEGORIES:
+        op.execute(_guarded_insert(row))
 
 
 def downgrade() -> None:

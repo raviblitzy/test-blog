@@ -155,6 +155,16 @@ def upgrade() -> None:
     # text-search configuration can reach it. IF NOT EXISTS keeps the block idempotent
     # against an environment that was provisioned with them already present.
     #
+    # DEPLOYMENT PREREQUISITE, and the one thing in this revision that is not self-contained:
+    # `CREATE EXTENSION` requires a superuser role, or an extension already installed in the
+    # target database. A least-privilege application role - the right thing to run the service
+    # under - therefore fails on this block rather than on anything below it. Two ways to
+    # satisfy it, and both are ordinary: install the three extensions once as a privileged role
+    # before the first `alembic upgrade head` (IF NOT EXISTS then makes this block a no-op), or
+    # run migrations under a role that may create them while the service itself connects as the
+    # restricted one. The local Compose database runs as a superuser, which is why this is a
+    # note rather than a failure anybody has seen here.
+    #
     # No extension is installed for UUID generation: gen_random_uuid() is a PostgreSQL 18
     # built-in, verified available with only these three installed.
     op.execute("CREATE EXTENSION IF NOT EXISTS citext")

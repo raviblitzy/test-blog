@@ -69,8 +69,17 @@ Coordinating with the migration that seeds the same categories
 ``backend/migrations/versions/0003_seed_reference_categories.py`` inserts the reference category
 set as migration *data*, and the backend container runs ``alembic upgrade head`` on start. By the
 time this script runs those rows therefore usually exist already, including on the very first run
-against a freshly upgraded database. Both orderings are handled by the same slug-and-name lookup:
-whichever writer gets there first, the other reports the rows as skipped and inserts nothing.
+against a freshly upgraded database. That is the ordinary direction, and :func:`seed_categories`
+handles it by looking each specification up by slug and by folded name and reporting eight skips.
+
+The reverse direction is reachable too - a database left at ``0002`` and seeded before it reached
+``head`` - and it is the revision, not this module, that has to absorb it: at that point ``0003``
+has never run, so the next ``alembic upgrade head`` does run it against rows this script wrote.
+Revision ``0003`` therefore carries the same reconciliation rule in SQL, as a
+``WHERE NOT EXISTS`` on each row's own slug and folded name. Both writers consequently agree on
+what "already present" means, and whichever gets there first, the other inserts nothing. Keep the
+two predicates in step: this module's lookup is the one ``0003`` mirrors, so a change to the match
+key here needs the same change there.
 
 :data:`REFERENCE_CATEGORIES` is public for exactly that reason - it is the single canonical
 statement of the taxonomy, and revision ``0003`` must insert the same names, the same derived

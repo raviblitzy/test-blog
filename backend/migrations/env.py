@@ -57,6 +57,22 @@ flags are what make the drift gate able to see any of it. Silencing a stubborn d
 turning either one off is not a fix; it disables the gate for the entire schema. Narrow the
 exclusion instead - :func:`include_object` is the place - and say in a comment why.
 
+``compare_server_default=True`` has one audible side effect, and it is Alembic's rather than
+this project's. Every comparison run - ``alembic check`` included - emits
+``UserWarning: Computed default on posts.search_vector cannot be modified`` from
+``alembic/autogenerate/compare/server_defaults.py``, because ``posts.search_vector`` is a
+``GENERATED ALWAYS AS ... STORED`` column whose expression Alembic can see but cannot diff.
+``check`` still reports no operations and still exits ``0``; the warning is the honest statement
+that this one column is outside what the gate can compare. **It is deliberately not filtered
+here.** A ``warnings.filterwarnings`` in this module would silence precisely the case where
+``app.models.post`` and revision ``0002`` had drifted apart on that expression, turning a visible
+caveat into a blind spot - and a generated column is the one thing autogeneration cannot report
+any other way. The consequence to know about is narrow: a pipeline that runs the check with
+``-W error`` turns the warning into a failure - measured, ``python -W error -m alembic check``
+exits ``1`` while the plain command exits ``0``. A continuous-integration job should therefore run
+``alembic check`` as it stands, or scope any ``-W error`` promotion so that this one Alembic
+warning stays a warning.
+
 The other half of that gate is the ``import app.models`` line below. Autogeneration compares
 the *model* side against the *database* side, and a relation joins the model side only once
 the module declaring it has been imported. Drop that import and ``upgrade`` still works,
