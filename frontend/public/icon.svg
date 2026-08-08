@@ -1,0 +1,52 @@
+<!-- Scalable site icon, served at /icon.svg and declared through
+  `metadata.icons` in src/app/layout.tsx. It lives in public/, so Next's
+  metadata FILE convention does not auto-detect it: the path is the contract.
+
+  VECTOR MASTER. favicon.ico and apple-icon.png are rasterisations of this mark
+  and og-default.png composes it, so changing the geometry or palette here means
+  regenerating all three or the family diverges.
+
+  PALETTE PARITY. An icon loaded through <link rel="icon"> renders outside the
+  page's CSS cascade, so a custom property cannot resolve and literals are
+  unavoidable. Each is copied from the token table in src/app/globals.css and
+  must be kept in step with it. Names omit the leading double hyphen, which an
+  XML comment may not contain.
+
+    #4f39f6  color-primary             light  indigo-600
+    #ffffff  color-primary-foreground  light  white
+    #7c86ff  color-primary             dark   indigo-400
+    #020618  color-primary-foreground  dark   slate-950
+
+  ARTWORK. Square viewBox, because all three derived assets are square. Tabs
+  rasterise to 16px, so the mark is four solid shapes: nothing thinner than 4
+  units, no interior detail, no gradient, no third colour, no <text> (an icon
+  has no font loading context). Every bar edge is on an EVEN coordinate, which
+  matters more than it looks: at 16px one device pixel spans two units, so even
+  edges land the bars and gaps whole on the grid in a 2px on, 2px off rhythm,
+  while a half-unit edge straddles a row and anti-aliases that bar paler than
+  its neighbours. Drawing the mark on its own opaque field holds 6.46:1 light
+  and 6.44:1 dark, which no single flat colour manages on both canvases, and the
+  short last line is a ragged paragraph edge, so the mark reads as written text
+  rather than a menu glyph and survives in monochrome.
+
+  Keep it inert: no script, no event handler, no external reference, no raster
+  payload, no editor metadata. public/ is world-readable and ships verbatim in
+  the production image. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img">
+  <title>Blog article mark: three stacked lines of text</title>
+  <style>
+    /* Dark scheme. The light palette is carried by the presentation attributes
+     * below, which CSS outranks, so the mark still renders correctly wherever
+     * this block is ignored. */
+    @media (prefers-color-scheme: dark) {
+      .field { fill: #7c86ff; }
+      .mark { fill: #020618; }
+    }
+  </style>
+  <rect class="field" width="32" height="32" rx="7" fill="#4f39f6" />
+  <g class="mark" fill="#ffffff">
+    <rect x="6" y="6" width="20" height="4" rx="2" />
+    <rect x="6" y="14" width="20" height="4" rx="2" />
+    <rect x="6" y="22" width="12" height="4" rx="2" />
+  </g>
+</svg>

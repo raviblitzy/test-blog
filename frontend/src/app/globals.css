@@ -149,12 +149,40 @@
  * the cascade and unreadable by `getComputedStyle`. `static` guarantees all
  * thirteen are always present.
  *
+ * WHY `inline`, AND WHY DARK MODE IS ENTIRELY BROKEN WITHOUT IT. This is the
+ * single most fragile line in the file. Do not remove the keyword.
+ *
+ * A `var()` written inside a custom-property declaration is substituted at
+ * computed-value time ON THE ELEMENT THAT DECLARES IT, and descendants then
+ * inherit the already-substituted result. Without `inline`, the engine emits
+ *     :root { --color-primary: var(--app-primary) }
+ *     .bg-primary { background-color: var(--color-primary) }
+ * so `--color-primary` resolves ONCE, at `:root`, against the LIGHT
+ * `--app-primary` - and that frozen light value is what every descendant
+ * inherits. The `.dark` block further down re-points `--app-primary`, but by
+ * then nothing downstream reads it: the alias chain has already been severed at
+ * `:root`. The measured result is a dark theme that is completely inert - every
+ * utility keeps painting its light colour inside `.dark`, the two themes render
+ * pixel-for-pixel identically, and NOTHING fails loudly: no error, no warning,
+ * no failed build.
+ *
+ * `inline` removes the intermediate reference. The engine instead emits
+ *     .bg-primary { background-color: var(--app-primary) }
+ * which is resolved on the element the utility is applied to, so the `.dark`
+ * override is picked up per subtree and theming works.
+ *
+ * Both properties above survive together: `static` still emits all thirteen
+ * `--color-*` custom properties at `:root` for `getComputedStyle`, and the
+ * opacity-modifier behaviour described above is preserved because the engine
+ * still has a variable rather than a literal to fold - `bg-primary/50` compiles
+ * to `color-mix(in oklab, var(--app-primary) 50%, transparent)`.
+ *
  * The `var(--color-<family>-<step>)` values in the blocks below are resolved by
  * the engine from its own default theme, so the mapping is stated by name and
  * cannot drift from a transcribed literal.
  * -------------------------------------------------------------------------- */
 
-@theme static {
+@theme static inline {
   /* Typeface. src/app/layout.tsx loads the faces through next/font and exposes
    * them as `--font-app-sans` and `--font-app-mono` on the root element. Those
    * two names are a character-for-character contract with that file: rename one
@@ -331,7 +359,7 @@
   ::after,
   ::backdrop,
   ::file-selector-button {
-    border-color: var(--color-border);
+    border-color: var(--app-border);
   }
 
   /* Binding the canvas here rather than on `html` is deliberate: with `html`
@@ -345,9 +373,24 @@
    * motion of that kind must be gated on `prefers-reduced-motion`, this file
    * authors no `@media` block by design, and shipping ungated smooth scrolling
    * would override a stated accessibility preference for every visitor. */
+  /* WHY THE HAND-WRITTEN RULES IN THIS LAYER READ `--app-*` AND NOT `--color-*`.
+   * The three rules below (body, :focus-visible, ::selection) are the only
+   * places in the project that reference a token from CSS rather than through a
+   * generated utility, and they deliberately reach for the INNER variable.
+   *
+   * `--color-*` is declared once, at `:root`, as `var(--app-*)`. A `var()` in a
+   * custom-property declaration is substituted on the declaring element, so
+   * `--color-*` is frozen to the light values there and inherits already
+   * resolved. That is harmless when `.dark` sits on the document element,
+   * because then the alias and the override are declared on the SAME element -
+   * but it silently breaks the subtree case, and the dark variant at the top of
+   * this file (`&:where(.dark, .dark *)`) exists precisely so a subtree CAN be
+   * themed on its own. Reading `--app-*` makes these three correct wherever
+   * `.dark` is applied. The generated utilities already do the same, via the
+   * `inline` keyword on the @theme block. */
   body {
-    background-color: var(--color-background);
-    color: var(--color-foreground);
+    background-color: var(--app-background);
+    color: var(--app-foreground);
 
     /* Keeps the webfont from rendering over-weight on macOS and iOS. */
     -webkit-font-smoothing: antialiased;
@@ -370,7 +413,7 @@
    * of visibly changing thickness. px, not rem, because a focus ring is a
    * border-like affordance that should not scale with the user's font size. */
   :focus-visible {
-    outline: 2px solid var(--color-ring);
+    outline: 2px solid var(--app-ring);
     outline-offset: 2px;
   }
 
@@ -378,8 +421,8 @@
    * relying on the browser's default blue - which can fall below AA over the
    * dark canvas. */
   ::selection {
-    background-color: var(--color-primary);
-    color: var(--color-primary-foreground);
+    background-color: var(--app-primary);
+    color: var(--app-primary-foreground);
   }
 
   /* Long unbroken strings - a pasted URL in a comment, a slug in a table cell -

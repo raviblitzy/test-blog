@@ -1,7 +1,7 @@
 /**
  * Vitest bootstrap for the frontend component-test suite.
  *
- * `frontend/vitest.config.mts` names this module as its only `setupFiles` entry,
+ * `frontend/vitest.config.ts` names this module as its only `setupFiles` entry,
  * so every statement below runs once per test file, before that file's own
  * modules are evaluated.
  *
@@ -36,7 +36,7 @@
  *     and on accessible names; class names belong to the token layer and are
  *     free to change without a test noticing.
  *   - Anything Playwright-related. `tests/e2e/**` is a separate runner with a
- *     separate lifecycle, and `vitest.config.mts` already excludes it.
+ *     separate lifecycle, and `vitest.config.ts` already excludes it.
  */
 
 // 1. DOM assertion matchers. The `/vitest` subpath extends Vitest's `expect`;
@@ -50,7 +50,7 @@ import { cleanup } from '@testing-library/react';
 import { setupServer } from 'msw/node';
 import { afterAll, afterEach, beforeAll, vi } from 'vitest';
 
-// `tests/` sits outside `src/`, and the only alias `vitest.config.mts` declares
+// `tests/` sits outside `src/`, and the only alias `vitest.config.ts` declares
 // is `@` -> `./src/`. This import therefore has to stay relative; `@/tests/...`
 // does not resolve.
 import { handlers } from './tests/msw/handlers';

@@ -46,7 +46,7 @@
 // which `--max-warnings=0` turns into a failed run (exit 1). Binding the array
 // to `config` first is therefore not a style preference, it is what makes the
 // gate passable. frontend/postcss.config.mjs and frontend/next.config.ts bind a
-// named constant for exactly the same reason; frontend/vitest.config.mts and
+// named constant for exactly the same reason; frontend/vitest.config.ts and
 // frontend/playwright.config.ts export a `defineConfig(...)` call, which the
 // rule permits because it allows call expressions.
 //

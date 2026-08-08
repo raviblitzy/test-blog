@@ -129,7 +129,7 @@ export default defineConfig({
   testDir: './tests/e2e',
 
   // Restricted to *.spec.ts so this runner can never collect the Vitest component tests
-  // (tests/components/*.test.tsx). vitest.config.mts excludes tests/e2e/** from the other
+  // (tests/components/*.test.tsx). vitest.config.ts excludes tests/e2e/** from the other
   // direction, so the two runners stay strictly disjoint. Playwright's default testMatch
   // would also match *.test.ts, which is precisely the overlap being prevented here.
   testMatch: '**/*.spec.ts',
