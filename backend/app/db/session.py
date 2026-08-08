@@ -53,6 +53,54 @@ file from ``README.md``'s environment table, ``docker-compose.yml`` and
 a deployment that genuinely needs different numbers changes a line of code that ships
 through the same review as any other.
 
+Every connection speaks UTC
+---------------------------
+:data:`CONNECT_ARGS` pins the PostgreSQL session time zone to UTC on every connection this
+engine opens, and that is part of the API's wire contract rather than a local preference.
+Every timestamp column in this schema is ``TIMESTAMP WITH TIME ZONE``, and psycopg loads
+such a value as an *aware* :class:`~datetime.datetime` carrying the offset of the
+**session** time zone - not necessarily UTC. Pydantic then serialises whatever offset it
+was handed, and every response schema in ``app.schemas`` documents its instants as UTC,
+for example ``2026-01-15T09:30:00Z``. Those two facts only agree if the connection is UTC.
+
+Measured on PostgreSQL 18.4 through psycopg 3.3.4, with the database's own default changed
+to a non-UTC zone (``ALTER DATABASE … SET timezone='America/New_York'``, which is exactly
+what an operator or a managed provider might do): an unpinned connection loaded
+``categories.created_at`` as ``2026-08-08T12:07:55.588258-04:00``, and Pydantic 2.13.4
+serialises that verbatim as ``…-04:00`` rather than as ``…Z``; the pinned connection loaded
+the same row as ``2026-08-08T16:07:55.588258+00:00``, which Pydantic renders ``…Z``. The
+instant is identical either way - so nothing here is *wrong* without the pin - but the
+published contract, the ``frontend/src/lib/format.ts`` formatters that resolve their
+calendar fields in UTC, and the end-to-end suite's pinned ``timezoneId: 'UTC'`` are all
+written against ``Z``, and a client comparing date strings or slicing the first ten
+characters of one would silently read the wrong calendar day either side of midnight.
+
+Pinning it here also means no other layer has to normalise: no response serialiser
+converting on the way out, no ``astimezone`` in a schema validator, and no per-connection
+event listener - one connect argument, applied before the first statement, and the values
+are already UTC by the time anything reads them.
+
+Isolation level: PostgreSQL's default, and what that means for a reader
+----------------------------------------------------------------------
+No isolation level is configured, so every transaction runs at **READ COMMITTED**, and
+that is a deliberate choice rather than an omission. Each *statement* therefore sees its
+own snapshot, taken when it begins.
+
+The consequence a caller has to know is that a multi-statement read is not one snapshot.
+``app.repositories.base.BaseRepository.paginate`` issues a count and then a window, and a
+``selectinload`` adds a statement of its own, so a write committed in between is visible to
+the later statement and not the earlier one: a ``total`` can describe a set marginally
+different from the ``items`` beside it. That method's own documentation states this rather
+than claiming an exactness it cannot supply.
+
+The alternative was considered and rejected. REPEATABLE READ would give one snapshot per
+transaction, but sessions here serve writes as well as reads, and under that level a
+concurrent update makes a write fail with ``40001 could not serialize access due to
+concurrent update`` - which would need a retry policy on every mutating route to buy
+consistency for a feed count. Where exactness genuinely decides a write, the fix is a row
+lock at that point (``get_by_id(..., for_update=True)``, ``UPDATE ... WHERE ... RETURNING``)
+rather than a level change across the whole application.
+
 Lazy by contract
 ----------------
 Constructing an engine opens no connection, and nothing in this module forces one: there
@@ -120,10 +168,12 @@ from sqlalchemy.ext.asyncio import (
 from app.core.config import settings
 
 __all__ = [
+    "CONNECT_ARGS",
     "MAX_OVERFLOW",
     "POOL_PRE_PING",
     "POOL_RECYCLE_SECONDS",
     "POOL_SIZE",
+    "SESSION_TIME_ZONE",
     "AsyncSessionLocal",
     "engine",
 ]
@@ -178,6 +228,22 @@ complements :data:`POOL_RECYCLE_SECONDS` rather than duplicating it - recycling 
 the ages this process can predict, pre-ping handles the closures it cannot.
 """
 
+SESSION_TIME_ZONE: Final[str] = "UTC"
+"""The PostgreSQL session time zone every connection this engine opens is pinned to.
+
+Part of the wire contract, not a preference - see "Every connection speaks UTC" in the
+module docstring for the measurement and for what breaks without it.
+"""
+
+CONNECT_ARGS: Final[dict[str, str]] = {
+    # A libpq `options` string, passed through by psycopg to the server at connection time,
+    # so the setting is established before the first statement and costs no extra round
+    # trip. `-c timezone=UTC` is the same thing as `SET TIME ZONE 'UTC'` without needing a
+    # statement, an event listener or a checkout hook to issue it.
+    "options": f"-c timezone={SESSION_TIME_ZONE}",
+}
+"""The connect arguments passed to psycopg for every connection. See :data:`engine`."""
+
 
 # ---------------------------------------------------------------------------------------
 # Engine
@@ -217,9 +283,12 @@ engine: AsyncEngine = create_async_engine(
     pool_size=POOL_SIZE,
     max_overflow=MAX_OVERFLOW,
     pool_recycle=POOL_RECYCLE_SECONDS,
-    # No connect_args. There is no connection pooler in front of PostgreSQL in this
-    # deployment - docker-compose.yml defines db, backend and frontend and nothing else -
-    # so prepared-statement or statement-cache tuning would be speculative.
+    # Exactly one connect argument, and it is a correctness requirement rather than tuning -
+    # see "Every connection speaks UTC" in the module docstring. Nothing else is passed:
+    # there is no connection pooler in front of PostgreSQL in this deployment
+    # (docker-compose.yml defines db, backend and frontend and nothing else), so
+    # prepared-statement or statement-cache tuning would be speculative.
+    connect_args=CONNECT_ARGS,
 )
 """The one engine this process owns, and the pool behind every session it hands out.
 

@@ -53,12 +53,14 @@ emits, which is exactly the class of defect this module exists to prevent.
 
 Field names are copied from that module, not invented
 -----------------------------------------------------
-The six top-level keys are inserted in :mod:`app.core.exceptions` in the order ``type``,
-``title``, ``status``, ``detail``, ``instance``, then ``errors``, and they are declared below in
-that same order, which is also the order they appear on the wire. The three item-level keys -
-``field``, ``message``, ``type`` - are taken verbatim from that module's ``FieldError``
-TypedDict, and they are the whole of it: the two keys Pydantic supplies and it drops, ``input``
-and ``ctx``, are absent here too, for the reasons recorded on :class:`ValidationErrorItem`.
+:mod:`app.core.exceptions` inserts six required top-level keys in the order ``type``, ``title``,
+``status``, ``detail``, ``instance``, ``request_id``, and then the optional seventh, ``errors``,
+only when a validation failure has per-field detail to report. All seven are declared below in
+that same order, which is also the order they appear on the wire, so the published schema lists
+six members under ``required`` and ``errors`` outside it. The three item-level keys - ``field``,
+``message``, ``type`` - are taken verbatim from that module's ``FieldError`` TypedDict, and they
+are the whole of it: the two keys Pydantic supplies and it drops, ``input`` and ``ctx``, are
+absent here too, for the reasons recorded on :class:`ValidationErrorItem`.
 
 Import purity
 -------------
@@ -364,7 +366,11 @@ class ProblemDetail(BaseModel):
     The result is that the schema describes the emitted document exactly rather than a superset
     of it. That equality is the point: this member is the one part of the problem document a
     client has to branch on structurally, and a document permitting ``null`` and ``[]`` would
-    force every consumer to write two guards that can never fire - which is precisely how
-    ``frontend/src/lib/types.ts`` came to model it as an optional non-null array while the
-    schema said otherwise.
+    force every consumer to write two guards that can never fire.
+
+    ``frontend/src/lib/types.ts`` mirrors all three properties on its own
+    ``ProblemDetail.errors`` - optional, never ``null``, never empty - so ``if (problem.errors)``
+    is a complete test on that side of the wire. Widening this member without widening that one,
+    or the reverse, reintroduces exactly the guard the pair exists to remove: change them
+    together.
     """

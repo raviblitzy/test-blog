@@ -109,9 +109,11 @@
  *
  * Every collection endpoint returns this envelope and no other: the home feed
  * (`GET /api/v1/posts`), an author's published posts (`GET /api/v1/users/{username}/posts`), a
- * post's comment thread (`GET /api/v1/posts/{id}/comments`) and each administrative table
+ * post's comment thread (`GET /api/v1/posts/{id}/comments`), the category taxonomy
+ * (`GET /api/v1/categories`) and each administrative table
  * (`GET /api/v1/admin/{users,posts,comments}`). That uniformity is the reason one pagination
- * component can drive all of them.
+ * component can drive all of them, and it holds without exception - a collection small enough to
+ * render in full is still a collection, and still arrives as a page.
  *
  * **Exactly five fields.** `has_next`, `has_prev`, `offset`, cursors and hypermedia links are all
  * absent and must stay absent: every one is computable from the five values here, and a sixth
@@ -128,8 +130,13 @@
  *   requested, returns an empty `items` array and raises nothing, so a caller can recognise that
  *   it has run off the end rather than being silently redirected to a page it never asked for.
  *
- * Requests are bounded server-side: `page` is at least 1 with no upper limit, `page_size` is
- * clamped to 1..100 and defaults to 20.
+ * Requests are **validated** server-side, not adjusted: `page` must be at least 1 with no upper
+ * limit, and `page_size` must be between 1 and 100, defaulting to 20 when it is not sent. An
+ * out-of-range value is **rejected**, not corrected - `?page_size=1000` and `?page_size=0` each
+ * answer `422` with the uniform {@link ProblemDetail} document naming the parameter, so a caller
+ * that sends a bad window learns it went wrong instead of silently receiving a different window
+ * than it asked for. A client offering a page-size control must therefore keep its options inside
+ * 1..100 rather than relying on the service to trim them.
  *
  * @typeParam T - The already-projected response shape of a single row, for example
  * {@link PostSummary}, {@link CommentPublic} or {@link AdminUser}.
@@ -151,8 +158,10 @@ export interface Page<T> {
    */
   page: number;
   /**
-   * The window size that was applied, after the service's 1..100 clamp. `items` may be shorter
-   * than this on the last page.
+   * The window size that was applied - the value the request asked for, echoed back after passing
+   * the service's 1..100 validation, or 20 when the request named none. It is never a different
+   * number than the one that was accepted, because an unacceptable one never produces a page at
+   * all. `items` may be shorter than this on the last page.
    */
   page_size: number;
   /** How many pages `total` rows occupy at this `page_size`. Zero when `total` is zero. */
@@ -229,15 +238,22 @@ export interface ProblemDetail {
    */
   request_id: string;
   /**
-   * Per-field detail, carried only by a request-validation failure.
+   * Per-field detail, carried only by a request-validation failure - and then never empty.
    *
-   * The service omits the key entirely on every other failure path - it never sends `null` and
-   * never sends `[]` - so `undefined` is what a consumer actually sees. `null` is admitted here
-   * anyway because both mean the same thing, "no per-field detail", and a mirror that forbade it
-   * would make a defensive read a type error. Test it for content - `errors?.length` - never for
-   * the presence of the key alone.
+   * **Omission is the only no-errors state.** The service publishes this member as an optional
+   * array with `minItems: 1` and no `null` branch, and its single assembly point normalises both
+   * absent forms away: `errors` is left out of the document entirely when there is no per-field
+   * detail, rather than serialised as `null` or as `[]`. So `undefined` is the one thing a
+   * consumer ever sees in place of a list, and the mirror says exactly that rather than a
+   * superset of it - the tuple-with-rest spelling below is how TypeScript expresses "an array
+   * with at least one element".
+   *
+   * The practical consequence is that `if (problem.errors)` is a complete test. There is no
+   * empty list to guard against and no `null` to guard against, so a length check adds nothing,
+   * and inside the branch `errors[0]` is known to exist rather than merely typed as though it
+   * might.
    */
-  errors?: ValidationErrorItem[] | null;
+  errors?: [ValidationErrorItem, ...ValidationErrorItem[]];
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -507,13 +523,14 @@ export interface UserPublic {
    * Human-readable name to render wherever the account appears - the byline on each of its posts,
    * the heading of its profile, the author column of a table.
    *
-   * Always populated in practice, because the underlying column is non-nullable and registration
-   * falls back to the username when no name was supplied. It is nonetheless typed as nullable so a
-   * consumer written against this contract stays correct if a future projection omits it, and so
-   * nothing is ever surprised into rendering the word `null` into a byline. Fall back to
-   * {@link UserPublic.username}.
+   * Never `null` and never absent. The underlying column is `TEXT NOT NULL` and registration
+   * derives the value from the username when no name was supplied, so the service has no state
+   * this member could report as null — which is why it is typed non-nullable here rather than
+   * defensively widened: a mirror wider than the state the database can hold would make every
+   * consumer write a fallback for a case that cannot occur, and would let an incorrect projection
+   * type-check.
    */
-  display_name: string | null;
+  display_name: string;
   /** Short self-description, or `null` when the account has not written one. */
   bio: string | null;
   /**
@@ -619,11 +636,17 @@ export interface CategorySummary {
 }
 
 /**
- * A category in full: the element type of `GET /api/v1/categories` and the response of
+ * A category in full: the item type of `GET /api/v1/categories` and the response of
  * `GET /api/v1/categories/{slug}`.
  *
- * `GET /api/v1/categories` returns the whole taxonomy as a plain array rather than a {@link Page},
- * because the set is small, bounded and rendered in its entirety by the filter control.
+ * `GET /api/v1/categories` is a collection, so it returns {@link Page}`<CategoryPublic>` like every
+ * other collection on this API - the taxonomy arrives as `items` inside the page envelope, not as a
+ * bare array. The set being small and bounded is a reason the filter control can request a single
+ * generous `page_size` and render the whole of it; it is not a reason for a second collection shape.
+ * One envelope everywhere is what lets `@/hooks/use-pagination` and `@/components/ui/pagination`
+ * drive any list without knowing which one they are looking at, so an API wrapper for this route
+ * reads `page.items`, and a wrapper that returned `CategoryPublic[]` would be parsing a page object
+ * as an array.
  *
  * Extends {@link CategorySummary}, so anything that renders a badge from the slim shape renders one
  * from this too.
@@ -1027,10 +1050,11 @@ export interface AdminUser {
   /** Public handle, and the path segment its profile is addressed by. */
   username: string;
   /**
-   * Human-readable name for the table's name column. Typed as nullable for the same reason as on
-   * {@link UserPublic}; fall back to {@link AdminUser.username}.
+   * Human-readable name for the table's name column. Non-nullable for the same reason as on
+   * {@link UserPublic}: both mirror one `TEXT NOT NULL` column, so the two declarations must
+   * agree with it and with each other.
    */
-  display_name: string | null;
+  display_name: string;
   /** The account's authority. Changed through {@link AdminUserUpdate}. */
   role: UserRole;
   /**

@@ -12,8 +12,10 @@ times, and no declared response shape anywhere. Here the pattern is declared onc
 
 The document
 ------------
-Five fields, always, plus a sixth that appears only when there is per-field information to
-report. The shape is fixed; it is not extended per call site.
+Six fields, always - ``type``, ``title``, ``status``, ``detail``, ``instance`` and
+``request_id``, inserted in that order - plus ``errors`` as an optional seventh that appears
+only when there is per-field information to report. The shape is fixed; it is not extended per
+call site.
 
 .. code-block:: json
 
@@ -63,7 +65,8 @@ report. The shape is fixed; it is not extended per call site.
     ``{"field": ..., "message": ..., "type": ...}`` objects - see :class:`FieldError`.
     Omitted entirely, rather than sent as ``null``, for every other error.
 
-The document is therefore six fields plus ``errors``.
+Those six keys therefore appear on every error response and the seventh on a validation failure
+alone, because :func:`_problem_response` is the only place any of them is written.
 
 Media type
 ----------

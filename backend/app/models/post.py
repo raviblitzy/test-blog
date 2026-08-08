@@ -513,15 +513,27 @@ class Post(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         # NULL, which is what lets the column be NOT NULL without a Python-side default.
         server_default=text("0"),
     )
-    """A readership counter, never null and never negative, and currently always zero.
+    """A readership counter, never null and never negative, and never *measured*.
 
-    The column the schema provides for "how many times this post has been read", and at present
-    nothing advances it: no endpoint in the REST surface increments it, no repository method
-    updates it and no input model accepts it, so every row reports the ``0`` this server default
-    writes. That is stated rather than glossed because a reader of this attribute would otherwise
-    reasonably assume a populated counter - and because ``app.repositories.post_repository``
-    depends on the same fact, shipping no ``"popular"`` sort on the grounds that ordering by a
-    uniformly zero column would silently do nothing.
+    Both halves of the first claim are enforced by the database rather than asserted here:
+    ``NOT NULL`` on the column above, and ``ck_posts_view_count_non_negative`` in
+    :attr:`__table_args__`. The second one matters because ``app.schemas.post`` publishes the
+    bound as ``ge=0`` on both the summary and the detail projection, and the framework validates
+    a handler's return value against its response model - so a negative value would not merely be
+    wrong in the table, it would make every read of that post a ``500``.
+
+    The column the schema provides for "how many times this post has been read", and **nothing
+    advances it**: no endpoint in the REST surface increments it, no repository method updates it
+    and no input model accepts it. A row therefore reports whatever was written when it was
+    inserted, and never anything else - the ``0`` of this server default for a post created
+    through the API, and a plausible fabricated figure for one created by ``app.db.seed``, which
+    supplies a deterministic value per post so a card, a profile and an administrative table are
+    not each rendering the same zero.
+
+    That distinction is stated rather than glossed because it decides how the value may be used.
+    It is *not* an audience signal and must not be presented as one, and
+    ``app.repositories.post_repository`` ships no ``"popular"`` sort for exactly that reason:
+    ordering a feed by this column would rank real articles by numbers nobody measured.
 
     Deliberately a stored counter on the post rather than a derived count: there is no view
     relation to aggregate, and inventing one would trade a column for a table that grows without
@@ -589,6 +601,24 @@ class Post(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             # interpolate (`InvalidRequestError: Naming convention including
             # %(constraint_name)s token requires that constraint is explicitly named`).
             name="published_at_required",
+        ),
+        CheckConstraint(
+            # The non-negativity of `view_count`, which this module's attribute docstring and
+            # `app.schemas.post`'s `ge=0` bound both state as a guarantee. Without this line
+            # they state it about a column whose DDL is only `NOT NULL DEFAULT 0`, so the
+            # guarantee holds by nothing more than nobody having written a decrement yet - and
+            # the first one to get its sign wrong would store a negative counter that the
+            # response model then rejects, turning a correct read into a 500 on every request
+            # for that post. A CHECK moves the promise into the schema that has to keep it,
+            # which is the same reason `published_at_required` is here rather than in a service.
+            #
+            # `>= 0` rather than `> 0`: zero is the server default and the honest value for a
+            # post nobody has read, so it is the whole population today.
+            #
+            # Interpolates to `ck_posts_view_count_non_negative` - 32 characters, inside the
+            # 63-byte limit. The stem-not-finished-name rule above applies identically.
+            "view_count >= 0",
+            name="view_count_non_negative",
         ),
         Index(
             # The home page's primary query: "recent published posts". Leading with the

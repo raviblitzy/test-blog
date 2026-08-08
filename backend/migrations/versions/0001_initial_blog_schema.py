@@ -29,6 +29,11 @@ Invariants the database enforces, so that no application bug can violate them
 * **A published post always carries a publication instant**, enforced by
   ``ck_posts_published_at_required``. A bug in the publish path cannot produce a ``PUBLISHED``
   row with a null ``published_at``.
+* **A readership counter is never negative**, enforced by
+  ``ck_posts_view_count_non_negative``. ``app.schemas.post`` publishes that bound as ``ge=0`` on
+  the projections a reader receives, and the framework validates a handler's return value against
+  its response model - so a negative counter would turn every read of that post into a ``500``
+  rather than merely looking odd. The constraint keeps the promise where it can be kept.
 * **A like is unique per (post, user)**, enforced by the composite primary key on
   ``post_likes``. That key *is* the idempotency guarantee rather than a convenience: two
   conflict-ignoring inserts leave the count at one, which is why
@@ -62,7 +67,7 @@ literally rather than resolved from live metadata. The revision reaches the data
 through the connection Alembic binds to it, and ``migrations/env.py`` remains the sole
 resolver of the connection URL.
 
-Naming: full names everywhere except the check constraint
+Naming: full names everywhere except the check constraints
 ---------------------------------------------------------
 Every primary key, foreign key, unique constraint and index below is named in full, so the
 identifier in this file is the identifier in the database and neither depends on a convention
@@ -70,17 +75,17 @@ that lives elsewhere. An unnamed key would instead reach the database with Postg
 server-side name - ``posts_pkey`` rather than ``pk_posts`` - which is both an ``alembic check``
 drift report and a downgrade that cannot find the object it needs to drop.
 
-The one exception is the check constraint, and the reason is worth stating because it is easy
-to get backwards. :meth:`alembic.op.create_table` builds its table against a throwaway
-``MetaData``, but it copies ``target_metadata.naming_convention`` onto it, so the convention in
-``app/db/base.py`` *is* in force here. For the ``pk``, ``fk``, ``uq`` and ``ix`` templates that
-changes nothing, because SQLAlchemy applies a convention only to a construct whose name is
-``None``. The ``ck`` template is different: it interpolates ``%(constraint_name)s``, which
-makes SQLAlchemy re-render an already-named check constraint through the template. Passing the
-finished ``ck_posts_published_at_required`` therefore yields
-``ck_posts_ck_posts_published_at_required`` - measured, not hypothesised. The short name is
-what belongs there, exactly as ``app/models/post.py`` declares it, and the convention supplies
-the ``ck_posts_`` prefix.
+The exceptions are the two check constraints on ``posts``, and the reason is worth stating
+because it is easy to get backwards. :meth:`alembic.op.create_table` builds its table against a
+throwaway ``MetaData``, but it copies ``target_metadata.naming_convention`` onto it, so the
+convention in ``app/db/base.py`` *is* in force here. For the ``pk``, ``fk``, ``uq`` and ``ix``
+templates that changes nothing, because SQLAlchemy applies a convention only to a construct
+whose name is ``None``. The ``ck`` template is different: it interpolates
+``%(constraint_name)s``, which makes SQLAlchemy re-render an already-named check constraint
+through the template. Passing the finished ``ck_posts_published_at_required`` therefore yields
+``ck_posts_ck_posts_published_at_required`` - measured, not hypothesised. The short stems are
+what belong there - ``published_at_required`` and ``view_count_non_negative``, exactly as
+``app/models/post.py`` declares them - and the convention supplies the ``ck_posts_`` prefix.
 
 Reversibility
 -------------
@@ -323,6 +328,12 @@ def upgrade() -> None:
             "status <> 'PUBLISHED' OR published_at IS NOT NULL",
             name="published_at_required",
         ),
+        # Also a SHORT name, for the same reason: renders as
+        # `ck_posts_view_count_non_negative`. `view_count` is NOT NULL DEFAULT 0 above, which
+        # says the counter is always present but not that it is always sensible; this is what
+        # makes the non-negativity `app.models.post` documents and `app.schemas.post` publishes
+        # as `ge=0` a property of the schema rather than of the code that happens to write it.
+        sa.CheckConstraint("view_count >= 0", name="view_count_non_negative"),
         sa.ForeignKeyConstraint(
             ["author_id"],
             ["users.id"],

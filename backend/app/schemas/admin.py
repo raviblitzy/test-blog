@@ -283,14 +283,15 @@ class AdminUser(BaseModel):
             "what keeps a canonical profile link and its sitemap entry valid indefinitely."
         ),
     )
-    display_name: str | None = Field(
+    display_name: str = Field(
         ...,
         description=(
-            "Human-readable name to render in the table's name column. Always present in "
-            "practice, because `users.display_name` is `NOT NULL` and registration falls back to "
-            "the username when none was supplied; typed as nullable so a client written against "
-            "this contract stays correct if a future projection omits it, and is never surprised "
-            "into rendering the string `null`."
+            "Human-readable name to render in the table's name column. Never null and never "
+            "absent: `users.display_name` is `TEXT NOT NULL`, and registration derives it from "
+            "the username when none was supplied, so no persisted account lacks one. Declared "
+            "exactly as `UserPublic.display_name` is, because both project the same column and a "
+            "wire schema wider than the state the database can hold would let an incorrect "
+            "projection pass as contract-valid."
         ),
     )
     role: UserRole = Field(
@@ -619,13 +620,24 @@ class AdminPost(BaseModel):
     )
     view_count: int = Field(
         ...,
+        # The same bound the public projections in `app.schemas.post` declare, restated here
+        # rather than left off, because one column described by two response models under two
+        # different constraints is a contract that disagrees with itself - and the looser of the
+        # two is the one an administrative client would be written against. It is guaranteed by
+        # `ck_posts_view_count_non_negative`, so no legitimate value can violate it and the
+        # framework's validation of a handler's return value cannot turn a correct response into
+        # a 500.
+        ge=0,
         description=(
-            "The post's readership counter. Accepted from no input model, so it cannot be set, "
-            "reset or back-dated through the API - and **currently `0` for every post**, because "
-            "no endpoint in this API advances it: the column is provided so that counting reads "
-            "later needs no change to this contract. Do not present it as an audience signal or "
-            "sort the table by it while that holds; a column of zeroes reads as 'nobody has read "
-            "any of these' rather than as 'not measured yet'."
+            "The post's readership counter, never negative - `ck_posts_view_count_non_negative` "
+            "enforces that in the schema. Accepted from no input model, so it cannot be set, "
+            "reset or back-dated through the API - and **nothing measures it**, because no "
+            "endpoint in this API advances it: the value is whatever was written when the post "
+            "was created, `0` for one authored through this API and a fabricated figure for one "
+            "from the demonstration seed. The column is provided so that counting reads later "
+            "needs no change to this contract. Until then, do not present it as an audience "
+            "signal and do not sort the table by it: a moderator ranking posts by this column is "
+            "ranking them by nothing that was counted."
         ),
     )
     author: UserPublic = Field(

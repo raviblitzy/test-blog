@@ -142,6 +142,13 @@ vocabulary is declared where the statement is composed and the wire vocabulary i
 the wire is described - here, which is what puts it in ``/openapi.json`` as a documented enumerated
 query parameter rather than as an unvalidated free-text one.
 
+It is published on this module's public surface alongside the four models, and re-exported by
+``app.schemas``, because it is a wire type rather than an internal bound: the ``sort`` query
+parameter of ``GET /api/v1/posts`` is annotated with it, so the router that describes that
+parameter takes it from the contract layer exactly as it takes :class:`PostSummary`. Leaving it
+off would have left a router either importing a "private" name or restating the two values, and a
+restated vocabulary is a third source of truth for something that already has two by design.
+
 What this module does NOT do
 ---------------------------
 It declares. It does not decide.
@@ -202,14 +209,19 @@ from app.schemas.category import CategorySummary
 from app.schemas.common import omit_null_default
 from app.schemas.user import UserPublic
 
-# The module's public contract is these four models, in the order RUF022 enforces. The bounds,
-# the ordering vocabulary and the annotated aliases below are shared machinery - importable by a
-# router validating a query parameter, by a test, or by a client-side validator mirroring a
-# bound - but they are not part of the surface `app.schemas.__init__` re-exports, exactly as the
-# two length constants in `app.schemas.category` are not. Keep this list in step with what the
+# The module's public contract is the four models plus `PostSortOption`, in the order RUF022
+# enforces. The ordering vocabulary belongs on this list because it is a *wire* type, not shared
+# machinery: it is the declared annotation of the `sort` query parameter on
+# `GET /api/v1/posts`, so `app.api.v1.routers.posts` binds it exactly as it binds `PostSummary`,
+# and `app.schemas.__init__` re-exports it for the same reason it re-exports the models. The
+# bounds and the annotated aliases below are the genuinely shared machinery - importable by a
+# test or by a client-side validator mirroring a bound, reachable at their single module address,
+# and off this list exactly as the two length constants in `app.schemas.category` are.
+# `DEFAULT_POST_SORT_OPTION` stays off it too: a route spells its own default in its signature,
+# so no consumer outside this module needs the constant. Keep this list in step with what the
 # module defines: mypy's strict `no_implicit_reexport` consults it, and it is what tells a reader
 # that the three names imported above are dependencies rather than re-exports.
-__all__ = ["PostCreate", "PostDetail", "PostSummary", "PostUpdate"]
+__all__ = ["PostCreate", "PostDetail", "PostSortOption", "PostSummary", "PostUpdate"]
 
 
 # ---------------------------------------------------------------------------------------
@@ -317,8 +329,9 @@ PostSortOption = Literal["recent", "relevance"]
 Declared as an enumerated alias rather than left as free text so that an unrecognised value is a
 ``422`` naming the parameter, and so that ``/openapi.json`` publishes the two accepted values and
 ``/docs`` renders them as a picker. There is deliberately no ``"popular"``: no endpoint in this
-surface advances ``posts.view_count``, so ordering by it would be uniformly zero, and shipping a
-sort value that silently does nothing is worse than not shipping it.
+surface advances ``posts.view_count``, so it records nothing that was measured, and ordering a
+feed by it would rank articles either all-equal or by a fabricated figure - a sort value that
+looks authoritative while meaning nothing is worse than one that is absent.
 """
 
 DEFAULT_POST_SORT_OPTION: Final[PostSortOption] = "recent"
@@ -1026,18 +1039,20 @@ class PostSummary(BaseModel):
     )
     view_count: int = Field(
         ...,
-        # A counter that only ever advances from a zero server default cannot be negative, so the
-        # bound costs nothing and documents the guarantee in /openapi.json. Safe here in a way the
-        # same bound on `Page.page` would not be: the framework re-validates a handler's return
-        # value against its response model, so a constraint a legitimate value can violate turns a
-        # correct response into a 500 - and no legitimate value here can.
+        # The bound documents the guarantee in /openapi.json, and the guarantee is the schema's:
+        # `ck_posts_view_count_non_negative` on `posts`. Safe here in a way the same bound on
+        # `Page.page` would not be: the framework re-validates a handler's return value against
+        # its response model, so a constraint a legitimate value can violate turns a correct
+        # response into a 500 - and the CHECK is what makes sure none can.
         ge=0,
         description=(
-            "The post's readership counter, and at present `0` on every post: no endpoint in this "
-            "API advances it, which is also why `sort` offers no `popular` value. Always present "
-            "rather than omitted, and never null. The member is published so that counting reads "
-            "later changes behaviour without changing this contract - so render it only where a "
-            "zero is honest, not as a popularity signal."
+            "The post's readership counter. **Nothing measures it**: no endpoint in this API "
+            "advances the column, so the value is whatever was written when the post was created "
+            "- `0` for a post authored through this API, and a fabricated figure for one from the "
+            "demonstration seed - which is also why `sort` offers no `popular` value. Always "
+            "present rather than omitted, never null and never negative. The member is published "
+            "so that counting reads later changes behaviour without changing this contract; until "
+            "then, do not render it as a popularity signal."
         ),
     )
     created_at: datetime = Field(

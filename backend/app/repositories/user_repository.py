@@ -72,7 +72,14 @@ The two lookups are consequently not interchangeable, and the order is part of t
    former by revoking every token the account holds.
 
 :meth:`RefreshTokenRepository.revoke` remains the logout path, where revoking twice is the same
-outcome as revoking once and no replacement is minted.
+outcome as revoking once and no replacement is minted. It is one statement for the same reason
+:meth:`RefreshTokenRepository.claim` is - ``UPDATE ... SET revoked_at = coalesce(revoked_at,
+:now) WHERE id = :id RETURNING ...`` - because the instant it records is evidence of when a
+session ended, and a read-then-write pair lets the later of two concurrent logouts overwrite the
+earlier one's timestamp. What differs is only what each statement has to establish: rotation
+must prove it *alone* spent the token, so its predicate excludes an already-revoked row; logout
+only has to end the session, so its predicate matches the row and lets ``coalesce`` keep
+whichever instant got there first.
 
 Only hashed token values cross this boundary
 --------------------------------------------
@@ -136,6 +143,7 @@ from sqlalchemy import (
     # do entirely different things: one narrows a type for mypy, the other renders a SQL CAST.
     cast as sql_cast,
     delete,
+    func,
     or_,
     select,
     update,
@@ -606,7 +614,9 @@ class RefreshTokenRepository(UUIDPrimaryKeyRepository[RefreshToken]):
         """
         return await self.get_or_none(RefreshToken.token_hash == token_hash)
 
-    async def revoke(self, token: RefreshToken, *, now: datetime | None = None) -> RefreshToken:
+    async def revoke(
+        self, token: RefreshToken, *, now: datetime | None = None
+    ) -> RefreshToken | None:
         """Withdraw one token, idempotently. The **logout** path, not the rotation path.
 
         ``revoked_at`` is stamped only when it is currently ``NULL``, so revoking an
@@ -615,28 +625,86 @@ class RefreshTokenRepository(UUIDPrimaryKeyRepository[RefreshToken]):
         on a retry - or on a replayed logout - would destroy the audit trail that rotation-reuse
         detection reads.
 
+        The first instant is preserved **by the database**, not by a Python check
+        ----------------------------------------------------------------------
+        One statement, and the guard is inside it:
+
+        .. code-block:: sql
+
+            UPDATE refresh_tokens SET revoked_at = coalesce(revoked_at, :now)
+             WHERE id = :id
+            RETURNING ...
+
+        Reading ``token.revoked_at`` in Python and then writing an unconditional value cannot
+        offer that guarantee, however the two are ordered: two sessions both load the row while
+        it is ``NULL``, both decide to stamp, and the later ``UPDATE`` overwrites the earlier
+        instant - so the recorded end of the session is whichever logout happened to commit
+        second, and the idempotency this method's contract promises does not hold. ``coalesce``
+        closes it because PostgreSQL re-evaluates the ``SET`` expression against the *committed*
+        row after the second session's write unblocks: it sees the first instant and writes it
+        back unchanged. Verified on PostgreSQL 18.4 by revoking twice with two different instants
+        - ``2026-01-01`` then ``2026-06-01`` - and reading ``2026-01-01`` back from both calls.
+
+        ``coalesce`` rather than a ``WHERE revoked_at IS NULL`` term, because the two differ in
+        what they return rather than in what they write. With the term, the second call matches
+        no row and has nothing to hand back, so it would need a second statement to re-read the
+        settled value - and an empty result would then mean two different things, "already
+        revoked" and "no such row". With ``coalesce`` the statement always matches a row that
+        exists, so one round trip serves both the first call and every repeat, and an empty result
+        has exactly one meaning. The write it performs on a repeat is a no-op in value terms -
+        this relation carries no ``updated_at`` and no trigger, so rewriting the same instant
+        changes nothing an observer can read.
+
         Args:
             token: A persistent row the caller already holds, typically the one
-                :meth:`get_by_hash` just returned.
+                :meth:`get_by_hash` just returned. Only its ``id`` is used, so a stale
+                ``revoked_at`` on the instance cannot influence the outcome.
             now: Optional timezone-aware instant to record. Defaults to :func:`_utc_now`, so the
                 specified ``revoke(token)`` call is exactly what a service writes; supplying it
                 explicitly lets a test pin the instant, matching how
                 :meth:`delete_expired` takes its clock.
 
         Returns:
-            The same row, flushed and reloaded, with ``revoked_at`` set.
+            The row as the write left it, with ``revoked_at`` set - to *this* call's instant if
+            it was the first to revoke, and to the earlier one if it was not. It is the same
+            object the caller passed, refreshed in place by ``populate_existing``.
+
+            ``None`` when no row carries that key any more. The predicate is an unconditional
+            match on the primary key, so that is the only thing an empty result can mean, and it
+            has exactly one cause: :meth:`delete_expired` swept the row between the caller's read
+            and this write, which it only ever does to a token already past its expiry. There is
+            then nothing to revoke - the token cannot be exchanged either way - so the layer's
+            own convention applies and absence is reported as ``None`` rather than raised. Logout
+            reads that as success; nothing here decides it is a ``404``.
 
         Note:
-            Logout is the use case this serves, and the difference from :meth:`claim` is that
-            logout has nothing to lose to a race: revoking a token twice is the same outcome as
-            revoking it once, and the idempotent guard above preserves the first instant either
-            way. Rotation is not like that - it *mints a replacement*, so it must establish that
-            it alone spent the token, which a read followed by this write cannot do. Never build
-            rotation out of ``get_by_hash`` plus ``revoke``; call :meth:`claim`.
+            Logout is the use case this serves, and the difference from :meth:`claim` is what
+            each has to establish. Logout only has to end the session, and ending it twice is the
+            same outcome as ending it once. Rotation *mints a replacement*, so it must establish
+            that it alone spent the token - a fact no statement about idempotency can supply.
+            Never build rotation out of ``get_by_hash`` plus ``revoke``; call :meth:`claim`.
+
+            The two execution options are the ones :meth:`claim` documents, for the same reasons:
+            ``populate_existing`` so the identity map cannot keep a stale ``revoked_at`` of
+            ``None`` on the object the caller holds, and ``synchronize_session=False`` because
+            ``RETURNING`` refreshes the affected row directly.
         """
-        if token.revoked_at is None:
-            token.revoked_at = _utc_now() if now is None else now
-        return await self.save(token)
+        instant = _utc_now() if now is None else now
+        statement = (
+            update(RefreshToken)
+            .where(RefreshToken.id == token.id)
+            # The idempotency guard, evaluated by the database at the moment of the write
+            # rather than by Python at the moment of an earlier read.
+            .values(revoked_at=func.coalesce(RefreshToken.revoked_at, instant))
+            .returning(RefreshToken)
+        )
+        result = await self.session.execute(
+            statement,
+            execution_options={"synchronize_session": False, "populate_existing": True},
+        )
+        # `first()` rather than `one_or_none()`: the predicate is the primary key, so the result
+        # is one row or none, and an empty one means the row was swept - see `Returns:`.
+        return result.scalars().first()
 
     async def revoke_all_for_user(self, user_id: uuid.UUID, *, now: datetime | None = None) -> int:
         """Withdraw every token an account still holds, in one statement.
@@ -738,8 +806,11 @@ class RefreshTokenRepository(UUIDPrimaryKeyRepository[RefreshToken]):
         what the caller's own type annotation then documents. The option itself keeps the bulk
         write from walking the identity map to synchronise objects the session is not holding;
         the corollary is that an instance loaded *before* one of these calls keeps its stale
-        value until it is refreshed, which is why the per-row path (:meth:`revoke`) is a mutation
-        plus ``save`` rather than a bulk statement.
+        value until it is refreshed. The two per-row paths, :meth:`claim` and :meth:`revoke`, are
+        statements as well but are deliberately not routed through this helper: each carries
+        ``RETURNING`` and is executed with ``populate_existing`` beside the same option, which
+        refreshes the affected row directly - so neither needs the identity-map walk this
+        disables, and neither reads a ``rowcount``, having a row to return instead.
 
         The cast is honest rather than convenient. At runtime a bulk UPDATE or DELETE always
         yields a :class:`~sqlalchemy.CursorResult`; it is

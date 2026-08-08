@@ -29,14 +29,27 @@ effect of every migration command - before any migration had been asked for. The
 correctness requirement, and it is specific to where they sit.
 
 Nothing on this path has that property. Resolving this package loads :mod:`pydantic`, the eight
-siblings, :class:`~app.core.pagination.Page`, and the three enumerations the siblings take from
-the mapped-relation package rather than redeclaring - ``UserRole``, ``PostStatus`` and
+siblings, :class:`~app.core.pagination.Page`, :mod:`app.core.password_policy` for the credential
+bounds ``app.schemas.auth`` publishes, and the three enumerations the siblings take from the
+mapped-relation package rather than redeclaring - ``UserRole``, ``PostStatus`` and
 ``CommentStatus``. It reaches no engine, no session, no connection, no typed configuration object,
 no service, no router and no application factory, and it performs no work at import time beyond
 binding the names below. ``import app.schemas`` therefore succeeds with nothing configured and no
 database reachable, which is what lets the suite drive the API in-process. SQLAlchemy does appear
 in that closure, because each of those three enumerations is persisted by the column that declares
 it and so lives beside its relation; a connection to PostgreSQL does not.
+
+That last property is load-bearing and was not free. Because a package initialises before any of
+its submodules, **anything one sibling imports, this path imports** - and ``app.schemas.auth``
+used to take its password bounds from ``app.core.config``, which constructs the settings
+singleton at module scope. ``import app.schemas`` consequently failed with six ``Field required``
+validation errors - ``DATABASE_URL``, ``JWT_SECRET_KEY``, ``CORS_ALLOW_ORIGINS``, ``ENVIRONMENT``,
+``SEED_ADMIN_EMAIL``, ``SEED_ADMIN_PASSWORD`` - on any machine without a full environment, which
+is exactly the opposite of what the paragraph above claims. The rule now lives in
+``app.core.password_policy``, a module of constants and two pure functions that imports the
+standard library and nothing else, so the claim is true rather than aspirational. Anything added
+to a sibling from here on inherits the same obligation: a settings read placed in any one of the
+eight makes all thirty names unreachable without a configured deployment.
 
 Two names have one source, not two
 ----------------------------------
@@ -54,8 +67,12 @@ itself.
 
 What is deliberately absent
 ---------------------------
-This surface is twenty-nine types and nothing else. Three categories of name are kept off it on
-purpose, and each exclusion is a decision rather than an omission.
+This surface is thirty types and nothing else: twenty-nine models, and
+:data:`~app.schemas.post.PostSortOption`, the enumerated alias that types the ``sort`` query
+parameter of ``GET /api/v1/posts``. That one alias is here for the same reason every model is -
+a router binds it to describe a request - and the test of membership is exactly that: a shape or
+vocabulary that crosses the wire belongs on this list, and nothing else does. Three categories of
+name are kept off it on purpose, and each exclusion is a decision rather than an omission.
 
 *Validation bounds.* ``app.schemas.auth`` publishes ten of them - the password and username
 length limits, the character-group table, the refresh-token ceiling. None is re-exported here, and
@@ -64,7 +81,9 @@ own bounds off their own public lists, so lifting one module's would advertise t
 place to find ``PASSWORD_MIN_LENGTH`` while ``BODY_MAX_LENGTH`` next door raised an attribute
 error. Every one of them stays reachable at its single address,
 ``from app.schemas.auth import PASSWORD_MIN_LENGTH``, which is where a bound belongs: beside the
-annotated type that enforces it.
+annotated type that enforces it. ``app.schemas.post.DEFAULT_POST_SORT_OPTION`` is excluded on the
+same ground: a route states its own default in its signature, so the vocabulary crosses the wire
+and the default does not.
 
 *Mapped relations.* Nothing from the mapped-relation package is re-exported, and this is a
 boundary rather than a preference. An entity reachable as ``app.schemas.User`` would read as an
@@ -103,10 +122,15 @@ nothing configured and no database running::
     import app.schemas as schemas
 
     assert [name for name in schemas.__all__ if not hasattr(schemas, name)] == []
-    assert len(schemas.__all__) == 29
+    assert len(schemas.__all__) == 30
 
 A name in the list that does not resolve is not a lint finding; it is an ``ImportError`` the first
 time anything imports this package, which means it is a start-up failure of the whole service.
+
+"Cheap, with nothing configured" is the third assertion, and it is the one that regressed once
+already: the import above must succeed in a process with **no** environment file and **no**
+backend variable exported. Measured that way after the move described above - previously six
+``Field required`` errors, now a clean import.
 """
 
 from app.schemas.admin import (
@@ -123,7 +147,7 @@ from app.schemas.category import CategoryCreate, CategoryPublic, CategorySummary
 from app.schemas.comment import CommentCreate, CommentPublic, CommentUpdate
 from app.schemas.common import Page, ProblemDetail, ValidationErrorItem
 from app.schemas.like import LikeSummary
-from app.schemas.post import PostCreate, PostDetail, PostSummary, PostUpdate
+from app.schemas.post import PostCreate, PostDetail, PostSortOption, PostSummary, PostUpdate
 from app.schemas.user import UserMe, UserPublic, UserUpdate
 
 # Every name above is imported solely in order to be re-exported, and none is referenced inside
@@ -159,6 +183,7 @@ __all__ = [
     "Page",
     "PostCreate",
     "PostDetail",
+    "PostSortOption",
     "PostSummary",
     "PostUpdate",
     "ProblemDetail",

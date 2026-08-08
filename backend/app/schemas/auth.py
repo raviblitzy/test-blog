@@ -105,23 +105,28 @@ code and a problem document.
 
 Import purity
 -------------
-``typing``, ``pydantic``, and the password policy from :mod:`app.core.config`. Nothing else.
+``typing``, ``pydantic``, and the password policy from :mod:`app.core.password_policy`. Nothing
+else. **Importing this module needs nothing configured**: it reads no setting, constructs no
+settings object, opens no connection and performs no I/O, so it imports on a machine with no
+``.env`` and no exported variables - which is what lets ``import app.schemas`` succeed there
+too, and what lets a unit test import a request model with nothing running.
 
-That third import is narrow and deliberate. This module **reads no setting**: it imports four
-constants, one message and one pure classifier, all of them fixed at authorship time, and
-:attr:`TokenPair.expires_in` is still passed in by its caller rather than computed from
-``ACCESS_TOKEN_EXPIRE_MINUTES`` here - because a schema whose *shape* depended on the
-environment would publish a different contract per deployment. What the import buys is that
-the policy this module publishes at ``/openapi.json`` and the policy ``SEED_ADMIN_PASSWORD`` is
-held to are the same policy rather than two copies of it: the administrator account cannot be
-created through this schema, so a duplicated rule would leave the one account that matters most
-measured by the copy that drifted. ``app.core.config`` is where the shared declaration has to
-live, being the only module in the package that imports no ``app`` sibling; see "The credential
-policy lives here" in its docstring.
+That third import is narrow and deliberate. Four constants, one message and one pure classifier,
+all fixed at authorship time; and :attr:`TokenPair.expires_in` is still passed in by its caller
+rather than computed from ``ACCESS_TOKEN_EXPIRE_MINUTES`` here, because a schema whose *shape*
+depended on the environment would publish a different contract per deployment. What the import
+buys is that the policy this module publishes at ``/openapi.json`` and the policy
+``SEED_ADMIN_PASSWORD`` is held to are the same policy rather than two copies of it: the
+administrator account cannot be created through this schema, so a duplicated rule would leave
+the one account that matters most measured by the copy that drifted.
 
-The one consequence worth knowing is that importing this module now constructs the settings
-singleton, so it needs a configured environment - the same requirement ``app.core.security``,
-``app.db.session`` and every entry point already carry.
+It is taken from :mod:`app.core.password_policy` rather than from :mod:`app.core.config`, which
+re-exports the same objects, and the distinction is the whole point. Importing ``config``
+constructs the settings singleton at module scope, so reaching the policy through it made this
+module - and, because a package initialises before any submodule, the entire ``app.schemas``
+package - fail with six ``Field required`` errors wherever the environment was not fully
+supplied. The policy module reads nothing and imports nothing but the standard library, so this
+import cannot fail for configuration.
 
 Still absent, and for the original reasons: :mod:`app.core.security`, whose functions this
 module describes but must not call; :mod:`app.models`, which would drag SQLAlchemy and a
@@ -142,7 +147,14 @@ from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
 
-from app.core.config import (
+# `app.core.password_policy`, NOT `app.core.config`. The rule is the same object either way -
+# config re-exports every one of these names - but the reach is not: importing config constructs
+# the settings singleton, so taking them from there made this module, and therefore the whole
+# `app.schemas` package, unimportable without a fully configured environment. Six required
+# variables had to be present to import a module that describes JSON. The policy module reads
+# nothing and imports nothing but the standard library, so this import cannot fail for
+# configuration.
+from app.core.password_policy import (
     PASSWORD_CHARACTER_GROUPS,
     PASSWORD_MAX_LENGTH,
     PASSWORD_MIN_CHARACTER_CLASSES,
@@ -235,9 +247,9 @@ Uniqueness is the ``CITEXT UNIQUE`` index's, and any reserved-handle policy woul
 # ---------------------------------------------------------------------------------------
 # Password policy
 #
-# Declared in `app.core.config`, imported above, and re-exported from here. Two independent
-# controls, and it is worth being clear about which does what: the minimum length and the
-# character-group rule bound how weak a NEW password may be, while the maximum length bounds
+# Declared in `app.core.password_policy`, imported above, and re-exported from here. Two
+# independent controls, and it is worth being clear about which does what: the minimum length and
+# the character-group rule bound how weak a NEW password may be, while the maximum length bounds
 # how much work an argon2 call can be made to do - on registration and on login alike - and is
 # therefore a resource control rather than a strength rule.
 #
@@ -245,9 +257,12 @@ Uniqueness is the ``CITEXT UNIQUE`` index's, and any reserved-handle policy woul
 # SEED_ADMIN_PASSWORD opens the only ADMIN principal a fresh deployment has, and that account
 # is the one account in the system that cannot be created through `RegisterRequest` - so a
 # second copy of the policy here would leave the account that matters most measured by
-# whichever copy drifted. `app.core.config` is the only module in this package that imports no
-# `app` sibling, which is what makes one declaration reachable from both this schema and the
-# settings model; its docstring records the reasoning in full.
+# whichever copy drifted. `app.core.password_policy` is where one declaration can be reached by
+# both this schema and the settings model, because it imports the standard library and nothing
+# else: no pydantic, no environment read, no settings construction. `app.core.config` re-exports
+# the same objects and is deliberately NOT the import path used here - importing it would build
+# the settings singleton and make this contract module require a configured deployment. Both
+# modules' docstrings record the reasoning in full.
 #
 # The names are re-exported rather than merely used, and `__all__` above is what makes that
 # legitimate under mypy's strict `no_implicit_reexport`. They are the numbers

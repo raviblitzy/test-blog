@@ -142,11 +142,14 @@ Two values, and the shortness of that list is deliberate.
     degrades to ``"recent"`` rather than raising: there is nothing to rank against, and a
     listing is not the place to reject a combination of parameters that has an obvious reading.
 
-There is deliberately no ``"popular"``. Ordering by ``posts.view_count`` would be dead
-behaviour today: no endpoint in the REST surface advances that column, so it is uniformly zero
-and the ordering would degenerate to whatever the tiebreaker decided. View tracking and the
-analytics it would belong to are out of scope, and shipping a sort value that silently does
-nothing is worse than not shipping it. Should view accounting ever be requested, this alias and
+There is deliberately no ``"popular"``. No endpoint in the REST surface advances
+``posts.view_count``, so the column holds whatever was written at insert and nothing has measured
+it: ``0`` for a post created through the API, and a fabricated figure for one created by
+``app.db.seed``. Ordering a feed by it would therefore either degenerate to whatever the
+tiebreaker decided or, worse against seeded data, rank real articles by numbers nobody counted -
+and a sort that looks authoritative while meaning nothing is worse than one that is absent. View
+tracking and the analytics it would belong to are out of scope. Should view accounting ever be
+requested, this alias and
 :func:`_build_ordering` are the two places that change - add the member here, add a branch that
 orders by ``Post.view_count.desc()`` there, and nothing else in the module moves.
 

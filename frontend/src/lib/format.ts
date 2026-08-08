@@ -21,6 +21,15 @@
  *   PostgreSQL `timestamptz` columns to JSON, and `JSON.parse` has no date type. Strings are
  *   therefore parsed with `parseISO`, never `new Date(...)`, whose handling of non-standard
  *   input is implementation-defined.
+ * - Those strings carry the **`Z`** offset, and that is a guarantee the service tier makes
+ *   rather than an assumption made here: `backend/app/db/session.py` pins every application
+ *   connection's PostgreSQL session time zone to UTC (`-c timezone=UTC`), so `timestamptz`
+ *   values load as UTC-aware instants and Pydantic renders them `…Z` instead of with whatever
+ *   offset the database host happens to be configured for. Nothing in this module depends on
+ *   that — `parseISO` resolves any valid offset and every formatter below re-resolves in UTC, so
+ *   an offset string would still render the correct instant — but a consumer that compares
+ *   timestamp strings, sorts them lexically or slices the leading `YYYY-MM-DD` out of one does
+ *   depend on it, and that is why the pin exists on the tier that produces the value.
  * - Field names stay snake_case throughout this tier — `published_at`, `created_at`,
  *   `updated_at`, `view_count`, `like_count`, `post_count`. There is no camelCase mapping layer.
  * - `published_at` is legitimately `null` for a `DRAFT` post: the database `CHECK` constraint

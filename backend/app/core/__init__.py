@@ -6,11 +6,17 @@
 package depends on none of them in return. That one-way relationship is what keeps the
 layer boundaries reviewable, so it must never be inverted.
 
-The eight sibling modules this marker makes importable, in dependency order, own the
+The nine sibling modules this marker makes importable, in dependency order, own the
 concerns that have no other single owner:
 
+* ``password_policy`` - the single declaration of what makes a password acceptable: four
+  bounds, one rejection message and two pure functions. Imports the standard library and
+  nothing else - not even ``pydantic`` - which is what lets both ``config`` below and
+  ``app.schemas.auth`` reach the same rule while only one of them needs a configured
+  environment. The true root of the graph.
 * ``config`` - the typed settings contract over the environment, and the only module in
-  the repository permitted to read it. Root of the graph.
+  the repository permitted to read it. Imports ``password_policy`` and re-exports it, and
+  imports no other sibling.
 * ``pagination`` - the page envelope (``items``, ``total``, ``page``, ``page_size``,
   ``pages``) every list endpoint returns, so one client control can page them all.
 * ``slug`` - collision-safe derivation of the URL-safe slugs behind canonical post and

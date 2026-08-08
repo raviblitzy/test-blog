@@ -28,7 +28,9 @@ Two facts a maintainer needs before changing anything here
 ``settings.DATABASE_URL`` instead, so one settings object serves the application and the
 migration runner and the two can never disagree about which database they are pointed at.
 Nothing here reads the environment directly, carries a default or a fallback URL, or logs a
-URL that still has its password in it - :func:`_redacted` exists for that last part.
+URL that still carries a credential in it - :func:`_redacted` exists for that last part, and it
+drops the whole libpq query string as well as masking the authority password, because several
+libpq parameters are themselves credentials and ``hide_password`` does not touch them.
 
 **The engine built here is synchronous; the application's is asynchronous.**
 ``app.db.session`` owns the async engine and declares no synchronous one, so this module
@@ -67,12 +69,13 @@ What is deliberately absent
 * No ``os.environ``, ``os.getenv``, ``dotenv`` or ``.env`` read: ``app.core.config`` is the
   single reader of the environment, and it fails loudly at import when a required variable is
   missing. Softening that here would move the failure to a worse place.
-* No second logging configuration. ``app.core.logging.configure_logging()`` is called below
-  and is the only thing that configures logging here, so a migration's output has the same
-  shape - and the same one-line-per-event guarantee - as the service's. ``alembic.ini``
-  deliberately carries no ``[loggers]``/``[handlers]``/``[formatters]`` stanzas and this file
-  never calls :func:`~logging.config.fileConfig`: doing both would attach two handlers to the
-  root logger and render every line twice, once as plain text and once as JSON.
+* No second logging configuration. ``app.core.logging.configure_logging()`` is called below -
+  with ``stream=sys.stderr``, so that ``--sql`` output on stdout stays executable SQL - and is
+  the only thing that configures logging here, so a migration's output has the same shape, and
+  the same one-line-per-event guarantee, as the service's. ``alembic.ini`` deliberately carries
+  no ``[loggers]``/``[handlers]``/``[formatters]`` stanzas and this file never calls
+  :func:`~logging.config.fileConfig`: doing both would attach two handlers to the root logger
+  and render every line twice, once as plain text and once as JSON.
 * No ``Base.metadata.create_all()``. Creating the schema is the revisions' job, and
   ``create_all`` would bypass the version table entirely, leaving a populated database that
   Alembic believes is empty.
@@ -87,6 +90,7 @@ What is deliberately absent
 """
 
 import logging
+import sys
 from typing import TYPE_CHECKING
 
 from alembic import context
@@ -121,25 +125,38 @@ if TYPE_CHECKING:
 # The Config object Alembic built from backend/alembic.ini plus the command line.
 config = context.config
 
-# Logging comes from app.core.logging, exactly as it does for the service.
+# Logging comes from app.core.logging, exactly as it does for the service - ON STDERR.
 #
 # This is the one place a migration could have diverged, and it is why it does not. Alembic's
 # generated template configures logging from `[loggers]`/`[handlers]`/`[formatters]` stanzas in
-# alembic.ini via `fileConfig`, which installs a plain-text StreamHandler on stderr. In a
-# container at ENVIRONMENT=production that means the record of which revisions were applied -
-# the very lines the start-up step and the CI job read - is the one part of the stream a JSON
-# log collector cannot parse, while everything the same image logs a second later is JSON.
-# Calling configure_logging() instead puts `alembic` and `alembic.runtime.migration` through
-# the same processor chain as the application: human-readable under ENVIRONMENT=development,
-# one JSON object per line everywhere else, with `LOG_LEVEL` deciding the threshold.
+# alembic.ini via `fileConfig`, which installs a plain-text StreamHandler. In a container at
+# ENVIRONMENT=production that means the record of which revisions were applied - the very lines
+# the start-up step and the CI job read - is the one part of the stream a JSON log collector
+# cannot parse, while everything the same image logs a second later is JSON. Calling
+# configure_logging() instead puts `alembic` and `alembic.runtime.migration` through the same
+# processor chain as the application: human-readable under ENVIRONMENT=development, one JSON
+# object per line everywhere else, with `LOG_LEVEL` deciding the threshold.
+#
+# THE STREAM ARGUMENT IS LOAD-BEARING, NOT A STYLISTIC CHOICE. `alembic upgrade head --sql`
+# writes generated DDL to STDOUT, and the documented way to keep it is to redirect that stream
+# to a file. Every record emitted before the first statement therefore has to go somewhere
+# else, and an offline upgrade emits four of them: one from this module, plus
+# `Context impl PostgresqlImpl.`, `Generating static SQL` and `Will assume transactional DDL.`
+# from Alembic's own `alembic.runtime.migration` logger, which reaches the single root handler
+# this call installs. Left on stdout they land inside the redirected file ahead of `BEGIN;` and
+# the result is not executable SQL. Binding this process's handler to stderr makes
+# stdout a pure SQL channel STRUCTURALLY - for every logger, in both offline and online mode,
+# whatever LOG_LEVEL is set to - rather than relying on nobody adding a log line later. The
+# records are not lost: a container runtime and a CI job both collect stderr, and it is the
+# stream Alembic's own template binds its console handler to (`args=(sys.stderr,)`).
 #
 # alembic.ini therefore declares NO logging stanzas at all, and `fileConfig` is deliberately
 # not called - not even as a fallback. Calling both would attach two handlers to the root
-# logger and render every line twice.
+# logger and render every line twice, one of the two on stdout again.
 #
 # It also means `alembic upgrade head` fails fast on a misconfigured environment, because
 # app.core.config is imported before any connection is attempted.
-configure_logging()
+configure_logging(stream=sys.stderr)
 
 logger = logging.getLogger("alembic.env")
 """Diagnostics from this module, routed through alembic.ini's `alembic` logger at INFO."""
@@ -215,14 +232,40 @@ def _get_url() -> str:
 
 
 def _redacted(url: str) -> str:
-    """Render *url* with its password masked, so it is safe to put in a log line.
+    """Render *url* as scheme, user, host, port and database only - nothing else.
 
-    A connection URL carries a credential, and these log lines are collected by CI and by
-    whatever ships the container's output, so the raw value must never reach them. SQLAlchemy's
-    own renderer does the masking, which means it stays correct for every URL shape it accepts
-    rather than depending on a regular expression maintained here.
+    A connection URL carries credentials, and these log lines are collected by CI and by
+    whatever ships the container's output, so no part of the value that can hold a secret may
+    reach them. Two things are removed, and the second is the one that is easy to miss.
+
+    **The authority password**, by SQLAlchemy's own renderer via ``hide_password=True``. Using
+    the renderer rather than a regular expression maintained here means the masking stays
+    correct for every URL shape it accepts.
+
+    **The entire query string**, unconditionally, before it is rendered. ``hide_password``
+    masks *only* the password between ``://`` and ``@``; every libpq parameter after ``?`` is
+    rendered verbatim, and ``app.core.config`` deliberately accepts those parameters because
+    ``?sslmode=require`` and ``?connect_timeout=5`` are legitimate values a deployment needs.
+    Several of them are credentials - ``password``, ``sslpassword``, ``sslkey``,
+    ``sslcert``, ``sslcrl``, ``passfile``, ``krbsrvname``, ``gssdelegation`` - so a URL such as
+    ``…/blog?sslmode=verify-full&sslpassword=…`` rendered by ``hide_password`` alone writes a
+    key-file passphrase straight into a migration log and into ``--sql`` output. Measured on
+    SQLAlchemy 2.0.51: ``sslpassword=topsecret`` and even a second ``password=…`` in the query
+    survive ``hide_password=True`` untouched.
+
+    Dropping the whole mapping is deliberately chosen over redacting a list of sensitive keys.
+    A list is a thing to keep in step with libpq, and the first parameter it does not name is
+    logged in full; dropping everything cannot fall behind. Nothing is lost that a log line
+    needs, either - which database on which host this run is pointed at is the diagnostic
+    question, and connection *options* are configuration an operator already has in front of
+    them. The query mapping is therefore never read, never partially masked and never logged in
+    any form, here or anywhere else in this module.
     """
-    return make_url(url).render_as_string(hide_password=True)
+    parsed = make_url(url)
+    # `difference_update_query` returns a copy without the named keys; passing every key it
+    # carries leaves an empty query, and passing the keys of a URL that has none is a no-op.
+    without_query = parsed.difference_update_query(parsed.query.keys())
+    return without_query.render_as_string(hide_password=True)
 
 
 def _reflect_extension_owned_relations(connection: Connection) -> frozenset[str]:
@@ -405,8 +448,16 @@ def run_migrations_offline() -> None:
     execution: pointed at an unreachable host, both commands above still exit ``0`` and render
     output byte-identical to a run against a live server.
 
-    The diagnostic line below goes to stderr, because that is the stream ``alembic.ini`` binds
-    its console handler to, so redirecting stdout to a file captures the SQL and only the SQL.
+    **Stdout carries SQL and nothing but SQL**, which is what makes that redirection safe, and
+    it is arranged at the top of this module rather than here: ``configure_logging`` is called
+    with ``stream=sys.stderr``, so the single root handler - the exit for the diagnostic line
+    below, for Alembic's own ``Context impl``/``Generating static SQL``/``Will assume
+    transactional DDL`` records, for SQLAlchemy and for Python warnings alike - writes to
+    stderr. The guarantee is structural rather than a convention each log call has to remember,
+    and it does not depend on ``alembic.ini``, which deliberately configures no logging at all.
+    Verified by execution: with the handler on stdout the first four lines of
+    ``alembic upgrade head --sql`` were log records and the redirected file would not run; with
+    it on stderr the first line is ``BEGIN;`` and every record is still on stderr.
     """
     url = _get_url()
     logger.info("Rendering migrations offline for %s", _redacted(url))

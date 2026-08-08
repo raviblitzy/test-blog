@@ -43,13 +43,22 @@ lookups are case-insensitive in the database as well as in this module - which i
 perceived duplicate is never "resolved" by varying case. ``Alice`` and ``alice`` are one person
 to this schema, and one row.
 
-Two consequences are worth stating because they are easy to get wrong:
+Three consequences are worth stating because they are easy to get wrong:
 
 * **An existing row is never overwritten.** In particular an operator who rotated the
   administrator's password does not have it silently reset by the next ``make seed``.
 * **Nothing is deleted or truncated.** This module is additive. It is not a reset tool, and a
   request to "re-seed from scratch" is answered by dropping the database, not by editing this
   file.
+* **An existing *account* row is verified before it is adopted, and the run stops if it fails.**
+  Idempotency means "do not insert twice", not "trust whatever is there". Both account addresses
+  this module looks up are predictable - ``SEED_ADMIN_EMAIL`` is configuration and the three
+  :data:`AUTHOR_ROSTER` addresses are published constants here - and both are valid registration
+  inputs, so a row at either may belong to someone else entirely. Since :func:`seed_posts` grants
+  the row it is handed *ownership* of demonstration posts, a pre-claimed address would otherwise
+  be a way to acquire authored content. :func:`seed_administrator` and
+  :func:`_reject_unless_seeded_author` therefore fail closed instead, and neither elevates a
+  role, reactivates an account or rewrites an identity to make a run succeed.
 
 The whole run is one transaction with a single ``commit()`` at the end, so a failure anywhere
 leaves no half-seeded database. Each helper flushes when it finishes, so a constraint violation
@@ -407,6 +416,19 @@ is to own content and back a public profile. Sharing the administrator's passwor
 would hand four accounts to anyone holding one credential, and inventing a settings key for them
 would desynchronise ``.env.example`` from every file that documents it. A test needing an
 author-role principal builds one through ``backend/tests/factories.py``.
+
+The addresses are public, so a row found at one is not trusted
+-------------------------------------------------------------
+These three addresses are constants in a repository anyone can read, and they are valid inputs
+to ``POST /api/v1/auth/register``. Someone can therefore hold an ordinary ``READER`` account at
+one of them before a deployment is ever seeded. Because :func:`seed_posts` attributes every
+draft to the row :func:`seed_authors` returns, and a post's author may edit, delete, publish and
+unpublish it, adopting whatever row carries the address would turn a predictable email into a
+way to acquire authored content. :func:`_reject_unless_seeded_author` is what closes that: a row
+is adopted only when it is active, holds ``AUTHOR`` and carries the ``display_name`` below, and
+the seed stops rather than elevating, reassigning or skipping. ``example.com`` is reserved by
+RFC 2606 and receives no mail, so these are demonstration identities and not addresses anyone
+can prove they own.
 """
 
 
@@ -1871,8 +1893,66 @@ async def seed_administrator(session: AsyncSession) -> tuple[User, Tally]:
     return administrator, Tally(created=1)
 
 
+def _reject_unless_seeded_author(existing: User, spec: AuthorSpec) -> None:
+    """Raise unless *existing* is the demonstration author *spec* describes.
+
+    The gate that stops a pre-claimed account from acquiring seeded content. See "An existing
+    row is verified, never trusted" on :func:`seed_authors` for why a roster address can be
+    claimed at all and what the consequence would be.
+
+    Three invariants, checked together so one run reports every problem it can see:
+
+    * **Role.** ``AUTHOR`` exactly. A ``READER`` has no authoring privilege to receive the
+      corpus with, and an ``ADMIN`` at an author's address is a conflation of the two accounts
+      this module creates rather than a seeded author.
+    * **Active.** A deactivated account cannot sign in, so attributing published posts to it
+      would produce a public byline and profile nobody can administer from the inside.
+    * **Identity.** The roster's ``display_name``, which is also what the handle is derived
+      from. It is the one field that distinguishes "the row this seed created earlier" from
+      "somebody else's row that happens to sit at this address", and it is compared exactly:
+      ``display_name`` is ``TEXT`` rather than ``CITEXT``, so a case difference is a genuine
+      difference in what a byline renders.
+
+    ``email`` is deliberately not compared - it is the key this row was selected by - and
+    ``username`` is deliberately not compared either, because :func:`_resolve_username` may
+    legitimately have suffixed it (``priya-nair-2``) to avoid a collision when the row was
+    created.
+
+    Args:
+        existing: The row found at *spec*'s address.
+        spec: The roster entry that selected it.
+
+    Raises:
+        ValueError: When any invariant fails. The message names the address that selected the
+            row, every condition that disqualified it, and the two remedies available - and it
+            quotes no credential, no hash and no email other than the roster constant already
+            published in this file.
+    """
+    problems: list[str] = []
+    if existing.role is not UserRole.AUTHOR:
+        problems.append(f"its role is {existing.role.value} rather than {UserRole.AUTHOR.value}")
+    if not existing.is_active:
+        problems.append("it is deactivated")
+    if existing.display_name != spec.display_name:
+        problems.append(
+            f"its display name is {existing.display_name!r} rather than {spec.display_name!r}"
+        )
+    if not problems:
+        return
+
+    msg = (
+        f"an account already exists at the demonstration address {spec.email!r} but is not the "
+        f"seeded author: {' and '.join(problems)}. That address is published in this "
+        "repository and can be registered by anyone, so seeding will not attribute "
+        "demonstration posts to it, and it will not change a role, an active flag or a display "
+        "name that somebody else set. Rename or remove that account, or edit AUTHOR_ROSTER for "
+        "this deployment, and seed again."
+    )
+    raise ValueError(msg)
+
+
 async def seed_authors(session: AsyncSession) -> tuple[list[User], Tally]:
-    """Ensure every author in :data:`AUTHOR_ROSTER` exists.
+    """Ensure every author in :data:`AUTHOR_ROSTER` exists, or fail saying which one does not.
 
     Structurally required rather than decorative: ``posts.author_id`` is a non-null foreign key,
     so demonstration posts cannot exist without demonstration authors.
@@ -1881,6 +1961,36 @@ async def seed_authors(session: AsyncSession) -> tuple[list[User], Tally]:
     plaintext is discarded inside :func:`_demonstration_password`'s caller frame. See
     :data:`AUTHOR_ROSTER` for why these accounts are deliberately not sign-in fixtures.
 
+    An existing row is verified, never trusted
+    ------------------------------------------
+    This is the same contract :func:`seed_administrator` holds, and it is here for a sharper
+    reason. The three roster addresses are **published constants in this repository**, and they
+    are valid inputs to ``POST /api/v1/auth/register``: anyone may create an ordinary ``READER``
+    account at ``maya.rodriguez@example.com`` before a deployment is first seeded. Returning
+    whatever row carries that address would hand that account the whole demonstration corpus,
+    because :func:`seed_posts` attributes each draft to the row this function returns - and a
+    post's author may edit it, delete it, publish it and unpublish it. A predictable address
+    would therefore have been a way to acquire authored content, which is a privilege-escalation
+    path rather than an untidiness.
+
+    So a row found at a roster address is adopted only when it is *the seeded author*: active,
+    holding :attr:`UserRole.AUTHOR`, and carrying the roster's own ``display_name``. Anything
+    else raises, naming the mismatch. Three things this function will not do, each deliberate:
+
+    * **It will not elevate.** Promoting a ``READER`` to ``AUTHOR`` would let the collision
+      itself grant the authority, which is exactly the escalation the check exists to stop - and
+      it would also overrule an operator who demoted the account on purpose.
+    * **It will not reassign.** No post is moved off an account and no address is rewritten;
+      the run stops instead, and :func:`main` rolls the whole transaction back.
+    * **It will not silently skip the roster slot.** :attr:`PostDraft.author_slot` indexes this
+      list positionally, so a missing entry is not an option: it would either shift every later
+      author's content onto the wrong byline or raise an ``IndexError`` deep inside
+      :func:`seed_posts`.
+
+    The remedy an operator has is to rename or remove the colliding account, or to edit
+    :data:`AUTHOR_ROSTER` for this deployment - both decisions a human takes, which is why the
+    message names the address that selected the row and the state that disqualified it.
+
     Args:
         session: The unit of work. Not committed here. Call after
             :func:`seed_administrator` so the administrator's handle is already visible to
@@ -1888,7 +1998,14 @@ async def seed_authors(session: AsyncSession) -> tuple[list[User], Tally]:
 
     Returns:
         The roster's users in roster order - which is what :attr:`PostDraft.author_slot`
-        indexes - and a tally over them.
+        indexes - and a tally over them. Every returned row is active, holds ``AUTHOR`` and
+        carries the roster's ``display_name``, whether it was inserted here or found.
+
+    Raises:
+        ValueError: An account already exists at a roster address but is not the seeded author -
+            it is deactivated, holds a different role, or carries a different display name.
+            :func:`main` rolls the transaction back, logs the failure and re-raises, so the
+            process exits non-zero and nothing is written.
     """
     logger = get_logger(__name__)
 
@@ -1913,6 +2030,10 @@ async def seed_authors(session: AsyncSession) -> tuple[list[User], Tally]:
     for spec in AUTHOR_ROSTER:
         existing = by_email.get(spec.email.casefold())
         if existing is not None:
+            # Verified, not assumed - see "An existing row is verified, never trusted" above.
+            # All disqualifying conditions are reported together so an operator sees the whole
+            # picture in one run rather than discovering the next one after fixing the first.
+            _reject_unless_seeded_author(existing, spec)
             authors.append(existing)
             skipped += 1
             continue
@@ -1977,11 +2098,26 @@ async def seed_posts(
     the ``post_categories`` association table. Both let SQLAlchemy resolve the foreign keys at
     flush, so this function never needs an identifier that does not exist yet.
 
+    Ownership is granted here, and it is only ever granted to a verified row
+    ----------------------------------------------------------------------
+    Every draft becomes a row whose ``author_id`` points at one of *administrator* or *authors*,
+    and a post's author may edit, delete, publish and unpublish it - so this function is where
+    the corpus acquires an owner. It performs no verification of its own and must not: both
+    arguments arrive already checked, ``administrator`` by :func:`seed_administrator` and each
+    element of *authors* by :func:`_reject_unless_seeded_author`, and re-checking here would put
+    one rule in two places. What that division means for a caller is that these two arguments
+    may only ever be passed straight through from those two functions - which is what
+    :func:`seed_all` does - and never assembled from an arbitrary query, because a row this
+    function is handed is a row it hands the content to.
+
     Args:
         session: The unit of work. Not committed here.
         administrator: The account authoring the positions in
-            :data:`_ADMINISTRATOR_POSITIONS`.
-        authors: The roster, in roster order, exactly as :func:`seed_authors` returned it.
+            :data:`_ADMINISTRATOR_POSITIONS`. Exactly as :func:`seed_administrator` returned it,
+            and therefore active and holding ``ADMIN``.
+        authors: The roster, in roster order, exactly as :func:`seed_authors` returned it, and
+            therefore every element active, holding ``AUTHOR`` and carrying the roster's own
+            display name.
         categories_by_slug: The reference taxonomy, exactly as :func:`seed_categories`
             returned it.
 

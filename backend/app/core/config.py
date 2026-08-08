@@ -100,33 +100,46 @@ nothing may start to: catching it in order to serialise ``errors()`` into a log 
 would republish the value this module works to keep out of both. If a caller ever needs the
 detail programmatically, take ``str(exc)``, which is already sanitised.
 
-The credential policy lives here
---------------------------------
-Two credential rules are declared in this module and nowhere else: the per-algorithm
-minimum size of the HMAC signing key, and the password policy every new password is held
-to. Both are here for the same structural reason. This module is the only one in the
-package that imports no ``app`` sibling, so it is the only place a rule can sit and still
-be reachable from *both* directions - from :class:`Settings`, which has to validate an
-environment-supplied credential while the process is starting, and from
-``app.schemas.auth``, which has to publish the same numbers in ``/openapi.json`` and
-reject the same passwords on ``POST /api/v1/auth/register``. Declaring the policy in the
-schema layer instead would put it above the module that needs it and force either a
-duplicate or an inverted import; declaring it in ``app.core.security`` is impossible,
-because that module imports this one. So ``SEED_ADMIN_PASSWORD`` and a reader's chosen
-password are measured by exactly one function, :func:`password_policy_violation`, and a
-policy change is a one-line edit that both paths inherit.
+The credential policy lives one module down
+------------------------------------------
+Two credential rules govern this service, and only one of them is declared here.
+
+The **per-algorithm minimum size of the HMAC signing key** is this module's, because it is a
+fact about ``JWT_ALGORITHM`` and has exactly one consumer: the validation that refuses to
+start the process below the floor its configured algorithm requires.
+
+The **password policy** is not, and used to be. It lives in ``app.core.password_policy``,
+which imports the standard library and nothing else, and every name is re-exported from
+here so that ``from app.core.config import PASSWORD_MIN_LENGTH`` still resolves. Both
+consumers therefore import downwards: :class:`Settings` below, which holds
+``SEED_ADMIN_PASSWORD`` to the same rule the registration route applies, and
+``app.schemas.auth``, which publishes the numbers in ``/openapi.json`` and rejects the same
+passwords on ``POST /api/v1/auth/register``. The rule is still declared exactly once, so
+``SEED_ADMIN_PASSWORD`` and a reader's chosen password are measured by one function,
+:func:`~app.core.password_policy.password_policy_violation`.
+
+The move is not tidying. Declaring the policy here made a *contract* module depend on a
+*configured environment*, because importing this file constructs :data:`settings` -
+deliberately, so a missing variable stops a starting process. The measurable consequence was
+that ``import app.schemas`` failed with six ``Field required`` errors on a machine with no
+env file and no exported variables, since resolving that package imports every sibling and
+``app.schemas.auth`` needed four constants and one classifier at class-definition time. A
+module that describes JSON must be importable without a database URL.
 
 Import purity
 -------------
-This module imports ``pydantic``, ``pydantic-settings`` and the standard library, and
-nothing else - no ``app`` sibling, no SQLAlchemy, no engine, no logging configuration.
+This module imports ``pydantic``, ``pydantic-settings``, the standard library, and exactly
+one ``app`` sibling - ``app.core.password_policy``, which is pure by contract: no pydantic,
+no environment read, no side effect, nothing but constants and two functions. No SQLAlchemy,
+no engine, no logging configuration.
+
 ``backend/alembic.ini`` deliberately declares no ``sqlalchemy.url`` so that
 ``migrations/env.py`` can take the URL from here and the application and its migrations
 share one source of truth; every ``alembic upgrade head``, ``alembic downgrade base`` and
 ``alembic check`` therefore imports this file, and it has to stay cheap. Constructing
-:data:`settings` is its only import-time effect - which is also why ``app.schemas.auth``,
-the one schema module that imports this one, imports it for the credential policy alone
-and still reads no setting of its own.
+:data:`settings` is its only import-time effect - and it remains the only module in the
+repository that reads the environment. The sibling it imports is not an exception to that
+rule; it reads nothing at all.
 """
 
 import re
@@ -138,6 +151,26 @@ from urllib.parse import urlsplit
 
 from pydantic import EmailStr, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# The one `app` sibling this module imports, and the only one it may. `app.core.password_policy`
+# holds the shared password rule and imports the standard library and nothing else - no pydantic,
+# no environment read, no side effect - so it sits BELOW this module in the graph rather than
+# beside it, and importing it costs nothing and can fail for nothing. The rule lives there rather
+# than here because `app.schemas.auth` needs it too, and importing THIS module constructs
+# `settings`, which would make a JSON contract module require a configured deployment; see "The
+# credential policy lives one module down" below and that module's own docstring.
+#
+# Every name is re-exported through `__all__` below, so `from app.core.config import
+# PASSWORD_MIN_LENGTH` keeps resolving and the rule is still declared exactly once.
+from app.core.password_policy import (
+    PASSWORD_CHARACTER_GROUPS,
+    PASSWORD_MAX_LENGTH,
+    PASSWORD_MIN_CHARACTER_CLASSES,
+    PASSWORD_MIN_LENGTH,
+    PASSWORD_VARIETY_MESSAGE,
+    password_character_groups,
+    password_policy_violation,
+)
 
 __all__ = [
     "PASSWORD_CHARACTER_GROUPS",
@@ -226,176 +259,6 @@ _JWT_SECRET_KEY_MIN_BYTES: Final[Mapping[JwtAlgorithm, int]] = MappingProxyType(
 # first, so the algorithm-specific comparison has to be a model validator that runs once both
 # values are known.
 _JWT_SECRET_KEY_MIN_LENGTH: Final[int] = min(_JWT_SECRET_KEY_MIN_BYTES.values())
-
-
-# ---------------------------------------------------------------------------------------
-# Password policy
-#
-# The single declaration of what makes a password acceptable. Two paths are held to it, and
-# there is exactly one definition between them: `app.schemas.auth` publishes these numbers in
-# /openapi.json and enforces them on POST /api/v1/auth/register, and `Settings` below applies
-# them to SEED_ADMIN_PASSWORD so the seeded administrator - frequently the only ADMIN
-# principal a deployment has - cannot be created with a credential the registration route
-# would have refused, or with one so long that every later login is rejected. See "The
-# credential policy lives here" in the module docstring for why the rules sit in this module
-# rather than in the schema layer that publishes them.
-# ---------------------------------------------------------------------------------------
-
-PASSWORD_MIN_LENGTH: Final[int] = 12
-"""Shortest accepted new password, in characters.
-
-Length is the property that actually resists an offline attack on a stolen
-``users.password_hash``: each additional character multiplies the search space, where a
-composition rule only rearranges it. Twelve is the floor, and
-:data:`PASSWORD_MIN_CHARACTER_CLASSES` is what keeps a twelve-character password from also
-being a single-alphabet one.
-"""
-
-PASSWORD_MAX_LENGTH: Final[int] = 128
-"""Longest accepted password, in characters, on registration and on login alike.
-
-A denial-of-service bound rather than a storage limit. ``users.password_hash`` is unbounded
-``TEXT`` precisely so an argon2id hash may grow when its cost parameters are tuned, and
-``app.core.security.hash_password`` passes the plaintext through unmodified: argon2 is
-memory-hard and intentionally slow, so an unbounded input on an unauthenticated route is an
-amplification primitive. One hundred and twenty-eight characters is far above any password a
-human composes, so the bound costs no legitimate caller anything.
-
-It bounds ``SEED_ADMIN_PASSWORD`` for a second, sharper reason. ``LoginRequest`` applies this
-same ceiling, so a longer seeded password would hash and store perfectly well and then be
-refused at every login attempt - an administrator account that exists and cannot be used.
-"""
-
-PASSWORD_MIN_CHARACTER_CLASSES: Final[int] = 3
-"""How many of the five character groups a new password must draw on.
-
-Three of five. ``alllowercaseonly`` clears the length floor and is still trivially
-enumerable, so requiring variety is what makes the stated minimum length mean something.
-Three rather than all five, because a rule nobody can satisfy without a password manager is a
-rule that produces written-down passwords. The groups are listed in
-:data:`PASSWORD_CHARACTER_GROUPS`.
-"""
-
-PASSWORD_CHARACTER_GROUPS: Final[tuple[str, ...]] = (
-    # Indexed by the _GROUP_* constants below, in this exact order. Adding a group means
-    # adding its constant, its branch in password_character_groups, and a line here.
-    "a lowercase letter",
-    "an uppercase letter",
-    "a digit",
-    "a letter from a script that has no letter case, such as CJK, Hebrew or Arabic",
-    "any other character, such as a symbol, a punctuation mark or a space",
-)
-"""The five character groups :data:`PASSWORD_MIN_CHARACTER_CLASSES` counts, as prose.
-
-The list is the single source of the wording, so the field description a caller reads, the
-validation message a rejected caller receives and any client mirroring the policy all quote
-the same five phrases rather than three drifting paraphrases of them.
-
-The **fifth group is a catch-all**, and that is what makes the classification total: every
-character of every string lands in exactly one group, so no writing system is excluded by
-omission. The fourth group is the reason the catch-all is not enough on its own. A rule built
-only from "lowercase, uppercase, digit, symbol" is unsatisfiable at three groups for anyone
-writing in a script that has no letter case - a Japanese or Hebrew passphrase can reach two
-groups and no further, however long or strong it is - so counting caseless letters as a group
-of their own is what keeps this policy from quietly excluding most of the world's readers.
-"""
-
-_GROUP_LOWERCASE: Final[int] = 0
-_GROUP_UPPERCASE: Final[int] = 1
-_GROUP_DIGIT: Final[int] = 2
-_GROUP_CASELESS_LETTER: Final[int] = 3
-_GROUP_OTHER: Final[int] = 4
-
-PASSWORD_VARIETY_MESSAGE: Final[str] = (
-    f"Password must contain characters from at least {PASSWORD_MIN_CHARACTER_CLASSES} of these "
-    f"{len(PASSWORD_CHARACTER_GROUPS)} groups: {'; '.join(PASSWORD_CHARACTER_GROUPS)}."
-)
-"""The rejection message for a password that clears the length floor but not the group floor.
-
-Built from :data:`PASSWORD_CHARACTER_GROUPS` rather than written out, so the message and the
-documented policy cannot disagree. It is a complete, self-contained sentence on purpose:
-``app.core.exceptions`` copies a validator's message verbatim into the ``message`` member of
-each entry in the problem document's ``errors`` list, so this string is what a client renders
-beside the password field. It names what is required and never quotes what was submitted -
-``app.schemas.common.ValidationErrorItem`` drops pydantic's ``input`` key specifically so that
-a rejected password cannot reach a response body or an access log.
-"""
-
-
-def password_character_groups(password: str) -> frozenset[int]:
-    """Return the indices of :data:`PASSWORD_CHARACTER_GROUPS` the password draws on.
-
-    Total by construction: the four tests are tried in order and the final ``else`` catches
-    everything they do not, so every character contributes to exactly one group and no string
-    is left unclassified. That totality is the property the fifth group exists to provide -
-    see :data:`PASSWORD_CHARACTER_GROUPS` for why a four-group rule silently excluded caseless
-    scripts.
-
-    The tests are Unicode-aware because :meth:`str.islower`, :meth:`str.isupper` and
-    :meth:`str.isdigit` are: ``é`` counts as lowercase and ``Ä`` as uppercase, exactly as ``e``
-    and ``A`` do. ``isalpha`` is tried only after both case tests have failed, so it matches a
-    letter from a script that draws no case distinction - Japanese, Chinese, Hebrew, Arabic,
-    Devanagari, Thai, Hangul - rather than shadowing the two groups above it.
-
-    Every character is examined rather than stopping once three groups have been found. Callers
-    bound the input at :data:`PASSWORD_MAX_LENGTH`, so the loop is short, and returning the
-    complete set keeps the result meaningful to a caller that wants to report what was present
-    rather than only whether it was enough.
-
-    Args:
-        password: The candidate password, exactly as it was supplied.
-
-    Returns:
-        The set of group indices present. Empty only for an empty string.
-    """
-    groups: set[int] = set()
-    for character in password:
-        if character.islower():
-            groups.add(_GROUP_LOWERCASE)
-        elif character.isupper():
-            groups.add(_GROUP_UPPERCASE)
-        elif character.isdigit():
-            groups.add(_GROUP_DIGIT)
-        elif character.isalpha():
-            groups.add(_GROUP_CASELESS_LETTER)
-        else:
-            groups.add(_GROUP_OTHER)
-    return frozenset(groups)
-
-
-def password_policy_violation(password: str) -> str | None:
-    """Report why ``password`` is unacceptable as a new password, or ``None`` when it is fine.
-
-    The whole policy in one call: too short, too long, or drawing on too few character groups.
-    It returns a message rather than raising so that each caller can frame the failure for its
-    own audience - ``app.schemas.auth`` reports it against the ``password`` member of a request
-    body and :meth:`Settings._validate_seed_admin_password` reports it against an environment
-    variable name - while the *rule* stays singular.
-
-    Order matters. Length is reported before variety, so a caller who typed four characters is
-    told the length rule rather than the length rule *and* the group rule at once, and has one
-    actionable sentence to act on. ``app.schemas.auth`` reaches the same outcome from the other
-    direction: its ``StringConstraints`` reject a length violation before any validator runs,
-    so the only verdict this function ever returns there is the variety one.
-
-    Nothing here trims, folds or re-encodes, and no message quotes the candidate. Whitespace is
-    significant in a password - trimming it would change the credential - and a rejected
-    password must not reach a validation message, a log line or a traceback.
-
-    Args:
-        password: The candidate password, exactly as it was supplied.
-
-    Returns:
-        A complete, self-contained sentence naming the first rule that was not met, or ``None``
-        when the password satisfies every rule.
-    """
-    if len(password) < PASSWORD_MIN_LENGTH:
-        return f"Password must be at least {PASSWORD_MIN_LENGTH} characters."
-    if len(password) > PASSWORD_MAX_LENGTH:
-        return f"Password must be at most {PASSWORD_MAX_LENGTH} characters."
-    if len(password_character_groups(password)) < PASSWORD_MIN_CHARACTER_CLASSES:
-        return PASSWORD_VARIETY_MESSAGE
-    return None
 
 
 # ---------------------------------------------------------------------------------------
@@ -931,7 +794,14 @@ class Settings(BaseSettings):
 
         # A query string is legitimate - libpq connection parameters such as
         # `?sslmode=require` and `?connect_timeout=5` are passed straight through by
-        # psycopg - so it is deliberately allowed. A fragment is not: no part of a
+        # psycopg - so it is deliberately allowed, and no key in it is inspected or
+        # restricted here. That tolerance carries an obligation on every consumer that
+        # renders this value: some libpq parameters ARE credentials (`password`,
+        # `sslpassword`, `sslkey`, `passfile`), and SQLAlchemy's `hide_password=True` masks
+        # only the password inside the authority, never the query. So the query string is
+        # dropped wholesale before any URL derived from this value is logged - see
+        # `_redacted` in backend/migrations/env.py, the one place in this project that
+        # renders it. A fragment, by contrast, is not allowed at all: no part of a
         # connection URL is a document anchor, and one present means the value was pasted
         # from somewhere it did not belong.
         if parts.fragment:

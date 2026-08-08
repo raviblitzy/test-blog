@@ -57,8 +57,10 @@ Everything a dependency logs - ``uvicorn``, ``uvicorn.error``, ``gunicorn.error`
 ``sqlalchemy.engine.Engine``, ``alembic``, and Python warnings - is formatted by the same
 processors through ``structlog.stdlib.ProcessorFormatter``, so a non-development deployment
 emits JSON and only JSON. ``backend/migrations/env.py`` calls :func:`configure_logging` too,
-so ``alembic upgrade``, ``alembic downgrade`` and ``alembic check`` join the same stream
-instead of writing plain text to stderr from a ``fileConfig`` of their own. Those loggers also
+so ``alembic upgrade``, ``alembic downgrade`` and ``alembic check`` are rendered by the same
+processors instead of writing plain text from a ``fileConfig`` of their own - it passes
+``stream=sys.stderr`` because the same CLI writes generated DDL to stdout under ``--sql``, and
+:func:`configure_logging`'s ``stream`` argument documents that in full. Those loggers also
 have their own handlers detached and their propagation restored, so each line is written
 exactly once instead of twice: ``backend/Dockerfile`` runs Gunicorn with Uvicorn workers, and
 both families configure handlers of their own when they start.
@@ -106,8 +108,9 @@ reading it.
 
 Deliberate exclusions
 ---------------------
-stdout is the only sink. There is no file handler, no rotation, no syslog, no OTLP or APM
-exporter, no metrics registry and no tracing provider: structured logging with request
+A process stream is the only sink - stdout for the service, and stderr for the migration CLI
+whose stdout carries generated DDL. There is no file handler, no rotation, no syslog, no OTLP
+or APM exporter, no metrics registry and no tracing provider: structured logging with request
 correlation plus the liveness and readiness probes is this project's observability floor, and
 an exporter would be a dependency and an operational surface the scope does not call for. The
 request-identifier middleware is not here either - it lives in
@@ -165,7 +168,7 @@ import sys
 import unicodedata
 from collections.abc import MutableMapping
 from functools import cache
-from typing import Any, Final
+from typing import Any, Final, TextIO
 
 import structlog
 from structlog.tracebacks import ExceptionDictTransformer
@@ -730,14 +733,14 @@ def _replace_root_handler(handler: logging.Handler, level: int) -> None:
     _installed_handler = handler
 
 
-def configure_logging() -> None:
+def configure_logging(*, stream: TextIO | None = None) -> None:
     """Install this service's logging configuration. Safe to call more than once.
 
     ``app.main`` calls this first in its lifespan startup, and the test suite calls it from a
     session fixture. Both paths land on the same state:
 
     * *structlog* renders through the standard library, so one handler on the root logger -
-      writing to stdout, formatted by ``ProcessorFormatter`` - is the single exit for
+      writing to *stream*, formatted by ``ProcessorFormatter`` - is the single exit for
       application events, dependency events and Python warnings alike.
     * The threshold is ``settings.LOG_LEVEL``, applied in three places for one reason each.
       ``make_filtering_bound_logger`` makes a below-threshold call return immediately, before
@@ -754,15 +757,36 @@ def configure_logging() -> None:
     ``ENVIRONMENT`` or ``LOG_LEVEL`` on the settings object and calls this again gets the new
     renderer and the new threshold, and still exactly one handler.
 
-    The stream is resolved when this runs rather than when the module is imported, so it is
-    whatever ``sys.stdout`` is at configuration time - the process stdout the container
-    runtime collects in a deployment, and a capture buffer under a test.
-
     The settings import is local to this function, and that placement is load-bearing rather
     than stylistic: it is what keeps ``import app.core.logging`` - and therefore
     ``import app.core.exceptions`` and ``import app.middleware`` - free of any settings
     construction. See "Import purity" in the module docstring. It also preserves the
     reconfiguration property above, because the singleton is re-read on every call.
+
+    Args:
+        stream:
+            Where the single root handler writes. Defaults to ``sys.stdout``, which is the
+            service's sink and what ``app.main`` and ``app.db.seed`` therefore use by taking
+            the default. It is resolved when this function runs rather than when the module is
+            imported, so the default is whatever ``sys.stdout`` is at configuration time - the
+            process stdout the container runtime collects in a deployment, and a capture buffer
+            under a test.
+
+            One caller passes ``sys.stderr``, and the reason is a correctness requirement
+            rather than a preference. ``backend/migrations/env.py`` runs under a CLI whose
+            ``--sql`` mode writes *generated DDL* to stdout::
+
+                alembic upgrade head --sql > schema.sql
+
+            A log record on that stream lands inside the redirected file and makes it
+            non-executable SQL - and it is not only this project's own diagnostic line but
+            every record Alembic's own ``alembic.runtime.migration`` logger emits before the
+            first statement (``Context impl PostgresqlImpl.``, ``Generating static SQL``,
+            ``Will assume transactional DDL.``), all of which arrive through the root handler
+            installed here. Pointing that one process's handler at stderr keeps stdout a pure
+            SQL channel while the records still reach the container's collected output, which
+            takes both streams. It is also what Alembic's own generated template does: the
+            ``[handler_console]`` stanza it ships binds ``args=(sys.stderr,)``.
     """
     # Imported here, not at module scope. See the docstring above.
     from app.core.config import settings
@@ -783,7 +807,10 @@ def configure_logging() -> None:
         ],
     )
 
-    handler = logging.StreamHandler(stream=sys.stdout)
+    # `sys.stdout` is read here rather than bound as the parameter's default, so the default is
+    # resolved per call: a test that replaces sys.stdout between two calls gets the replacement,
+    # where a default evaluated at definition time would have captured the original object.
+    handler = logging.StreamHandler(stream=sys.stdout if stream is None else stream)
     handler.setFormatter(formatter)
     handler.setLevel(level)
     _replace_root_handler(handler, level)

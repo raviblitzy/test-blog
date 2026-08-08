@@ -133,17 +133,31 @@ class LikeSummary(BaseModel):
     them so the payload identifies itself - a client caching or merging by post reads the key
     out of the body instead of tracking which request a response belongs to.
 
-    Validated from whatever the layer below produced
-    -----------------------------------------------
-    This summary is not the projection of one row: ``post_id`` is echoed from the path, the tally
-    is an aggregate issued by ``app.repositories.like_repository``, and the caller's state is a
-    predicate ``app.services.like_service`` resolves beside it. ``from_attributes`` is enabled so
-    that however that layer hands the three values over - an object carrying them as attributes,
-    or the row of an aggregate select - is a valid input. All three forms therefore validate::
+    Assembled by the service, from three values that arrive separately
+    -----------------------------------------------------------------
+    This summary is not the projection of one row, and no single value the layer below returns
+    carries all three of its members. ``post_id`` is echoed from the path parameter;
+    :meth:`~app.repositories.like_repository.LikeRepository.count_and_state` returns the other two
+    as a plain ``tuple[int, bool]``, deliberately unlabelled because a repository does not name
+    wire fields. So the service **constructs this model explicitly**, and that is the only
+    supported form::
 
-        LikeSummary.model_validate(row)  # an object, by attribute
-        LikeSummary.model_validate(row._mapping)  # an aggregate select, by key
-        LikeSummary(post_id=post_id, like_count=count, liked_by_caller=liked)
+        like_count, liked_by_caller = await repository.count_and_state(
+            post_id, user_id=principal_id
+        )
+        return LikeSummary(
+            post_id=post_id,
+            like_count=like_count,
+            liked_by_caller=liked_by_caller,
+        )
+
+    ``from_attributes`` is enabled, and it earns its place by making any object that carries the
+    three as attributes a valid input - a stand-in in a unit test, or a future flat select whose
+    columns are ``.label()``-ed to these names, for which ``model_validate(row._mapping)`` would
+    then be correct. It cannot rename anything, though, so it does not make the *current* return
+    value validatable: measured against the pinned pydantic,
+    ``LikeSummary.model_validate((0, False))`` raises ``ValidationError``, because a two-element
+    tuple has neither the names nor the arity this model requires.
 
     Every field is required and none carries a default, so a service that forgets to resolve the
     caller's state fails validation loudly instead of quietly reporting ``False`` to someone who
@@ -153,11 +167,12 @@ class LikeSummary(BaseModel):
     """
 
     model_config = ConfigDict(
-        # The summary is assembled a layer down and may arrive as an object with these three
-        # attributes attached or as the row of an aggregate select, so attribute access has to
-        # be a valid input. A plain mapping still validates as well, which is what lets a
-        # repository feed this model straight from `row._mapping` without materialising an
-        # entity - and what makes the model testable with a two-line stand-in object.
+        # The summary is assembled a layer down from three values that arrive separately, so the
+        # supported construction is explicit keywords - see the class docstring. This setting
+        # additionally accepts any object carrying all three as attributes, which is what makes
+        # the model testable with a two-line stand-in and what a future flat select with
+        # `.label()`-ed columns would satisfy through `row._mapping`. It does NOT make the
+        # repository's current `tuple[int, bool]` validatable; nothing can rename a tuple.
         from_attributes=True,
         json_schema_extra={
             # Published verbatim in /openapi.json and rendered on /docs, so it is written for a

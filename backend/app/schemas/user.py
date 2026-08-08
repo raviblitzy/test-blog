@@ -376,15 +376,17 @@ class UserPublic(BaseModel):
             "it stays valid."
         ),
     )
-    display_name: str | None = Field(
+    display_name: str = Field(
         ...,
         description=(
             "Human-readable name to render wherever the account appears - the byline on each of "
-            "its posts, the heading of its profile, the author column of a table. Always present "
-            "in practice, because `users.display_name` is `NOT NULL` and registration falls back "
-            "to the username when none was supplied; typed as nullable so that a client written "
-            "against this contract stays correct if a future projection omits it, and so a "
-            "consumer is never surprised into rendering the string `null`."
+            "its posts, the heading of its profile, the author column of a table. Never null and "
+            "never absent: `users.display_name` is `TEXT NOT NULL`, and registration derives it "
+            "from the username when none was supplied, so the database has no state this member "
+            "could report as null. A client therefore renders it unconditionally and needs no "
+            "fallback - and if this projection ever did produce a null, the framework would "
+            "reject the response against this model rather than publish a shape the database "
+            "cannot hold."
         ),
     )
     bio: str | None = Field(

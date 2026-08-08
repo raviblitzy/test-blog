@@ -422,7 +422,8 @@ class BaseRepository[ModelT: Base]:
         The one primitive behind every list surface in the API - the home feed, an author's
         published posts, the author workspace and each administrative table - so all of them
         window identically and the client can share a single pagination component. Two
-        statements are executed: the count first, then the window.
+        statements are executed: the count first, then the window. They are two *snapshots* as
+        well as two statements, which the note below states precisely rather than glosses.
 
         Args:
             stmt: The fully composed ``SELECT`` over :attr:`model`, with filters, joins, loader
@@ -441,17 +442,43 @@ class BaseRepository[ModelT: Base]:
                 the count is derived from ``stmt`` itself.
 
         Returns:
-            ``(rows, total)``: the entities on this page, and how many rows match in total
-            ignoring the window. Deliberately not a ``Page``; the module docstring explains why
-            that wire shape belongs to the service layer, which passes ``list(rows)`` and
-            ``total`` on to ``build_page``.
+            ``(rows, total)``: the entities on this page, and how many rows matched the same
+            predicates ignoring the window, each as of its own statement's snapshot - see the
+            note on the two snapshots below. Deliberately not a ``Page``; the module docstring
+            explains why that wire shape belongs to the service layer, which passes
+            ``list(rows)`` and ``total`` on to ``build_page``.
 
         Note:
-            **The derived count matches the window exactly.** With no ``count_stmt`` the count is
-            ``SELECT count(*)`` over ``stmt.order_by(None).subquery()``. Subquerying the caller's
-            own statement is what guarantees an identical predicate set: no filter can be
-            forgotten, because none is restated. Stripping ``ORDER BY`` removes a sort PostgreSQL
-            would otherwise perform for a result nobody reads.
+            **The derived count applies exactly the same predicates as the window.** With no
+            ``count_stmt`` the count is ``SELECT count(*)`` over
+            ``stmt.order_by(None).subquery()``. Subquerying the caller's own statement is what
+            guarantees an identical predicate set: no filter can be forgotten, because none is
+            restated. Stripping ``ORDER BY`` removes a sort PostgreSQL would otherwise perform
+            for a result nobody reads. That is a statement about *which rows* each statement
+            asks for, and it is unconditional; it is not a statement about *when* each one looks,
+            which is the paragraph below.
+
+            **The count and the window are two snapshots, and the envelope is honest about it.**
+            ``app.db.session`` configures no isolation level, so both statements run at
+            PostgreSQL's READ COMMITTED default and each takes its own snapshot as it begins. A
+            transaction that commits between them is therefore visible to the window and not to
+            the count: a post published in that instant can make ``total`` one lower than the
+            set the rows were drawn from, and a deleted one can make it one higher. A
+            ``selectinload`` on the window adds a further statement and a further snapshot, so a
+            relationship loaded for a row can reflect a slightly later state than the row.
+
+            This is accepted rather than worked around, and the reason is that the alternatives
+            cost more than the property is worth on a list surface. A single-statement form -
+            ``count(*) OVER ()`` beside the rows - reports nothing at all when the window is
+            empty, and an empty window beside a real ``total`` is precisely the out-of-range page
+            this method is required to support. A repeatable-read transaction would give one
+            snapshot, at the price of ``40001`` serialisation failures on every mutating route
+            that shares the session factory. So no caller may read ``total`` as a count of the
+            rows it was handed, or as a value another request will agree with; it is the size of
+            the matching set as of its own statement, which is what a page indicator needs.
+            Where a count has to decide a *write*, that decision belongs behind a row lock -
+            :meth:`UUIDPrimaryKeyRepository.get_by_id` with ``for_update=True`` - and not behind
+            this method.
 
             Loader options need no stripping, and that was verified rather than assumed against
             SQLAlchemy 2.0.51: the outer ``select(func.count())`` is a Core statement, so ORM
@@ -469,8 +496,10 @@ class BaseRepository[ModelT: Base]:
             before they arrive here.
 
             **A zero total skips the second round trip.** With nothing matching there is no
-            window to fetch. For any correct ``count_stmt`` a zero total and a non-empty window
-            are mutually exclusive, so this cannot hide rows.
+            window to fetch, so the second statement is not issued at all - which is also the one
+            case where the two-snapshot behaviour above is *not* observable, because a single
+            snapshot produced the whole answer. A row inserted after that count is simply not in
+            the set this call describes, exactly as a row inserted after any read is not in it.
 
             **De-duplication is the caller's business.** Rows come back through
             ``.scalars().all()`` with no ``.unique()``. Applying it unconditionally would mask
@@ -538,8 +567,8 @@ class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
     decides what that means to a client.
     """
 
-    async def get_by_id(self, entity_id: uuid.UUID) -> ModelT | None:
-        """Fetch one row by its surrogate primary key.
+    async def get_by_id(self, entity_id: uuid.UUID, *, for_update: bool = False) -> ModelT | None:
+        """Fetch one row by its surrogate primary key, optionally locking it.
 
         This is *the* identity predicate for the whole codebase. It replaces the three
         hand-written copies the previous service carried - ``app.py:L28-29`` (read one),
@@ -555,10 +584,30 @@ class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
             entity_id: The server-generated UUID to look up. Identity always originates in
                 PostgreSQL through ``gen_random_uuid()``, so this value came either from an
                 earlier read or from a URL path segment a route already validated as a UUID.
+            for_update:
+                When ``True``, emit ``SELECT ... FOR UPDATE`` so the row is locked for the rest
+                of this transaction, and read it from the database even if this unit of work
+                already holds a copy - a lock over a cached instance would be no lock at all.
+                Verified against SQLAlchemy 2.0.51: passing ``with_for_update`` re-issues the
+                statement with ``FOR UPDATE`` appended and populates the *same* identity-map
+                instance, so the caller's object reference stays valid and its attributes are
+                the committed ones.
+
+                Ask for it whenever the value read is about to decide a write - the
+                read-check-write sequences behind delete, publish and moderation - because
+                without it two transactions can both read the same pre-state and both act on it.
+                Leave it ``False``, the default, for every read that only renders: a lock costs
+                a round trip, blocks other writers, and on a plain read buys nothing.
 
         Returns:
             The entity, or ``None`` when no row carries that key. Absence is never an error
             here; the service decides whether it means ``404``, ``403`` or a no-op.
+
+            Under ``for_update=True`` that ``None`` carries more weight than it does otherwise:
+            PostgreSQL follows the row's update chain before returning, so a row a concurrent
+            transaction deleted and committed is reported absent rather than handed back from a
+            snapshot - which is what makes a subsequent write conditional on a fact rather than
+            on a guess.
 
         Note:
             For relations keyed on a single surrogate column, which is every relation carrying
@@ -567,7 +616,11 @@ class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
             single-column identity to look up, so their repositories address rows by the whole
             composite key through :meth:`get_or_none` instead.
         """
-        return await self.session.get(self.model, entity_id)
+        # `with_for_update` takes None rather than False for "no lock": passing False would
+        # still be a request for a lock clause SQLAlchemy has to render.
+        return await self.session.get(
+            self.model, entity_id, with_for_update=True if for_update else None
+        )
 
     async def add(self, entity: ModelT) -> ModelT:
         """Persist a new instance and return it fully loaded.
@@ -598,8 +651,8 @@ class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
     async def delete_by_id(self, entity_id: uuid.UUID) -> bool:
         """Remove the row carrying this primary key, reporting whether one existed.
 
-        Built from :meth:`get_by_id` and :meth:`delete` rather than from a single bulk
-        ``DELETE ... WHERE id = :id``. That trades one extra SELECT for three properties the
+        Built from a **locking** :meth:`get_by_id` and :meth:`delete` rather than from a single
+        bulk ``DELETE ... WHERE id = :id``. That trades one extra SELECT for three properties the
         bulk form cannot offer:
 
         * **Safety on composite keys.** Deriving the key column from the mapper would take the
@@ -608,9 +661,8 @@ class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
           instead of one row. Routing through
           :meth:`~sqlalchemy.ext.asyncio.AsyncSession.get` makes the misuse fail loudly rather
           than destroy data.
-        * **An exact answer.** ``False`` means the row was absent, established by looking. A
-          bulk statement reports rows matched, which conflates "absent" with "matched but
-          invisible to this transaction".
+        * **An exact answer** - which is what the lock is for, and it does not hold without one.
+          See below.
         * **A coherent session.** The instance leaves the identity map as part of the delete, so
           a later :meth:`get_by_id` in the same transaction cannot hand back a deleted entity
           from cache.
@@ -618,15 +670,37 @@ class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
         It also keeps the identity predicate singular: the lookup is :meth:`get_by_id`'s, not a
         second copy of it.
 
+        Why the read takes ``FOR UPDATE``
+        --------------------------------
+        The returned boolean claims a fact about the database, so the read that establishes it
+        has to still be true when the write lands. Unlocked, it is not. Measured on PostgreSQL
+        18.4 with two concurrent sessions: both loaded the same row, both issued
+        ``DELETE FROM users WHERE users.id = …``, and **both commits succeeded** - the second
+        statement matched nothing, SQLAlchemy at most warns about it, and this method reported
+        ``True`` for a row it did not delete. A service reading that as "deleted" returns ``204``
+        to one of two callers who both believe they removed the record.
+
+        Locking the row closes the window rather than narrowing it. The second caller blocks on
+        the first's row lock, and when the first commits PostgreSQL follows the update chain,
+        finds the row deleted, and returns nothing - so :meth:`get_by_id` yields ``None`` and
+        this method reports ``False``. Re-measured that way on the same stack: exactly one caller
+        deleted the row and returned ``True``, and the other returned ``False``.
+
         Args:
             entity_id: The surrogate primary key to remove.
 
         Returns:
-            ``True`` when a row existed and was deleted, ``False`` when none carried that key.
-            Absence never raises - the service turns ``False`` into a ``404`` if that is what the
-            endpoint means.
+            ``True`` when a row existed and this call deleted it, ``False`` when none carried
+            that key by the time the lock was granted. Absence never raises - the service turns
+            ``False`` into a ``404`` if that is what the endpoint means.
+
+        Note:
+            The lock is held until the enclosing transaction ends, which is the service's commit
+            or rollback rather than this method's return - so two requests deleting the same row
+            serialise rather than interleave. That is a property of the transaction this
+            repository was handed, not something it arranges: nothing here commits.
         """
-        entity = await self.get_by_id(entity_id)
+        entity = await self.get_by_id(entity_id, for_update=True)
         if entity is None:
             return False
         await self.delete(entity)

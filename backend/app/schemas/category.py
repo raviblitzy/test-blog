@@ -249,8 +249,12 @@ class CategorySummary(BaseModel):
 
     model_config = ConfigDict(
         # Projected from a mapped `app.models.Category`, so attribute access has to be a valid
-        # input. A plain mapping still validates as well, which is what lets a repository that
-        # selected individual columns feed this model without materialising an entity.
+        # input - and for THIS model, which declares only columns the entity has,
+        # `model_validate(category)` is genuinely all a service needs. A mapping whose keys are
+        # these three field names validates as well, which is what lets a repository selecting
+        # individual LABELLED columns feed it without materialising an entity. `CategoryPublic`
+        # below adds `post_count`, which no entity carries, and its docstring records the
+        # explicit projection that consequently becomes necessary there.
         from_attributes=True,
         json_schema_extra={
             # One category, carried through all four models in this module with the same values,
@@ -313,13 +317,37 @@ class CategoryPublic(CategorySummary):
     source of truth that every publish, unpublish, delete and re-categorisation had to remember
     to update, and one missed path is a number that is wrong forever.
 
-    That makes the count an attribute the *query* supplies rather than one the entity has, and
-    ``from_attributes`` accommodates both ways of supplying it: a mapped ``Category`` with the
-    count attached as an attribute, or the row of an aggregate select, whose ``_mapping``
-    validates directly::
+    That makes the count an attribute the *query* supplies rather than one the entity has, so a
+    caller has to **project the two values explicitly**. This model is not validatable from the
+    repository's return value as it stands, and that is worth being precise about because the
+    shape is not obvious:
+    :meth:`~app.repositories.category_repository.CategoryRepository.list_with_post_counts`
+    returns ``Sequence[tuple[Category, int]]`` - a two-element tuple per category, the entity and
+    its tally - so neither member of the pair carries all six of this model's fields and the pair
+    itself carries none of them by name. The projection belongs to the service layer, which is
+    the layer that knows the count is a ``post_count``::
 
-        CategoryPublic.model_validate(row)  # entity, or Row, via attributes
-        CategoryPublic.model_validate(row._mapping)  # aggregate select, via keys
+        for category, post_count in await repository.list_with_post_counts():
+            items.append(
+                CategoryPublic(
+                    id=category.id,
+                    name=category.name,
+                    slug=category.slug,
+                    description=category.description,
+                    post_count=post_count,
+                    created_at=category.created_at,
+                )
+            )
+
+    ``from_attributes`` remains enabled, and it is still doing work: it makes any object that
+    carries all six as attributes a valid input, which is what a future repository returning a
+    flat, correctly *labelled* select - ``select(Category.id, …, func.count(Post.id).label(
+    "post_count"))`` - would produce, and ``model_validate(row._mapping)`` would then be the
+    right spelling. What it cannot do is invent a member name. Measured against the pinned
+    pydantic and the current query: both ``CategoryPublic.model_validate(row)`` and
+    ``CategoryPublic.model_validate(row._mapping)`` raise ``ValidationError`` on a
+    ``(Category, count)`` row, because the mapping's keys are the entity and the unlabelled
+    aggregate rather than this model's fields.
 
     ``updated_at`` is deliberately not published
     --------------------------------------------
