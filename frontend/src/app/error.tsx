@@ -4,13 +4,31 @@
 // visitor and a blank page.
 //
 // Next.js wraps every route segment beneath src/app/layout.tsx in this
-// component. Anything that throws while that subtree renders - a Server
-// Component's data fetch, a Client Component's event handler, a render-time
-// type error - lands here instead of tearing the document down. The most
-// concrete case in this application is the home feed: src/app/page.tsx lets a
-// failed posts request PROPAGATE rather than swallowing it (it degrades
-// gracefully only on the categories request, which is decoration), so a backend
-// or network outage renders this file.
+// component. What lands here is anything that throws while that subtree is being
+// RENDERED - a Server Component's data fetch, a render-time type error in a
+// Client Component, or an exception from an effect callback - instead of tearing
+// the document down. The most concrete case in this application is the home feed:
+// src/app/page.tsx lets a failed posts request PROPAGATE rather than swallowing it
+// (it degrades gracefully only on the categories request, which is decoration), so
+// a backend or network outage renders this file.
+//
+// WHAT DOES NOT LAND HERE, because it is the single most common thing to assume
+// wrongly about this file: an exception thrown from an EVENT HANDLER, or from any
+// asynchronous continuation - an onClick, a form submit handler, a rejected
+// promise, a setTimeout callback. Those run outside React's render and commit
+// work, so no boundary anywhere above them observes them; React's own
+// documentation lists event handlers and asynchronous code among the cases error
+// boundaries do not catch. An unhandled rejection there leaves the page standing
+// and the visitor with no feedback at all - which is worse than this screen, not
+// better, because nothing tells them the action failed.
+//
+// The consequence is a requirement on every interactive island rather than on this
+// file: a component that mutates - the like button, the comment form, the post
+// editor, the admin row actions - OWNS its own synchronous and asynchronous
+// failures and must catch them at the call site, where the code knows which
+// request failed and what its status means, and report them through the toast host
+// the root layout mounts. Nothing about this boundary reduces that obligation, and
+// no handler may be written on the assumption that this file is its safety net.
 //
 // ---------------------------------------------------------------------------
 // 1. 'use client' IS MANDATORY, AND MUST BE THE FIRST LINE
@@ -46,13 +64,30 @@
 // rendered ONLY when present, because an empty "Support reference:" line is
 // worse than no line at all.
 //
-// A single console.error in an effect gives a developer the real object in
-// devtools without putting one character of it on the screen. It is in an effect
-// rather than in the render body deliberately: the body re-runs on every
-// re-render, an effect keyed on `error` runs once per distinct error. No
-// telemetry SDK, no error-tracking backend and no analytics call belongs here -
-// all three are explicitly out of scope for this project, and an error boundary
-// that reaches for the network can itself fail.
+// The digest is also the ONLY thing this file does with the error. It writes
+// nothing to the browser console, and that is a security decision rather than a
+// convenience one. `console.error(error)` looks harmless because the console is
+// "for developers", but the console belongs to whoever is holding the browser: the
+// object it prints is the same object the screen deliberately withholds, so
+// logging it hands every visitor the message, the stack, and whatever request
+// path, payload fragment or internal hostname they carry. The framework's
+// production redaction narrows that for a server-render failure and does nothing
+// at all for one thrown in the browser, where the object is the real one. A
+// boundary whose stated contract is "opaque digest only" cannot also print the
+// non-opaque original, so it does not.
+//
+// Where the detail actually belongs is the place that already has it: Next.js
+// writes the real message and stack to the SERVER log next to the same digest the
+// visitor can read off this page, so an operator joins the two without the
+// visitor's browser ever being the transport. A developer who wants the object in
+// devtools has React's own uncaught-error reporting and the framework's dev
+// overlay, both of which run without this file's help.
+//
+// No telemetry SDK, no error-tracking backend and no analytics call belongs here
+// either - all three are explicitly out of scope for this project, and an error
+// boundary that reaches for the network can itself fail. If approved telemetry
+// ever exists, it takes safe correlation metadata, server-side; it does not take
+// the thrown value from the client.
 //
 // ---------------------------------------------------------------------------
 // 3. WHY THE HEADING COMES FROM CardTitle AND NOT FROM AlertTitle
@@ -190,8 +225,18 @@
 //  10. A retry counter, a countdown or an automatic re-render. An error boundary
 //      that retries itself on a timer turns one failed request into a loop
 //      against an already-struggling service. The visitor decides.
+//  11. `console.error(error)`, in an effect or anywhere else, and any other write
+//      of the thrown value to a browser sink - `console.*`, `sessionStorage`, a
+//      `data-` attribute, a hidden element. This is the one entry on this list
+//      that is a SECURITY boundary rather than a design preference, and it is the
+//      one most likely to be added back by someone who reads the empty component
+//      body as an oversight. It is not: section 2 explains why the console is the
+//      visitor's surface and not the developer's, and where the real message and
+//      stack already go. The component body reads `error.digest` and nothing else,
+//      and `useEffect` is consequently not imported - so restoring the log means
+//      adding an import, which is exactly the visible signal a reviewer needs.
 
-import { startTransition, useEffect, type JSX } from 'react';
+import { startTransition, type JSX } from 'react';
 
 import { TriangleAlert } from 'lucide-react';
 import Link from 'next/link';
@@ -240,7 +285,9 @@ interface RootErrorProps {
  * The root segment's error boundary.
  *
  * Rendered by Next.js in place of any route beneath `src/app/layout.tsx` that
- * throws while rendering, so it appears inside the site shell with the header and
+ * throws WHILE RENDERING - which includes a Server Component's data fetch and an
+ * effect callback, and excludes an event handler or any asynchronous continuation
+ * (see the file header). It appears inside the site shell with the header and
  * footer still framing it. Named `RootError` rather than `Error` so that the
  * global `Error` type referenced by {@link RootErrorProps} is not shadowed by a
  * declaration in this module; the framework keys on the file name and the default
@@ -250,11 +297,12 @@ interface RootErrorProps {
  * happened in fixed terms, an opaque support reference when one exists, a control
  * that genuinely re-requests and re-renders the segment, and a link back to the
  * home feed that works even with no working client bundle. What the visitor never
- * gets is one character of the thrown value.
+ * gets is one character of the thrown value - not on the screen and not in the
+ * browser console, which is the visitor's surface too.
  *
  * This component holds no state, reads no environment variable, issues no request
- * of its own and makes no decision based on the shape of the error - the only
- * thing it inspects is whether `digest` exists.
+ * of its own, writes to no browser log and makes no decision based on the shape of
+ * the error - the only thing it inspects is whether `digest` exists.
  *
  * @param error - The thrown value; only `digest` is read. @see {@link RootErrorProps}
  * @param reset - Framework callback that clears this boundary's error state.
@@ -262,15 +310,6 @@ interface RootErrorProps {
  */
 export default function RootError({ error, reset }: RootErrorProps): JSX.Element {
   const router = useRouter();
-
-  // Put the real object in the developer console once per distinct error, so it
-  // is inspectable in devtools while none of it reaches the screen. Keyed on
-  // `error` rather than left dependency-free so that a second, different failure
-  // after a retry is logged too; in an effect rather than in the render body so
-  // that a re-render does not repeat the entry.
-  useEffect(() => {
-    console.error(error);
-  }, [error]);
 
   /**
    * Re-requests the failed segment, then clears the error so the fresh result

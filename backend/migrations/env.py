@@ -67,9 +67,12 @@ What is deliberately absent
 * No ``os.environ``, ``os.getenv``, ``dotenv`` or ``.env`` read: ``app.core.config`` is the
   single reader of the environment, and it fails loudly at import when a required variable is
   missing. Softening that here would move the failure to a worse place.
-* No ``app.core.logging.configure_logging()`` call. During a migration ``alembic.ini`` owns
-  logging through :func:`~logging.config.fileConfig` below; installing structlog's
-  configuration on top would double-configure the handlers and duplicate every line.
+* No second logging configuration. ``app.core.logging.configure_logging()`` is called below
+  and is the only thing that configures logging here, so a migration's output has the same
+  shape - and the same one-line-per-event guarantee - as the service's. ``alembic.ini``
+  deliberately carries no ``[loggers]``/``[handlers]``/``[formatters]`` stanzas and this file
+  never calls :func:`~logging.config.fileConfig`: doing both would attach two handlers to the
+  root logger and render every line twice, once as plain text and once as JSON.
 * No ``Base.metadata.create_all()``. Creating the schema is the revisions' job, and
   ``create_all`` would bypass the version table entirely, leaving a populated database that
   Alembic believes is empty.
@@ -84,7 +87,6 @@ What is deliberately absent
 """
 
 import logging
-from logging.config import fileConfig
 from typing import TYPE_CHECKING
 
 from alembic import context
@@ -103,6 +105,7 @@ from sqlalchemy.engine import make_url
 # the import being unnecessary.
 import app.models  # noqa: F401
 from app.core.config import settings
+from app.core.logging import configure_logging
 from app.db.base import metadata
 
 if TYPE_CHECKING:
@@ -118,17 +121,25 @@ if TYPE_CHECKING:
 # The Config object Alembic built from backend/alembic.ini plus the command line.
 config = context.config
 
-# Logging comes from the six stanzas at the end of alembic.ini: WARNING at the root so the
-# SQLAlchemy engine does not echo every statement it emits, INFO on `alembic` so
-# `alembic.runtime.migration` announces each revision as it is applied. Those INFO lines are
-# the evidence the container start-up step and the CI job read to confirm what actually ran.
+# Logging comes from app.core.logging, exactly as it does for the service.
 #
-# The None guard is not defensive padding. `config_file_name` is None whenever Alembic is
-# driven programmatically rather than from the CLI - which is how a test harness or a
-# start-up hook would call it - and fileConfig(None) raises. `disable_existing_loggers=False`
-# keeps the call from silencing loggers the calling process has already installed.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name, disable_existing_loggers=False)
+# This is the one place a migration could have diverged, and it is why it does not. Alembic's
+# generated template configures logging from `[loggers]`/`[handlers]`/`[formatters]` stanzas in
+# alembic.ini via `fileConfig`, which installs a plain-text StreamHandler on stderr. In a
+# container at ENVIRONMENT=production that means the record of which revisions were applied -
+# the very lines the start-up step and the CI job read - is the one part of the stream a JSON
+# log collector cannot parse, while everything the same image logs a second later is JSON.
+# Calling configure_logging() instead puts `alembic` and `alembic.runtime.migration` through
+# the same processor chain as the application: human-readable under ENVIRONMENT=development,
+# one JSON object per line everywhere else, with `LOG_LEVEL` deciding the threshold.
+#
+# alembic.ini therefore declares NO logging stanzas at all, and `fileConfig` is deliberately
+# not called - not even as a fallback. Calling both would attach two handlers to the root
+# logger and render every line twice.
+#
+# It also means `alembic upgrade head` fails fast on a misconfigured environment, because
+# app.core.config is imported before any connection is attempted.
+configure_logging()
 
 logger = logging.getLogger("alembic.env")
 """Diagnostics from this module, routed through alembic.ini's `alembic` logger at INFO."""
@@ -264,23 +275,36 @@ def include_object(
     why the set is empty on this schema's three extensions and why the guard still belongs here.
 
     This is the narrow place to exclude a genuine false positive, should one ever appear, and
-    the four candidates worth naming are the PostgreSQL-specific constructs this schema uses
+    the five candidates worth naming are the PostgreSQL-specific constructs this schema uses
     that autogeneration is known to compare imperfectly: ``posts.search_vector``, a
     ``GENERATED ALWAYS AS ... STORED`` ``tsvector``; the three native enumerated types
     ``user_role``, ``post_status`` and ``comment_status``; the four ``citext`` columns
-    ``users.email``, ``users.username``, ``posts.slug`` and ``categories.slug``; and the GIN
-    index over ``posts.title`` carrying the ``gin_trgm_ops`` operator class.
+    ``users.email``, ``users.username``, ``posts.slug`` and ``categories.slug``; the three GIN
+    indexes carrying a ``gin_trgm_ops`` operator class **on a column** - over ``posts.title``,
+    ``categories.name`` and ``comments.body``; and the four carrying it on an **expression**, the
+    text cast of each ``citext`` column - ``ix_users_username_trgm``, ``ix_users_email_trgm``,
+    ``ix_posts_slug_trgm`` and ``ix_categories_slug_trgm``.
 
-    **All four were verified clean** against PostgreSQL 18.4 with both comparison flags on -
+    **All five were verified clean** against PostgreSQL 18.4 with both comparison flags on -
     ``alembic check`` reported no pending operations across a full ``upgrade`` / ``check`` /
     ``downgrade base`` / ``upgrade`` / ``check`` cycle - so not one of them is excluded here,
     and none should be excluded speculatively. Two reasons they hold, worth recording so a
     future reader does not go looking: the models declare each construct explicitly rather than
     leaving it to a default (``Computed(..., persisted=True)``, ``postgresql.ENUM(...,
     create_type=False)`` with a matching ``server_default``, an explicit ``CITEXT``, and
-    ``postgresql_using``/``postgresql_ops`` on the index), and ``citext`` is registered in
+    ``postgresql_using``/``postgresql_ops`` on every index), and ``citext`` is registered in
     SQLAlchemy's PostgreSQL ``ischema_names``, so it reflects back as the same type the model
     declares rather than as a generic one.
+
+    The **expression** indexes hold for a third reason, and it is a spelling requirement rather
+    than a property of the schema. Each is declared as a labelled
+    :func:`~sqlalchemy.literal_column` with its operator class in ``postgresql_ops``, never as one
+    ``text("(col::text) gin_trgm_ops")`` string. The two render identical DDL, but Alembic's
+    PostgreSQL comparator warns ``Expression ... detected to include an operator clause. Expression
+    compare cannot proceed`` on the inline form and then skips that index entirely - which would
+    leave four objects silently unguarded by the gate this function exists to keep honest, and would
+    add a warning to every ``check``. Measured both ways against 18.4: the labelled form compares
+    clean and warning-free, the inline form warns and stops comparing.
 
     The one artefact the comparison does produce is a ``UserWarning`` on every ``check``:
     ``Computed default on posts.search_vector cannot be modified``. It is informational -

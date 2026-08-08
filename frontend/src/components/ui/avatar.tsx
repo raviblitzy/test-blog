@@ -21,7 +21,30 @@
 // `onError`/`onLoad` dance, and reimplementing it here would also throw away the
 // `delayMs` option that suppresses a fallback flash on a fast connection.
 //
-// WHY RADIX'S IMAGE PART AND NOT AN <img> OR next/image - BOTH ARE GATE-BREAKING
+// AN AVATAR URL IS UNTRUSTED DATA, AND THIS FILE IS WHERE THAT IS ENFORCED
+//
+// `avatar_url` is whatever a user typed into their profile: the service stores
+// any absolute http(s) URL (`pydantic.HttpUrl`). Rendering one unchecked would
+// make every reader's browser issue a request to a host that user chose, which
+// hands that host each reader's IP address, user-agent and the timing of the page
+// view - a disclosure the reader never opted into and cannot see. It would also
+// contradict the host policy this tier declares for the image optimiser.
+//
+// `AvatarImage` therefore asks `isAllowedImageUrl` from `@/lib/utils` before the
+// URL reaches the DOM, and drops a denied `src` to `undefined`. That single
+// module is also what `next.config.ts` derives `images.remotePatterns` from, so
+// the answer here and the optimiser's answer are the same answer by construction
+// rather than by two lists agreeing for now. A denied URL is not an error state:
+// dropping the `src` is exactly what makes Radix keep `AvatarFallback` mounted,
+// so the initials show and the composition degrades the way a missing avatar
+// already does.
+//
+// `referrerPolicy` defaults to `no-referrer` for the same reason, one layer
+// deeper: even an admitted delivery host has no business learning which page a
+// reader was on. A caller that needs a host's referrer-based hotlink protection
+// passes its own value.
+//
+// WHY RADIX'S IMAGE PART AND NOT AN <img> OR next/image
 //
 //   * A raw <img> cannot appear in this repository's JSX. `@next/next/no-img-
 //     element` is enabled at WARN by eslint-config-next's core-web-vitals set,
@@ -30,13 +53,13 @@
 //     node_modules, where the rule does not look - so the element we need
 //     reaches the DOM without the JSX that would trip the gate. Verified by
 //     running the gate; see the validation note at the foot of this comment.
-//   * next/image is not the alternative either. The optimiser rejects any host
-//     absent from `images.remotePatterns` in next.config.ts, and that list is a
-//     deliberately short security policy (four named hosts over TLS). An avatar
-//     URL is arbitrary user-supplied data, so routing avatars through the
-//     optimiser would turn "the host is not on the list" into a broken avatar
-//     for a correctly-configured user. Graceful degradation for a missing or
-//     unreachable image is `AvatarFallback`'s job, not the image optimiser's.
+//   * next/image is not the alternative either, and the reason is Radix's
+//     loading state machine rather than the host policy: `next/image` reports
+//     load and error through its own callbacks, so pairing it with
+//     `Avatar.Fallback` means reimplementing the very handshake this primitive
+//     wraps a library to avoid. The optimiser's `remotePatterns` and this file's
+//     predicate now resolve from one list, so nothing is gained by swapping in
+//     the optimiser and the fallback handshake is lost.
 //
 // WHY 'use client'
 //
@@ -89,6 +112,10 @@
 //      would only create a second place for it to drift.
 //   7. Upload, cropping or object-storage behaviour. Avatars are URL references;
 //      this product has no image pipeline.
+//   8. A host list of this file's own, or an `unsafeAllowAnyHost` escape hatch.
+//      The policy has exactly one definition, in `@/lib/utils`, and it is
+//      configured through NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST rather than edited in
+//      a component. A second list here is the drift this design exists to remove.
 //
 // TESTING NOTE. jsdom never fetches an image, so `image.complete` stays false
 // and no `load` event ever fires - which means `AvatarImage` renders null and
@@ -99,7 +126,7 @@
 import * as AvatarPrimitive from '@radix-ui/react-avatar';
 import type { ComponentProps, JSX } from 'react';
 
-import { cn } from '@/lib/utils';
+import { allowedImageUrl, cn } from '@/lib/utils';
 
 /**
  * Props of the Radix avatar root, derived from the primitive so this wrapper
@@ -163,15 +190,40 @@ export function Avatar({ className, ...props }: AvatarProps): JSX.Element {
  * so the caller passes `alt=""`; standing alone - an author card with no name
  * beside it - it passes descriptive text.
  *
+ * ### The host policy is applied here, before the URL reaches the DOM
+ *
+ * `src` is filtered through `allowedImageUrl` from `@/lib/utils`, the one module
+ * that decides which remote image hosts this tier fetches from and the module
+ * `next.config.ts` derives `images.remotePatterns` from. A URL that is not
+ * `https`, that carries embedded credentials, or whose host is not admitted
+ * becomes `undefined`, and Radix keeps `AvatarFallback` mounted - so a
+ * user-supplied host that the policy excludes never causes a request from a
+ * reader's browser, and the reader sees initials rather than a broken image.
+ * Admitting a host is a change to `NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST`, not to this
+ * file.
+ *
  * @param className - Extra utilities, merged last so they win their group.
- * @param props - `src`, `alt`, `referrerPolicy`, `crossOrigin`,
- *   `onLoadingStatusChange`, `ref` and every other image prop, spread straight
- *   onto the primitive.
+ * @param src - The stored avatar URL. Dropped when the shared host policy denies
+ *   it, which shows the fallback instead.
+ * @param referrerPolicy - Defaults to `no-referrer`, so an admitted host learns
+ *   nothing about which page the reader was on. Pass a value to override it.
+ * @param props - `alt`, `crossOrigin`, `onLoadingStatusChange`, `ref` and every
+ *   other image prop, spread straight onto the primitive.
  */
-export function AvatarImage({ className, ...props }: AvatarImageProps): JSX.Element {
+export function AvatarImage({
+  className,
+  src,
+  referrerPolicy = 'no-referrer',
+  ...props
+}: AvatarImageProps): JSX.Element {
   return (
     <AvatarPrimitive.Image
       className={cn('aspect-square h-full w-full object-cover', className)}
+      // The prop type admits a `Blob` as well as a URL string. Only a string can
+      // name a remote host, so only a string is policed; a `Blob` is local data
+      // with no host to check and is passed through untouched.
+      src={typeof src === 'string' ? allowedImageUrl(src) : src}
+      referrerPolicy={referrerPolicy}
       {...props}
     />
   );

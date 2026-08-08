@@ -126,8 +126,14 @@
 /* -----------------------------------------------------------------------------
  * THE TOKEN CONTRACT
  *
- * Twelve semantic colour tokens, plus one boundary token explained in the A11Y
- * note below. Each name generates the full utility family - `bg-*`, `text-*`,
+ * Fourteen semantic colour tokens, and exactly fourteen. Thirteen flip with the
+ * theme; the fourteenth, `scrim`, must not, and says so where it is declared.
+ * The set is closed: a component that needs a colour composes it from one of
+ * these names rather than reaching for a primitive family or a literal, and a
+ * fifteenth is not added to serve one call site - see the A11Y note below for
+ * how the boundary of an interactive control is expressed inside the fourteen,
+ * with no token of its own. Each name generates the full utility family -
+ * `bg-*`, `text-*`,
  * `border-*`, `ring-*`, `outline-*`, `divide-*`, `fill-*`, `stroke-*` - and each
  * is emitted as a real custom property, which is the dual emission that makes
  * the zero-hardcoded-values rule mechanically checkable rather than aspirational.
@@ -147,7 +153,7 @@
  * WHY `static`. Without it the engine emits only the tokens some utility
  * happens to reference, so a token no component uses yet would be missing from
  * the cascade and unreadable by `getComputedStyle`. `static` guarantees all
- * thirteen are always present.
+ * fourteen are always present.
  *
  * WHY `inline`, AND WHY DARK MODE IS ENTIRELY BROKEN WITHOUT IT. This is the
  * single most fragile line in the file. Do not remove the keyword.
@@ -171,7 +177,7 @@
  * which is resolved on the element the utility is applied to, so the `.dark`
  * override is picked up per subtree and theming works.
  *
- * Both properties above survive together: `static` still emits all thirteen
+ * Both properties above survive together: `static` still emits all fourteen
  * `--color-*` custom properties at `:root` for `getComputedStyle`, and the
  * opacity-modifier behaviour described above is preserved because the engine
  * still has a variable rather than a literal to fold - `bg-primary/50` compiles
@@ -211,9 +217,8 @@
   --color-muted-foreground: var(--app-muted-foreground);
 
   /* Hairline used for card outlines, table rules and footer dividers. See the
-   * A11Y note below for why control boundaries use `border-strong` instead. */
+   * A11Y note below for what an interactive control's boundary uses instead. */
   --color-border: var(--app-border);
-  --color-border-strong: var(--app-border-strong);
 
   /* Brand. `primary` + `primary-foreground` is the accessible pair for the
    * primary button variant; the two contrast with each other, not merely with
@@ -231,20 +236,38 @@
 
   /* Status. `danger` backs the destructive button variant and the destructive
    * dropdown item treatment in the admin row actions; `success` backs the
-   * approved and published affirmative states in badge.tsx and alert.tsx. Both
-   * are legible as text on every canvas AND as a solid fill beneath
-   * `text-primary-foreground`, so either treatment is safe. */
+   * approved and published affirmative states in badge.tsx and alert.tsx;
+   * `warning` backs the cautionary ones - an unpublished draft, a destructive
+   * action awaiting confirmation, a comment held for moderation. All three are
+   * legible as text on every canvas AND as a solid fill beneath
+   * `text-primary-foreground`, so either treatment is safe.
+   *
+   * `warning` exists as a token of its own precisely so that a cautionary state
+   * is not spelled with `accent`. Borrowing the brand hue for it would make
+   * "caution" and "emphasis" the same colour, which is a semantic collision the
+   * reader cannot resolve; and `danger` was not an option either, because
+   * warning and destructive would then be indistinguishable and the choice
+   * between them meaningless. */
   --color-danger: var(--app-danger);
   --color-success: var(--app-success);
+  --color-warning: var(--app-warning);
 
   /* Keyboard focus indicator. Deliberately the brand hue rather than a neutral,
    * so focus reads as intentional; it clears the 3:1 non-text threshold against
    * background, surface and surface-muted in both themes. */
   --color-ring: var(--app-ring);
+
+  /* Modal scrim - the wash dialog.tsx paints over the page behind an open
+   * dialog, and the ONE token in this contract that deliberately does not
+   * invert. See the note in the value blocks below for why a non-inverting dark
+   * value is the only correct answer here, and the measured figures in the A11Y
+   * note for what it composites to. It carries its own alpha, so consumers write
+   * `bg-scrim` with no opacity modifier and cannot dilute it by accident. */
+  --color-scrim: var(--app-scrim);
 }
 
 /* -----------------------------------------------------------------------------
- * BLITZY [A11Y] - one deliberate, flagged deviation, recorded rather than hidden
+ * BLITZY [A11Y] - how a control boundary is expressed inside the closed set
  *
  * `--color-border` is a DECORATIVE hairline and measures 1.23:1 on surface in
  * light and 1.73:1 in dark - below the 3:1 in WCAG 1.4.11. That is intentional.
@@ -255,15 +278,25 @@
  * every table row - a visual-quality regression, and not what the standard asks.
  *
  * The part of 1.4.11 that DOES bite is the boundary of an interactive control,
- * where the border is what identifies the control at all. That case gets its own
- * token: `--color-border-strong` (slate-500) clears the threshold against both
- * canvases in both themes - 4.77:1 on light surface, 3.74:1 on dark. Input,
- * textarea, select and checkbox borders should use `border-border-strong`;
- * everything decorative uses `border-border`.
+ * where the border is what identifies the control at all. That case uses
+ * `border-muted-foreground`, and it does so WITHOUT adding a token: a control
+ * boundary is composed from an existing name rather than served by one of its
+ * own. `--color-muted-foreground` is the
+ * right member to compose from because it is the one neutral in the set defined
+ * to stay legible on all three canvases - it already carries a 4.5:1 body-text
+ * guarantee, measured at 7.23:1 on the light canvas and 6.90:1 on light
+ * surface-muted, 7.68:1 and 5.58:1 in dark (see the table below) - so a border
+ * drawn in it clears the 3:1 non-text floor with room to spare in both themes.
+ * Input, textarea, the select trigger and the secondary button therefore use
+ * `border-muted-foreground`; everything decorative uses `border-border`.
  *
- * This mirrors the `--border` / `--input` split in the component library this
- * layer is modelled on. Flagged for designer review rather than silently
- * auto-corrected in either direction.
+ * A dedicated mid-grey boundary token was considered and is deliberately not
+ * declared. It would have measured 4.77:1 light and 3.74:1 dark - compliant, but
+ * lower than what the composition above achieves, and it would have widened the
+ * catalogue to serve four call sites that an existing token already serves
+ * better. `scrim` and `warning` are additions for the opposite reason: no
+ * existing member can express either, which is the only case in which this
+ * layer grows.
  *
  * Every other pair was computed, not estimated, and clears WCAG AA in both
  * themes. Body text (4.5:1 floor), worst case per theme:
@@ -271,15 +304,35 @@
  *          muted-foreground/background 7.23  muted-foreground/surface-muted 6.90
  *          primary/surface 6.44  accent/surface 8.07
  *          danger/surface-muted 5.86  success/surface-muted 4.51
+ *          warning/surface-muted 4.61
  *   dark   foreground/background 19.27  foreground/surface 17.05
  *          muted-foreground/background 7.68  muted-foreground/surface-muted 5.58
  *          primary/surface-muted 4.70  accent/surface 8.88
  *          danger/surface-muted 5.07  success/surface-muted 8.26
+ *          warning/surface-muted 8.54
  * Solid-fill labels, `primary-foreground` over each fill (4.5:1 floor):
- *   light  primary 6.44  danger 6.42  success 4.94  accent 8.07
- *   dark   primary 6.47  danger 6.97  success 11.36  accent 10.04
+ *   light  primary 6.44  danger 6.42  success 4.94  accent 8.07  warning 5.05
+ *   dark   primary 6.47  danger 6.97  success 11.36  accent 10.04  warning 11.75
  * Focus ring (3:1 non-text floor), against background/surface/surface-muted:
  *   light  6.15 / 6.44 / 5.88        dark  6.47 / 5.72 / 4.70
+ *
+ * `--color-warning` follows the same ramp the other chromatic tokens do -
+ * amber-700 in light, amber-400 in dark - so it sits at 4.61:1 on the tightest
+ * light canvas (surface-muted, the ground alert.tsx uses) and never below 8:1 in
+ * dark. amber-600 was measured and rejected at 2.91:1 on that same ground.
+ *
+ * `--color-scrim` is not a text pair and is not measured as one. What matters for
+ * it is that it DIMS in both themes, and it does, measured as the luminance drop
+ * of what it covers: over the light canvas (slate-50) it composites to #646873,
+ * an 85.6% drop; over a raised dark surface (slate-900) it composites to #070d1f,
+ * a 51.7% drop. Over the dark canvas itself the drop is 0% - the scrim and that
+ * canvas are the same colour - which is correct rather than a shortfall, because
+ * the canvas is already the darkest thing on the page and it is the CONTENT that
+ * has to recede: foreground text over a surface card falls from 17.05:1 to 3.46:1
+ * behind the scrim, so the page reads as pushed back while the unscrimmed dialog
+ * panel keeps its full contrast. The previous spelling of this wash -
+ * `bg-foreground/60`, an inverting token - RAISED the luminance of most of the
+ * dark viewport instead, which is the defect this token exists to remove.
  * -------------------------------------------------------------------------- */
 
 /* -----------------------------------------------------------------------------
@@ -308,22 +361,46 @@
     --app-accent: var(--color-indigo-700);
     --app-danger: var(--color-red-700);
     --app-success: var(--color-green-700);
+    --app-warning: var(--color-amber-700);
     --app-ring: var(--color-indigo-600);
 
-    /* Theme-invariant on purpose. slate-500 is the one neutral that clears 3:1
-     * against the light canvas AND the dark one, so a control boundary needs no
-     * per-theme value; it is therefore absent from the `.dark` block below. */
-    --app-border-strong: var(--color-slate-500);
+    /* Theme-invariant on purpose, and the ONLY token in this contract that is.
+     * A scrim's job is to REMOVE emphasis from the content behind a modal, which
+     * means it has to be darker than that content in both themes - so it must
+     * not invert, and it is therefore absent from the `.dark` block below.
+     *
+     * This is why every other token was the wrong tool for it, and the reason is
+     * worth keeping: `foreground` and `muted-foreground` are dark in light and
+     * LIGHT in dark, so a scrim built from either brightens roughly the whole
+     * viewport on the dark canvas and inverts this system's "raised is lighter"
+     * elevation metaphor; `background`, `surface`, `surface-muted` and
+     * `primary-foreground` are the reverse, and produce no visible dimming at
+     * all in light mode because the scrim and the page canvas are then the same
+     * colour. None of them can be a scrim, so a scrim is its own token - a token
+     * is not obliged to invert. That is also why it is an ADDITION to the
+     * catalogue rather than a composition: unlike an interactive control's
+     * boundary, which composes from `muted-foreground` at better contrast than a
+     * dedicated token would have given, no existing member can express this.
+     *
+     * The alpha lives IN the token rather than in a `bg-scrim/60` modifier at the
+     * call site, so the wash cannot be diluted by a consumer and the one place it
+     * is decided is here. `color-mix` names the primitive rather than
+     * transcribing a literal rgba(), which keeps the mapping readable and is the
+     * same function the engine's own opacity modifiers compile to. */
+    --app-scrim: color-mix(in oklab, var(--color-slate-950) 60%, transparent);
   }
 
   .dark {
     color-scheme: dark;
 
-    /* Every one of the twelve flips. The neutrals invert across the slate ramp
-     * and the chromatic tokens step lighter, because a mid-dark indigo, red or
-     * green cannot hold 4.5:1 against a near-black canvas. `primary-foreground`
-     * inverts with them: in light it is white over a dark fill, in dark it is
-     * near-black over a light fill. */
+    /* Every one of the thirteen flips. The neutrals invert across the slate ramp
+     * and the chromatic tokens step lighter, because a mid-dark indigo, red,
+     * green or amber cannot hold 4.5:1 against a near-black canvas.
+     * `primary-foreground` inverts with them: in light it is white over a dark
+     * fill, in dark it is near-black over a light fill.
+     *
+     * `scrim` is absent by design - it is the one theme-invariant token in the
+     * contract and is declared once, above. */
     --app-background: var(--color-slate-950);
     --app-surface: var(--color-slate-900);
     --app-surface-muted: var(--color-slate-800);
@@ -335,6 +412,7 @@
     --app-accent: var(--color-indigo-300);
     --app-danger: var(--color-red-400);
     --app-success: var(--color-green-400);
+    --app-warning: var(--color-amber-400);
     --app-ring: var(--color-indigo-400);
   }
 }

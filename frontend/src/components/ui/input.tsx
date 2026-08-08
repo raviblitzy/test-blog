@@ -9,10 +9,16 @@
 // under src/app/, src/components/blog/, src/components/layout/ and
 // src/components/admin/ imports `Input` instead of writing its own field.
 //
-// IT IS ALSO THE HOUSE STYLE FOR THE WHOLE FIELD FAMILY. textarea.tsx shares
-// this token vocabulary and select.tsx's trigger is styled to match it, so the
-// three read as one control family rather than three near-misses. A field token
-// changed here has to change there in the same commit.
+// IT IS ALSO THE HOUSE STYLE FOR THE WHOLE FIELD FAMILY, AND NOW LITERALLY SO.
+// The shared surface, boundary, focus, disabled, motion and invalid classes are
+// exported from this file as FIELD_CONTROL_CLASSES and FIELD_INVALID_CLASSES;
+// textarea.tsx and select.tsx's trigger import them. The three therefore read as
+// one control family by construction rather than by three copies of the same
+// string being edited in the same commit and hoped to stay in step - which is how
+// a "near-miss" family happens. Each of the three keeps only what is genuinely
+// its own: its display mode, its height or minimum height, its resize behaviour,
+// its placeholder mechanism, and in the select's case the flex row that holds a
+// value beside a chevron.
 //
 // Because that boundary is only honourable if nothing is lost by crossing it,
 // every native attribute passes straight through - `id`, `name`, `value`,
@@ -57,6 +63,105 @@
 import type { ComponentProps } from 'react';
 
 import { cn } from '@/lib/utils';
+
+/**
+ * The field-control class set shared by every control in this family.
+ *
+ * Imported by `@/components/ui/textarea` and by `@/components/ui/select`'s
+ * trigger, so a change here reaches all three at once and the family cannot
+ * drift. Each group below is here because it is genuinely identical across the
+ * three; anything element-specific is left at the call site.
+ *
+ *   `w-full min-w-0 rounded-md px-3`
+ *     A field fills its form row, and `min-w-0` is what lets it also SHRINK
+ *     inside a flex row. Every one of these controls carries an intrinsic minimum
+ *     width - an `<input>` from its `size`, a `<textarea>` from its `cols`, the
+ *     select trigger from its own content - and without this a field in a flex
+ *     container forces horizontal overflow at narrow viewports, which the
+ *     responsive criteria forbid at every width. Radius and inline padding come
+ *     from the engine's `--radius-*` and `--spacing` scales; `px-*` emits
+ *     `padding-inline`, so it is already correct under a right-to-left writing
+ *     mode.
+ *
+ *   `border-muted-foreground bg-surface text-foreground border text-base shadow-xs`
+ *     `border-muted-foreground`, NOT `border-border`. `--color-border` is a
+ *     decorative hairline (1.23:1 in light, 1.73:1 in dark) which WCAG 1.4.11
+ *     exempts for card outlines and table rules, whereas the boundary of an
+ *     interactive control is what identifies the control and has to clear 3:1.
+ *     The fourteen-token catalogue in globals.css is closed, so this composes
+ *     from the one neutral already guaranteed legible on every canvas:
+ *     `--color-muted-foreground` measures 7.23:1 on the light background and
+ *     6.90:1 on light surface-muted, 7.68:1 and 5.58:1 in dark. That file names
+ *     input, textarea, the select trigger and the secondary button as the
+ *     consumers of this composition.
+ *     `shadow-xs` is what keeps a field readable when it sits flush on a
+ *     `bg-surface` card, where the fill alone cannot distinguish it. `text-base`
+ *     is 1rem and is chosen over `text-sm` for the whole family: iOS Safari zooms
+ *     the viewport when a focused control's text is smaller than 16px, a real
+ *     defect at the 375px viewport the responsive criteria test.
+ *
+ *   the `focus-visible:` group
+ *     An outline, not a `ring` box-shadow, and restated here rather than left to
+ *     the `:focus-visible` floor in globals.css. Three reasons: the outline
+ *     survives an ancestor's `overflow: hidden`; `outline-2` and
+ *     `outline-offset-2` are exactly what that floor emits, so layering on the
+ *     same mechanism cannot change the indicator's thickness or position; and
+ *     utilities outrank the base layer, so a field keeps a visible indicator even
+ *     if the document floor is ever narrowed. `focus-visible:border-ring` adds a
+ *     second cue inside the control's own edge. No bare `outline-none` appears
+ *     anywhere in this family - removing the indicator would breach the
+ *     accessibility floor outright.
+ *
+ *   the `disabled:` group
+ *     A recessed fill plus a not-allowed cursor, so the state is readable from
+ *     both the surface and the pointer rather than from opacity alone. WCAG 1.4.3
+ *     exempts inactive controls from the contrast minimum, which is what makes
+ *     the dimming legitimate here and nowhere else. It reaches the select trigger
+ *     too, because Radix forwards `disabled` to a real `<button>`.
+ *
+ *   the `motion-safe:` group
+ *     Border and outline colours ease between states instead of snapping.
+ *     `motion-safe:` is the engine's own `prefers-reduced-motion: no-preference`
+ *     variant, which is how transitions are required to be gated; it is not a
+ *     hand-authored media query, and no file in this family authors one.
+ *     `transition-colors` and not `transition-all`, so a textarea being dragged
+ *     by its resize handle does not animate against the pointer.
+ *
+ * Deliberately NOT included: the placeholder colour. `<input>` and `<textarea>`
+ * tint a real `::placeholder`, while the select trigger has no placeholder
+ * pseudo-element and tints itself through Radix's `data-placeholder` attribute
+ * instead. They are two different mechanisms for one intent, so each control
+ * states its own and neither emits a rule the other cannot use.
+ */
+export const FIELD_CONTROL_CLASSES = cn(
+  'w-full min-w-0 rounded-md px-3',
+  'border-muted-foreground bg-surface text-foreground border text-base shadow-xs',
+  'focus-visible:border-ring focus-visible:outline-ring focus-visible:outline-2 focus-visible:outline-offset-2',
+  'disabled:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-60',
+  'motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out',
+);
+
+/**
+ * The classes added to any control in this family when it is in an invalid state.
+ *
+ * A danger border plus a soft halo of the same token, so the error reads at a
+ * glance without the field having to grow or move.
+ *
+ * The two `focus-visible:` entries are the point of this set rather than an
+ * afterthought: they OVERRIDE the brand-coloured focus treatment in
+ * {@link FIELD_CONTROL_CLASSES}, because a field that turned indigo the moment it
+ * was focused would drop its error signal exactly when the user arrived to fix
+ * it. globals.css measures `--color-danger` at 6.42:1 on the light surface and
+ * 6.97:1 on the dark one, so a red indicator still clears the 3:1 non-text floor
+ * and focus stays as visible as it is on a valid field.
+ *
+ * Colour is never the only signal: each control mirrors its invalid state into
+ * `aria-invalid`, and the owning form supplies the visible half by rendering its
+ * message and pointing `aria-describedby` at it, so the reason is readable rather
+ * than merely implied by a hue.
+ */
+export const FIELD_INVALID_CLASSES =
+  'border-danger ring-danger/20 focus-visible:border-danger focus-visible:outline-danger ring-2';
 
 type InputProps = ComponentProps<'input'> & {
   /**
@@ -141,87 +246,32 @@ export function Input({
       // not already say.
       aria-invalid={ariaInvalid ?? (invalid || undefined)}
       className={cn(
-        // --- Box -------------------------------------------------------------
-        // `block w-full` so a field fills its form row. `min-w-0` so it can also
-        // shrink inside a flex row: an <input> carries an intrinsic minimum
-        // width from its `size` attribute, and without this a field in a flex
-        // container forces horizontal overflow at narrow viewports - which the
-        // responsive criteria forbid at every width.
+        // Surface, boundary, text, focus, disabled and motion - the whole shared
+        // vocabulary, declared once above and consumed identically by
+        // textarea.tsx and select.tsx's trigger.
+        FIELD_CONTROL_CLASSES,
+
+        // --- What is specific to a single-line input --------------------------
+        // `block` because a bare <input> is inline-block, which leaves a baseline
+        // gap under it that reads as uneven spacing in a form column.
         //
         // `h-11` is 2.75rem = 44px, the WCAG 2.5.5 target-size floor. No design
-        // source specifies a smaller field (the plan records zero attachments
-        // and zero Figma frames), so the accessible minimum governs, and
-        // textarea.tsx and select.tsx match it. Height, padding and radius all
-        // come from the engine's `--spacing` and `--radius-*` scales.
-        'block h-11 w-full min-w-0 rounded-md px-3',
+        // source specifies a smaller field (the plan records zero attachments and
+        // zero Figma frames), so the accessible minimum governs; select.tsx's
+        // trigger matches it exactly, which is what makes a picker and a text
+        // field line up in the same form row, and textarea.tsx uses a minimum
+        // height instead because a body field grows.
+        'block h-11',
 
-        // --- Surface, boundary and text --------------------------------------
-        // `border-border-strong`, NOT `border-border`. globals.css splits those
-        // two deliberately: `--color-border` is a decorative hairline (1.23:1 in
-        // light, 1.73:1 in dark) which WCAG 1.4.11 exempts for card outlines and
-        // table rules, whereas the boundary of an interactive control is what
-        // identifies the control and has to clear 3:1. `--color-border-strong`
-        // measures 4.77:1 on the light surface and 3.74:1 on the dark one, and
-        // that file names input, textarea, select and checkbox as its consumers.
-        //
-        // `shadow-xs` is what keeps the field readable when it sits flush on a
-        // `bg-surface` card, where the fill alone cannot distinguish it.
-        //
-        // `text-base` is 1rem = 16px and is chosen over `text-sm` for the entire
-        // field family: iOS Safari zooms the viewport when a focused control's
-        // text is smaller than 16px, a real defect at the 375px viewport the
-        // responsive criteria test.
-        'border-border-strong bg-surface text-foreground border text-base shadow-xs',
-
-        // --- Placeholder -----------------------------------------------------
         // A placeholder is a hint, not content, so it takes the secondary text
         // token - which still clears 4.5:1 on every canvas, so the hint stays
-        // legible rather than merely faint.
+        // legible rather than merely faint. This is the real `::placeholder`
+        // pseudo-element; the select trigger reaches the same intent through
+        // Radix's `data-placeholder` attribute instead, which is why the rule is
+        // not in the shared set.
         'placeholder:text-muted-foreground',
 
-        // --- Focus -----------------------------------------------------------
-        // An outline, not a `ring` box-shadow, and restated here rather than left
-        // to the `:focus-visible` floor in globals.css. Three reasons: the
-        // outline survives an ancestor's `overflow: hidden`; `outline-2` and
-        // `outline-offset-2` are exactly what that floor emits, so layering on
-        // the same mechanism cannot change the indicator's thickness or position;
-        // and utilities outrank the base layer, so the field keeps a visible
-        // indicator even if the document floor is ever narrowed.
-        //
-        // `focus-visible:border-ring` adds a second cue inside the control's own
-        // edge, so focus is legible even where an outline is clipped. No bare
-        // `outline-none` appears anywhere in this file - removing the indicator
-        // would breach the accessibility floor outright.
-        'focus-visible:border-ring focus-visible:outline-ring focus-visible:outline-2 focus-visible:outline-offset-2',
-
-        // --- Disabled --------------------------------------------------------
-        // Recessed fill plus a not-allowed cursor, so the state is readable from
-        // both the surface and the pointer rather than from opacity alone.
-        // WCAG 1.4.3 exempts inactive controls from the contrast minimum, which
-        // is what makes the dimming legitimate here and nowhere else.
-        'disabled:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-60',
-
-        // --- Motion ----------------------------------------------------------
-        // The border and outline colours ease between states instead of snapping.
-        // `motion-safe:` is the engine's own `prefers-reduced-motion:
-        // no-preference` variant, which is how the accessibility guidance
-        // requires transitions to be gated - this is not a hand-authored media
-        // query, and the file authors no responsive breakpoint at all.
-        'motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out',
-
-        // --- Invalid ---------------------------------------------------------
-        // Danger border plus a soft halo of the same token, so the error reads
-        // at a glance without the field having to grow or move.
-        //
-        // The two `focus-visible:` entries are the point of this group: they
-        // override the brand-coloured focus treatment above, because a field
-        // that turned indigo the moment it was focused would drop its error
-        // signal exactly when the user arrived to fix it. `--color-danger`
-        // measures 6.42:1 on the light surface and 6.97:1 on the dark one, so a
-        // red indicator still clears the 3:1 non-text floor and focus stays as
-        // visible as it is on a valid field.
-        invalid &&
-          'border-danger ring-danger/20 focus-visible:border-danger focus-visible:outline-danger ring-2',
+        invalid && FIELD_INVALID_CLASSES,
 
         // Last, so a caller's class wins its Tailwind group. That determinism is
         // `cn()`'s whole purpose and is what keeps consumers from reaching for an

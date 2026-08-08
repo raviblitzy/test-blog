@@ -38,31 +38,68 @@
 # Assuming they behave alike is the trap; each is handled explicitly below.
 #
 # Interpreter: CPython 3.14.7 (backend/.python-version).
-# Runtime pins: mirrored verbatim from backend/requirements.txt - see below.
+# Runtime pins: mirrored verbatim from the DECLARED section of
+#               backend/requirements.txt - see below.
 # =============================================================================
 
 [build-system]
-# setuptools >= 77 is required for the PEP 639 SPDX `license` string used below;
-# 80 is the floor actually exercised in this repository. `wheel` is deliberately
-# absent - setuptools.build_meta requests it itself when one is needed.
-requires = ["setuptools>=80"]
+# EXACT, not a floor. A range here is not reproducible: PEP 517 build isolation
+# resolves `requires` against the index at build time, so `setuptools>=80` builds
+# this distribution with whatever release exists on the day it runs, and the
+# metadata a range produces is therefore a function of the calendar rather than
+# of this repository. 83.0.0 is the release actually exercised here on CPython
+# 3.14.7 (metadata generation and wheel build both verified), and it is the only
+# release this file authorises. Bumping it is a deliberate, re-verified change.
+#
+# setuptools >= 77 is separately required for the PEP 639 SPDX `license` string
+# used below, so the pin must never move backwards past that floor.
+#
+# `wheel` is deliberately absent - setuptools.build_meta requests it itself when
+# one is needed.
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "blog-api-backend"
 version = "1.0.0"
 description = "FastAPI service tier of the blog platform, persisted in PostgreSQL"
-requires-python = ">=3.14"
+
+# EXACT, not a floor. backend/.python-version pins the interpreter to 3.14.7 and
+# backend/requirements.txt is hash-locked to the artifacts that install on that
+# exact interpreter, so `>=3.14` would advertise support this repository does not
+# actually verify - 3.14.8 or 3.15 would satisfy the range while resolving a
+# different artifact set. The three declarations are kept in lockstep:
+#   backend/.python-version   3.14.7
+#   requires-python           ==3.14.7   (this line)
+#   Programming Language ::   3.14       (classifier granularity stops at minor)
+requires-python = "==3.14.7"
 license = "MIT"
 authors = [{ name = "Blitzy Agent", email = "agent@blitzy.com" }]
 keywords = ["blog", "fastapi", "postgresql", "rest-api", "sqlalchemy", "jwt"]
+
+# Classifiers describe what this distribution IS. Every entry below is a real
+# trove classifier and is true of this code.
+#
+# There is deliberately no WSGI classifier. This is an ASGI application end to
+# end - `FastAPI` subclasses Starlette, every route handler is `async def`, the
+# database session is an `AsyncSession`, and gunicorn runs it only through
+# `uvicorn.workers.UvicornWorker`. Nothing here implements or is callable through
+# the WSGI protocol, so "Topic :: Internet :: WWW/HTTP :: WSGI :: Application"
+# was a false statement about the artifact and has been removed rather than
+# translated: the trove list has no ASGI counterpart to translate it into
+# (verified against the `trove-classifiers` dataset - zero entries contain
+# "ASGI"). `Framework :: AsyncIO` and the protocol-neutral Dynamic Content topic
+# carry the accurate part of the same intent.
 classifiers = [
     "Framework :: FastAPI",
+    "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.14",
-    "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
-    # This distribution is built and run in place; it is never published.
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    # Not a trove classifier, and that is the point: PyPI rejects any classifier
+    # it does not recognise, so this one makes an accidental upload fail. This
+    # distribution is built and run in place; it is never published.
     "Private :: Do Not Upload",
 ]
 
@@ -84,14 +121,53 @@ classifiers = [
 # above carries the summary, and the root README remains the single narrative
 # source of truth.
 
-# Runtime dependencies - mirrored package-for-package and version-for-version
-# from backend/requirements.txt, with every extra intact and every pin exact.
-# `==` throughout, never a range: two manifests that disagree are worse than
-# one, and a loose specifier here would silently reintroduce the unpinned state
-# this project replaced. Change one file and you must change the other.
+# Runtime dependencies - this array is the DIRECT set: the packages this
+# service depends on because its own code or its own operation needs them, every
+# one of them mirrored package-for-package and version-for-version from the
+# first section of backend/requirements.txt, with every extra intact and every
+# pin exact. `==` throughout, never a range: two manifests that disagree are
+# worse than one, and a loose specifier here would silently reintroduce the
+# unpinned state this project replaced. Change one file and you must change the
+# other.
+#
+# The two files are deliberately not identical, and the difference is one thing:
+# requirements.txt carries a second section pinning the 29 transitive
+# distributions this set resolves to, so an install reproduces the whole
+# environment rather than only the request. That belongs there and not here,
+# because this array states what the DISTRIBUTION depends on - a consumer that
+# installed this package would have its own resolver and its own lock, and a
+# library that pinned its dependencies' dependencies would be unusable inside
+# anyone else's. `requirements.txt` is the deployment lock; this array is the
+# dependency declaration. When the direct set changes, both change - and the
+# closure in requirements.txt has to be regenerated, not edited.
+#
+# Every package the backend imports is here, including the ones a parent would
+# have supplied anyway: `starlette` because three modules import it directly,
+# and `pydantic` and `greenlet` for the same reason applied to a runtime need.
+# Inheriting a pin from another project's metadata means that project can move
+# it, or drop it, on its own release schedule.
 dependencies = [
-    # Web framework and ASGI/WSGI servers
+    # Web framework and ASGI server stack
     "fastapi==0.141.1",
+    # Starlette is a DIRECT dependency, not merely fastapi's. Three modules
+    # import it by name:
+    #   app/core/exceptions.py            starlette.exceptions.HTTPException
+    #   app/middleware/request_context.py starlette.datastructures.{Headers,
+    #                                     MutableHeaders}, starlette.types.
+    #                                     {ASGIApp,Message,Receive,Scope,Send}
+    #   app/middleware/security_headers.py starlette.datastructures.
+    #                                     MutableHeaders, starlette.types.*
+    # Both middleware are written against the raw ASGI protocol rather than
+    # BaseHTTPMiddleware, so Starlette's type and datastructure API is a
+    # first-class part of this project's own contract. Declaring it makes that
+    # visible and pins it: without this line the installed Starlette is whatever
+    # fastapi's range happens to resolve to on the day of the install, and a
+    # release that is compatible with fastapi could still move the
+    # `MutableHeaders` or `Message` surface underneath code that reaches for it
+    # directly. 1.4.1 is the release fastapi 0.141.1 resolves to here and the one
+    # every gate in this repository was verified against; it is also the version
+    # backend/requirements.txt locks, hashes included.
+    "starlette==1.4.1",
     "uvicorn[standard]==0.52.1",
     "gunicorn==26.0.0",
     # Schema and settings layer
@@ -153,9 +229,10 @@ exclude = ["tests*", "migrations*"]
 line-length = 100
 indent-width = 4
 
-# Agrees with `requires-python = ">=3.14"` above; ruff would infer the same
-# value, but stating it keeps the target explicit if this table is ever read in
-# isolation. Verified accepted by the pinned ruff 0.16.1.
+# Agrees with `requires-python = "==3.14.7"` above; ruff's target granularity is
+# minor-version only, so `py314` is the exact translation of that pin. ruff would
+# infer the same value, but stating it keeps the target explicit if this table is
+# ever read in isolation. Verified accepted by the pinned ruff 0.16.1.
 target-version = "py314"
 
 # Roots for first-party import resolution. "." is the backend package root, so
@@ -335,8 +412,10 @@ plugins = ["pydantic.mypy"]
 # three are listed because they are the untyped-import candidates in this
 # dependency set and the entry is provably inert while they keep shipping
 # py.typed; it costs nothing and survives a future release dropping the marker.
-# greenlet, gunicorn and python-multipart also lack markers but are transitive -
-# no application module imports them - so they are not listed.
+# greenlet, gunicorn and python-multipart also lack markers, but no application
+# module imports them - they are needed at runtime rather than at type-check time
+# - so they are not listed. `starlette` IS imported by application code and does
+# ship py.typed, which is why declaring it above added no override here.
 [[tool.mypy.overrides]]
 module = ["bleach.*", "pwdlib.*", "slowapi.*", "slugify.*"]
 ignore_missing_imports = true

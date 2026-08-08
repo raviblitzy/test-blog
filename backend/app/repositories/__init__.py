@@ -35,9 +35,11 @@ rediscovered six times below.
 The import direction runs one way
 ---------------------------------
 This file imports its six siblings. **No sibling imports this package.** Every concrete
-repository reaches its base class at the module that declares it::
+repository reaches its base class at the module that declares it, naming whichever of the two
+matches its relation's key shape::
 
-    from app.repositories.base import BaseRepository
+    from app.repositories.base import UUIDPrimaryKeyRepository  # five id-keyed relations
+    from app.repositories.base import BaseRepository  # post_likes, keyed on a pair
 
 Spelling that ``from app.repositories import BaseRepository`` instead would be a genuine circular
 import rather than a matter of taste. Resolving this package means running the import block below,
@@ -69,7 +71,7 @@ no question can arise about which metadata collection is authoritative.
 
 from __future__ import annotations
 
-from app.repositories.base import BaseRepository, ModelT
+from app.repositories.base import BaseRepository, ModelT, UUIDPrimaryKeyRepository
 from app.repositories.category_repository import CategoryRepository
 from app.repositories.comment_repository import CommentRepository
 from app.repositories.like_repository import LikeRepository
@@ -97,5 +99,6 @@ __all__ = [
     "PostRepository",
     "PostSort",
     "RefreshTokenRepository",
+    "UUIDPrimaryKeyRepository",
     "UserRepository",
 ]

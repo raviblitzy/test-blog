@@ -62,14 +62,21 @@ and ``ctx``, are absent here too, for the reasons recorded on :class:`Validation
 
 Import purity
 -------------
-Two imports, and no more: ``pydantic`` and ``Page``. Not :mod:`app.core.exceptions` - that is
-the cycle above. Not a sibling schema module, which would make the import order of this package
+``typing``, ``pydantic`` and ``Page``, and no more. Not :mod:`app.core.exceptions` - that is the
+cycle above. Not a sibling schema module, which would make the import order of this package
 load-bearing. Not ``app.models``, not ``app.core.config``, not the environment: importing this
 module performs no I/O, reaches no database and reads no setting, which is what lets a test
 import it with nothing running.
+
+The one name this module exports beyond the two models is :func:`omit_null_default`, and the
+direction of that dependency is worth noting: the five partial-update schemas import it *from
+here*, so this module gains no import of its own by being the place the pattern is declared.
 """
 
+from typing import Annotated, Any
+
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from app.core.pagination import Page
 
@@ -79,7 +86,59 @@ from app.core.pagination import Page
 # `from app.schemas.common import Page`. A per-line lint suppression would have silenced only
 # the first of those, so this list is functional rather than decorative - keep it exactly in
 # step with what the module defines.
-__all__ = ["Page", "ProblemDetail", "ValidationErrorItem"]
+__all__ = ["Page", "ProblemDetail", "ValidationErrorItem", "omit_null_default"]
+
+
+def omit_null_default(json_schema: dict[str, Any]) -> None:
+    """Strip the ``default: null`` a non-nullable optional field would otherwise publish.
+
+    The second half of this package's **optional-but-not-nullable** pattern, and the reason it
+    exists is that Pydantic offers no single spelling for "this member may be omitted, and may
+    not be sent as null". Making a member optional requires a default, the only sensible default
+    is ``None``, and Pydantic then advertises two things a caller should not believe: ``null`` as
+    a permitted type, and ``null`` as the member's default value. The first is removed by
+    annotating the union member as ``SkipJsonSchema[None]``; the second is removed by this
+    function, passed as ``json_schema_extra``::
+
+        display_name: DisplayName | SkipJsonSchema[None] = Field(
+            default=None, json_schema_extra=omit_null_default, description=...
+        )
+
+    The published member is then exactly ``{"type": "string", ...}``: not required, no ``null``
+    branch, no contradictory default. That matters because ``/openapi.json`` is what generated
+    clients and ``/docs`` are built from, and a schema advertising ``null`` on a member the API
+    rejects publishes requests that cannot succeed.
+
+    Runtime validation is deliberately untouched. ``SkipJsonSchema`` affects the generated schema
+    only, so the annotation still admits ``None`` and the model still needs its own field
+    validator to reject an explicit null - which is the right division: the validator is what
+    produces a ``422`` naming the field, and this function is what stops the document promising
+    that ``null`` would have been accepted.
+
+    Declared here rather than in each partial-update module because six models share it, and a
+    helper copied six times is six chances for one of them to drift. Mutating the mapping in
+    place and returning ``None`` is the callable contract Pydantic defines for
+    ``json_schema_extra``; returning a value would be ignored.
+
+    Args:
+        json_schema: The generated schema for one field, mutated in place. ``default`` is
+            removed when present, and its absence is not an error - the same helper is safe on a
+            field whose default was never serialised.
+    """
+    json_schema.pop("default", None)
+
+
+ValidationErrors = Annotated[list["ValidationErrorItem"], Field(min_length=1)]
+"""A non-empty list of field-level failures.
+
+The bound is the contract rather than a precaution. ``app.core.exceptions`` emits ``errors``
+only for a validation failure and only with at least one entry - its request-validation handler
+substitutes a placeholder entry rather than emitting an empty list, and its single assembly site
+normalises an empty sequence away - so ``minItems: 1`` in the published schema is a statement of
+what the service actually sends. Without it the document would permit ``"errors": []``, which is
+a self-contradictory validation failure: a client would iterate it, find nothing, and have
+nothing to show the reader.
+"""
 
 
 class ValidationErrorItem(BaseModel):
@@ -165,7 +224,7 @@ class ProblemDetail(BaseModel):
         async def read_post(slug: str) -> PostDetail:
             return await service.get_published(slug)
 
-    Five fields are always present. ``errors`` is the sixth, and it appears only when there is
+    Six fields are always present. ``errors`` is the seventh, and it appears only when there is
     per-field information to report - in practice, a payload that failed its model:
 
     .. code-block:: json
@@ -176,6 +235,7 @@ class ProblemDetail(BaseModel):
           "status": 422,
           "detail": "The request payload failed validation.",
           "instance": "/api/v1/posts",
+          "request_id": "b3d0f7a19c4e4f0d8a1c2e5b7d9f0a13",
           "errors": [
             {
               "field": "title",
@@ -186,18 +246,23 @@ class ProblemDetail(BaseModel):
         }
 
     Two properties of that document are contractual rather than incidental. ``errors`` is
-    *omitted* from every other response rather than sent as ``null``, so a consumer must treat
-    an absent key and a null value as the same thing. And there is deliberately no
-    ``request_id`` member: correlation travels in the ``X-Request-ID`` response header, which
-    keeps a value that matters to support out of a body a client may render to a reader.
+    *omitted* from every other response - never ``null``, never ``[]`` - and the published
+    schema says exactly that: the member is not required, its declared type is an array with
+    ``minItems: 1``, and ``null`` is not one of its permitted values. So a consumer writes one
+    check, "is the key present", and needs no guard for a null or a zero-length list, because
+    neither is representable. And ``request_id`` is present on *every* failure, carrying the
+    same correlation value as the ``X-Request-ID`` response header: both are written from one
+    value at the single assembly point in :mod:`app.core.exceptions`, so the body and the
+    header cannot disagree, and a reader who can quote only what is on screen can still be
+    matched to the exact log line that recorded the failure.
 
     Extra members are neither declared nor forbidden. RFC 9457 allows a problem document to be
     extended, so configuring ``extra="forbid"`` would publish ``additionalProperties: false``
-    into the schema and contradict that; the "exactly these six fields" guarantee comes instead
-    from there being one assembly point in :mod:`app.core.exceptions`, and from the Pydantic
-    mypy plugin rejecting an unknown keyword at every construction site. A test that wants
-    exact parity with the wire should compare key sets directly rather than rely on parsing
-    failing.
+    into the schema and contradict that; the "exactly these seven fields" guarantee comes
+    instead from there being one assembly point in :mod:`app.core.exceptions`, and from the
+    Pydantic mypy plugin rejecting an unknown keyword at every construction site. A test that
+    wants exact parity with the wire should compare key sets directly rather than rely on
+    parsing failing.
     """
 
     model_config = ConfigDict(
@@ -213,6 +278,7 @@ class ProblemDetail(BaseModel):
                 "status": 404,
                 "detail": "Post not found",
                 "instance": "/api/v1/posts/does-not-exist",
+                "request_id": "b3d0f7a19c4e4f0d8a1c2e5b7d9f0a13",
             }
         }
     )
@@ -262,11 +328,43 @@ class ProblemDetail(BaseModel):
             "identity and because a query string is where credentials get pasted by mistake."
         ),
     )
-    errors: list[ValidationErrorItem] | None = Field(
+    request_id: str = Field(
+        ...,
+        description=(
+            "Correlation identifier for the request that failed, identical to the value on "
+            "the `X-Request-ID` response header. Present on every failure, and the field to "
+            "quote when reporting one: every structured log line emitted while the request "
+            "was in flight carries the same value, so it is what turns a screenshot into a "
+            "single log query. Echoed from the inbound `X-Request-ID` header when the caller "
+            "supplies a usable one, otherwise generated per request. Empty only if the "
+            "correlation middleware did not run, which cannot happen in the assembled "
+            "application."
+        ),
+    )
+    errors: ValidationErrors | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             "Per-field detail, present only for a validation failure and then never empty. "
             "Absent for every other failure: the key is omitted rather than serialised as "
-            "null, so treat a missing `errors` and a null `errors` as the same thing."
+            "null or as an empty array, so a consumer treats a missing `errors` as 'no "
+            "per-field detail' and never has to handle a null or a zero-length list."
         ),
     )
+    """Field-level failures, omitted rather than nulled, and never empty when present.
+
+    The declaration is the module's optional-but-not-nullable pattern applied to a list, and
+    each of its three parts answers something the emitter actually guarantees.
+    :data:`ValidationErrors` carries ``minItems: 1``, because ``app.core.exceptions`` never
+    sends a zero-length list. ``SkipJsonSchema[None]`` keeps ``null`` out of the published
+    type, because the key is omitted rather than nulled. :func:`omit_null_default` removes the
+    ``default: null`` that the ``None`` default would otherwise advertise on a member whose
+    published type is an array.
+
+    The result is that the schema describes the emitted document exactly rather than a superset
+    of it. That equality is the point: this member is the one part of the problem document a
+    client has to branch on structurally, and a document permitting ``null`` and ``[]`` would
+    force every consumer to write two guards that can never fire - which is precisely how
+    ``frontend/src/lib/types.ts`` came to model it as an optional non-null array while the
+    schema said otherwise.
+    """

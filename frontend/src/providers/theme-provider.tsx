@@ -90,8 +90,9 @@ export function ThemeProvider({ children, ...props }: ThemeProviderProps): React
       attribute="class"
       // Follow the operating-system preference until the visitor picks a theme.
       defaultTheme="system"
-      // Offer `system` alongside `light` and `dark` so the toggle can cycle all
-      // three and so the OS preference keeps being tracked after first paint.
+      // Offer `system` alongside `light` and `dark` so the toggle can present
+      // all three as selectable options and so the OS preference keeps being
+      // tracked after first paint.
       enableSystem
       // Suppress colour transitions for the instant the class flips, so
       // switching theme does not smear every surface through an animation.

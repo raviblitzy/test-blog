@@ -42,27 +42,40 @@
  * ## Server/client determinism
  *
  * These helpers run in both React Server Components and client islands, so identical input must
- * produce identical output in both places or React reports a hydration mismatch. Two choices
- * follow from that, and both are load-bearing:
+ * produce identical output in both places or React reports a hydration mismatch — and the mismatch
+ * is not theoretical: a server in UTC and a browser in New York disagree about the calendar day of
+ * every instant between midnight and 04:00 UTC, which is a real fraction of every day's
+ * publications. Every function here is therefore a *pure function of its arguments alone*: none
+ * reads the host timezone, and none reads the clock. Three choices implement that, and all three
+ * are load-bearing:
  *
- * 1. {@link formatMachineDate} normalises to UTC via `Date.prototype.toISOString`. date-fns'
+ * 1. {@link formatDate} resolves its calendar fields in **UTC**, through an `Intl.DateTimeFormat`
+ *    pinned to `timeZone: 'UTC'`. date-fns' `format` uses the host's local calendar day instead,
+ *    so `2025-03-12T02:00:00Z` renders as `12 March 2025` on a UTC server and `11 March 2025` in
+ *    a New York browser — one instant, two labels, and a hydration mismatch on the boundary.
+ *    UTC is also the timezone the end-to-end suite pins (`timezoneId: 'UTC'` in
+ *    playwright.config.ts) and the timezone the API's `timestamptz` values are serialised in, so
+ *    the rendered day always matches the instant the service reported.
+ * 2. {@link formatMachineDate} normalises to UTC via `Date.prototype.toISOString`. date-fns'
  *    `formatISO` emits the *local* offset, so the same instant serialises as
  *    `2025-03-12T02:00:00.000Z` on a UTC server but `2025-03-11T22:00:00-04:00` in a New York
  *    browser — two different `dateTime` attributes for one instant.
- * 2. The `Intl` formatters below pin an explicit locale. Left unpinned, `1234` renders as
- *    `1.2K` on an en-US server and `1,2 k` in a fr-FR browser. Pinning a single locale is the
- *    opposite of localising; internationalisation is explicitly out of scope for this project.
+ * 3. {@link formatRelativeTime} takes its reference instant as a **required** argument. A
+ *    relative label derived from `Date.now()` is computed against a different clock on the server
+ *    and in the browser — milliseconds apart at best, and across a distance boundary
+ *    ("about 1 hour ago" against "about 2 hours ago") at worst — so the caller supplies the
+ *    instant to measure against and owns where it came from.
  *
- * Note that this module deliberately performs **no** timezone conversion and accepts no timezone
- * argument. date-fns' own default (English month names, runtime-local calendar day) is used for
- * human-readable output.
+ * The `Intl` formatters below also pin an explicit locale. Left unpinned, `1234` renders as
+ * `1.2K` on an en-US server and `1,2 k` in a fr-FR browser. Pinning a single locale is the
+ * opposite of localising; internationalisation is explicitly out of scope for this project.
  *
  * This module is intentionally free of any client-boundary directive: these are pure functions
  * that must remain callable from Server Components, which is what keeps rendered content in the
  * initial HTML response for search-engine crawlers.
  */
 
-import { format, formatDistance, formatDistanceToNow, isValid, parseISO } from 'date-fns';
+import { formatDistance, isValid, parseISO } from 'date-fns';
 
 /**
  * Every timestamp shape this module accepts.
@@ -100,16 +113,21 @@ export const WORDS_PER_MINUTE = 200;
 export const COMPACT_COUNT_THRESHOLD = 1000;
 
 /**
- * The one human-readable date pattern used across the whole module, so a publication date reads
- * identically on a post card, in a byline, on the post page and in an admin table.
- */
-const DATE_FORMAT = 'd MMMM yyyy';
-
-/**
  * Pinned formatting locale. See the module documentation — this exists to make server and client
  * output byte-identical, not to support localisation.
  */
 const FORMAT_LOCALE = 'en-US';
+
+/**
+ * The timezone every human-readable date is resolved in.
+ *
+ * Fixed rather than configurable, and fixed to UTC specifically. The API serialises PostgreSQL
+ * `timestamptz` columns as UTC instants, `playwright.config.ts` pins `timezoneId: 'UTC'` so the
+ * end-to-end assertions read the same calendar day, and — decisively — a timezone that came from
+ * the host would differ between the server render and the browser render of the same instant,
+ * which is the hydration mismatch this module exists to make impossible.
+ */
+const FORMAT_TIME_ZONE = 'UTC';
 
 /**
  * Suffix appended by {@link formatReadingTime}. Named so the label is declared exactly once.
@@ -129,6 +147,22 @@ const compactCountFormatter = new Intl.NumberFormat(FORMAT_LOCALE, {
 
 const exactCountFormatter = new Intl.NumberFormat(FORMAT_LOCALE, {
   maximumFractionDigits: 0,
+});
+
+/**
+ * Resolves an instant's day, month name and year in {@link FORMAT_TIME_ZONE}.
+ *
+ * `Intl.DateTimeFormat` is what makes the timezone explicit — it is the only formatting API in the
+ * platform that accepts one, which is why the human-readable date is built here rather than with
+ * date-fns' `format`. The parts are reassembled by {@link formatDate} rather than taken from
+ * `format()`'s single string, because the assembled order is then *ours*: a locale's own
+ * day/month/year order and its separators can change with an ICU update, and this label must not.
+ */
+const dateFieldFormatter = new Intl.DateTimeFormat(FORMAT_LOCALE, {
+  timeZone: FORMAT_TIME_ZONE,
+  day: 'numeric',
+  month: 'long',
+  year: 'numeric',
 });
 
 /**
@@ -158,12 +192,19 @@ function toValidDate(value: DateInput): Date | null {
 }
 
 /**
- * Formats an instant as an absolute, human-readable date.
+ * Formats an instant as an absolute, human-readable date, resolved in UTC.
  *
  * This is the byline and post-card form — the label a reader sees next to an author's name and in
- * an admin table's "published" column. It is rendered with date-fns' built-in English month
- * names, which are independent of the host's locale settings, using the runtime's local calendar
- * day.
+ * an admin table's "published" column. The month name comes from the pinned locale and the
+ * calendar fields from {@link FORMAT_TIME_ZONE}, so the output depends only on the argument: the
+ * same instant produces the same string on the server, in every visitor's browser and in every
+ * test, whatever timezone the host is configured for. The assembled order is `day month year`,
+ * fixed here rather than taken from the locale's own pattern.
+ *
+ * The consequence worth stating plainly: the day shown is the UTC calendar day, so an instant at
+ * `2025-03-12T02:00:00Z` reads `12 March 2025` for every reader, including one in New York for
+ * whom it was still the evening of the 11th locally. That is the deliberate trade — one instant
+ * with one label everywhere, over a locally-correct label that changes across hydration.
  *
  * @param value - The instant to format; typically a `published_at`, `created_at` or `updated_at`
  * value straight off the wire.
@@ -173,6 +214,7 @@ function toValidDate(value: DateInput): Date | null {
  * @example
  * ```ts
  * formatDate('2025-03-12T09:30:00Z'); // '12 March 2025'
+ * formatDate('2025-03-12T02:00:00Z'); // '12 March 2025' — UTC day, in every timezone
  * formatDate(null);                   // '' — an unpublished draft
  * formatDate('not-a-date');           // '' — never 'Invalid Date'
  * ```
@@ -184,7 +226,16 @@ export function formatDate(value: DateInput): string {
     return EMPTY_VALUE;
   }
 
-  return format(date, DATE_FORMAT);
+  // `formatToParts` rather than `format`, so the three fields are recombined in an order this
+  // module fixes. The literal parts a locale would insert - a comma between month and year in
+  // en-US, for instance - are discarded along with everything that is not one of the three
+  // fields requested, which is what keeps the output stable across ICU versions.
+  const parts = dateFieldFormatter.formatToParts(date);
+  const day = parts.find((part) => part.type === 'day')?.value ?? '';
+  const month = parts.find((part) => part.type === 'month')?.value ?? '';
+  const year = parts.find((part) => part.type === 'year')?.value ?? '';
+
+  return `${day} ${month} ${year}`;
 }
 
 /**
@@ -195,41 +246,51 @@ export function formatDate(value: DateInput): string {
  * the result reads as a direction in time ("3 days ago", "in 3 days") rather than a bare
  * duration.
  *
- * The output of a relative formatter necessarily depends on "now", which would make any test
- * asserting on it time-dependent. `referenceDate` exists so a test can pin the comparison
- * instant and get a stable string. It is optional, so no production call site is burdened: when
- * omitted the current time is used. A `referenceDate` that is itself absent or unparseable is
- * treated as omitted — the subject instant is still valid, so the function reports something true
- * about it rather than degrading to a placeholder.
+ * ### `referenceDate` is required, and that is the whole design
+ *
+ * A relative label is a function of two instants, and reading the second one from the clock would
+ * make this function impure — which breaks it in the one place it is most used. The same comment
+ * is rendered twice for one visitor: once on the server, once again when React hydrates. Two
+ * different clocks produce two different strings, and where the elapsed time sits near one of
+ * date-fns' distance boundaries the two are visibly different words, not merely different
+ * milliseconds: "about 1 hour ago" against "about 2 hours ago". React reports that as a hydration
+ * mismatch and replaces the markup.
+ *
+ * Requiring the argument moves that decision to the caller, who is the only one able to make it
+ * correctly — a Server Component captures one instant and passes it to the client island that
+ * re-renders the same list, or a client island that genuinely wants a live label captures
+ * `Date.now()` in an effect and re-renders on a timer, after hydration, where a changing value is
+ * intended rather than accidental. A test simply passes the instant it wants.
+ *
+ * A `referenceDate` that is absent or unparseable yields {@link EMPTY_VALUE}, exactly as an absent
+ * subject does: with no instant to measure against there is no true statement to make, and
+ * silently substituting the clock is the defect this signature removes.
  *
  * @param value - The instant to describe.
- * @param referenceDate - Optional instant to measure against; defaults to the current time.
- * @returns A phrase such as `'3 days ago'`, or {@link EMPTY_VALUE} when `value` is absent or
- * unparseable.
+ * @param referenceDate - The instant to measure against. Required.
+ * @returns A phrase such as `'3 days ago'`, or {@link EMPTY_VALUE} when either instant is absent
+ * or unparseable.
  *
  * @example
  * ```ts
- * // Deterministic: pinned reference instant, stable across runs.
+ * // Deterministic by construction: both instants are arguments.
  * formatRelativeTime('2025-03-12T09:30:00Z', '2025-03-15T09:30:00Z'); // '3 days ago'
- * formatRelativeTime('2025-03-12T09:30:00Z');                         // relative to now
- * formatRelativeTime(undefined);                                      // ''
+ * formatRelativeTime('2025-03-18T09:30:00Z', '2025-03-15T09:30:00Z'); // 'in 3 days'
+ * formatRelativeTime('2025-03-12T09:30:00Z', undefined);              // ''
+ * formatRelativeTime(undefined, '2025-03-15T09:30:00Z');              // ''
  * ```
  */
-export function formatRelativeTime(value: DateInput, referenceDate?: DateInput): string {
+export function formatRelativeTime(value: DateInput, referenceDate: DateInput): string {
   const date = toValidDate(value);
+  const reference = toValidDate(referenceDate);
 
-  if (date === null) {
+  if (date === null || reference === null) {
     return EMPTY_VALUE;
   }
 
-  const reference = toValidDate(referenceDate);
-
-  if (reference === null) {
-    return formatDistanceToNow(date, { addSuffix: true });
-  }
-
   // Subject first, reference second: that argument order is what makes a past instant read
-  // "3 days ago" rather than "in 3 days".
+  // "3 days ago" rather than "in 3 days". `formatDistance` measures the interval between two
+  // instants, so unlike a calendar-field format it carries no timezone dependency of its own.
   return formatDistance(date, reference, { addSuffix: true });
 }
 

@@ -40,13 +40,18 @@
 //      at the origin root.
 //   8. `experimental.*`. Nothing in the delivered feature set needs a flag whose
 //      shape can change between patch releases.
+//   9. A SECOND copy of the remote-image host list. `src/lib/utils.ts` owns it -
+//      see the `images` block below for why that has to be the only copy.
 //
-// This module reads no environment variable, because nothing it configures is
-// deployment-specific: the API origin belongs to the client module that calls it,
-// the canonical site origin belongs to the metadata helpers, and the host
-// allow-list below is a security policy rather than a per-environment value.
+// The one deployment-specific value this module reads is the remote-image host
+// allow-list, and it does not read it directly: it imports the resolved list from
+// src/lib/utils.ts, which is the module every rendering component asks as well.
+// The API origin belongs to the client module that calls it and the canonical
+// site origin belongs to the metadata helpers, so neither appears here.
 
 import type { NextConfig } from 'next';
+
+import { IMAGE_HOST_ALLOWLIST } from './src/lib/utils';
 
 const nextConfig: NextConfig = {
   // Emit .next/standalone: server.js plus only the node_modules that the traced
@@ -69,27 +74,35 @@ const nextConfig: NextConfig = {
     // image the optimiser fetches is third-party hosted and must be named here.
     // next/image rejects any origin missing from this list, which is exactly what
     // keeps the optimiser from acting as an open proxy for arbitrary remote
-    // content - so the list stays short, literal and justified per entry. No
-    // entry uses a wildcard host, and no entry admits plain `http`; every one
-    // names a single origin over TLS. `search` is left unset so that a host may
-    // append its own query string (`?v=4`) without being rejected, while
-    // `pathname` is stated explicitly on every entry so that narrowing one later
-    // is a one-word edit.
+    // content - so no entry uses a wildcard host, and no entry admits plain
+    // `http`; every one names a single hostname over TLS. `search` is left unset
+    // so that a host may append its own query string (`?v=4`) without being
+    // rejected, while `pathname` is `/**` because these are delivery CDNs whose
+    // path shape is theirs, not ours.
     //
-    // This list is also the contract the seeded demonstration content draws
-    // from: cover_image_url and avatar_url may reference only these hosts.
-    // Admitting another one is a policy decision, made by adding an entry here
-    // with the same one-line justification.
-    remotePatterns: [
-      // Unsplash delivery CDN - the demonstration cover photography.
-      { protocol: 'https', hostname: 'images.unsplash.com', pathname: '/**' },
-      // Lorem Picsum - deterministic placeholder covers, /seed/<slug>/<w>/<h>.
-      { protocol: 'https', hostname: 'picsum.photos', pathname: '/**' },
-      // Cloudinary delivery host - where an author's own cover image is hosted.
-      { protocol: 'https', hostname: 'res.cloudinary.com', pathname: '/**' },
-      // GitHub avatar host - the default source of user avatar URLs.
-      { protocol: 'https', hostname: 'avatars.githubusercontent.com', pathname: '/**' },
-    ],
+    // THE LIST IS DERIVED, NOT DECLARED, AND THAT IS THE POINT.
+    //
+    // `IMAGE_HOST_ALLOWLIST` resolves in src/lib/utils.ts from
+    // NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST (documented in .env.example), defaulting
+    // to the four delivery hosts the seeded content uses. The same module exports
+    // the `isAllowedImageUrl` predicate that every component asks before handing
+    // a stored URL to next/image or to an avatar, so the optimiser's list and the
+    // components' list are the same list by construction.
+    //
+    // Writing the hosts out again here would recreate exactly the defect this
+    // derivation removes. The service accepts any absolute http(s) URL for
+    // cover_image_url and avatar_url (pydantic.HttpUrl), so the two tiers already
+    // disagree about what is storable; the presentation tier's answer must at
+    // least be single-valued, or a stored cover renders through the optimiser on
+    // one surface and as a broken request on another. Admitting a host is a
+    // configuration change - one entry in NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST -
+    // rather than an edit here, so an operator can keep this tier in step with
+    // whatever the service has been allowed to store without a redeploy of code.
+    remotePatterns: IMAGE_HOST_ALLOWLIST.map((hostname) => ({
+      protocol: 'https' as const,
+      hostname,
+      pathname: '/**',
+    })),
   },
 };
 

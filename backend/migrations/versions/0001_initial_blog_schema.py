@@ -421,10 +421,29 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
     )
-    # Threaded retrieval for one post, in posting order; and the moderation queue, which
-    # filters on status alone across every post.
+    # Four access paths, in the order app/models/comment.py declares them.
+    #
+    # The first two are the two reading surfaces: threaded retrieval for one post, in posting
+    # order; and the moderation queue, which filters on status alone across every post.
+    #
+    # The last two cover the columns that REFERENCE another relation, and they are required
+    # rather than optional. PostgreSQL creates an index on a referenced key automatically and
+    # none at all on a referencing column, so these two would not exist unless created here:
+    #
+    #   (parent_id, status)  the recursive descent that assembles a thread of any depth. Every
+    #                        step of the recursive CTE in app/repositories/comment_repository.py
+    #                        asks `parent_id = ? AND status IN (...)`, so the join column leads
+    #                        and the filter column follows and one index serves both halves at
+    #                        every level. It carries the self-referencing ON DELETE CASCADE too,
+    #                        which walks the same edge once per level of the subtree. Without it
+    #                        each level is a sequential scan over the whole relation.
+    #   author_id            the users cascade: deleting an account removes the comments it
+    #                        wrote, and PostgreSQL locates them by this column. Also the access
+    #                        path for moderating one account rather than one post.
     op.create_index("ix_comments_post_id_created_at", "comments", ["post_id", "created_at"])
     op.create_index("ix_comments_status", "comments", ["status"])
+    op.create_index("ix_comments_parent_id_status", "comments", ["parent_id", "status"])
+    op.create_index("ix_comments_author_id", "comments", ["author_id"])
 
     # --- post_likes ----------------------------------------------------------------------
     # No surrogate key: (post_id, user_id) is the primary key, and that is the whole
@@ -475,6 +494,8 @@ def downgrade() -> None:
     op.drop_table("post_likes")
 
     # --- comments ------------------------------------------------------------------------
+    op.drop_index("ix_comments_author_id", table_name="comments")
+    op.drop_index("ix_comments_parent_id_status", table_name="comments")
     op.drop_index("ix_comments_status", table_name="comments")
     op.drop_index("ix_comments_post_id_created_at", table_name="comments")
     op.drop_table("comments")

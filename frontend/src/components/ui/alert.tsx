@@ -15,21 +15,37 @@
 // them is that the live-region role is DERIVED FROM THE VARIANT instead of being
 // fixed:
 //
-//     variant="destructive"  ->  role="alert"    assertive: interrupts whatever
-//                                                the screen reader is saying
-//     every other variant    ->  role="status"   polite: announced once the user
-//                                                is idle, never interrupting
+//     variant="destructive"      ->  role="alert"   assertive: interrupts
+//                                                   whatever the screen reader
+//                                                   is saying
+//     variant="success"|"warning" ->  role="status"  polite: announced once the
+//                                                   user is idle
+//     variant="info"|"empty"     ->  NO ROLE        ordinary page content that
+//                                                   announces nothing at all
 //
-// So `<Alert variant="destructive">` speaks up and `<Alert variant="empty">`
-// stays quiet, with no ceremony at the call site. A single hardcoded role would
-// have made this component wrong for one of its two jobs: `role="alert"` on a
-// server-rendered empty state makes every page load interrupt the visitor, and
-// `role="status"` on a submission error is easy to miss entirely.
+// WHY `info` AND `empty` GET NO LIVE REGION, WHICH IS THE SUBTLE PART
 //
-// The role is applied BEFORE the props spread, so a caller who knows better
-// always wins - a decorative notice can pass `role="presentation"`, and a
-// consumer that has already wrapped the alert in its own live region can pass
-// `role="none"` to stop the announcement being made twice.
+// A live region is a promise that the element's content will CHANGE and that the
+// change is worth interrupting the reader's own navigation to hear. `success` and
+// `warning` keep it because they are outcomes - they appear in response to
+// something the visitor just did, which is exactly the case `role="status"`
+// exists for. `info` and `empty` are the opposite: they are rendered as part of
+// the page, present in the very first HTML the server sends, and giving them a
+// live region makes every page load announce "no posts match this filter"
+// unprompted, out of document order, ahead of the heading and the search field
+// that would let the visitor act on it. An empty state is CONTENT. It is read
+// when the reader arrives at it, like any other paragraph.
+//
+// So the default is silence, and speech is the exception - which is also the
+// right way round for the failure case: a role that is applied everywhere gets
+// tuned out, and a `status` on a submission error is easy to miss entirely.
+//
+// A consumer that renders `info` or `empty` INTO an already-loaded page, where
+// the panel really does appear in response to an action, opts in explicitly:
+// `<Alert variant="empty" role="status">`. The variant-derived role is applied
+// BEFORE the props spread, so that opt-in wins - and so does the opposite
+// direction, where a caller that has already wrapped a destructive alert in its
+// own live region passes `role="none"` to stop the announcement being made twice.
 //
 // ---------------------------------------------------------------------------
 // TOKEN DISCIPLINE
@@ -37,7 +53,7 @@
 // Every colour, radius, spacing step, icon size and text size below resolves to
 // a token declared in src/app/globals.css - there is no literal colour or
 // dimension anywhere in this file. The variants reference the SEMANTIC layer
-// (`danger`, `success`, `accent`, `surface-muted`, `border`, `foreground`,
+// (`danger`, `success`, `warning`, `surface-muted`, `border`, `foreground`,
 // `muted-foreground`) and never a primitive family and shade, which is what
 // makes dark mode automatic: globals.css declares each token twice and this file
 // needs no `dark:` conditional and carries none.
@@ -50,18 +66,19 @@
 // WHY EVERY VARIANT SHARES THE `surface-muted` GROUND INSTEAD OF A TINT
 //
 // A translucent tint per variant - a background utility carrying a ten-percent
-// opacity modifier on the danger, success or accent token - is a supported
+// opacity modifier on the danger, success or warning token - is a supported
 // pattern in this token layer and it looks richer, so the omission is
 // deliberate. (Those utility names are spelled out in prose rather than written
 // literally anywhere in this file, because the engine's scanner reads comments
 // too and would emit dead rules for any candidate it finds here.)
 //
 // globals.css states the contrast ratio it has COMPUTED for each
-// pair it expects to be used, and the two it computed for this component are
-// `danger/surface-muted` and `success/surface-muted` - coloured text on the
-// recessed neutral ground. Tinting the ground moves the measurement off those
-// pairs, and because every token in this theme is a dark value in light mode, a
-// tint DARKENS the ground and narrows the gap rather than widening it.
+// pair it expects to be used, and the three it computed for this component are
+// `danger/surface-muted`, `success/surface-muted` and `warning/surface-muted` -
+// coloured text on the recessed neutral ground. Tinting the ground moves the
+// measurement off those pairs, and because every token in this theme is a dark
+// value in light mode, a tint DARKENS the ground and narrows the gap rather than
+// widening it.
 //
 // That is not hypothetical. Measured in a browser: `text-success` over a
 // ten-percent success tint composited on the page canvas gives 4.11:1, under
@@ -115,7 +132,7 @@
 //      `ComponentProps<typeof Alert>` and so cannot drift from the real surface.
 
 import { cva, type VariantProps } from 'class-variance-authority';
-import type { ComponentProps, JSX } from 'react';
+import type { ComponentProps, ElementType, JSX } from 'react';
 
 import { cn } from '@/lib/utils';
 
@@ -199,18 +216,17 @@ const alertVariants = cva(
          * Cautionary notice - a destructive action about to be confirmed, or a
          * draft that has not been published yet.
          *
-         * BLITZY [DESIGN_SYSTEM_GAP]: the token layer declares no
-         * `--color-warning`. `accent` is used as the nearest existing semantic
-         * token ("emphasis", one step more emphatic than `primary` in the
-         * direction of the active theme). `danger` was rejected because it would
-         * render `warning` and `destructive` identically and so make the choice
-         * between them meaningless. Resolving this properly means adding a
-         * warning token to the semantic layer in globals.css - which is that
-         * file's decision to make, not this one's - after which only the two
-         * class names on this line change. Flagged for designer review rather
-         * than papered over with a hardcoded amber.
+         * `warning` is the token globals.css declares for exactly this state, and
+         * using it is what keeps the five variants distinguishable: the brand
+         * `accent` would make "caution" and "emphasis" the same colour, and
+         * `danger` would make `warning` and `destructive` identical and so make
+         * the choice between them meaningless. The token layer measures it at
+         * 4.61:1 on this ground in light and 8.54:1 in dark, so the tone is
+         * legible in both themes - and, as with every variant here, the title and
+         * description text says what has happened, so the tone is never the only
+         * carrier of the meaning.
          */
-        warning: 'border-accent bg-surface-muted text-accent',
+        warning: 'border-warning bg-surface-muted text-warning',
 
         /**
          * Error or failure, and the only variant that announces assertively. Use
@@ -224,9 +240,9 @@ const alertVariants = cva(
          * centred panel with a dashed hairline, so it reads as an absence of
          * content rather than as a notice demanding attention - and so that it
          * is distinguishable from `info` by shape and alignment, not by colour
-         * alone. It announces politely like every non-destructive variant, which
-         * is what keeps a server-rendered empty feed from interrupting the
-         * visitor on load.
+         * alone. It carries NO live-region role, which is what keeps a
+         * server-rendered empty feed from announcing itself on load; a caller that
+         * renders one in response to an action passes `role="status"` itself.
          *
          * The leading-icon slot is designed for the notice variants: an `svg`
          * first child is pinned to the inline-start edge, which reads correctly
@@ -250,12 +266,39 @@ const alertVariants = cva(
 type AlertProps = ComponentProps<'div'> & VariantProps<typeof alertVariants>;
 
 /**
+ * The live-region role each variant announces through, or `undefined` for the two
+ * that are ordinary page content and must announce nothing.
+ *
+ * Declared as an exhaustive table rather than written inline as a conditional, for
+ * the same reason the variant classes are a table: adding a sixth variant then
+ * fails to compile until its announcement behaviour has been decided, instead of
+ * silently inheriting whichever branch a ternary happened to end on. The header's
+ * "WHY `info` AND `empty` GET NO LIVE REGION" section is the reasoning behind the
+ * two `undefined` entries.
+ */
+const ALERT_ROLES: Readonly<
+  Record<NonNullable<VariantProps<typeof alertVariants>['variant']>, 'alert' | 'status' | undefined>
+> = {
+  // Ordinary page content, present in the server's first HTML. Read in document
+  // order like any paragraph; a caller that renders one in response to an action
+  // passes `role="status"` itself.
+  info: undefined,
+  empty: undefined,
+  // Outcomes of something the visitor just did: announced politely, once idle.
+  success: 'status',
+  warning: 'status',
+  // A failure the visitor has to act on: announced assertively.
+  destructive: 'alert',
+};
+
+/**
  * An inline notice or empty-state panel.
  *
- * Renders a live region whose politeness is derived from `variant`:
- * `destructive` announces assertively as `role="alert"`, every other variant
- * announces politely as `role="status"`. Pass `role` explicitly to override that
- * default.
+ * Announcement behaviour is derived from `variant`: `destructive` announces
+ * assertively as `role="alert"`, `success` and `warning` announce politely as
+ * `role="status"`, and `info` and `empty` are ordinary page content with no
+ * live-region role at all - see the header for why silence is the default. Pass
+ * `role` explicitly to override in either direction.
  *
  * Compose it from {@link AlertTitle} and {@link AlertDescription}, optionally
  * preceded by an icon as the first child:
@@ -271,7 +314,8 @@ type AlertProps = ComponentProps<'div'> & VariantProps<typeof alertVariants>;
  * This is not a toast. It renders where it is written and does not disappear on
  * its own; reach for `sonner` when you want transient feedback.
  *
- * @param variant - Tone and announcement politeness. Defaults to `info`.
+ * @param variant - Tone and announcement behaviour. Defaults to `info`, which is
+ *   silent.
  * @param className - Merged through `cn()`, so it overrides the variant's own
  *   classes within each property group.
  * @param props - Every other `div` prop, including `ref`, spread onto the root.
@@ -281,9 +325,11 @@ function Alert({ variant, className, ...props }: AlertProps): JSX.Element {
   return (
     <div
       // Placed before the spread so an explicit caller `role` wins. `variant` is
-      // `null | undefined` when omitted, and both fall through to `status` -
-      // which is correct, because the default variant is `info`.
-      role={variant === 'destructive' ? 'alert' : 'status'}
+      // `null | undefined` when omitted, and both fall through to the `info`
+      // branch - which is correct, because `info` is the default variant, and
+      // `undefined` here means the attribute is not rendered at all rather than
+      // rendered empty.
+      role={ALERT_ROLES[variant ?? 'info']}
       className={cn(alertVariants({ variant }), className)}
       {...props}
     />
@@ -302,11 +348,69 @@ function Alert({ variant, className, ...props }: AlertProps): JSX.Element {
  */
 type AlertTitleElement = 'div' | 'p' | 'span' | 'strong' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
 
-/** Props of {@link AlertTitle}: every `div` attribute, plus the `as` escape hatch. */
-type AlertTitleProps = ComponentProps<'div'> & {
-  /** Element to render. Defaults to `div` so no heading level is assumed. */
-  as?: AlertTitleElement;
+/**
+ * Tag allow-list, indexed by `as` to obtain the JSX element type.
+ *
+ * The internal counterpart of the discriminated `AlertTitleProps` union below,
+ * and required for the same reason `@/components/ui/card` needs its own: with the
+ * tag typed as the literal union, React demands props assignable to EVERY member
+ * at once and `ref` is invariant, so `Ref<HTMLSpanElement>` is rejected against
+ * `Ref<HTMLDivElement>`. A member access on a module-level constant is opaque to
+ * control-flow narrowing, so the tag really does have type `ElementType`; it is
+ * also a STATIC component lookup, which is what keeps
+ * `react-hooks/static-components` quiet under `--max-warnings=0` where a helper
+ * call in the same position would fail. `Record<AlertTitleElement, ElementType>`
+ * is exhaustive, so widening the union fails to compile until this table and the
+ * props union are both extended.
+ */
+const ALERT_TITLE_ELEMENTS: Record<AlertTitleElement, ElementType> = {
+  div: 'div',
+  p: 'p',
+  span: 'span',
+  strong: 'strong',
+  h2: 'h2',
+  h3: 'h3',
+  h4: 'h4',
+  h5: 'h5',
+  h6: 'h6',
 };
+
+/**
+ * The public props of {@link AlertTitle}: one branch per element it may render as.
+ *
+ * A discriminated union rather than `ComponentProps<'div'> & { as?: ... }`,
+ * because these tags are genuinely different element interfaces -
+ * `HTMLDivElement`, `HTMLParagraphElement`, `HTMLSpanElement`, `HTMLElement` and
+ * `HTMLHeadingElement`. The intersection form types every branch as a `div`, so a
+ * caller passing `ref` on `<AlertTitle as="h2">` either gets a rejection or, worse,
+ * a `RefObject<HTMLDivElement>` pointing at a heading. Discriminating on the `as`
+ * literal gives each branch that element's own attributes and its own `ref`.
+ *
+ * The five heading levels share one branch because they share one DOM interface;
+ * `div`, `p`, `span` and `strong` each need their own. `as` is optional only on
+ * the `div` branch, which is what makes `<AlertTitle>` resolve to it.
+ */
+type AlertTitleProps =
+  | (ComponentProps<'div'> & {
+      /** Element to render. Omit for the default `div`, which assumes no heading level. */
+      as?: 'div';
+    })
+  | (ComponentProps<'p'> & {
+      /** Element to render. @see {@link AlertTitleElement} */
+      as: 'p';
+    })
+  | (ComponentProps<'span'> & {
+      /** Element to render. @see {@link AlertTitleElement} */
+      as: 'span';
+    })
+  | (ComponentProps<'strong'> & {
+      /** Element to render. @see {@link AlertTitleElement} */
+      as: 'strong';
+    })
+  | (ComponentProps<'h2'> & {
+      /** Heading level to render. All five levels share one branch - one DOM interface. */
+      as: 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
+    });
 
 /**
  * The alert's headline - one short line saying what happened.
@@ -320,7 +424,9 @@ type AlertTitleProps = ComponentProps<'div'> & {
  * @param className - Merged through `cn()`.
  * @param props - Every other prop, including `ref`, spread onto the element.
  */
-function AlertTitle({ as: Component = 'div', className, ...props }: AlertTitleProps): JSX.Element {
+function AlertTitle({ as = 'div', className, ...props }: AlertTitleProps): JSX.Element {
+  const Component = ALERT_TITLE_ELEMENTS[as];
+
   return <Component className={cn('font-medium tracking-tight', className)} {...props} />;
 }
 

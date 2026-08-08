@@ -17,6 +17,11 @@ Two responsibilities, split so each can be tested on its own:
 * :func:`unique_slug` resolves a collision against the slugs that already exist by
   appending an ascending numeric suffix.
 
+Both bound their result by ``max_length`` unconditionally, suffix included: there is no input
+for which either returns something longer. A bound too small to hold a suffixed slug is a
+caller error and raises, rather than being honoured approximately - a slug that overshoots the
+number the caller sized its column and its URLs against is not a usable slug.
+
 Both are pure functions of their arguments. This module reads no environment variable,
 opens no connection, and imports nothing from ``app.db``, ``app.models``,
 ``app.repositories``, ``app.services`` or ``app.api``: ``app.core`` is the bottom layer of
@@ -215,16 +220,21 @@ def unique_slug(
     returned value keeps the casing of ``base`` itself - normalising shape is
     :func:`slugify_title`'s job, and its output is already lowercase.
 
-    The length bound is honoured out of one budget rather than two. A suffix is spent from
-    ``max_length`` instead of being added on top of it, so a ``base`` already sitting at the
-    limit is shortened on a hyphen boundary to make room and the result still fits; a
-    ``base`` longer than ``max_length`` - which cannot arrive from :func:`slugify_title`
-    under the same limit - is shortened before anything else looks at it. One pathological
-    corner is settled in favour of validity: when ``max_length`` cannot hold even a
-    one-character stem plus the marker, which means a limit below three, or below four once
-    the suffix reaches double digits, the marker is kept and the bound is exceeded. A slug a
-    character or two over an implausible limit is still usable; one that opens with a hyphen
-    or carries no suffix at all is not.
+    The length bound is honoured out of one budget rather than two, and it is honoured
+    **unconditionally**. A suffix is spent from ``max_length`` instead of being added on top of
+    it, so a ``base`` already sitting at the limit is shortened on a hyphen boundary to make
+    room and the result still fits; a ``base`` longer than ``max_length`` - which cannot arrive
+    from :func:`slugify_title` under the same limit - is shortened before anything else looks at
+    it. No return value ever exceeds ``max_length``, for any input, which is what lets the
+    caller size a column and a URL against that number and be right.
+
+    Where a bound is too small to hold a suffixed slug at all, this function raises rather than
+    quietly overshooting. A limit that cannot fit a one-character stem plus ``-2`` - that is,
+    anything below three, or below four once the suffix reaches double digits - describes no
+    valid slug, so returning one that breaks the stated bound would trade a loud, immediate,
+    caller-side mistake for a silent one that surfaces later as an over-length path segment or a
+    rejected insert. The condition is unreachable in this service: both slug columns are used at
+    :data:`DEFAULT_MAX_LENGTH`, and the smallest bound any caller passes is far above three.
 
     This function performs no database access, by design. The caller asks its repository for
     the slugs already matching the base - one indexed lookup against the ``citext`` unique
@@ -241,10 +251,12 @@ def unique_slug(
 
     Returns:
         A non-empty slug absent from ``taken`` under case-insensitive comparison, of at most
-        ``max_length`` characters outside the pathological corner described above.
+        ``max_length`` characters - always, with no exception.
 
     Raises:
-        ValueError: If ``max_length`` is not a positive integer.
+        ValueError: If ``max_length`` is not a positive integer, or if a collision has to be
+            suffixed and ``max_length`` cannot hold a one-character stem alongside the marker
+            that would be needed.
 
     Examples:
         >>> unique_slug("scaling-fastapi", set())
@@ -274,7 +286,23 @@ def unique_slug(
     last_suffix = _FIRST_COLLISION_SUFFIX + len(reserved)
     for suffix in range(_FIRST_COLLISION_SUFFIX, last_suffix + 1):
         marker = f"{_SEPARATOR}{suffix}"
-        stem = _truncate_on_boundary(source, max(1, max_length - len(marker)))
+        stem_budget = max_length - len(marker)
+        if stem_budget < 1:
+            # The bound cannot hold a stem beside this marker, so no candidate at this suffix
+            # both fits and is a valid slug. Raising is the honest answer: the previous
+            # behaviour kept the marker and overshot max_length, which turned a caller's
+            # mistake into a value that violated the contract this function publishes - and
+            # did so silently, to be discovered later as an over-length path segment or a
+            # rejected insert. `max_length` and the marker are named so the caller can see
+            # exactly what would not fit; the base is not quoted, since a caller passing a
+            # two-character bound has a bug in the bound rather than in the title.
+            msg = (
+                f"max_length={max_length} is too small to suffix a collision: the marker "
+                f"{marker!r} leaves no room for a stem. A suffixed slug needs at least "
+                f"{len(marker) + 1} characters."
+            )
+            raise ValueError(msg)
+        stem = _truncate_on_boundary(source, stem_budget)
         candidate = f"{stem}{marker}"
         if candidate.casefold() not in reserved:
             return candidate
@@ -305,11 +333,12 @@ def derive_unique_slug(
         max_length: Maximum length of the returned slug, suffix included.
 
     Returns:
-        A non-empty slug absent from ``taken``, bounded by ``max_length`` on exactly the
-        terms :func:`unique_slug` documents.
+        A non-empty slug absent from ``taken``, never longer than ``max_length``.
 
     Raises:
-        ValueError: If ``max_length`` is not a positive integer.
+        ValueError: If ``max_length`` is not a positive integer, or if a collision has to be
+            suffixed and ``max_length`` cannot hold a stem alongside the marker - the same
+            conditions :func:`unique_slug` documents, since this function only composes.
 
     Examples:
         >>> derive_unique_slug("Hello, World!", set())

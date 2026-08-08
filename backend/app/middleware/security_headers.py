@@ -9,43 +9,55 @@ most five list appends. That restraint is deliberate: ``backend/Dockerfile`` dec
 ``HEALTHCHECK`` against ``/healthz``, a probe whose whole value is that it performs no
 database work, and this module sits on the hot path of every one of those polls.
 
-Position in the stack
----------------------
-``app.main`` registers this class **first** of its three middlewares.
-``Starlette.add_middleware`` inserts at index 0, so first-registered is *innermost*::
+Position in the stack - a requirement, not a preference
+------------------------------------------------------
+``Starlette.add_middleware`` inserts at index 0, so first-registered ends up *innermost*.
+``app.main`` MUST register the three middlewares so that the stack comes out like this::
 
     ServerErrorMiddleware            <- outermost; renders handlers keyed on Exception/500
       RequestContextMiddleware       <- app.middleware.request_context
-        CORSMiddleware               <- built from settings.CORS_ALLOW_ORIGINS
-          SecurityHeadersMiddleware  <- THIS MODULE, innermost of the three
+        SecurityHeadersMiddleware    <- THIS MODULE
+          CORSMiddleware             <- built from settings.CORS_ALLOW_ORIGINS
             ExceptionMiddleware      <- runs the handlers app.core.exceptions registers
               Router -> endpoints
 
-Innermost is the entire point rather than an accident of ordering. It places this wrapper
-immediately *outside* ``ExceptionMiddleware``, so every problem document
-``app.core.exceptions`` renders - 400, 401, 403, 404, 405, 409, 415, 422, 429 - travels
-back out through the send wrapper below and is hardened exactly like a 200. So are the
-``/healthz`` and ``/readyz`` probes. Registering this class later, and so further out,
-would silently strip these headers from every error response, which is why the resulting
-behaviour is asserted by the test suite rather than left to convention.
+which means registering ``CORSMiddleware`` **first**, this class **second** and
+``RequestContextMiddleware`` **last**.
 
-Being innermost has one accepted consequence, recorded here so it is not mistaken for a
-bug: ``CORSMiddleware`` answers a CORS preflight itself, without calling anything further
-in, so an ``OPTIONS`` preflight response carries none of these headers. Nothing is lost by
-that - a preflight is a bodiless negotiation whose own headers are the entire payload - and
-the alternative ordering would trade it for unhardened error responses, which is a far
-worse bargain.
+Two properties have to hold at once, and only this ordering delivers both.
+
+This wrapper must sit outside ``ExceptionMiddleware``, so that every problem document
+``app.core.exceptions`` renders - 400, 401, 403, 404, 405, 409, 415, 422, 429 - travels back
+out through the send wrapper below and is hardened exactly like a 200. So are the
+``/healthz`` and ``/readyz`` probes.
+
+And it must sit outside ``CORSMiddleware``, because ``CORSMiddleware`` answers a CORS
+preflight *itself* and never calls the application beneath it. Anything registered inside it
+therefore never runs for an ``OPTIONS`` preflight, and every preflight response would leave
+the service with none of these headers on it. A preflight is a small response, but it is
+still a response this origin emitted, and "most responses are hardened" is not a property
+worth having when the ordering that hardens all of them costs nothing. Note the direction
+carefully: being outside CORS does not weaken the point above, because ``ExceptionMiddleware``
+is inside CORS as well.
 
 The one response this cannot reach
 ----------------------------------
 Starlette hoists a handler registered for bare ``Exception`` - or for status 500 - onto
 ``ServerErrorMiddleware``, which wraps the *outside* of the whole user stack, outside
 everything added with ``add_middleware``. A genuinely unhandled exception is therefore
-rendered beyond this wrapper and receives none of these headers. That is a property of the
-ASGI middleware model, not a defect to work around here: ``app.core.exceptions`` already
-compensates where it matters, setting ``X-Request-ID`` itself in its 500 handler for
-exactly this reason, and catching exceptions in this module to "fix" the gap would break
-the single error contract instead. See :meth:`SecurityHeadersMiddleware.__call__`.
+rendered beyond this wrapper, and no registration order can change that: catching exceptions
+in this module to "fix" it would swallow the exceptions ``ExceptionMiddleware`` must see and
+collapse the single error contract into an opaque 500.
+
+It is closed from the other side instead. ``app.core.exceptions`` applies
+:func:`resolved_security_headers` - the same set, from the same definitions in this module - to
+the 500 problem document it renders, alongside the ``X-Request-ID`` it attaches for the same
+reason. Sharing the resolver rather than restating the headers there is what keeps the two
+paths from drifting: add a header to :data:`BASE_SECURITY_HEADERS` and the outer 500 gains it
+too. One limitation is worth naming rather than discovering: that path resolves transport
+security from ``settings.is_production``, so a deployment that overrides ``enable_hsts`` on the
+middleware still gets the settings-derived answer on the outer 500. Every other header is
+identical. See :meth:`SecurityHeadersMiddleware.__call__`.
 
 No Content-Security-Policy
 --------------------------
@@ -90,13 +102,12 @@ from typing import Final
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.core.config import settings
-
 __all__ = [
     "BASE_SECURITY_HEADERS",
     "HSTS_HEADER",
     "HSTS_VALUE",
     "SecurityHeadersMiddleware",
+    "resolved_security_headers",
 ]
 
 
@@ -207,6 +218,47 @@ a domain, and a middleware default must not make it on their behalf.
 """
 
 
+def resolved_security_headers(*, enable_hsts: bool | None = None) -> tuple[tuple[str, str], ...]:
+    """Return the exact header set a response should carry, as immutable pairs.
+
+    The single place the HSTS question is answered, so the middleware below and
+    ``app.core.exceptions`` - which has to harden the one response class the middleware cannot
+    reach - apply the *same* set rather than two lists that agree until someone edits one.
+
+    Args:
+        enable_hsts: Whether to include :data:`HSTS_HEADER`. ``None``, the default, defers to
+            ``settings.is_production``, which is the right answer whenever the deployment stage
+            and TLS termination coincide. Pass an explicit ``bool`` to override - a staging
+            deployment that terminates TLS, or a test pinning one branch - which is how the
+            requirement that HSTS be settings-driven is met without adding a twelfth
+            environment variable to ``app.core.config``.
+
+    Returns:
+        A tuple of ``(name, value)`` pairs: :data:`BASE_SECURITY_HEADERS` in declaration order,
+        followed by transport security when it applies. A tuple rather than a mapping because
+        the caller iterates it on the hot path and must not be able to mutate a shared default.
+    """
+    if enable_hsts is None:
+        # Imported inside the function, never at module scope, so that importing this module -
+        # and therefore `app.middleware` - constructs no `Settings` and needs no environment.
+        # The barrel documents that property and the assembly point relies on it.
+        #
+        # `settings.is_production` rather than a comparison against ENVIRONMENT: the predicate
+        # is declared once in app.core.config, and it correctly answers False for "staging" as
+        # well as for "development" and "test", so a stage that has not been confirmed to
+        # terminate TLS never pins a client by default.
+        from app.core.config import settings
+
+        hsts_enabled = settings.is_production
+    else:
+        hsts_enabled = enable_hsts
+
+    headers = dict(BASE_SECURITY_HEADERS)
+    if hsts_enabled:
+        headers[HSTS_HEADER] = HSTS_VALUE
+    return tuple(headers.items())
+
+
 class SecurityHeadersMiddleware:
     """Pure-ASGI middleware that applies :data:`BASE_SECURITY_HEADERS` to every response.
 
@@ -235,36 +287,35 @@ class SecurityHeadersMiddleware:
         app.add_middleware(SecurityHeadersMiddleware, enable_hsts=True)
     """
 
-    def __init__(self, app: ASGIApp, *, enable_hsts: bool | None = None) -> None:
+    def __init__(self, app: ASGIApp, *, enable_hsts: bool) -> None:
         """Resolve the response header set once, at application construction time.
 
         :param app: The next ASGI application in the chain. Supplied by Starlette when the
             class is registered with ``add_middleware``.
-        :param enable_hsts: Whether to emit :data:`HSTS_HEADER`. ``None``, the default,
-            defers to ``settings.is_production``, which is the right answer whenever the
-            deployment stage and TLS termination coincide. Pass an explicit ``bool`` to
-            override - a staging deployment that terminates TLS, or a test pinning one
-            branch - which is how the requirement that HSTS be settings-driven is met
-            without adding a twelfth environment variable to ``app.core.config``.
+        :param enable_hsts: Whether to emit :data:`HSTS_HEADER`. **Required**, with no
+            default, and keyword-only. ``app.main`` passes ``settings.is_production``,
+            which is the right answer whenever the deployment stage and TLS termination
+            coincide; a stage that terminates TLS without being production - or a test
+            pinning one branch - passes ``True`` or ``False`` explicitly. Requiring it is
+            what keeps this class free of ``app.core.config`` while still meeting the
+            requirement that HSTS be settings-driven, and it means the question cannot be
+            skipped at the assembly point: the failure mode of a default would be a
+            production deployment quietly serving no transport-security header at all.
+            :func:`resolved_security_headers` keeps the optional form, because
+            ``app.core.exceptions`` hardens a response it reaches with no assembly point to
+            ask.
         """
         self._app = app
 
-        # `settings.is_production` rather than a comparison against ENVIRONMENT: the
-        # predicate is declared once in app.core.config, and it correctly answers False
-        # for "staging" as well as for "development" and "test", so a stage that has not
-        # been confirmed to terminate TLS never pins a client by default. A stage that
-        # does terminate TLS opts in through `enable_hsts` above.
-        hsts_enabled = settings.is_production if enable_hsts is None else enable_hsts
-
-        headers = dict(BASE_SECURITY_HEADERS)
-        if hsts_enabled:
-            headers[HSTS_HEADER] = HSTS_VALUE
-
-        # Frozen into a tuple of pairs HERE, deliberately, and never recomputed. Resolving
-        # the HSTS question per request would repeat a decision that cannot change for the
-        # lifetime of the application, on the hot path of a health check polled on a fixed
-        # interval; a tuple also cannot be mutated later by a caller holding a reference.
-        self._headers: tuple[tuple[str, str], ...] = tuple(headers.items())
+        # Resolved ONCE, here, and never recomputed. Answering the HSTS question per request
+        # would repeat a decision that cannot change for the lifetime of the application, on
+        # the hot path of a health check polled on a fixed interval; the tuple it returns also
+        # cannot be mutated later by a caller holding a reference. The resolution itself lives
+        # in `resolved_security_headers` so that `app.core.exceptions`, which hardens the one
+        # response class this middleware cannot reach, applies the identical set.
+        self._headers: tuple[tuple[str, str], ...] = resolved_security_headers(
+            enable_hsts=enable_hsts
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Forward the call, applying the resolved headers to the response start message.

@@ -105,15 +105,29 @@ code and a problem document.
 
 Import purity
 -------------
-Two imports, ``typing`` and ``pydantic``, and no third. Not :mod:`app.core.config` - a schema
-that read a setting would make the shape of the API depend on the environment, and
-:attr:`TokenPair.expires_in` is passed in by its caller for exactly that reason rather than
-computed from ``ACCESS_TOKEN_EXPIRE_MINUTES`` here. Not :mod:`app.core.security`, whose
-functions this module describes but must not call. Not :mod:`app.models`, which would drag
-SQLAlchemy and a database dialect into a module about JSON. Not a sibling schema module, which
-would make this package's import order load-bearing. Importing this module performs no I/O,
-opens no connection and reads no environment variable, which is what lets a unit test import it
-with nothing running.
+``typing``, ``pydantic``, and the password policy from :mod:`app.core.config`. Nothing else.
+
+That third import is narrow and deliberate. This module **reads no setting**: it imports four
+constants, one message and one pure classifier, all of them fixed at authorship time, and
+:attr:`TokenPair.expires_in` is still passed in by its caller rather than computed from
+``ACCESS_TOKEN_EXPIRE_MINUTES`` here - because a schema whose *shape* depended on the
+environment would publish a different contract per deployment. What the import buys is that
+the policy this module publishes at ``/openapi.json`` and the policy ``SEED_ADMIN_PASSWORD`` is
+held to are the same policy rather than two copies of it: the administrator account cannot be
+created through this schema, so a duplicated rule would leave the one account that matters most
+measured by the copy that drifted. ``app.core.config`` is where the shared declaration has to
+live, being the only module in the package that imports no ``app`` sibling; see "The credential
+policy lives here" in its docstring.
+
+The one consequence worth knowing is that importing this module now constructs the settings
+singleton, so it needs a configured environment - the same requirement ``app.core.security``,
+``app.db.session`` and every entry point already carry.
+
+Still absent, and for the original reasons: :mod:`app.core.security`, whose functions this
+module describes but must not call; :mod:`app.models`, which would drag SQLAlchemy and a
+database dialect into a module about JSON; and any sibling schema module, which would make this
+package's import order load-bearing. Importing this module performs no I/O and opens no
+connection.
 
 Published examples carry no credential
 --------------------------------------
@@ -128,6 +142,15 @@ from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
 
+from app.core.config import (
+    PASSWORD_CHARACTER_GROUPS,
+    PASSWORD_MAX_LENGTH,
+    PASSWORD_MIN_CHARACTER_CLASSES,
+    PASSWORD_MIN_LENGTH,
+    PASSWORD_VARIETY_MESSAGE,
+    password_character_groups,
+)
+
 # Exported in the order ruff's isort profile sorts identifiers - screaming-case constants,
 # then classes - so the list stays stable under `ruff check --select I`. The constants are
 # public deliberately: they are the numbers `frontend/src/lib/validation/auth.ts` has to agree
@@ -141,6 +164,7 @@ __all__ = [
     "PASSWORD_MAX_LENGTH",
     "PASSWORD_MIN_CHARACTER_CLASSES",
     "PASSWORD_MIN_LENGTH",
+    "PASSWORD_VARIETY_MESSAGE",
     "REFRESH_TOKEN_MAX_LENGTH",
     "USERNAME_MAX_LENGTH",
     "USERNAME_MIN_LENGTH",
@@ -211,101 +235,26 @@ Uniqueness is the ``CITEXT UNIQUE`` index's, and any reserved-handle policy woul
 # ---------------------------------------------------------------------------------------
 # Password policy
 #
-# Two independent controls, and it is worth being clear about which does what. The minimum
-# length and the character-group rule bound how weak a NEW password may be. The maximum
-# length bounds how much work an argon2 call can be made to do, on registration and on
-# login alike, and is therefore a resource control rather than a strength rule.
+# Declared in `app.core.config`, imported above, and re-exported from here. Two independent
+# controls, and it is worth being clear about which does what: the minimum length and the
+# character-group rule bound how weak a NEW password may be, while the maximum length bounds
+# how much work an argon2 call can be made to do - on registration and on login alike - and is
+# therefore a resource control rather than a strength rule.
+#
+# The rules are declared one layer down because `Settings` has to apply them too.
+# SEED_ADMIN_PASSWORD opens the only ADMIN principal a fresh deployment has, and that account
+# is the one account in the system that cannot be created through `RegisterRequest` - so a
+# second copy of the policy here would leave the account that matters most measured by
+# whichever copy drifted. `app.core.config` is the only module in this package that imports no
+# `app` sibling, which is what makes one declaration reachable from both this schema and the
+# settings model; its docstring records the reasoning in full.
+#
+# The names are re-exported rather than merely used, and `__all__` above is what makes that
+# legitimate under mypy's strict `no_implicit_reexport`. They are the numbers
+# `frontend/src/lib/validation/auth.ts` has to agree with, and a client mirror should read them
+# from the module that describes the request body it is mirroring, without needing to know
+# where in the backend they are declared.
 # ---------------------------------------------------------------------------------------
-
-PASSWORD_MIN_LENGTH: Final[int] = 12
-"""Shortest accepted new password, in characters.
-
-Twelve is the floor OWASP's Application Security Verification Standard states for a
-user-chosen password, and length is the property that actually resists offline attack on a
-stolen ``users.password_hash``: each additional character multiplies the search space, where a
-substitution inside a fixed length merely rearranges it.
-
-Enforced by ``StringConstraints``, which runs before
-:meth:`RegisterRequest.validate_password_variety`. A caller therefore sees ``String should have
-at least 12 characters`` for a short password rather than that message *and* the group message
-at once, which is what lets a client render one actionable sentence per field.
-"""
-
-PASSWORD_MAX_LENGTH: Final[int] = 128
-"""Longest accepted password, in characters, on registration and on login alike.
-
-A deliberate denial-of-service bound, not a storage limit. ``users.password_hash`` is unbounded
-``TEXT`` precisely so an argon2id hash may grow when its cost parameters are tuned, and
-:func:`app.core.security.hash_password` passes the plaintext through unmodified - it performs
-no truncation, imposes no maximum of its own, and states that bounding the input is this
-schema's responsibility. Argon2 is memory-hard and intentionally slow by design, so an
-unbounded input on an unauthenticated route is an amplification primitive: one large body
-would buy an attacker a large, slow, memory-heavy computation.
-
-One hundred and twenty-eight characters is far above any password a human composes and well
-above the sixty-four an entirely passphrase-based policy needs, so the bound costs no
-legitimate caller anything. It is applied to :attr:`LoginRequest.password` as well, because
-login is where an unauthenticated caller reaches argon2 verification and is therefore the more
-exposed of the two call sites - the rate limiter on that route thins the flood, and this bound
-caps the cost of each request that gets through it.
-"""
-
-PASSWORD_MIN_CHARACTER_CLASSES: Final[int] = 3
-"""How many of the five character groups a new password must draw on.
-
-Three of five. The rule exists so that a twelve-character password cannot also be a
-single-alphabet one: ``alllowercaseonly`` clears the length floor and is still trivially
-enumerable, and requiring variety is what makes the stated minimum length mean something.
-
-Three rather than all five, because a rule nobody can satisfy without a password manager is a
-rule that produces written-down passwords. The groups themselves are listed in
-:data:`PASSWORD_CHARACTER_GROUPS`.
-"""
-
-PASSWORD_CHARACTER_GROUPS: Final[tuple[str, ...]] = (
-    # Indexed by the _GROUP_* constants below, in this exact order. Adding a group means
-    # adding its constant, its branch in _password_character_groups, and a line here.
-    "a lowercase letter",
-    "an uppercase letter",
-    "a digit",
-    "a letter from a script that has no letter case, such as CJK, Hebrew or Arabic",
-    "any other character, such as a symbol, a punctuation mark or a space",
-)
-"""The five character groups :data:`PASSWORD_MIN_CHARACTER_CLASSES` counts, as prose.
-
-The list is the single source of the wording, so the field description, the validation message
-a rejected caller receives and any client mirroring the policy all quote the same five phrases
-rather than three drifting paraphrases of them.
-
-The **fifth group is a catch-all**, and that is what makes the classification total: every
-character of every string lands in exactly one group, so no writing system is excluded by
-omission. The fourth group is the reason the catch-all is not enough on its own. A rule built
-only from "lowercase, uppercase, digit, symbol" is unsatisfiable at three groups for anyone
-writing in a script that has no letter case - a Japanese or Hebrew passphrase can reach two
-groups and no further, however long or strong it is - so counting caseless letters as a group
-of their own is what keeps this policy from quietly excluding most of the world's readers.
-"""
-
-_GROUP_LOWERCASE: Final[int] = 0
-_GROUP_UPPERCASE: Final[int] = 1
-_GROUP_DIGIT: Final[int] = 2
-_GROUP_CASELESS_LETTER: Final[int] = 3
-_GROUP_OTHER: Final[int] = 4
-
-_PASSWORD_VARIETY_MESSAGE: Final[str] = (
-    f"Password must contain characters from at least {PASSWORD_MIN_CHARACTER_CLASSES} of these "
-    f"{len(PASSWORD_CHARACTER_GROUPS)} groups: {'; '.join(PASSWORD_CHARACTER_GROUPS)}."
-)
-"""The rejection message for a password that clears the length floor but not the group floor.
-
-Built from :data:`PASSWORD_CHARACTER_GROUPS` rather than written out, so the message and the
-documented policy cannot disagree. It is a complete, self-contained sentence on purpose:
-:mod:`app.core.exceptions` copies a validator's message verbatim into the ``message`` member of
-each entry in the problem document's ``errors`` list, so this string is what a client renders
-beside the password field. It names what is required and never quotes what was submitted -
-:class:`~app.schemas.common.ValidationErrorItem` drops pydantic's ``input`` key specifically so
-that a rejected password cannot reach a response body or an access log.
-"""
 
 
 # ---------------------------------------------------------------------------------------
@@ -351,47 +300,6 @@ setting, and raising ``REFRESH_TOKEN_ENTROPY_BYTES`` would then reject every tok
 had just minted. The shape of a refresh token is opaque to this contract by design; only its
 size is bounded.
 """
-
-
-def _password_character_groups(password: str) -> frozenset[int]:
-    """Return the indices of :data:`PASSWORD_CHARACTER_GROUPS` the password draws on.
-
-    Total by construction: the four tests are tried in order and the final ``else`` catches
-    everything they do not, so every character contributes to exactly one group and no string
-    is left unclassified. That totality is the property the fifth group exists to provide -
-    see :data:`PASSWORD_CHARACTER_GROUPS` for why a four-group rule silently excluded caseless
-    scripts.
-
-    The tests are Unicode-aware because :meth:`str.islower`, :meth:`str.isupper` and
-    :meth:`str.isdigit` are: ``é`` counts as lowercase and ``Ä`` as uppercase, exactly as ``e``
-    and ``A`` do. ``isalpha`` is tried only after both case tests have failed, so it matches a
-    letter from a script that draws no case distinction - Japanese, Chinese, Hebrew, Arabic,
-    Devanagari, Thai, Hangul - rather than shadowing the two groups above it.
-
-    Every character is examined rather than stopping at the first three groups found. The input
-    is capped at :data:`PASSWORD_MAX_LENGTH`, so the loop is bounded and short, and returning
-    the complete set keeps the function's result meaningful to a caller that wants to report
-    what was found rather than only whether it was enough.
-
-    Args:
-        password: The candidate password, already length-checked by ``StringConstraints``.
-
-    Returns:
-        The set of group indices present. Empty only for an empty string.
-    """
-    groups: set[int] = set()
-    for character in password:
-        if character.islower():
-            groups.add(_GROUP_LOWERCASE)
-        elif character.isupper():
-            groups.add(_GROUP_UPPERCASE)
-        elif character.isdigit():
-            groups.add(_GROUP_DIGIT)
-        elif character.isalpha():
-            groups.add(_GROUP_CASELESS_LETTER)
-        else:
-            groups.add(_GROUP_OTHER)
-    return frozenset(groups)
 
 
 class RegisterRequest(BaseModel):
@@ -554,11 +462,11 @@ class RegisterRequest(BaseModel):
         Raises:
             ValueError: If fewer than :data:`PASSWORD_MIN_CHARACTER_CLASSES` of the five groups
                 are present. Pydantic converts this into a field error whose ``message`` is
-                :data:`_PASSWORD_VARIETY_MESSAGE`, which the exception handler copies into the
+                :data:`PASSWORD_VARIETY_MESSAGE`, which the exception handler copies into the
                 problem document's ``errors`` list.
         """
-        if len(_password_character_groups(password)) < PASSWORD_MIN_CHARACTER_CLASSES:
-            raise ValueError(_PASSWORD_VARIETY_MESSAGE)
+        if len(password_character_groups(password)) < PASSWORD_MIN_CHARACTER_CLASSES:
+            raise ValueError(PASSWORD_VARIETY_MESSAGE)
         return password
 
 

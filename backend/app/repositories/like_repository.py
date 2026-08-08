@@ -242,20 +242,28 @@ class LikeRepository(BaseRepository[PostLike]):
     for. :meth:`~app.repositories.base.BaseRepository.delete` remains available for the case where
     a service already holds a loaded instance.
 
-    Three inherited members are **not** applicable, and the reason is the composite key rather
-    than preference:
+    Three operations the other five repositories have are **absent from this class entirely**,
+    and their absence is the reason it extends
+    :class:`~app.repositories.base.BaseRepository` rather than
+    :class:`~app.repositories.base.UUIDPrimaryKeyRepository`. All three presuppose a single
+    surrogate key, ``post_likes`` has none, and each would fail in a different and worse way:
 
-    * :meth:`~app.repositories.base.BaseRepository.get_by_id` takes a single UUID. This relation
-      has no single-column identity, so its lookups are keyed by the pair -
-      :meth:`exists_for` when only presence matters, and
-      :meth:`~app.repositories.base.BaseRepository.get_or_none` with both predicates when a service
-      genuinely needs the row.
-    * :meth:`~app.repositories.base.BaseRepository.delete_by_id` would have to derive a key column
-      from the mapper, which here is ``post_id`` - so it would delete *every* like on a post.
+    * ``get_by_id`` takes one UUID where this mapper expects two, so a call would type-check and
+      then raise at runtime. Lookups here are keyed by the pair instead - :meth:`exists_for`
+      when only presence matters, and
+      :meth:`~app.repositories.base.BaseRepository.get_or_none` with both predicates when a
+      service genuinely needs the row.
+    * ``delete_by_id`` inherits that same misuse, and the bulk form it deliberately avoids
+      would derive the *first* key column - ``post_id`` - and delete **every** like on a post.
       :meth:`unlike` states both predicates instead.
-    * :meth:`~app.repositories.base.BaseRepository.add` persists an ORM instance and refreshes it.
-      Liking goes through a conflict-ignoring insert precisely so that a repeat is absorbed by the
-      key rather than raising, and there is no entity to refresh afterwards.
+    * ``add`` persists an ORM instance and refreshes it, which would defeat the whole design of
+      :meth:`like`: liking goes through a conflict-ignoring insert precisely so that a repeat is
+      absorbed by the key rather than raising, and a second ``add`` would raise instead.
+
+    Documenting them as inapplicable is not the same as their not being there, which is why the
+    generic base was split: on this class the three names simply do not resolve, so each mistake
+    is a type error at the call site rather than an ``IntegrityError``, a runtime failure, or a
+    mass deletion in production.
 
     Instances are cheap, hold no cached state and are exactly as concurrency-safe as the
     ``AsyncSession`` they wrap - which is to say they must not be shared between concurrent tasks,

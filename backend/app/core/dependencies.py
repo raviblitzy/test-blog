@@ -111,8 +111,9 @@ from collections.abc import AsyncGenerator
 from typing import Annotated, Final
 from uuid import UUID
 
-from fastapi import Depends, Query
+from fastapi import Depends, Query, Request
 from fastapi.security import OAuth2PasswordBearer
+from fastapi.security.utils import get_authorization_scheme_param
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ForbiddenError, UnauthorizedError
@@ -207,6 +208,13 @@ generated documentation posts credentials into a 404: this scheme's declaration 
 route ``app.api.v1.routers.auth`` mounts. It is the fully prefixed path, since the value is
 what a documentation client is told to call, not a path relative to a router's own prefix.
 """
+
+# The one authentication scheme this API accepts, folded to lower case because RFC 7235
+# declares auth-scheme case-insensitive - `bearer`, `Bearer` and `BEARER` are the same
+# scheme, and a client that spells it unconventionally is not a client that failed to
+# authenticate. Private: `_bearer_token` is the only comparison site, and the constant exists
+# so that the literal is not repeated between the comparison and the message that explains it.
+_BEARER_SCHEME: Final[str] = "bearer"
 
 
 # ---------------------------------------------------------------------------------------
@@ -315,15 +323,91 @@ by a scheme that raises before the endpoint is entered.
 The scheme performs no verification of its own. It reads a header, checks the ``Bearer``
 prefix and hands over the remaining characters; whether those characters are a token is
 decided by :func:`app.core.security.decode_access_token`.
+
+**What it cannot express, and why :func:`_bearer_token` exists.** With ``auto_error=False``
+the scheme returns ``None`` for two situations that are not the same situation: a request
+that carried no ``Authorization`` header at all, and a request that carried one this scheme
+could not use - ``Basic dXNlcjpwYXNz``, a bare ``Bearer`` with nothing after it, or a raw
+token with no scheme. Collapsing those into one value is harmless for
+:func:`get_current_user`, which rejects both, and wrong for
+:func:`get_current_user_optional`, which must serve the first anonymously and refuse the
+second. So the scheme is kept for what only it can do - declaring the security requirement
+in the OpenAPI document - and the header is parsed once more, this time with the two cases
+kept apart.
 """
 
-_BearerToken = Annotated[str | None, Depends(oauth2_scheme)]
-"""The raw credential, or ``None`` when the caller presented no usable ``Authorization``.
+
+async def _bearer_token(
+    request: Request,
+    _scheme: Annotated[str | None, Depends(oauth2_scheme)],
+) -> str | None:
+    """Extract the bearer credential, distinguishing *absent* from *unusable*.
+
+    The single credential extractor both resolvers below are built on, and the whole of its
+    value is in the distinction :data:`oauth2_scheme` cannot make:
+
+    * **No ``Authorization`` header** - the caller is anonymous. Returns ``None``, and
+      :func:`get_current_user_optional` serves the public projection.
+    * **An ``Authorization`` header this API cannot use** - a scheme other than ``Bearer``, a
+      ``Bearer`` with no credential after it, or a value with no scheme at all. Raises
+      :class:`~app.core.exceptions.UnauthorizedError`, because the caller *tried* to
+      authenticate and a request that tried and failed must be told so.
+
+    Without that second branch a stale or malformed credential is silently downgraded to
+    anonymous: the reader keeps browsing, permanently served the public view, with nothing in
+    any response to say their session had lapsed and no signal for the client's
+    refresh-on-401 to act on. A 401 is precisely what makes the client exchange its refresh
+    token and retry, so swallowing it removes the only route back to an authenticated session.
+
+    The scheme is still a declared dependency - ``_scheme``, deliberately unused - and that is
+    not decoration. FastAPI collects security requirements by walking the dependency graph, so
+    depending on :data:`oauth2_scheme` is what puts ``OAuth2PasswordBearer`` into
+    ``/openapi.json`` and renders the ``Authorize`` control on ``/docs``. Parsing the header
+    here rather than trusting the scheme's return value is what makes the two cases separable;
+    keeping the scheme in the graph is what keeps the documentation honest. The parse itself
+    uses ``fastapi.security.utils.get_authorization_scheme_param``, the same helper the scheme
+    uses internally, so "what counts as a Bearer header" has one definition rather than two.
+
+    Args:
+        request: The incoming request. Only the ``Authorization`` header is read.
+        _scheme: The credential :data:`oauth2_scheme` extracted, which this function
+            deliberately ignores in favour of its own parse. Present so the security scheme
+            reaches the generated document; the leading underscore is what says so at a glance.
+
+    Returns:
+        The credential with its ``Bearer`` prefix removed, or ``None`` when the request carried
+        no ``Authorization`` header.
+
+    Raises:
+        UnauthorizedError: An ``Authorization`` header was present but is not a usable
+            ``Bearer`` credential. Raised bare, so the response is identical to the one an
+            expired or forged token produces - which check failed is not a caller's business.
+    """
+    header = request.headers.get("Authorization")
+    if header is None:
+        return None
+
+    # Case-insensitive on the scheme, because RFC 7235 declares auth-scheme case-insensitive;
+    # `get_authorization_scheme_param` splits on the first space and returns ("", "") for a
+    # value with no space in it, which is how a raw token pasted without its scheme lands here.
+    scheme, credential = get_authorization_scheme_param(header)
+    if scheme.lower() != _BEARER_SCHEME or not credential.strip():
+        raise UnauthorizedError
+
+    return credential
+
+
+_BearerToken = Annotated[str | None, Depends(_bearer_token)]
+"""The raw credential, or ``None`` when the caller presented no ``Authorization`` header.
 
 Private, because it is a *parameter* type for the two resolvers below rather than part of
 the wiring vocabulary. A router that reached for a raw token would be re-implementing the
 principal resolution this module exists to centralise, so the name is deliberately not
 exported.
+
+Note the narrowed meaning of ``None`` compared with what :data:`oauth2_scheme` alone yields:
+here it means "no header", never "a header I could not use". :func:`_bearer_token` has
+already turned the second case into a 401.
 """
 
 
@@ -351,16 +435,22 @@ async def _resolve_principal(token: str, db: AsyncSession) -> User:
 
     Raises:
         TokenExpiredError: The token's signature was valid but its lifetime has elapsed.
-            Propagated from :func:`app.core.security.decode_access_token` untouched, so a
-            client can tell "refresh me" from "sign in again".
+            Propagated from :func:`app.core.security.decode_access_token` untouched.
         InvalidTokenError: The token failed signature, structure or claim validation, or it
             was a refresh token presented as a bearer credential.
         UnauthorizedError: The token was valid but names an account that no longer exists.
+
+    Note:
+        All three are 401s in the :class:`~app.core.exceptions.UnauthorizedError` family and
+        all three render the same ``type`` and ``title``, so they are one branch to a client -
+        which attempts a single refresh on any 401 and falls back to sign-in if that is
+        refused. The classes differ so that this service can raise precisely and a server-side
+        log can name the check that failed.
     """
     # Every decode failure already leaves `decode_access_token` as a 401 in the
-    # UnauthorizedError family, so it is neither caught nor re-wrapped here: catching it to
-    # re-raise a generic error would discard the expired-versus-invalid distinction the
-    # client uses to decide whether refreshing is worth attempting.
+    # UnauthorizedError family, so it is neither caught nor re-wrapped here: re-raising a
+    # generic error would discard the expired-versus-invalid distinction that a server-side log
+    # line records, without changing anything the caller sees.
     claims = decode_access_token(token)
 
     # A primary-key identity load, not a query. `AsyncSession.get` consults the session's
@@ -396,8 +486,9 @@ async def get_current_user(token: _BearerToken, db: DbSession) -> User:
     is still permitted to act. Prefer :data:`CurrentUser`, which adds that check.
 
     Args:
-        token: The credential extracted by :data:`oauth2_scheme`, or ``None`` when the
-            request carried no usable ``Authorization`` header.
+        token: The credential extracted by :func:`_bearer_token`, or ``None`` when the
+            request carried no ``Authorization`` header at all. A header that was present but
+            unusable never reaches here - it has already been refused with a 401.
         db: The request-scoped session.
 
     Returns:
@@ -411,13 +502,12 @@ async def get_current_user(token: _BearerToken, db: DbSession) -> User:
             ``WWW-Authenticate: Bearer`` challenge, because telling a caller which check
             failed tells an attacker which one to fix next.
     """
-    # `not token` covers both cases the scheme can produce for a caller with no usable
-    # credential: a missing or non-Bearer header, which yields None, and a well-formed
-    # `Authorization: Bearer` with nothing after the prefix, which yields "". An empty
-    # string would otherwise reach `decode_access_token` and be rejected there anyway, but
-    # as an InvalidTokenError - "the token is invalid" - which misdescribes a request that
-    # presented no token at all.
-    if not token:
+    # `None` here means one thing only - no `Authorization` header - because
+    # `_bearer_token` has already rejected a non-Bearer scheme and an empty credential.
+    # This resolver refuses both cases anyway, so the narrowing changes nothing it does; it
+    # matters for the optional resolver below, and stating the reason once keeps the two
+    # readings of `None` from drifting apart.
+    if token is None:
         raise UnauthorizedError
 
     return await _resolve_principal(token, db)
@@ -444,16 +534,26 @@ async def get_current_user_optional(token: _BearerToken, db: DbSession) -> User 
       holding a stale token, permanently served the anonymous view, with nothing in the
       response to tell them their session had lapsed - and no route to recovering it.
 
+    That asymmetry is only expressible because the credential arrives from
+    :func:`_bearer_token` rather than from :data:`oauth2_scheme` directly. The scheme reports
+    ``None`` for an absent header *and* for a header it could not use, so reading it here
+    would have made every malformed credential an anonymous request - the second bullet above
+    silently inverted. The two cases are separated one layer down, which leaves this function
+    with a single meaning for ``None`` and nothing to decide beyond it.
+
     Args:
-        token: The credential extracted by :data:`oauth2_scheme`, or ``None``.
+        token: The credential extracted by :func:`_bearer_token`, or ``None`` when - and only
+            when - the request carried no ``Authorization`` header.
         db: The request-scoped session.
 
     Returns:
         The loaded principal, or ``None`` when the request was anonymous.
 
     Raises:
-        UnauthorizedError: A credential was presented and could not be used - malformed,
-            expired, of the wrong token type, or naming an account that no longer exists.
+        UnauthorizedError: A credential was presented and could not be used - a scheme other
+            than ``Bearer``, an empty ``Bearer``, or a token that is malformed, expired, of
+            the wrong type, or naming an account that no longer exists. The first two are
+            raised by :func:`_bearer_token` before this function is entered.
 
     Note:
         This resolver deliberately does **not** apply the deactivated-account check. It
@@ -461,7 +561,10 @@ async def get_current_user_optional(token: _BearerToken, db: DbSession) -> User 
         reading a public page. Anything a deactivated account must be barred from doing is
         a protected operation and therefore depends on :data:`CurrentUser` instead.
     """
-    if not token:
+    # `is None` rather than a truthiness test, and the difference is the finding this
+    # resolver exists to answer: an empty or non-Bearer credential is no longer represented
+    # as a falsy token here, so there is no value left that could be mistaken for anonymity.
+    if token is None:
         return None
 
     return await _resolve_principal(token, db)

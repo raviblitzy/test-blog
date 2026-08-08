@@ -10,8 +10,11 @@ report can quote a value that matches the server's own record of the same reques
 Nothing else belongs here. No query, no session, no service call, no authority decision -
 those live in ``app.repositories``, ``app.services`` and ``app.core.dependencies``
 respectively, and a copy of any of them at this layer would be a second, divergent one. This
-module reads no environment variable, opens no connection and performs no I/O at all: the only
-thing it awaits is the application beneath it.
+module reads no environment variable and opens no connection, and the only thing it awaits is
+the application beneath it. It performs no I/O of its own beyond the one access line it writes,
+and one last-resort trace on stderr if writing that line ever fails - see the ``finally`` block
+in :meth:`RequestContextMiddleware.__call__` for why a logging failure is reported there and
+then swallowed rather than allowed to propagate.
 
 Where it sits, and why the position is the whole design
 ------------------------------------------------------
@@ -20,8 +23,8 @@ of ``user_middleware``, so last-registered is outermost, and the stack it builds
 
     ServerErrorMiddleware          <- outermost; owns the Exception / 500 handler
       RequestContextMiddleware     <- this module
-        CORSMiddleware
-          SecurityHeadersMiddleware
+        SecurityHeadersMiddleware  <- outside CORS, so preflights are hardened too
+          CORSMiddleware
             ExceptionMiddleware    <- runs the AppError / HTTPException / validation
               Router -> endpoint      / rate-limit handlers
 
@@ -65,14 +68,34 @@ path containing a carriage return and a newline; it is not a hypothetical.
 
 What is never logged
 --------------------
-The line carries five fields and no others: the method, the path, the status, the duration and
-the client address. Request headers are never enumerated, so an ``Authorization`` header, a
-``Cookie``, an access or refresh token and a password form field cannot reach the log by
-accident. The query string is not logged at all - not even its key names, which this module
-would be permitted to include - because a badly behaved client can put a credential in a query
-value, and a field that is never emitted cannot leak one. Nothing is truncated as a mitigation:
-the prefix of a bearer token is still credential material, so the answer to sensitive input is
-omission, not shortening.
+The line carries six fields and no others: the method, the path, the status that was sent, how
+the request ended, the duration, and the anonymised network the request came from. Request
+headers are never enumerated, so an ``Authorization`` header, a ``Cookie``, an access or
+refresh token and a password form field cannot reach the log by accident. The query string is
+not logged at all - not even its key names, which this module would be permitted to include -
+because a badly behaved client can put a credential in a query value, and a field that is never
+emitted cannot leak one. Truncation is never used as a mitigation for sensitive input: the
+prefix of a bearer token is still credential material, so the answer there is omission.
+
+The client's address is not among the six. ``app.core.logging.anonymised_client_network``
+reduces it to the ``/24`` or ``/64`` it sits in before it is written, and drops anything that
+does not parse as an address rather than logging it as text. An IP address identifies a person
+for practical and for regulatory purposes, while what an operator needs from this field is the
+ability to see that a burst of failures shares an origin - which a network prefix answers
+exactly as well.
+
+The remaining two untrusted values, the method and the path, go through
+``app.core.logging.log_safe_text``, which bounds their length and replaces every character in
+Unicode's ``Cc``, ``Cf``, ``Zl`` and ``Zp`` categories. Both properties matter: an unbounded
+path is a log-volume amplifier under an attacker's control, and the characters removed are the
+ones that forge a line break (including U+2028 and U+2029, which the C0 range does not cover)
+or reverse a rendered line's reading order.
+
+The servers' own access logs are not merely redundant against this line - they are switched
+off. ``app.core.logging`` silences ``uvicorn.access`` and ``gunicorn.access``, because
+uvicorn's format includes the full request target with its query string, and because two
+records describing one request under two schemas cannot be correlated by anything. This module
+is the single access-log owner.
 
 Import purity
 -------------
@@ -99,7 +122,9 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import time
+import traceback
 import uuid
 from http import HTTPStatus
 from typing import Any, Final
@@ -108,8 +133,16 @@ import structlog
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.core.exceptions import REQUEST_ID_HEADER
-from app.core.logging import get_logger
+from app.core.exceptions import REQUEST_ID_CONTEXT_KEY, REQUEST_ID_HEADER, is_usable_request_id
+from app.core.logging import (
+    HTTP_LOG_FIELD_CLIENT_NETWORK,
+    HTTP_LOG_FIELD_METHOD,
+    HTTP_LOG_FIELD_PATH,
+    HTTP_LOG_FIELD_STATUS,
+    anonymised_client_network,
+    get_logger,
+    log_safe_text,
+)
 
 __all__ = [
     "QUIET_ACCESS_LOG_PATHS",
@@ -123,23 +156,21 @@ __all__ = [
 # ---------------------------------------------------------------------------------------
 # Public contract constants
 #
-# `REQUEST_ID_HEADER` is imported from `app.core.exceptions` rather than declared again, and
-# re-exported above so that importing it from either module is legitimate. That module owns
-# the literal because its 500 handler needs the same name for the case described in this
-# module's docstring, and one literal in two files is how two files stop agreeing without
-# anyone noticing. `app.main` puts the same constant in the CORS `expose_headers` list, so a
-# browser client can read the header off a cross-origin response.
+# The whole correlation contract - the header name, the key the identifier is bound under, the
+# length bound and the grammar predicate - is declared in `app.core.exceptions` and imported
+# here, then re-exported above so that importing either name from either module is legitimate.
+#
+# That module owns them because it is the one that has to answer the same questions from
+# OUTSIDE this middleware: Starlette dispatches the bare-`Exception` handler through
+# `ServerErrorMiddleware`, beyond everything registered with `add_middleware`, so that handler
+# reads the identifier back off `request.state`, validates it with the same predicate this
+# module accepts an inbound one under, and sets the same header itself. One declaration is how
+# two modules stop agreeing without anyone noticing; two would look identical right up until
+# one of them was edited.
+#
+# `app.main` puts REQUEST_ID_HEADER in the CORS `expose_headers` list as well, so a browser
+# client can read the header off a cross-origin response.
 # ---------------------------------------------------------------------------------------
-
-REQUEST_ID_CONTEXT_KEY: Final[str] = "request_id"
-"""Key the identifier is bound under, in both *structlog*'s context and ``scope["state"]``.
-
-Fixed rather than incidental. ``structlog.contextvars.merge_contextvars`` is the first
-processor in the chain ``app.core.logging`` configures, and it is what lifts this key onto
-every line every layer emits during the request; ``app.core.exceptions`` reads the same key off
-``request.state``. Renaming it here silently drops correlation from the whole service while the
-log continues to look perfectly healthy.
-"""
 
 QUIET_ACCESS_LOG_PATHS: Final[frozenset[str]] = frozenset({"/healthz", "/readyz"})
 """Paths whose *successful* requests are logged at ``debug`` instead of ``info``.
@@ -161,41 +192,33 @@ _ACCESS_LOG_EVENT: Final[str] = "http_request"
 
 _HTTP_SCOPE_TYPE: Final[str] = "http"
 _RESPONSE_START: Final[str] = "http.response.start"
-
-_REQUEST_ID_MAX_LENGTH: Final[int] = 128
-"""Longest inbound identifier accepted. Generous for any real tracing scheme, and bounded."""
-
-_REQUEST_ID_ALLOWED: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9._-]+")
-"""Characters an inbound identifier may consist of, and implicitly that it must be non-empty.
-
-Safe in both places the value ends up: a response header value, where a carriage return or
-newline would let a caller inject a header of their choosing, and a log line, where the same
-characters would let them forge a record. Deliberately narrower than either grammar strictly
-requires - a UUID, a hex string and a W3C trace identifier all pass.
-"""
+_HEADERS_MESSAGE_KEY: Final[str] = "headers"
+"""Key on a response-start message. ASGI makes it optional, which is why it is normalised."""
 
 _HEADER_NAME_ALLOWED: Final[re.Pattern[str]] = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 """RFC 9110 ``token``: the grammar a header field name must follow.
 
-Kept separate from :data:`_REQUEST_ID_ALLOWED` even though the default header name satisfies
+Kept separate from the identifier grammar in ``app.core.exceptions`` even though the default
+header name satisfies
 both. They constrain different things - a field name on the wire against a field value this
 module mints and echoes - and folding them together would make one of the two error messages
 a lie the next person has to debug.
 """
 
-_UNSAFE_LOG_CHARACTERS: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-"""C0 controls, DEL and the C1 range: everything that could forge or corrupt a log line.
-
-The JSON renderer escapes these, so in every non-development environment they are already
-inert; the console renderer used in development does not, which is exactly where an injected
-line or a stray ANSI escape sequence would mislead the person reading it.
-"""
-
-_UNSAFE_REPLACEMENT: Final[str] = "\ufffd"
-"""U+FFFD REPLACEMENT CHARACTER: marks that something was removed, unlike silent deletion."""
-
 _DURATION_PRECISION: Final[int] = 2
 """Decimal places kept on ``duration_ms``. Sub-10-microsecond resolution is noise here."""
+
+_OUTCOME_FIELD: Final[str] = "outcome"
+"""Key carrying how the request ended, independently of the status that was sent."""
+
+_OUTCOME_COMPLETED: Final[str] = "completed"
+"""A response started and the application returned without raising."""
+
+_OUTCOME_FAILED: Final[str] = "failed"
+"""The application raised. The status field still reports whatever had already been sent."""
+
+_OUTCOME_ABORTED: Final[str] = "aborted"
+"""No response ever started and nothing raised: the client disconnected mid-request."""
 
 
 def get_request_id() -> str | None:
@@ -219,11 +242,6 @@ def get_request_id() -> str | None:
     return bound if isinstance(bound, str) else None
 
 
-def _log_safe(value: str) -> str:
-    """Neutralise control characters so *value* cannot forge or corrupt a log line."""
-    return _UNSAFE_LOG_CHARACTERS.sub(_UNSAFE_REPLACEMENT, value)
-
-
 def _scope_str(scope: Scope, key: str) -> str:
     """Read a string entry from *scope*, defaulting to empty when absent or another type.
 
@@ -236,31 +254,26 @@ def _scope_str(scope: Scope, key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _client_host(scope: Scope) -> str | None:
-    """Return the peer address, or ``None`` when the transport does not have one.
+def _client_network(scope: Scope) -> str | None:
+    """Return the anonymised network the request came from, or ``None``.
 
     ``scope["client"]`` is a ``(host, port)`` pair for a real socket, but it is optional in
     the ASGI specification and absent or ``None`` for an in-process transport, which is how
     the integration suite drives the application. Reaching straight for ``scope["client"][0]``
     is therefore a crash on every test in that suite, and this guard is the reason there
     isn't one.
+
+    The address itself is never logged. ``app.core.logging.anonymised_client_network``
+    discards the host bits, so what reaches the record is the ``/24`` or ``/64`` - enough to
+    see that a burst of failures shares an origin, not enough to identify the person behind
+    it - and anything that does not parse as an address is dropped rather than written out as
+    text.
     """
     client: Any = scope.get("client")
     if not client:
         return None
     host: Any = client[0]
-    return _log_safe(host) if isinstance(host, str) else None
-
-
-def _usable_request_id(candidate: str) -> bool:
-    """Report whether an inbound identifier may be trusted, echoed and logged as-is.
-
-    Length is checked first: it is the cheaper test and it bounds the work the pattern does.
-    """
-    return (
-        len(candidate) <= _REQUEST_ID_MAX_LENGTH
-        and _REQUEST_ID_ALLOWED.fullmatch(candidate) is not None
-    )
+    return anonymised_client_network(host) if isinstance(host, str) else None
 
 
 def _resolve_request_id(scope: Scope, header_name: str) -> str:
@@ -278,32 +291,42 @@ def _resolve_request_id(scope: Scope, header_name: str) -> str:
         header_name: Header to look for, normally :data:`REQUEST_ID_HEADER`.
 
     Returns:
-        A value guaranteed to satisfy :func:`_usable_request_id`.
+        A value guaranteed to satisfy :func:`app.core.exceptions.is_usable_request_id`.
     """
     inbound = Headers(scope=scope).get(header_name)
-    if inbound is not None and _usable_request_id(inbound):
+    if inbound is not None and is_usable_request_id(inbound):
         return inbound
     # 32 unambiguous hex characters, needing no quoting in a log line, from a source that
     # cannot be guessed or derived from anything about the request.
     return uuid.uuid4().hex
 
 
-def _access_log_level(status: int | None, *, quiet: bool) -> int:
+def _access_log_level(status: int | None, *, quiet: bool, failed: bool) -> int:
     """Choose the level of the access line from how the request ended.
 
-    Severity tracks the status class so that a deployment going wrong is visible in a stream
-    rather than only to someone who thought to query for it: ``error`` for a 5xx, ``warning``
+    *failed* is decided first, and that ordering is the point. The status alone is not enough
+    to describe the outcome: a streaming response, a background-task failure, or anything that
+    raises after ``http.response.start`` has already gone out leaves ``status`` at ``200``
+    while the request has genuinely failed and the client has received a truncated body.
+    Choosing the level from the status in that case files a server-side exception at ``info``
+    - or, on a quiet path, at ``debug`` - which is precisely the record nobody will ever
+    query for. Any non-null failure is therefore ``error``, whatever was sent, and the status
+    that WAS sent is still reported in the record alongside an ``outcome`` field.
+
+    Otherwise severity tracks the status class, so a deployment going wrong is visible in a
+    stream rather than only to someone who thought to look: ``error`` for a 5xx, ``warning``
     for a 4xx, ``info`` otherwise.
 
-    A *quiet* path is downgraded to ``debug`` only when it did **not** fail. Quietening the
-    probes is about the volume of successful polls; a readiness probe answering 503 because
-    the database is unreachable is precisely the line that must not be hidden, and downgrading
-    it would defeat the point of choosing the level by status class in the first place.
+    A *quiet* path is downgraded to ``debug`` only when it neither failed nor answered badly.
+    Quietening the probes is about the volume of successful polls; a readiness probe answering
+    503 because the database is unreachable is exactly the line that must not be hidden.
 
-    A *status* of ``None`` means no response ever started, which happens when the client
-    disconnected mid-request. That is not a server fault, so it is a ``warning`` rather than an
-    ``error``, but it is not ordinary either, so it is not ``info``.
+    A *status* of ``None`` with no failure means no response ever started, which happens when
+    the client disconnected mid-request. That is not a server fault, so it is a ``warning``
+    rather than an ``error``, but it is not ordinary either, so it is not ``info``.
     """
+    if failed:
+        return logging.ERROR
     if status is None:
         return logging.WARNING
     if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
@@ -419,6 +442,14 @@ class RequestContextMiddleware:
             nonlocal response_status
             if message["type"] == _RESPONSE_START:
                 response_status = message["status"]
+                # ASGI makes `headers` OPTIONAL on a response-start message, defaulting to
+                # empty, and `MutableHeaders(scope=...)` raises KeyError when it is absent.
+                # Starlette always supplies it, so this never fires in front of a Starlette
+                # application - but this middleware wraps whatever it is given, and a
+                # conformant raw-ASGI application beneath it would otherwise turn a
+                # correlation header into a 500. Normalising is a one-line correctness fix,
+                # not error handling.
+                message.setdefault(_HEADERS_MESSAGE_KEY, [])
                 # Assignment, not `append`: it replaces any value already present, so a nested
                 # application or a downstream component that set the same header cannot
                 # produce a duplicate. `http.response.body` is never inspected or rewritten -
@@ -435,18 +466,44 @@ class RequestContextMiddleware:
             failure = exc
             raise
         finally:
-            # In `finally`, so exactly one line is written whichever way the request ended -
-            # cleanly, by raising, or by being cancelled. Never none, never two.
-            self._log_access(
-                scope=scope,
-                status=response_status,
-                elapsed=time.perf_counter() - started,
-                failure=failure,
-            )
-            # The real no-leak guarantee: it runs on the success path, on an exception and on
-            # cancellation alike, so no identifier survives into whatever this task handles
-            # next.
-            structlog.contextvars.clear_contextvars()
+            # Observability is strictly subordinate to the request, and these nested blocks are
+            # what make that true rather than intended.
+            #
+            # The access line is written in `finally`, so exactly one is written whichever way
+            # the request ended - cleanly, by raising, or by being cancelled. Never none, never
+            # two. But writing it means running a processor chain and a handler this module does
+            # not own, and those can fail: a renderer given a value it cannot serialise, a
+            # closed stream, a processor a test replaced. Unguarded, such a failure would do two
+            # things that are both worse than a missing log line. The context would never be
+            # cleared, so this request's identifier would stay bound to a worker task the ASGI
+            # server reuses for the NEXT request, silently mislabelling it. And because an
+            # exception raised in a `finally` REPLACES the one already in flight, a logging
+            # failure would erase the application's own exception on the way out -
+            # `ServerErrorMiddleware` would render its 500 for the logging error while the real
+            # failure vanished, taking the reason for the request's outcome with it.
+            #
+            # So the log call is caught and the cleanup is unconditional. `Exception` and not
+            # `BaseException`: a `CancelledError` or a `KeyboardInterrupt` arriving here is the
+            # process being torn down and must keep propagating.
+            try:
+                self._log_access(
+                    scope=scope,
+                    status=response_status,
+                    elapsed=time.perf_counter() - started,
+                    failure=failure,
+                )
+            except Exception:
+                # Swallowed, but never silently. The structured sink is the thing that just
+                # failed, so reporting through it would be circular; stderr is what is left,
+                # and it is the same last resort the standard library's own
+                # `logging.Handler.handleError` falls back to. One diagnosable trace of the
+                # logging failure, and the request's own outcome left exactly as it was.
+                traceback.print_exc(file=sys.stderr)
+            finally:
+                # The real no-leak guarantee: it runs on the success path, on an application
+                # exception, on cancellation, and on a failure of the call above alike, so no
+                # identifier survives into whatever this task handles next.
+                structlog.contextvars.clear_contextvars()
 
     def _log_access(
         self,
@@ -459,12 +516,18 @@ class RequestContextMiddleware:
         """Write the single access line for a finished request.
 
         Args:
-            scope: The HTTP scope, read for the method, path and peer address.
-            status: Status of the response that started, or ``None`` if none did.
+            scope: The HTTP scope, read for the method, the path and the peer address - the
+                first two normalised and bounded, the third reduced to its network, before
+                either reaches the record.
+            status: Status of the response that started, or ``None`` if none did. Reported as
+                it is; no status is invented for a request that never sent one.
             elapsed: Seconds measured on the monotonic clock, converted to milliseconds here.
             failure: The exception the application raised, if it raised one. Its frames are
-                attached to this line, which is what keeps an unhandled failure correlated
-                even though ``ServerErrorMiddleware`` renders its response out of reach.
+                attached to this line - and to no other line in the service - which is what
+                keeps an unhandled failure correlated even though ``ServerErrorMiddleware``
+                renders its response out of reach. It also forces the level to ``error``
+                regardless of the status, because a failure after ``http.response.start`` would
+                otherwise be filed at ``info``.
         """
         # Obtained here rather than at module scope on purpose, matching
         # `app.core.exceptions`: `app.core.logging.get_logger` documents that a logger created
@@ -472,34 +535,65 @@ class RequestContextMiddleware:
         # moment, and `configure_logging` runs in `app.main`'s lifespan - after every import.
         logger = get_logger(__name__)
 
-        path = _scope_str(scope, "path")
-        effective_status = (
-            status
-            if status is not None
-            else (int(HTTPStatus.INTERNAL_SERVER_ERROR) if failure is not None else None)
-        )
+        # The raw path is used for the quiet-path comparison and the normalised one is what
+        # gets logged. Comparing the normalised value would mean a bounded or replaced
+        # character could never match `/healthz`, which is the opposite of what the bound is
+        # for.
+        raw_path = _scope_str(scope, "path")
 
-        # An allow-list of five fields, passed as keyword arguments so the renderer emits one
+        if failure is not None:
+            outcome = _OUTCOME_FAILED
+        elif status is None:
+            outcome = _OUTCOME_ABORTED
+        else:
+            outcome = _OUTCOME_COMPLETED
+
+        # A fixed allow-list of fields, passed as keyword arguments so the renderer emits one
         # queryable record rather than a sentence to be taken apart again. Request headers are
         # never enumerated and the query string is never read, so no credential can arrive
-        # here. `request_id` is deliberately absent: `merge_contextvars` adds it, and relying
-        # on that is what keeps the mechanism the rest of the service depends on exercised.
+        # here. Every untrusted value goes through `log_safe_text`, which bounds its length and
+        # replaces every Cc/Cf/Zl/Zp character, and the peer address is reduced to its network
+        # before it is written. The names come from `app.core.logging` because
+        # `app.core.exceptions` logs the same request from outside this middleware and the two
+        # records have to be correlatable by more than the request identifier.
+        #
+        # `status_code` is the status that was ACTUALLY sent - `None` when nothing started -
+        # rather than a synthesised 500, because inventing a status the client never received
+        # makes the record disagree with both the access log of any proxy in front of it and
+        # the response the caller actually got. `outcome` carries what a synthesised status
+        # used to imply, and carries it unambiguously.
+        #
+        # `request_id` is deliberately absent: `merge_contextvars` adds it, and relying on that
+        # is what keeps the mechanism the rest of the service depends on exercised.
         fields: dict[str, Any] = {
-            "http_method": _log_safe(_scope_str(scope, "method")),
-            "path": _log_safe(path),
-            "status_code": effective_status,
+            HTTP_LOG_FIELD_METHOD: log_safe_text(_scope_str(scope, "method")),
+            HTTP_LOG_FIELD_PATH: log_safe_text(raw_path),
+            HTTP_LOG_FIELD_STATUS: status,
+            _OUTCOME_FIELD: outcome,
             "duration_ms": round(elapsed * 1000, _DURATION_PRECISION),
-            "client_ip": _client_host(scope),
+            HTTP_LOG_FIELD_CLIENT_NETWORK: _client_network(scope),
         }
         if failure is not None:
-            # The exception object rather than `True`, so the frames are captured from it
-            # directly instead of from ambient interpreter state. The configured renderer
-            # serialises frames with `show_locals=False`, so a local holding a password or a
-            # signing key cannot be written out with them.
+            # THE traceback for this request, and the only one. The exception object rather
+            # than `True`, so the frames are captured from it directly instead of from ambient
+            # interpreter state. The configured renderer serialises frames with
+            # `show_locals=False`, so a local holding a password or a signing key cannot be
+            # written out with them, and the exception's own `str()` is never placed in a field
+            # of its own - a message can quote a value, and a rendered traceback is read by a
+            # person while a field is indexed by a machine.
+            #
+            # `app.core.exceptions` logs the 500 it renders WITHOUT frames, and
+            # `app.core.logging` filters uvicorn's re-raised copy, so one unhandled exception
+            # produces exactly one traceback in the stream - this one, with the request
+            # identifier bound.
             fields["exc_info"] = failure
 
         logger.log(
-            _access_log_level(effective_status, quiet=path in self.quiet_paths),
+            _access_log_level(
+                status,
+                quiet=raw_path in self.quiet_paths,
+                failed=failure is not None,
+            ),
             _ACCESS_LOG_EVENT,
             **fields,
         )

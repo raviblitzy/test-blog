@@ -53,28 +53,56 @@ assert on the shape production emits.
 
 The standard library goes through the same chain
 ------------------------------------------------
-Everything a dependency logs - ``uvicorn``, ``uvicorn.access``, ``uvicorn.error``,
-``gunicorn.error``, ``gunicorn.access``, ``sqlalchemy.engine``, ``alembic``, and Python
-warnings - is formatted by the same processors through
-``structlog.stdlib.ProcessorFormatter``, so a non-development deployment emits JSON and only
-JSON. Those loggers also have their own handlers detached and their propagation restored, so
-each line is written exactly once instead of twice: ``backend/Dockerfile`` runs Gunicorn with
-Uvicorn workers, and both families configure handlers of their own when they start.
+Everything a dependency logs - ``uvicorn``, ``uvicorn.error``, ``gunicorn.error``,
+``sqlalchemy.engine.Engine``, ``alembic``, and Python warnings - is formatted by the same
+processors through ``structlog.stdlib.ProcessorFormatter``, so a non-development deployment
+emits JSON and only JSON. ``backend/migrations/env.py`` calls :func:`configure_logging` too,
+so ``alembic upgrade``, ``alembic downgrade`` and ``alembic check`` join the same stream
+instead of writing plain text to stderr from a ``fileConfig`` of their own. Those loggers also
+have their own handlers detached and their propagation restored, so each line is written
+exactly once instead of twice: ``backend/Dockerfile`` runs Gunicorn with Uvicorn workers, and
+both families configure handlers of their own when they start.
 
-One boundary is worth naming, because it is visible in a real deployment and is not a defect
-in this module. A server writes a few lines before it has imported the application at all -
-Uvicorn installs its own logging dictionary while its ``Config`` is constructed and then logs
-``Started server process`` and ``Waiting for application startup.``, and Gunicorn's boot
-messages arrive the same way. Nothing this module does can reach back and reshape a line that
-was already written, so with :func:`configure_logging` invoked from the lifespan those first
-lines carry the server's own plain-text format; everything from application startup onward is
-structured. Measured under Uvicorn 0.52 at ``ENVIRONMENT=production``: two plain lines then
-twelve JSON ones, with the access line appearing exactly once. Whoever owns the entry point
-can close even that gap, because Uvicorn configures its logging *before* it imports the
-application: calling :func:`configure_logging` while ``app.main`` is imported, rather than
-only in the lifespan, made all ten lines of the same run JSON with none in plain text. That
-is a decision for the entry point, not for this module, which stays free of import-time
-effects for the reasons below.
+Three things a dependency would otherwise log are not bridged but removed, because in each
+case this service already logs the same event better:
+
+* ``uvicorn.access`` and ``gunicorn.access`` are **silenced**. One request must produce one
+  access record, and ``app.middleware.request_context`` is its owner: it writes the
+  correlated ``http_request`` event with a bounded, control-character-neutralised path, an
+  anonymised client network and the duration, and deliberately without the query string.
+  Uvicorn's own access line describes the same request on an uncorrelated schema *and*
+  includes the full request target, query string and all - so keeping it would mean two
+  records per request, one of which can carry a credential a client put in a query value.
+* Uvicorn's ``Exception in ASGI application`` traceback is **filtered out**.
+  ``ServerErrorMiddleware`` re-raises after the 500 document is sent so that a server can log
+  the failure, which makes that the third serialisation of one exception. The request
+  middleware is the single traceback owner - it has the frames and the request identifier -
+  and ``app.core.exceptions`` records the correlated summary of the response it rendered, so
+  the third copy adds nothing but volume and a record with no request identifier on it.
+* Statement logging stays off unless ``LOG_LEVEL`` is ``DEBUG``, and ``app.db.session``
+  builds its engine with ``hide_parameters=True`` and no ``echo``, so a statement that does
+  appear carries a marker where its bound values would be and arrives through this chain
+  rather than through a handler SQLAlchemy attached itself.
+
+One boundary remains, it is visible in a real deployment, and closing it belongs to the entry
+point rather than to this module. A server writes a few lines before it has imported the
+application at all - Uvicorn installs its own logging dictionary while its ``Config`` is
+constructed, and Gunicorn's boot messages arrive the same way. Nothing this module does can
+reach back and reshape a line that was already written. Measured under Uvicorn 0.52 at
+``ENVIRONMENT=production`` with :func:`configure_logging` invoked from the lifespan: two plain
+lines, then JSON for everything from application startup onward.
+
+That window is closable, and whoever writes ``app.main`` is required to close it rather than
+invited to. Uvicorn calls ``Config.load()`` - which imports the application module - *before*
+it logs ``Started server process``, so calling :func:`configure_logging` at ``app.main``
+**import** time, in addition to the lifespan, makes every line of the run structured; the same
+run measured that way produced ten JSON lines and no plain text. Both calls are wanted: the
+import-time one shapes the server's own boot lines, the lifespan one re-applies the
+configuration after any test fixture or embedding host has reconfigured logging underneath it,
+and :func:`configure_logging` is idempotent precisely so that calling it twice is correct.
+This module still performs no configuration on import, for the reasons under *Import purity*
+below - a settings read must not reconfigure the root logger of whatever process happens to be
+reading it.
 
 Deliberate exclusions
 ---------------------
@@ -87,8 +115,19 @@ request-identifier middleware is not here either - it lives in
 
 Import purity, and why it is a requirement
 ------------------------------------------
-Importing this module has **no** side effect: it attaches no handler, mutates no logger and
-writes nothing. Configuration happens only when :func:`configure_logging` is called.
+Importing this module has **no** side effect: it attaches no handler, mutates no logger,
+writes nothing, and - the part that is easy to lose - **constructs no settings**. The two
+values it needs, ``LOG_LEVEL`` and the development predicate, are read inside
+:func:`configure_logging` rather than at module scope, so ``app.core.config`` is imported only
+when logging is actually being configured. Configuration happens only when
+:func:`configure_logging` is called.
+
+That is a requirement rather than a nicety, because this module sits underneath things that
+must be importable before the application is assembled. ``app.core.exceptions`` imports
+:func:`get_logger`, ``app.middleware.request_context`` imports ``app.core.exceptions``, and
+``app.middleware`` re-exports both - so a module-scope settings construction here would make
+``import app.middleware`` fail on a machine with no ``JWT_SECRET_KEY``, before
+``app.main`` had a chance to assemble anything or report anything useful.
 ``backend/migrations/env.py`` and the unit suite import from ``app.core`` without asking for
 logging to be reconfigured underneath them, and an ``alembic upgrade head`` that silently
 re-pointed the root logger would be a surprise in the worst possible place.
@@ -96,24 +135,208 @@ re-pointed the root logger would be a surprise in the worst possible place.
 Secrets never reach a log line
 ------------------------------
 A log line leaves the process, so it is an exfiltration path in the same way a committed file
-is. Nothing here logs a value: the module reads two settings and never renders them, never
-logs ``settings`` as an object, and the JSON traceback renderer is constructed with
+is. Nothing here logs a value: :func:`configure_logging` reads two settings and never renders
+them, never logs ``settings`` as an object, and the JSON traceback renderer is constructed with
 ``show_locals=False`` precisely so that a frame holding a password, a signing key or a raw
 refresh token cannot be serialised into a traceback. Callers keep that guarantee by logging
 identifiers rather than credentials.
+
+Untrusted values are normalised here, once
+------------------------------------------
+Three helpers exist for the values that come from outside the process, and they are here
+rather than in a middleware because two different layers log the same request:
+``app.middleware.request_context`` writes the access line, and ``app.core.exceptions`` writes
+the correlated record for a 500 it rendered.
+
+:func:`log_safe_text` bounds a value's length and replaces every character in Unicode's
+``Cc``, ``Cf``, ``Zl`` and ``Zp`` categories - so a path arriving percent-decoded as
+``/a\\r\\nlevel=critical`` cannot forge a second line, and a bidirectional override cannot
+make a rendered line read as something other than what was logged.
+:func:`anonymised_client_network` reduces a peer address to its ``/24`` or ``/64`` and drops
+anything that is not an address at all. And the ``HTTP_LOG_FIELD_*`` constants fix the field
+names both layers use, because two events describing one request under different keys cannot
+be correlated by a query.
 """
 
+import ipaddress
 import logging
+import re
 import sys
-from typing import Final
+import unicodedata
+from collections.abc import MutableMapping
+from functools import cache
+from typing import Any, Final
 
 import structlog
 from structlog.tracebacks import ExceptionDictTransformer
 from structlog.typing import FilteringBoundLogger, Processor
 
-from app.core.config import settings
+__all__ = [
+    "HTTP_LOG_FIELD_CLIENT_NETWORK",
+    "HTTP_LOG_FIELD_METHOD",
+    "HTTP_LOG_FIELD_PATH",
+    "HTTP_LOG_FIELD_STATUS",
+    "LOG_EXCEPTION_VALUE_MAX_LENGTH",
+    "LOG_TEXT_MAX_LENGTH",
+    "anonymised_client_network",
+    "configure_logging",
+    "get_logger",
+    "log_safe_text",
+]
 
-__all__ = ["configure_logging", "get_logger"]
+
+# ---------------------------------------------------------------------------------------
+# Field names shared by every HTTP log event
+#
+# `app.middleware.request_context` writes the access line for a finished request and
+# `app.core.exceptions` writes the correlated record for the 500 it rendered. They describe
+# the same request from two layers, so they must use the SAME keys: two events keyed
+# `path` and `http_path` cannot be correlated by a query, and the reader who tries has no
+# way to know the difference is accidental. Declaring the names here, in the module both
+# already depend on, is what makes agreement structural instead of coincidental.
+# ---------------------------------------------------------------------------------------
+HTTP_LOG_FIELD_METHOD: Final[str] = "http_method"
+"""Request method. Uppercase token, bounded and neutralised like any other field."""
+
+HTTP_LOG_FIELD_PATH: Final[str] = "path"
+"""Request path, percent-decoded by the server, therefore untrusted, therefore normalised."""
+
+HTTP_LOG_FIELD_STATUS: Final[str] = "status_code"
+"""Response status actually sent, or absent when no response started."""
+
+HTTP_LOG_FIELD_CLIENT_NETWORK: Final[str] = "client_network"
+"""Anonymised peer network - see :func:`anonymised_client_network`. Never a full address."""
+
+
+# ---------------------------------------------------------------------------------------
+# Bounded, control-character-free log text
+#
+# Two hazards, one function. The first is forgery: `scope["path"]` arrives percent-DECODED
+# from the server, so a request for `/a%0D%0Alevel=critical` really does reach this process
+# carrying a carriage return and a newline, and a console renderer will happily write them
+# out as a second line that looks like a record this service emitted. The C0/C1 ranges are
+# the obvious carriers, but they are not the only ones: U+2028 LINE SEPARATOR and U+2029
+# PARAGRAPH SEPARATOR are line breaks to many readers and log viewers, and the Cf category
+# holds the bidirectional overrides (U+202E and friends) that can make a rendered line read
+# right-to-left and so display text that is not what was logged. Every character in
+# Unicode's Cc, Cf, Zl and Zp categories is therefore replaced.
+#
+# The second hazard is size. A path is attacker-controlled and effectively unbounded, so an
+# unbounded field is both a log-volume amplifier and a way to push the rest of a record out
+# of a viewer's line. Every value is truncated to LOG_TEXT_MAX_LENGTH with a marker, so the
+# reader can see that truncation happened rather than silently reading a prefix as the whole.
+# ---------------------------------------------------------------------------------------
+LOG_TEXT_MAX_LENGTH: Final[int] = 256
+"""Longest text any single log field carries. Generous for a real path, and bounded."""
+
+_LOG_TRUNCATION_MARKER: Final[str] = "…"
+"""Appended when a value was shortened, so a prefix is never mistaken for the whole value."""
+
+_UNSAFE_REPLACEMENT: Final[str] = "\ufffd"
+"""U+FFFD REPLACEMENT CHARACTER: marks that something was removed, unlike silent deletion."""
+
+_UNSAFE_ASCII_CHARACTERS: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
+"""C0 controls and DEL: the fast path, since almost every value is pure ASCII."""
+
+_UNSAFE_UNICODE_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cf", "Zl", "Zp"})
+"""Control, format, line-separator and paragraph-separator characters.
+
+``Cc`` covers C0 and C1, ``Cf`` covers the bidirectional overrides, the zero-width joiners
+and U+FEFF, ``Zl`` is U+2028 and ``Zp`` is U+2029. Together they are every character that can
+forge a line break or make a rendered line read as something other than what was logged.
+Surrogates (``Cs``) and unassigned code points (``Cn``) are deliberately not here: they
+cannot be constructed from a decoded HTTP scope, and rejecting them would replace legitimate
+text in some scripts.
+"""
+
+
+@cache
+def _is_unsafe_character(character: str) -> bool:
+    """Whether *character* belongs to a category that must never reach a log line.
+
+    Cached because the set of characters flowing through paths and methods in a running
+    service is tiny and repeats endlessly, while ``unicodedata.category`` is a table lookup
+    per call. The cache is bounded in practice by the number of DISTINCT characters seen,
+    which is orders of magnitude smaller than the number of requests.
+    """
+    return unicodedata.category(character) in _UNSAFE_UNICODE_CATEGORIES
+
+
+def log_safe_text(value: str, *, limit: int = LOG_TEXT_MAX_LENGTH) -> str:
+    """Return *value* bounded to *limit* and with every unsafe character neutralised.
+
+    The single normalisation used by every HTTP log field in this service, so a method, a
+    path and any other untrusted string are treated identically no matter which layer emits
+    them.
+
+    Truncation happens **after** neutralisation, so the limit counts characters that will
+    actually be written and a replacement cannot push the value back over the bound.
+
+    Args:
+        value: The untrusted text.
+        limit: Maximum length of the returned string, marker included.
+
+    Returns:
+        Text safe to write into a structured record or a console line: no character that can
+        forge a line, reverse the reading order, or hide what follows it, and no more than
+        *limit* characters.
+    """
+    if value.isascii():
+        # Fast path. `str.isascii` is a flag check, and this covers effectively every real
+        # request; the general path below is reserved for values that genuinely need it.
+        cleaned = _UNSAFE_ASCII_CHARACTERS.sub(_UNSAFE_REPLACEMENT, value)
+    else:
+        cleaned = "".join(
+            _UNSAFE_REPLACEMENT if _is_unsafe_character(character) else character
+            for character in value
+        )
+
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(limit - len(_LOG_TRUNCATION_MARKER), 0)] + _LOG_TRUNCATION_MARKER
+
+
+_IPV4_ANONYMISED_PREFIX: Final[int] = 24
+"""Bits kept from an IPv4 peer address: the /24 it sits in, not the address itself."""
+
+_IPV6_ANONYMISED_PREFIX: Final[int] = 64
+"""Bits kept from an IPv6 peer address: the /64, the smallest block usually assigned to one
+subscriber."""
+
+
+def anonymised_client_network(host: str | None) -> str | None:
+    """Reduce a peer address to the network it came from, or drop it entirely.
+
+    An IP address identifies a person for practical and for regulatory purposes, and an
+    access log is retained, shipped and searched. What an operator actually needs from it is
+    the ability to see that a burst of failures shares an origin - which the network prefix
+    answers - not the ability to identify the individual behind it. So the host bits are
+    discarded here rather than by whoever reads the log later: IPv4 keeps its first three
+    octets (a ``/24``) and IPv6 its routing prefix (a ``/64``), which is the smallest block
+    a single subscriber is normally assigned.
+
+    Anything that does not parse as an address is dropped rather than logged as text. That
+    closes the last route by which a value from the transport could reach a log line
+    unvalidated, and it costs nothing: a non-address peer name is an in-process or
+    unix-socket transport, where there is no network to record.
+
+    Args:
+        host: ``scope["client"][0]``, or ``None`` when the transport has no peer.
+
+    Returns:
+        A network in CIDR form - ``"203.0.113.0/24"``, ``"2001:db8::/64"`` - or ``None``.
+    """
+    if not host:
+        return None
+    # An IPv6 scope identifier (`fe80::1%eth0`) is a local interface name, not part of the
+    # address, and `ip_address` rejects the whole value if it is present.
+    candidate = host.partition("%")[0]
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    prefix = _IPV4_ANONYMISED_PREFIX if address.version == 4 else _IPV6_ANONYMISED_PREFIX
+    return str(ipaddress.ip_network(f"{address}/{prefix}", strict=False))
 
 
 # ---------------------------------------------------------------------------------------
@@ -126,16 +349,15 @@ __all__ = ["configure_logging", "get_logger"]
 # renderings of one event into one, and it is why this list exists at all.
 # ---------------------------------------------------------------------------------------
 _DELEGATED_LOGGERS: Final[tuple[str, ...]] = (
-    # Uvicorn: `uvicorn.error` carries lifecycle and application errors, `uvicorn.access`
-    # carries the request line. Both are children of `uvicorn`, which is named as well
-    # because uvicorn's own dictionary configures the parent too.
+    # Uvicorn: `uvicorn.error` carries lifecycle and application errors. Both it and the
+    # parent `uvicorn` are named because uvicorn's own dictionary configures the parent too.
+    # `uvicorn.access` is deliberately NOT here - see _SILENCED_ACCESS_LOGGERS below.
     "uvicorn",
-    "uvicorn.access",
     "uvicorn.error",
     # Gunicorn: the production process manager (see backend/Dockerfile). Present only when
     # the service runs under it; naming a logger that never emits costs nothing.
+    # `gunicorn.access` is likewise absent, for the same reason.
     "gunicorn",
-    "gunicorn.access",
     "gunicorn.error",
     # Alembic: `Running upgrade …` at INFO is the record of what a migration actually did,
     # so it is worth having in the same structured stream as everything else.
@@ -147,15 +369,89 @@ _DELEGATED_LOGGERS: Final[tuple[str, ...]] = (
 )
 
 # ---------------------------------------------------------------------------------------
+# Server access logs, which this service does not want at all
+#
+# `app.middleware.request_context` is the SOLE owner of the access log. It writes exactly
+# one `http_request` event per request, carrying the correlated request identifier, a bounded
+# and control-character-neutralised path, an anonymised client network and the duration -
+# and deliberately not the query string, because a badly behaved client can put a credential
+# in a query value.
+#
+# The servers' own access loggers describe the same request again, on a different schema,
+# with none of that correlation, and uvicorn's format includes the full request target -
+# query string included. Two records per request is not twice the information: it is the same
+# event, differently shaped, one of which leaks. So these are not bridged into the chain;
+# they are silenced outright, which leaves one owner instead of a formatting compromise
+# between two.
+#
+# Silenced rather than filtered by level: a NullHandler plus `propagate = False` means the
+# record reaches nothing, cannot be re-enabled by an ambient LOG_LEVEL, and cannot fall
+# through to `logging.lastResort` either.
+# ---------------------------------------------------------------------------------------
+_SILENCED_ACCESS_LOGGERS: Final[tuple[str, ...]] = ("uvicorn.access", "gunicorn.access")
+
+# ---------------------------------------------------------------------------------------
+# The one duplicate traceback the server produces
+#
+# `ServerErrorMiddleware` re-raises after the 500 problem document has been sent - by design,
+# so that a server can log the failure - and uvicorn then writes `Exception in ASGI
+# application` with the full traceback on `uvicorn.error`. That is the THIRD serialisation of
+# one exception: `app.middleware.request_context` already logged it with its frames and the
+# request identifier attached, and `app.core.exceptions` logged the correlated summary of the
+# response it rendered. The middleware is the single traceback owner, so this last copy is
+# dropped.
+#
+# Matched on the message prefix and the presence of exception information, which is as narrow
+# as this can be made: uvicorn logs that exact string with `exc_info` set, from one call site
+# (`uvicorn.protocols.http.*.RequestResponseCycle.run_asgi`), in the pinned 0.52.1. Anything
+# else on `uvicorn.error` - a lifespan failure, a protocol error, a startup message - is
+# untouched. If a future uvicorn renames the message the filter simply stops matching, and
+# the failure mode is a duplicate log line rather than a lost one.
+# ---------------------------------------------------------------------------------------
+_ASGI_EXCEPTION_MESSAGE_PREFIX: Final[str] = "Exception in ASGI application"
+
+
+class _DuplicateAsgiTracebackFilter(logging.Filter):
+    """Drop uvicorn's re-raised copy of an exception this service has already logged."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return ``False`` for the duplicate, ``True`` for everything else.
+
+        Args:
+            record: The record ``uvicorn.error`` is about to emit.
+
+        Returns:
+            Whether the record should be handled.
+        """
+        message = record.msg if isinstance(record.msg, str) else ""
+        return not (
+            record.exc_info is not None and message.startswith(_ASGI_EXCEPTION_MESSAGE_PREFIX)
+        )
+
+
+# ---------------------------------------------------------------------------------------
 # SQLAlchemy's namespace, which needs a threshold rather than only a handler
 #
-# SQLAlchemy emits every rendered statement, and its bound parameters, at INFO on
-# `sqlalchemy.engine`. Letting that namespace simply inherit an INFO root would turn one
-# request into a dozen lines of SQL in production, so statement echo is opt-in: it is
-# enabled only when the operator asks for DEBUG, and an explicit `create_engine(echo=True)`
-# still works because that sets the logger's own level, which wins over the value set here.
+# SQLAlchemy emits every rendered statement at INFO on `sqlalchemy.engine.Engine`. Letting
+# that namespace simply inherit an INFO root would turn one request into a dozen lines of SQL
+# in production, so statement logging is opt-in: it is enabled only when the operator asks
+# for DEBUG. `app.db.session` builds the engine with `hide_parameters=True`, so what appears
+# at DEBUG is the statement and a marker in place of the bound values, never the values
+# themselves.
+#
+# `sqlalchemy.engine.Engine` is named explicitly, and it is the important one. It is the
+# logger SQLAlchemy actually emits statements on, and the one it attaches a plain-text
+# StreamHandler of its own to when an engine is constructed with `echo=True`
+# (`sqlalchemy.log._add_default_handler`). `app.db.session` sets no `echo`, so no such
+# handler is created - but naming the logger here means that if one ever is, this bridge
+# detaches it and the second, unstructured rendering of every statement disappears with it.
 # ---------------------------------------------------------------------------------------
-_SQL_LOGGERS: Final[tuple[str, ...]] = ("sqlalchemy", "sqlalchemy.engine", "sqlalchemy.pool")
+_SQL_LOGGERS: Final[tuple[str, ...]] = (
+    "sqlalchemy",
+    "sqlalchemy.engine",
+    "sqlalchemy.engine.Engine",
+    "sqlalchemy.pool",
+)
 
 _SQL_QUIET_LEVEL: Final[int] = logging.WARNING
 """Level pinned on the SQLAlchemy namespace unless ``LOG_LEVEL`` is ``DEBUG``."""
@@ -166,8 +462,8 @@ _SQL_QUIET_LEVEL: Final[int] = logging.WARNING
 _installed_handler: logging.Handler | None = None
 
 
-def _resolve_level() -> int:
-    """Translate the configured ``LOG_LEVEL`` name into its numeric level.
+def _resolve_level(level_name: str) -> int:
+    """Translate a ``LOG_LEVEL`` name into its numeric level.
 
     ``logging.getLevelNamesMapping`` is the standard library's own name-to-number table, so
     there is no second copy of ``{"INFO": 20, ...}`` to keep in step here.
@@ -177,8 +473,16 @@ def _resolve_level() -> int:
     process is still starting, so a lookup miss is impossible by construction. Were one to
     happen anyway it must raise, because ``.get(name, logging.INFO)`` would answer a
     misconfiguration by quietly logging at a level nobody asked for.
+
+    Args:
+        level_name: One of the five names ``Settings.LOG_LEVEL`` permits. Passed in by
+            :func:`configure_logging` rather than read here, so that importing this module
+            constructs no settings - see "Import purity" in the module docstring.
+
+    Returns:
+        The numeric threshold to apply to the wrapper class, the root logger and the handler.
     """
-    return logging.getLevelNamesMapping()[settings.LOG_LEVEL]
+    return logging.getLevelNamesMapping()[level_name]
 
 
 def _shared_processors() -> list[Processor]:
@@ -186,8 +490,9 @@ def _shared_processors() -> list[Processor]:
 
     The same list is used twice: as the head of *structlog*'s own chain, and as
     ``ProcessorFormatter``'s ``foreign_pre_chain`` for records that came from the standard
-    library. That is what makes a line from ``uvicorn.access`` carry the same keys, in the
-    same order, as a line from a service.
+    library. That is what makes a line from ``uvicorn.error``, ``alembic.runtime.migration``
+    or ``sqlalchemy.engine.Engine`` carry the same keys, in the same order, as a line from a
+    service.
 
     Order is a contract, not a preference:
 
@@ -215,7 +520,75 @@ def _shared_processors() -> list[Processor]:
     ]
 
 
-def _terminal_processors() -> list[Processor]:
+LOG_EXCEPTION_VALUE_MAX_LENGTH: Final[int] = 1024
+"""Longest exception message kept in a rendered traceback.
+
+Larger than :data:`LOG_TEXT_MAX_LENGTH`, because an exception message is written by the code
+that raised it rather than by a caller, and a driver or validation error can legitimately need
+several hundred characters to be useful. Bounded all the same: a message built by
+interpolating a request body into a string is an unbounded field with a different name.
+"""
+
+_EXCEPTION_KEY: Final[str] = "exception"
+_EXCEPTION_VALUE_KEY: Final[str] = "exc_value"
+_EXCEPTION_NOTES_KEY: Final[str] = "exc_notes"
+
+
+def _sanitise_exception_values(
+    _logger: object, _name: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Bound and neutralise the message of every exception in a rendered traceback.
+
+    Runs between ``ExceptionRenderer`` and ``JSONRenderer``, on the structured frames the
+    former produces, and rewrites only ``exc_value`` and ``exc_notes`` - the two members that
+    hold text somebody else composed. Frames, filenames and line numbers come from the
+    interpreter and are left exactly as they are.
+
+    The message of an exception is not a trusted string. ``raise ValueError(f"bad slug:
+    {value}")`` puts a request-supplied value into it verbatim, so a carriage return in that
+    value becomes a line break in a rendered log, a bidirectional override reverses how the
+    rest of the record reads, and an unbounded value makes an unbounded field. Applying
+    :func:`log_safe_text` here means an exception message is subject to the same rules as a
+    path, wherever it was raised and whoever wrote it - which is the only way to get that
+    guarantee without auditing every ``raise`` in the codebase forever.
+
+    What this cannot do is remove a secret somebody deliberately interpolated into a message,
+    and it does not pretend to: the traceback renderer is already constructed with
+    ``show_locals=False`` so a frame's variables are never serialised, and the standing rule
+    for callers is that a message names what failed rather than the value that failed. The
+    development path renders tracebacks as a single formatted string for a human reading a
+    terminal and is deliberately left alone; the structured path is the one that ships.
+
+    Args:
+        _logger: The wrapped logger. Unused, part of the *structlog* processor signature.
+        _name: The method name. Unused, part of the same signature.
+        event_dict: The event being rendered, possibly carrying an ``exception`` list.
+
+    Returns:
+        The same event dictionary, mutated in place and returned as the chain requires.
+    """
+    rendered = event_dict.get(_EXCEPTION_KEY)
+    if not isinstance(rendered, list):
+        return event_dict
+
+    for entry in rendered:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get(_EXCEPTION_VALUE_KEY)
+        if isinstance(value, str):
+            entry[_EXCEPTION_VALUE_KEY] = log_safe_text(value, limit=LOG_EXCEPTION_VALUE_MAX_LENGTH)
+        notes = entry.get(_EXCEPTION_NOTES_KEY)
+        if isinstance(notes, list):
+            entry[_EXCEPTION_NOTES_KEY] = [
+                log_safe_text(note, limit=LOG_EXCEPTION_VALUE_MAX_LENGTH)
+                if isinstance(note, str)
+                else note
+                for note in notes
+            ]
+    return event_dict
+
+
+def _terminal_processors(*, development: bool) -> list[Processor]:
     """Return the exception renderer and the terminal renderer, chosen as one pair.
 
     They are returned together because they only make sense together, and pairing them in a
@@ -235,14 +608,25 @@ def _terminal_processors() -> list[Processor]:
     signing key inside ``core.security`` and a raw refresh token inside token rotation, so
     the shortcut would turn any exception on those paths into a credential leak. Structured
     frames without locals keep the diagnostic value and drop the hazard.
+
+    Args:
+        development: Whether to render for a human reading a terminal. Supplied by
+            :func:`configure_logging` from ``settings.is_development`` rather than read here,
+            so that importing this module constructs no settings - see "Import purity" in the
+            module docstring. Keyword-only, because a bare boolean at a call site says
+            nothing about which of the two renderers it selects.
+
+    Returns:
+        The exception renderer and terminal renderer, in the order they must run.
     """
-    if settings.is_development:
+    if development:
         return [
             structlog.processors.format_exc_info,
             structlog.dev.ConsoleRenderer(colors=sys.stdout.isatty()),
         ]
     return [
         structlog.processors.ExceptionRenderer(ExceptionDictTransformer(show_locals=False)),
+        _sanitise_exception_values,
         structlog.processors.JSONRenderer(),
     ]
 
@@ -265,16 +649,53 @@ def _delegate_to_root(name: str, level: int) -> None:
     logger.setLevel(level)
 
 
+def _silence(name: str) -> None:
+    """Make one library logger emit nothing at all, whatever its level.
+
+    Used for the servers' own access loggers, whose event
+    ``app.middleware.request_context`` already owns. Three steps, each closing one way the
+    records could still get out: the logger's own handlers are detached, ``propagate`` is
+    switched off so the root handler this module installed is never reached, and a
+    ``NullHandler`` is attached so the record does not fall through to
+    ``logging.lastResort`` (which writes WARNING and above to stderr, unformatted).
+
+    Deliberately not done by raising the level: a level is something an ambient
+    ``LOG_LEVEL`` or a later ``dictConfig`` can lower again, whereas a logger with no route
+    to a handler stays silent.
+    """
+    logger = logging.getLogger(name)
+    for attached in list(logger.handlers):
+        logger.removeHandler(attached)
+    logger.propagate = False
+    logger.addHandler(logging.NullHandler())
+
+
 def _bridge_library_loggers(level: int) -> None:
-    """Route every dependency's logger through the root handler exactly once.
+    """Route every dependency's logger through the root handler exactly once - or nowhere.
 
     Called after the root handler is in place. The uvicorn, gunicorn, alembic and warnings
     loggers inherit the configured threshold; the SQLAlchemy namespace is pinned to
-    ``WARNING`` unless the operator asked for ``DEBUG``, so statement echo is something a
-    deployment opts into rather than something it discovers in a bill for log storage.
+    ``WARNING`` unless the operator asked for ``DEBUG``, so statement logging is something a
+    deployment opts into rather than something it discovers in a bill for log storage; the
+    servers' access loggers are silenced, because this service already writes exactly one
+    access line per request from the middleware that has the request identifier bound; and
+    ``uvicorn.error`` additionally carries a filter that drops the one duplicate traceback
+    ``ServerErrorMiddleware`` causes it to write.
     """
     for name in _DELEGATED_LOGGERS:
         _delegate_to_root(name, logging.NOTSET)
+
+    # After the delegation above, which detached uvicorn's own handlers - the filter belongs
+    # on the logger rather than on a handler so it applies wherever the record would go, and
+    # it is re-added idempotently because `configure_logging` may be called more than once.
+    uvicorn_error = logging.getLogger("uvicorn.error")
+    for existing in list(uvicorn_error.filters):
+        if isinstance(existing, _DuplicateAsgiTracebackFilter):
+            uvicorn_error.removeFilter(existing)
+    uvicorn_error.addFilter(_DuplicateAsgiTracebackFilter())
+
+    for name in _SILENCED_ACCESS_LOGGERS:
+        _silence(name)
 
     sql_level = logging.NOTSET if level <= logging.DEBUG else _SQL_QUIET_LEVEL
     for name in _SQL_LOGGERS:
@@ -336,8 +757,17 @@ def configure_logging() -> None:
     The stream is resolved when this runs rather than when the module is imported, so it is
     whatever ``sys.stdout`` is at configuration time - the process stdout the container
     runtime collects in a deployment, and a capture buffer under a test.
+
+    The settings import is local to this function, and that placement is load-bearing rather
+    than stylistic: it is what keeps ``import app.core.logging`` - and therefore
+    ``import app.core.exceptions`` and ``import app.middleware`` - free of any settings
+    construction. See "Import purity" in the module docstring. It also preserves the
+    reconfiguration property above, because the singleton is re-read on every call.
     """
-    level = _resolve_level()
+    # Imported here, not at module scope. See the docstring above.
+    from app.core.config import settings
+
+    level = _resolve_level(settings.LOG_LEVEL)
     shared = _shared_processors()
 
     # `remove_processors_meta` first, because it deletes the bookkeeping keys
@@ -349,7 +779,7 @@ def configure_logging() -> None:
         foreign_pre_chain=shared,
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-            *_terminal_processors(),
+            *_terminal_processors(development=settings.is_development),
         ],
     )
 

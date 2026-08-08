@@ -8,20 +8,43 @@
  * The suite it prepares is a blocking gate: `make test` runs
  * `npm run test -- --run`, and the CI workflow fails the build on the result. A
  * gate whose outcome depends on ambient machine state - a stray dev server, a
- * developer's `.env.local`, a reachable network - proves nothing, so this module
- * pins each of those inputs rather than hoping they are absent.
+ * developer's `.env.local`, a reachable network - proves nothing, so each of
+ * those inputs is pinned rather than hoped to be absent.
  *
- * Five responsibilities, in the order they appear below:
+ * The public runtime configuration is pinned by `vitest.config.ts` through its
+ * `test.env` block and NOT here, and that placement is load-bearing rather than
+ * tidy: ES module imports are hoisted, so any assignment written in this file
+ * would run *after* every module this file imports had already been evaluated,
+ * and a module that reads `process.env.NEXT_PUBLIC_*` at its top level would
+ * observe a developer's ambient value instead of the pinned one. Vitest applies
+ * `test.env` before a setup file or a test module is evaluated, which makes that
+ * block the single source of truth for the four values and makes the ordering
+ * correct by construction rather than by convention.
+ *
+ * Three responsibilities, in the order they appear below:
  *
  *   1. Register the jest-dom matchers, so a test can assert on an accessible
  *      name or on visible text instead of on markup structure. Styling and
  *      design-token changes must never be able to break a test.
- *   2. Pin the public runtime configuration, so no test reads a developer's
- *      environment.
- *   3. Own the Mock Service Worker lifecycle, intercepting HTTP at the network
- *      boundary.
- *   4. Unmount every rendered tree between tests.
- *   5. Fill in the browser APIs jsdom does not implement.
+ *   2. Unmount every rendered tree between tests.
+ *   3. Fill in the browser APIs jsdom does not implement.
+ *
+ * WHERE THE REQUEST-INTERCEPTION LIFECYCLE LIVES, AND WHY NOT HERE
+ *
+ * Component tests intercept HTTP at the network boundary with Mock Service
+ * Worker rather than by mocking `fetch` or `src/lib/api/client.ts`, and `msw` is
+ * pinned in package.json for exactly that. The server instance, its default
+ * handler list and its `listen`/`resetHandlers`/`close` hooks all belong to the
+ * test-support boundary that introduces `tests/**` alongside the first specs
+ * that need them - not to this file.
+ *
+ * The distinction is not bookkeeping. Naming a module here that the test-support
+ * boundary has not written yet makes this file the reason that module has to
+ * exist, which inverts the dependency: an unresolved import fails every test
+ * file at collection time, so the runner cannot be exercised at all until an
+ * out-of-boundary path is materialised to satisfy it. This module therefore
+ * imports nothing from `tests/`, and the suite it prepares is runnable on its own
+ * from the moment the first spec lands.
  *
  * Deliberately absent, and not to be added:
  *
@@ -47,74 +70,10 @@
 import '@testing-library/jest-dom/vitest';
 
 import { cleanup } from '@testing-library/react';
-import { setupServer } from 'msw/node';
-import { afterAll, afterEach, beforeAll, vi } from 'vitest';
-
-// `tests/` sits outside `src/`, and the only alias `vitest.config.ts` declares
-// is `@` -> `./src/`. This import therefore has to stay relative; `@/tests/...`
-// does not resolve.
-import { handlers } from './tests/msw/handlers';
+import { afterEach, vi } from 'vitest';
 
 /* -------------------------------------------------------------------------- */
-/* 2. Hermetic public configuration                                           */
-/* -------------------------------------------------------------------------- */
-
-/*
- * The three `NEXT_PUBLIC_*` values, fixed to what `.env.example` documents.
- *
- * These are assigned unconditionally rather than defaulted, on purpose: a
- * developer's `frontend/.env.local` must not be able to change the outcome of a
- * gate. Neither URL can reach a real service from a component test, because MSW
- * is started with `onUnhandledRequest: 'error'` below and so raises instead of
- * opening a socket.
- *
- * The base URL carries the `/api/v1` prefix, matching the contract: client code
- * appends paths such as `/posts` to it and never repeats the prefix.
- *
- * Note that ES module imports are hoisted, so `./tests/msw/handlers` is
- * evaluated before these assignments run. A handler module that reads the base
- * URL at module scope therefore has to carry the same documented default
- * itself - which is why the values here are the documented ones rather than
- * invented test hostnames.
- */
-process.env.NEXT_PUBLIC_API_BASE_URL = 'http://localhost:8000/api/v1';
-process.env.NEXT_PUBLIC_SITE_URL = 'http://localhost:3000';
-process.env.NEXT_PUBLIC_SITE_NAME = 'Modern Blog';
-
-/* -------------------------------------------------------------------------- */
-/* 3. Mock Service Worker lifecycle                                           */
-/* -------------------------------------------------------------------------- */
-
-/**
- * The single request-interception server shared by every component test.
- *
- * Exported so an individual test can narrow behaviour for itself with
- * `server.use(...)` - an error status, a delay, a specific payload. Those
- * overrides are discarded after each test by the `resetHandlers` hook below, so
- * one test can never inherit another's mock.
- */
-export const server = setupServer(...handlers);
-
-beforeAll(() => {
-  // `'error'` is the point of this line and must not be relaxed to `'warn'` or
-  // `'bypass'`. An unhandled request means a component reached for the network
-  // with no mock behind it, which under a blocking gate has to fail loudly
-  // rather than pass quietly. It also keeps the suite honest about the API
-  // client being the only module allowed to perform HTTP: anything else that
-  // quietly fetches surfaces here as a failure.
-  server.listen({ onUnhandledRequest: 'error' });
-});
-
-afterEach(() => {
-  server.resetHandlers();
-});
-
-afterAll(() => {
-  server.close();
-});
-
-/* -------------------------------------------------------------------------- */
-/* 4. Rendered-tree cleanup                                                   */
+/* 2. Rendered-tree cleanup                                                   */
 /* -------------------------------------------------------------------------- */
 
 /*
@@ -128,17 +87,16 @@ afterAll(() => {
  * explicit, and it is idempotent - a second `cleanup()` on an already-unmounted
  * tree is a no-op.
  *
- * This is a separate hook from `resetHandlers` above so that a throw in either
- * cannot skip the other. The two touch disjoint state - the DOM and MSW's
- * handler registry - and both are synchronous, so their relative order carries
- * no meaning.
+ * It is registered as a hook of its own rather than folded into any other
+ * teardown this file might later gain, so that a throw elsewhere in teardown
+ * cannot skip the unmount and leak a tree into the next test.
  */
 afterEach(() => {
   cleanup();
 });
 
 /* -------------------------------------------------------------------------- */
-/* 5. Browser APIs jsdom 30 does not implement                                */
+/* 3. Browser APIs jsdom 30 does not implement                                */
 /* -------------------------------------------------------------------------- */
 
 /*

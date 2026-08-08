@@ -40,7 +40,8 @@ and with it a live async engine, plus the entire declarative model tree into eve
 ``alembic upgrade head``, ``alembic downgrade base`` and ``alembic check`` run - purely
 as a side effect of importing the parent package, before any migration was asked for.
 
-``__version__`` is deliberately absent as well. It belongs to ``app/__init__.py``, the
-single source of the version ``app.main`` publishes in its OpenAPI document; a second
-declaration here would be a second source of truth.
+``__version__`` is deliberately absent as well, here and in every other package marker
+including ``app/__init__.py``. ``[project] version`` in ``backend/pyproject.toml`` is the
+single source of the version ``app.main`` publishes in its OpenAPI document, read from that
+project metadata; a declaration in any module would be a second source of truth.
 """

@@ -102,7 +102,7 @@ and the test harness.
 
 Access paths
 ------------
-Five indexes serve this relation, and each exists for a query the product actually issues:
+Six indexes serve this relation, and each exists for a query the product actually issues:
 
 * ``ix_posts_status_published_at`` over ``(status, published_at DESC)`` - the home feed's
   default ordering, "recent published posts", which is the single most-issued query in the
@@ -114,6 +114,12 @@ Five indexes serve this relation, and each exists for a query the product actual
   Ranked full-text search remains the primary path; this one exists for the near-miss.
 * ``ix_posts_slug`` - the unique index ``unique=True`` and ``index=True`` together produce,
   which resolves a canonical URL to a row in one probe.
+* ``ix_posts_slug_trgm`` - a GIN trigram index over ``(slug::text)``, for the anchored
+  ``slug LIKE 'base%'`` family scan that slug de-duplication runs before every insert and
+  retitle. The unique index above cannot serve that predicate: it carries the default operator
+  class over a ``citext`` column, which offers nothing for a pattern match at any size. The
+  index is over the text *cast* for the same reason every citext trigram index in this schema
+  is - see the comment on the index itself.
 * ``ix_posts_author_id`` - profile and author-dashboard listings.
 
 The ``pg_trgm`` extension the trigram operator class belongs to is enabled by revision
@@ -140,7 +146,11 @@ likely to attract behaviour:
 * **No ownership check.** ``author_id`` records who owns a row; deciding what that permits is
   ``app.services.post_service`` and ``app.core.dependencies``, and every protected operation
   re-checks it server-side.
-* **No view-count increment.** :attr:`Post.view_count` is a column the service layer advances.
+* **No view-count increment.** :attr:`Post.view_count` is a column and nothing else - there is no
+  ``record_view()`` method here. Nor is there one anywhere else yet: no route in the REST surface
+  advances the counter, and ``app.repositories.post_repository`` records at its own head that it
+  deliberately ships no increment operation and no ``"popular"`` sort. The column exists so that
+  advancing it later is a service-layer change behind an unchanged contract.
 * **No statement of any kind.** No query, no classmethod finder, no hybrid property, no
   property that filters a collection. Every statement in the backend is built in
   ``app.repositories.*``, and the feed's composition of relevance ranking, category joins,
@@ -176,12 +186,13 @@ have a counterpart in a revision even though the revisions split the work in two
   use, and the ``name=`` passed below is the stem the convention interpolates rather than the
   full name.
 * ``migrations/versions/0002_post_search_vector_and_indexes.py`` adds the generated column and
-  the two GIN indexes, kept separate so the index build is a distinct, re-runnable step. The
-  split does **not** license omitting those three objects from this model: metadata is the
+  the three GIN indexes - ``ix_posts_search_vector``, ``ix_posts_title_trgm`` and
+  ``ix_posts_slug_trgm`` - kept separate so the index build is a distinct, re-runnable step. The
+  split does **not** license omitting those four objects from this model: metadata is the
   reference side, so an object present in the database and absent here would be proposed for
   removal on the next autogenerate. They are declared below for exactly that reason. Be aware
   that Alembic does not reliably detect purely expression-based indexes, so the correspondence
-  between those two indexes and revision ``0002`` has to be maintained deliberately rather
+  between those three indexes and revision ``0002`` has to be maintained deliberately rather
   than relied upon to be caught by the gate.
 * ``app.models.__init__`` re-exports both :class:`Post` and :class:`PostStatus`; a relation the
   migration runner never imports is a relation autogeneration cannot see.
@@ -196,7 +207,17 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, Computed, DateTime, ForeignKey, Index, Integer, Text, text
+from sqlalchemy import (
+    CheckConstraint,
+    Computed,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Text,
+    literal_column,
+    text,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import CITEXT, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -406,9 +427,17 @@ class Post(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     Written from :mod:`app.core.slug`, which derives it from the title within an 80-character
     bound and suffixes a collision so uniqueness is reached before the insert rather than by
-    catching the violation. **Stable once assigned**: a canonical URL that changes after
-    publication is a broken link and a lost ranking, which is why the SEO requirement rests on
-    this column and why ``app.services.post_service`` re-derives it only on an explicit retitle.
+    catching the violation.
+
+    **Derived once, at creation, and never again.** A canonical URL that changes after publication
+    is a broken link and a lost ranking, and this column is what the whole SEO requirement rests
+    on: ``/blog/{slug}`` is the address in every published link, every ``<link rel="canonical">``
+    tag and every sitemap entry. So a retitle changes :attr:`title` alone - the headline a reader
+    sees moves and the address they bookmarked keeps resolving. Nothing in the backend recomputes
+    this value: :mod:`app.core.slug` ships no "re-slug from the new title" helper,
+    ``app.schemas.post.PostUpdate`` exposes no member that could ask for one and rejects a
+    submitted ``slug`` with ``422`` under ``extra="forbid"``, and no repository method assigns to
+    this column after the insert.
     """
 
     excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -484,11 +513,20 @@ class Post(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         # NULL, which is what lets the column be NOT NULL without a Python-side default.
         server_default=text("0"),
     )
-    """How many times the post has been read, never null and never negative in practice.
+    """A readership counter, never null and never negative, and currently always zero.
 
-    Advanced by ``app.services.post_service`` when a detail page is served. Deliberately a
-    stored counter on the post rather than a derived count: there is no view relation to
-    aggregate, and inventing one would trade a column for a table that grows without bound.
+    The column the schema provides for "how many times this post has been read", and at present
+    nothing advances it: no endpoint in the REST surface increments it, no repository method
+    updates it and no input model accepts it, so every row reports the ``0`` this server default
+    writes. That is stated rather than glossed because a reader of this attribute would otherwise
+    reasonably assume a populated counter - and because ``app.repositories.post_repository``
+    depends on the same fact, shipping no ``"popular"`` sort on the grounds that ordering by a
+    uniformly zero column would silently do nothing.
+
+    Deliberately a stored counter on the post rather than a derived count: there is no view
+    relation to aggregate, and inventing one would trade a column for a table that grows without
+    bound. Keeping the column means the day a service advances it, the API contract that already
+    publishes it does not change.
     """
 
     search_vector: Mapped[str] = mapped_column(
@@ -586,6 +624,34 @@ class Post(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "title",
             postgresql_using="gin",
             postgresql_ops={"title": "gin_trgm_ops"},
+        ),
+        Index(
+            # The slug FAMILY scan, which is a different question from the slug lookup above.
+            # ix_posts_slug resolves one slug to one row; this one answers "which slugs begin with
+            # this stem", the query app.repositories.post_repository.slugs_starting_with issues
+            # before every create and every retitle so that uniqueness is reached before the
+            # INSERT rather than by catching a unique violation.
+            #
+            # Anchoring that pattern means the query is not PREVENTED from using an index, but the
+            # default operator class over a citext column does not provide one - so it was a
+            # sequential scan over every post whatever ix_posts_slug did. Measured on PostgreSQL
+            # 18.4 at twenty thousand posts: a sequential scan on the column, a bitmap index scan
+            # over the text cast.
+            #
+            # gin_trgm_ops is defined over `text` and citext's own `~~`/`~~*` operators are not in
+            # that operator family, so this indexes the CAST, and post_repository writes the
+            # matching predicate as `cast(Post.slug, Text).ilike(...)` - ILIKE rather than LIKE,
+            # because casting away citext also casts away the case-folding that makes a stored
+            # `My-Post` correctly rule out a proposed `my-post`.
+            #
+            # A LABELLED literal_column with the operator class in `postgresql_ops`, not one
+            # text("(slug::text) gin_trgm_ops") string: both render the same DDL, but Alembic warns
+            # on the inline form and then stops comparing the index, leaving it unguarded by the
+            # drift gate. Built by revision 0002 alongside the two above.
+            "ix_posts_slug_trgm",
+            literal_column("(slug::text)").label("slug_text"),
+            postgresql_using="gin",
+            postgresql_ops={"slug_text": "gin_trgm_ops"},
         ),
     )
 

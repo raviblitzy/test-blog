@@ -9,10 +9,11 @@
 // belongs to determines what it is allowed to contain, and this one contributes token-derived
 // VISUALS and nothing else.
 //
-// Its consumers are src/components/layout/user-menu.tsx and the three admin row-action menus
-// (user-row-actions, post-row-actions, comment-moderation-actions). Those three offer delete
-// actions, which is why the item part carries a destructive treatment rather than leaving each
-// call site to invent one.
+// Its consumers are src/components/layout/user-menu.tsx, src/components/layout/theme-toggle.tsx
+// and the three admin row-action menus (user-row-actions, post-row-actions,
+// comment-moderation-actions). The three row menus offer delete actions, which is why the item
+// part carries a destructive treatment rather than leaving each call site to invent one; the
+// theme control is why the file also exports a radio pair (see section 4).
 //
 // ---------------------------------------------------------------------------
 // 1. WHAT RADIX OWNS - AND MUST NOT BE REIMPLEMENTED HERE
@@ -55,10 +56,11 @@
 // not a neutral wash, which is exactly why the highlight flips the label to
 // primary-foreground instead of leaving it as foreground.
 //
-// `border-border` rather than `border-border-strong` is deliberate. globals.css reserves the
-// strong token for boundaries that IDENTIFY an interactive control (input, textarea, select),
-// where WCAG 1.4.11 applies. A menu panel's outline is decorative - the items are identified by
-// their labels - so the decorative hairline is the correct choice.
+// `border-border` rather than `border-muted-foreground` is deliberate. globals.css composes the
+// higher-contrast boundary from that token only for boundaries that IDENTIFY an interactive
+// control (input, textarea, the select trigger, the secondary button), where WCAG 1.4.11 applies.
+// A menu panel's outline is decorative - the items are identified by their labels - so the
+// decorative hairline is the correct choice.
 //
 // There is no `dark:` conditional anywhere below, and there must never be one. Dark mode is a
 // token-layer concern: globals.css declares each token twice and src/providers/theme-provider
@@ -96,12 +98,21 @@
 // ---------------------------------------------------------------------------
 // 4. DELIBERATELY ABSENT - DO NOT ADD
 //
-//   1. DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuCheckboxItem,
-//      DropdownMenuRadioItem, DropdownMenuSub* and a "shortcut" span. The contract is fixed at
-//      five parts, and none of the four described consumers needs more: the user menu is a flat
-//      list of links plus sign-out, and each admin row menu is a flat list of actions. An
-//      unused export is dead weight the lint gate can flag, and every extra part is one more
-//      surface to keep themed. Add one only when a real consumer needs it.
+//   1. DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuCheckboxItem, DropdownMenuSub* and
+//      a "shortcut" span. The contract is fixed at seven parts, and no described consumer needs
+//      more: the user menu is a flat list of links plus sign-out, each admin row menu is a flat
+//      list of actions, and the theme control is a single radio group. An unused export is dead
+//      weight the lint gate can flag, and every extra part is one more surface to keep themed.
+//      Add one only when a real consumer needs it.
+//
+//      The radio pair - DropdownMenuRadioGroup and DropdownMenuRadioItem - is the one part that
+//      graduated off this list, under exactly that rule. The colour theme is a THREE-valued
+//      setting (System, Light, Dark), and no boolean control can state which of the three is
+//      current: `aria-pressed` misreports two of them however it is wired, and a label naming
+//      the next value describes a state the visitor is not in. A radio group exposes the domain
+//      and the selection directly, so the setting is observable rather than inferred. The pair
+//      is styled from the same MENU_ITEM_BASE as the plain item and adds only an indicator
+//      gutter, so it costs one lookup and no new token.
 //   2. An import of ./button. Consumers compose that themselves through
 //      `<DropdownMenuTrigger asChild><Button /></DropdownMenuTrigger>`; importing it here would
 //      couple two independent primitives and force the button into every bundle that opens a
@@ -115,19 +126,10 @@
 //      caller's className still wins its property group.
 
 import * as DropdownMenuPrimitive from '@radix-ui/react-dropdown-menu';
+import { Check } from 'lucide-react';
 import type { ComponentProps, JSX } from 'react';
 
 import { cn } from '@/lib/utils';
-
-/**
- * Gap between the trigger and the panel, in CSS pixels.
- *
- * Radix's positioning props are numbers, not class names, so this is the one value in the file
- * that cannot be a utility. It is still traceable to the scale: 4 is exactly one step of the
- * engine's `--spacing` unit (0.25rem = 4px), the same step `p-1` applies inside the panel.
- * Callers override it with the `sideOffset` prop.
- */
-const CONTENT_SIDE_OFFSET = 4;
 
 /**
  * Panel classes.
@@ -289,10 +291,17 @@ const DropdownMenuGroup = DropdownMenuPrimitive.Group;
  * that clips or scrolls. That is not cosmetic: the admin row menus sit inside a horizontally
  * scrollable table container, and an unportalled panel would be cropped by it.
  *
- * `align` ("start" | "center" | "end") and every other positioning prop - `side`,
+ * `align` ("start" | "center" | "end") and every other positioning prop - `side`, `sideOffset`,
  * `alignOffset`, `collisionPadding`, `avoidCollisions` - reach the primitive through the
- * spread, as do the behavioural ones such as `loop`. `sideOffset` is the only one given a
- * default, which a caller can still override.
+ * spread with Radix's own defaults, as do the behavioural ones such as `loop`. NOTHING is
+ * defaulted here, and that includes the gap between trigger and panel: the panel sits flush
+ * against its trigger unless a caller asks otherwise. Radix takes that offset as a NUMBER rather
+ * than a class, so any non-zero default would be a raw dimension literal in a component, which the
+ * project's token rule does not permit and which no scale lookup can launder - the value has to
+ * cross from CSS into JavaScript. A flush panel needs no literal and still reads as its own
+ * surface, because CONTENT_CLASSES gives it the raised fill, the hairline and the elevation
+ * shadow. `@/components/ui/select` makes the identical choice, so the two floating surfaces still
+ * sit at an identical distance from their triggers.
  *
  * Arrow keys CLAMP at the first and last row rather than wrapping, because Radix's `loop`
  * defaults to false and this wrapper does not override it. Pass `loop` if a menu wants
@@ -323,18 +332,10 @@ const DropdownMenuGroup = DropdownMenuPrimitive.Group;
  * </DropdownMenuContent>
  * ```
  */
-function DropdownMenuContent({
-  className,
-  sideOffset = CONTENT_SIDE_OFFSET,
-  ...props
-}: DropdownMenuContentProps): JSX.Element {
+function DropdownMenuContent({ className, ...props }: DropdownMenuContentProps): JSX.Element {
   return (
     <DropdownMenuPrimitive.Portal>
-      <DropdownMenuPrimitive.Content
-        sideOffset={sideOffset}
-        className={cn(CONTENT_CLASSES, className)}
-        {...props}
-      />
+      <DropdownMenuPrimitive.Content className={cn(CONTENT_CLASSES, className)} {...props} />
     </DropdownMenuPrimitive.Portal>
   );
 }
@@ -370,10 +371,98 @@ function DropdownMenuItem({
   );
 }
 
+/**
+ * Indicator-gutter classes for a radio row.
+ *
+ * A radio row reserves space for its tick whether or not it is the selected one, so the labels of
+ * every row in a group line up instead of shifting by the width of a glyph as the selection moves.
+ * `ps-9` is the gutter (the 3-step inline padding of MENU_ITEM_BASE plus a 4-step glyph plus a
+ * 2-step gap) and the indicator is absolutely positioned inside it, at the logical inline-start so
+ * it moves to the correct side under a right-to-left document.
+ */
+const MENU_RADIO_ITEM_BASE = 'ps-9';
+
+/** The absolutely-positioned tick well, sized from the spacing scale like every other glyph here. */
+const MENU_RADIO_INDICATOR_CLASSES = 'absolute start-3 flex size-4 items-center justify-center';
+
+/**
+ * A group of mutually exclusive rows, and the part that makes the CURRENT SELECTION observable.
+ *
+ * Radix renders `role="group"` here and gives each child row `role="menuitemradio"` with
+ * `aria-checked` maintained from `value`, so a screen reader announces both the options and which
+ * one is active - the thing a single cycling button cannot express, whatever it is labelled. Drive
+ * it with `value` + `onValueChange`.
+ *
+ * Re-exported unstyled: the rows carry the visuals, and the group's only job is the state.
+ *
+ * WHY THIS PART EARNS ITS PLACE IN THE PRIMITIVE LAYER. A tri-state setting - the colour theme is
+ * this application's one example, with System, Light and Dark - cannot be honestly represented by a
+ * control that reports one boolean. `aria-pressed` misreports two of the three states whichever way
+ * it is wired, and a label that names the NEXT state ("Switch to dark mode") is both a hydration
+ * hazard and a lie about the present one. A radio group states the domain and the selection
+ * directly, which is why the theme control is built from these two parts rather than from a button
+ * that cycles.
+ */
+const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup;
+
+/** Props of {@link DropdownMenuRadioItem}, taken from the primitive so they cannot drift. */
+type DropdownMenuRadioItemProps = ComponentProps<typeof DropdownMenuPrimitive.RadioItem>;
+
+/**
+ * One option inside a {@link DropdownMenuRadioGroup}.
+ *
+ * Renders `role="menuitemradio"` with `aria-checked` reflecting whether its `value` is the group's
+ * current one, and paints a tick in the reserved gutter when it is - so the selection is exposed
+ * BOTH programmatically and visibly, and neither depends on the other being noticed.
+ *
+ * Styled from the same MENU_ITEM_BASE and default-variant classes as {@link DropdownMenuItem}, so a
+ * group of radio rows and a group of plain rows read as one menu. There is no `destructive` variant:
+ * choosing between options is not a destructive act, and offering the tint here would invite it to
+ * be used decoratively.
+ *
+ * The tick is `aria-hidden`: `aria-checked` already carries the selected state, so announcing the
+ * glyph as well would say it twice.
+ *
+ * @param className - Merged through `cn()`, so a caller's utility wins its property group.
+ * @param children - The option's visible label.
+ * @param props - `value` (required), `disabled`, `onSelect`, `ref` and every other prop of the
+ *   primitive, spread straight onto it.
+ *
+ * @example The colour-theme setting
+ * ```tsx
+ * <DropdownMenuRadioGroup value={theme} onValueChange={setTheme}>
+ *   <DropdownMenuRadioItem value="system">System</DropdownMenuRadioItem>
+ *   <DropdownMenuRadioItem value="light">Light</DropdownMenuRadioItem>
+ *   <DropdownMenuRadioItem value="dark">Dark</DropdownMenuRadioItem>
+ * </DropdownMenuRadioGroup>
+ * ```
+ */
+function DropdownMenuRadioItem({
+  className,
+  children,
+  ...props
+}: DropdownMenuRadioItemProps): JSX.Element {
+  return (
+    <DropdownMenuPrimitive.RadioItem
+      className={cn(MENU_ITEM_BASE, MENU_ITEM_VARIANTS.default, MENU_RADIO_ITEM_BASE, className)}
+      {...props}
+    >
+      <span className={MENU_RADIO_INDICATOR_CLASSES}>
+        <DropdownMenuPrimitive.ItemIndicator>
+          <Check aria-hidden="true" />
+        </DropdownMenuPrimitive.ItemIndicator>
+      </span>
+      {children}
+    </DropdownMenuPrimitive.RadioItem>
+  );
+}
+
 export {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuGroup,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
 };

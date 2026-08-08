@@ -1,4 +1,4 @@
-"""The generic, session-bound repository that every concrete repository in this service extends.
+"""The generic, session-bound repositories that every concrete repository in this service extends.
 
 ``app.repositories`` is the only layer in the backend that builds a SQL statement, and this
 module is the only place in that layer that builds a *generic* one. Everything here is
@@ -8,6 +8,34 @@ a caller's statement - so that the concrete repositories which subclass it hold 
 queries that are genuinely about their own relation. ``post_repository`` in particular stays
 the single home of feed composition: relevance ranking, category joins, author filtering,
 status scoping, ordering.
+
+Two base classes, split on key shape
+------------------------------------
+:class:`BaseRepository` holds what is true of any mapped class: the session binding, a
+criteria lookup, existence, counting, saving and deleting a loaded instance, and windowing.
+:class:`UUIDPrimaryKeyRepository` adds the three operations that presuppose a *single*
+surrogate primary key - :meth:`~UUIDPrimaryKeyRepository.get_by_id`,
+:meth:`~UUIDPrimaryKeyRepository.add` and
+:meth:`~UUIDPrimaryKeyRepository.delete_by_id`.
+
+The split follows the schema exactly. Five relations carry
+``app.db.base.UUIDPrimaryKeyMixin`` - ``users``, ``refresh_tokens``, ``categories``,
+``posts``, ``comments`` - and their repositories extend the subclass. ``post_likes`` is keyed
+``(post_id, user_id)``, so ``LikeRepository`` extends :class:`BaseRepository` directly and
+none of those three appears on it at all. That is the point of separating them rather than
+documenting them as inapplicable: a single-UUID lookup against a composite key is a runtime
+failure that a type checker cannot see, and an ORM ``add`` against ``post_likes`` bypasses
+the conflict-ignoring insert that makes liking idempotent. Removing them from the surface
+turns both mistakes into type errors at the call site.
+
+A subclass names its base according to the relation it maps, and nothing else changes::
+
+    class PostRepository(UUIDPrimaryKeyRepository[Post]):  # id-keyed
+        model = Post
+
+
+    class LikeRepository(BaseRepository[PostLike]):  # (post_id, user_id)-keyed
+        model = PostLike
 
 The defect this module retires
 ------------------------------
@@ -24,8 +52,9 @@ wrote the same identity predicate three separate times, once per handler that ne
 Each of those handlers also mutated the module global directly - ``items.append(item)`` at
 ``app.py:L17``, ``items[index] = updated_item`` at ``L38``, ``items.pop(index)`` at ``L47`` -
 so there was no repository, no data-access object, no accessor and no injected provider
-anywhere in the service. :meth:`BaseRepository.get_by_id` is that predicate, written once for
-the whole codebase, and no sibling repository may re-implement a by-primary-key fetch. That
+anywhere in the service. :meth:`UUIDPrimaryKeyRepository.get_by_id` is that predicate,
+written once for the whole codebase, and no sibling repository may re-implement a
+by-primary-key fetch. That
 is a structural objective of the restructure rather than a stylistic preference: a predicate
 with exactly one definition is tested once and is then correct everywhere.
 
@@ -44,9 +73,10 @@ to produce the five-field envelope (``items``, ``total``, ``page``, ``page_size`
 that every list endpoint serialises. ``build_page`` takes a ``list``, so a service passes
 ``list(rows)``.
 
-Nothing here raises. Absence is reported as ``None`` (:meth:`~BaseRepository.get_by_id`,
-:meth:`~BaseRepository.get_or_none`), as ``False`` (:meth:`~BaseRepository.exists`,
-:meth:`~BaseRepository.delete_by_id`), as ``0`` (:meth:`~BaseRepository.count`) or as an
+Nothing here raises. Absence is reported as ``None``
+(:meth:`~UUIDPrimaryKeyRepository.get_by_id`, :meth:`~BaseRepository.get_or_none`), as
+``False`` (:meth:`~BaseRepository.exists`, :meth:`~UUIDPrimaryKeyRepository.delete_by_id`),
+as ``0`` (:meth:`~BaseRepository.count`) or as an
 empty sequence (:meth:`~BaseRepository.paginate`). No HTTP status code is chosen, no framework
 HTTP exception is constructed and no domain exception is emitted, because a repository cannot
 know whether a missing row is a ``404``, a ``403`` in disguise, or an entirely legitimate empty
@@ -81,7 +111,7 @@ follow, and only one of them is what the folklore says:
 * After an **INSERT** nothing is left expired. Measured against PostgreSQL 18.4 through
   psycopg 3.3.4, SQLAlchemy 2.0.51 emits ``INSERT ... RETURNING id, created_at, updated_at``
   and the instance arrives with every server-generated value already loaded -
-  ``inspect(entity).unloaded`` was empty. :meth:`~BaseRepository.add`'s ``refresh`` is
+  ``inspect(entity).unloaded`` was empty. :meth:`~UUIDPrimaryKeyRepository.add`'s ``refresh`` is
   therefore defensive: it costs one SELECT and buys independence from the dialect's RETURNING
   support and from SQLAlchemy's eager-defaults heuristics, so the postcondition "the returned
   entity is fully loaded" holds by construction rather than by luck.
@@ -167,7 +197,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import Base
 
-__all__ = ["BaseRepository", "ModelT"]
+__all__ = ["BaseRepository", "ModelT", "UUIDPrimaryKeyRepository"]
 
 ModelT = TypeVar("ModelT", bound=Base)
 """A type variable carrying the declarative base as its bound.
@@ -182,25 +212,34 @@ choice is available rather than reinvented, and so the bound is stated in exactl
 
 
 class BaseRepository[ModelT: Base]:
-    """Generic data-access helpers over one mapped class, bound to one unit of work.
+    """Key-shape-agnostic data-access helpers over one mapped class, bound to one unit of work.
 
-    A concrete repository subclasses it, parameterises it with its relation, names that
-    relation once, and adds only the queries that relation actually needs::
+    Everything here works whatever a relation's primary key looks like: a criteria lookup,
+    existence, counting, saving and deleting an instance the caller already holds, and
+    windowing a statement. A concrete repository parameterises it with its relation, names
+    that relation once, and adds only the queries that relation actually needs::
 
         from collections.abc import Sequence
 
         from sqlalchemy import select
 
         from app.models.post import Post
-        from app.repositories.base import BaseRepository
+        from app.repositories.base import UUIDPrimaryKeyRepository
 
 
-        class PostRepository(BaseRepository[Post]):
+        class PostRepository(UUIDPrimaryKeyRepository[Post]):
             model = Post
 
             async def list_recent(self, limit: int, offset: int) -> tuple[Sequence[Post], int]:
                 stmt = select(Post).order_by(Post.published_at.desc())
                 return await self.paginate(stmt, limit=limit, offset=offset)
+
+    Note which base that example names. Five of this service's six repositories extend
+    :class:`UUIDPrimaryKeyRepository`, which adds the three operations that presuppose a single
+    surrogate key, because their relations carry ``app.db.base.UUIDPrimaryKeyMixin``. Extend
+    **this** class directly only when the relation has no single-column identity, which in this
+    schema means ``post_likes`` alone - see the module docstring for why that distinction is
+    enforced by the class hierarchy rather than described in prose.
 
     Two invariants must not be violated, here or in any subclass:
 
@@ -251,37 +290,6 @@ class BaseRepository[ModelT: Base]:
                 never created here, never closed here, and never committed.
         """
         self.session = session
-
-    async def get_by_id(self, entity_id: uuid.UUID) -> ModelT | None:
-        """Fetch one row by its surrogate primary key.
-
-        This is *the* identity predicate for the whole codebase. It replaces the three
-        hand-written copies the previous service carried - ``app.py:L28-29`` (read one),
-        ``app.py:L36-37`` (update) and ``app.py:L45-46`` (delete) - and no sibling repository
-        may re-implement a by-primary-key fetch.
-
-        :meth:`~sqlalchemy.ext.asyncio.AsyncSession.get` is used rather than a ``select()``
-        because it consults the session's identity map first: an entity already loaded in this
-        unit of work comes back with no round trip, and a row the service wrote a moment ago is
-        seen by the next lookup inside the same transaction.
-
-        Args:
-            entity_id: The server-generated UUID to look up. Identity always originates in
-                PostgreSQL through ``gen_random_uuid()``, so this value came either from an
-                earlier read or from a URL path segment a route already validated as a UUID.
-
-        Returns:
-            The entity, or ``None`` when no row carries that key. Absence is never an error
-            here; the service decides whether it means ``404``, ``403`` or a no-op.
-
-        Note:
-            For relations keyed on a single surrogate column, which is every relation carrying
-            ``UUIDPrimaryKeyMixin``. The two association relations - ``post_categories`` keyed
-            ``(post_id, category_id)`` and ``post_likes`` keyed ``(post_id, user_id)`` - have no
-            single-column identity to look up, so their repositories address rows by the whole
-            composite key through :meth:`get_or_none` instead.
-        """
-        return await self.session.get(self.model, entity_id)
 
     async def get_or_none(self, *criteria: ColumnExpressionArgument[bool]) -> ModelT | None:
         """Fetch the first row matching arbitrary criteria, or ``None``.
@@ -349,32 +357,6 @@ class BaseRepository[ModelT: Base]:
         matched = result.scalar()
         return 0 if matched is None else matched
 
-    async def add(self, entity: ModelT) -> ModelT:
-        """Persist a new instance and return it fully loaded.
-
-        The instance is built by the caller - a service - from validated input, and it must not
-        carry a primary key: ``id`` is generated by PostgreSQL, which is what makes a duplicate
-        identifier unstorable rather than merely unlikely. The previous service made the client
-        the sole source of ``Item.id``, so two records could share one identifier and the first
-        one stored permanently shadowed every later one.
-
-        ``flush()`` emits the INSERT, so identity, defaults and every constraint apply now and a
-        unique violation surfaces at this call instead of at some later commit. ``refresh()``
-        then reloads the row so the returned entity holds no expired attribute for a response
-        serialiser to trip over; the module docstring records the measurement behind that.
-
-        Args:
-            entity: A transient instance of :attr:`model`.
-
-        Returns:
-            The same instance, now persistent, with ``id`` and the audit timestamps populated
-            from the database.
-        """
-        self.session.add(entity)
-        await self.session.flush()
-        await self.session.refresh(entity)
-        return entity
-
     async def save(self, entity: ModelT) -> ModelT:
         """Flush pending changes to an already-persistent instance and reload it.
 
@@ -426,43 +408,6 @@ class BaseRepository[ModelT: Base]:
         """
         await self.session.delete(entity)
         await self.session.flush()
-
-    async def delete_by_id(self, entity_id: uuid.UUID) -> bool:
-        """Remove the row carrying this primary key, reporting whether one existed.
-
-        Built from :meth:`get_by_id` and :meth:`delete` rather than from a single bulk
-        ``DELETE ... WHERE id = :id``. That trades one extra SELECT for three properties the
-        bulk form cannot offer:
-
-        * **Safety on composite keys.** Deriving the key column from the mapper would take the
-          *first* column of the primary key. On ``post_likes``, keyed ``(post_id, user_id)``,
-          that is ``post_id`` - so the statement would silently delete every like on a post
-          instead of one row. Routing through
-          :meth:`~sqlalchemy.ext.asyncio.AsyncSession.get` makes the misuse fail loudly rather
-          than destroy data.
-        * **An exact answer.** ``False`` means the row was absent, established by looking. A
-          bulk statement reports rows matched, which conflates "absent" with "matched but
-          invisible to this transaction".
-        * **A coherent session.** The instance leaves the identity map as part of the delete, so
-          a later :meth:`get_by_id` in the same transaction cannot hand back a deleted entity
-          from cache.
-
-        It also keeps the identity predicate singular: the lookup is :meth:`get_by_id`'s, not a
-        second copy of it.
-
-        Args:
-            entity_id: The surrogate primary key to remove.
-
-        Returns:
-            ``True`` when a row existed and was deleted, ``False`` when none carried that key.
-            Absence never raises - the service turns ``False`` into a ``404`` if that is what the
-            endpoint means.
-        """
-        entity = await self.get_by_id(entity_id)
-        if entity is None:
-            return False
-        await self.delete(entity)
-        return True
 
     async def paginate(
         self,
@@ -547,3 +492,142 @@ class BaseRepository[ModelT: Base]:
 
         window_result = await self.session.execute(stmt.limit(limit).offset(max(offset, 0)))
         return window_result.scalars().all(), total
+
+
+class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
+    """The three operations that only make sense for a relation keyed on one surrogate UUID.
+
+    Every relation carrying ``app.db.base.UUIDPrimaryKeyMixin`` - ``users``,
+    ``refresh_tokens``, ``categories``, ``posts`` and ``comments`` - has a single-column
+    identity that a caller can name in a URL path segment and hand straight to a repository.
+    These three methods are written against exactly that shape::
+
+        class PostRepository(UUIDPrimaryKeyRepository[Post]):
+            model = Post
+
+    Why this is a separate class rather than three more methods on
+    :class:`BaseRepository`
+    ---------------------------------------------------------------
+    ``post_likes`` is keyed ``(post_id, user_id)`` and ``post_categories`` is keyed
+    ``(post_id, category_id)``. Neither has a single-column identity, so all three operations
+    below are meaningless on them - and, on the base class, all three were nonetheless
+    *callable*:
+
+    * :meth:`get_by_id` would pass one UUID where the mapper expects two, raising at runtime
+      on a method the type checker had accepted.
+    * :meth:`delete_by_id` inherits that, and its ``get_by_id``-then-``delete`` construction
+      is safe only because it never derives a key column from the mapper - the alternative
+      bulk form would take ``post_id`` on ``post_likes`` and delete *every* like on a post.
+    * :meth:`add` persists and refreshes an ORM instance, which is the wrong write entirely
+      for a relation whose whole point is a conflict-ignoring insert:
+      ``app.repositories.like_repository.LikeRepository.like`` is idempotent because the key
+      absorbs a repeat, and routing a like through ``add`` would raise on the second call
+      instead.
+
+    A docstring saying "do not call these three" is not the same thing as their not being
+    there. Splitting the class removes them from ``LikeRepository``'s surface, so the mistake
+    is a type error at the call site rather than an ``IntegrityError`` or a mass deletion in
+    production. ``LikeRepository`` extends :class:`BaseRepository` directly and keeps
+    everything that is genuinely key-shape agnostic - :meth:`~BaseRepository.get_or_none`,
+    :meth:`~BaseRepository.exists`, :meth:`~BaseRepository.count`,
+    :meth:`~BaseRepository.save`, :meth:`~BaseRepository.delete` and
+    :meth:`~BaseRepository.paginate` - and addresses its rows by the whole composite key.
+
+    Both invariants the base class states hold here unchanged: nothing commits, and nothing
+    constructs an HTTP artefact. Absence is ``None`` or ``False``, and the service above
+    decides what that means to a client.
+    """
+
+    async def get_by_id(self, entity_id: uuid.UUID) -> ModelT | None:
+        """Fetch one row by its surrogate primary key.
+
+        This is *the* identity predicate for the whole codebase. It replaces the three
+        hand-written copies the previous service carried - ``app.py:L28-29`` (read one),
+        ``app.py:L36-37`` (update) and ``app.py:L45-46`` (delete) - and no sibling repository
+        may re-implement a by-primary-key fetch.
+
+        :meth:`~sqlalchemy.ext.asyncio.AsyncSession.get` is used rather than a ``select()``
+        because it consults the session's identity map first: an entity already loaded in this
+        unit of work comes back with no round trip, and a row the service wrote a moment ago is
+        seen by the next lookup inside the same transaction.
+
+        Args:
+            entity_id: The server-generated UUID to look up. Identity always originates in
+                PostgreSQL through ``gen_random_uuid()``, so this value came either from an
+                earlier read or from a URL path segment a route already validated as a UUID.
+
+        Returns:
+            The entity, or ``None`` when no row carries that key. Absence is never an error
+            here; the service decides whether it means ``404``, ``403`` or a no-op.
+
+        Note:
+            For relations keyed on a single surrogate column, which is every relation carrying
+            ``UUIDPrimaryKeyMixin``. The two association relations - ``post_categories`` keyed
+            ``(post_id, category_id)`` and ``post_likes`` keyed ``(post_id, user_id)`` - have no
+            single-column identity to look up, so their repositories address rows by the whole
+            composite key through :meth:`get_or_none` instead.
+        """
+        return await self.session.get(self.model, entity_id)
+
+    async def add(self, entity: ModelT) -> ModelT:
+        """Persist a new instance and return it fully loaded.
+
+        The instance is built by the caller - a service - from validated input, and it must not
+        carry a primary key: ``id`` is generated by PostgreSQL, which is what makes a duplicate
+        identifier unstorable rather than merely unlikely. The previous service made the client
+        the sole source of ``Item.id``, so two records could share one identifier and the first
+        one stored permanently shadowed every later one.
+
+        ``flush()`` emits the INSERT, so identity, defaults and every constraint apply now and a
+        unique violation surfaces at this call instead of at some later commit. ``refresh()``
+        then reloads the row so the returned entity holds no expired attribute for a response
+        serialiser to trip over; the module docstring records the measurement behind that.
+
+        Args:
+            entity: A transient instance of :attr:`model`.
+
+        Returns:
+            The same instance, now persistent, with ``id`` and the audit timestamps populated
+            from the database.
+        """
+        self.session.add(entity)
+        await self.session.flush()
+        await self.session.refresh(entity)
+        return entity
+
+    async def delete_by_id(self, entity_id: uuid.UUID) -> bool:
+        """Remove the row carrying this primary key, reporting whether one existed.
+
+        Built from :meth:`get_by_id` and :meth:`delete` rather than from a single bulk
+        ``DELETE ... WHERE id = :id``. That trades one extra SELECT for three properties the
+        bulk form cannot offer:
+
+        * **Safety on composite keys.** Deriving the key column from the mapper would take the
+          *first* column of the primary key. On ``post_likes``, keyed ``(post_id, user_id)``,
+          that is ``post_id`` - so the statement would silently delete every like on a post
+          instead of one row. Routing through
+          :meth:`~sqlalchemy.ext.asyncio.AsyncSession.get` makes the misuse fail loudly rather
+          than destroy data.
+        * **An exact answer.** ``False`` means the row was absent, established by looking. A
+          bulk statement reports rows matched, which conflates "absent" with "matched but
+          invisible to this transaction".
+        * **A coherent session.** The instance leaves the identity map as part of the delete, so
+          a later :meth:`get_by_id` in the same transaction cannot hand back a deleted entity
+          from cache.
+
+        It also keeps the identity predicate singular: the lookup is :meth:`get_by_id`'s, not a
+        second copy of it.
+
+        Args:
+            entity_id: The surrogate primary key to remove.
+
+        Returns:
+            ``True`` when a row existed and was deleted, ``False`` when none carried that key.
+            Absence never raises - the service turns ``False`` into a ``404`` if that is what the
+            endpoint means.
+        """
+        entity = await self.get_by_id(entity_id)
+        if entity is None:
+            return False
+        await self.delete(entity)
+        return True

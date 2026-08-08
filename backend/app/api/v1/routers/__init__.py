@@ -42,7 +42,7 @@ Nothing else belongs here. No ``APIRouter`` and no route, so this file can never
 mount point that sidesteps the aggregate and the version prefix with it. No dependency and
 nothing security-bearing: ``get_current_user`` and ``require_admin`` are reachable only
 through ``app.core.dependencies``, which gives the administrator gate one spelling and no
-way around it. And no ``__version__``: that belongs to ``app/__init__.py`` alone, the single
-source of the version ``app.main`` publishes in its OpenAPI document and the one kept
-identical to the ``[project]`` version in ``backend/pyproject.toml``.
+way around it. And no ``__version__``: no module declares one. ``[project] version`` in
+``backend/pyproject.toml`` is the single source of the version ``app.main`` publishes in its
+OpenAPI document, and it is read from that project metadata rather than restated in code.
 """

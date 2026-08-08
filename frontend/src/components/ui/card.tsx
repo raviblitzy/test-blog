@@ -25,9 +25,9 @@
  *                                                      than the page canvas in
  *                                                      BOTH themes
  *   hairline      border-border     --color-border     DECORATIVE outline. Note
- *                                                      globals.css reserves
- *                                                      border-border-strong for
- *                                                      interactive control
+ *                                                      globals.css composes
+ *                                                      border-muted-foreground
+ *                                                      for interactive control
  *                                                      boundaries (WCAG 1.4.11)
  *                                                      - a card outline is not
  *                                                      one, so it uses the
@@ -106,16 +106,19 @@ type CardElement = 'div' | 'article' | 'section' | 'li';
 /**
  * Tag allow-list, indexed by the `as` prop to obtain the JSX element type.
  *
- * This indirection is load-bearing and was settled by compiling, not by taste.
- * Three shorter spellings all fail:
+ * This is the INTERNAL half of the polymorphism; the public half is the
+ * discriminated `CardProps` union below, and the two solve different problems.
+ * The union is what gives a caller the right attributes and the right `ref` per
+ * `as` value. This table is what lets the implementation render the resulting
+ * union of props onto one JSX tag, and the indirection is load-bearing rather
+ * than stylistic - it was settled by compiling, not by taste. Three shorter
+ * spellings all fail:
  *
  *   1. `function Card({ as: Component = 'div', ...props })` and rendering
- *      `<Component {...props} />` does not type-check. `props` is
- *      `ComponentProps<'div'>`, whose `ref` is `Ref<HTMLDivElement>`, and
- *      `RefObject<T>` is a mutable property and therefore invariant - so no
- *      single `ref` type satisfies `div`, `article`, `section` and `li` at once.
- *      tsc reports "Type 'Ref<HTMLDivElement>' is not assignable to type
- *      'Ref<HTMLLIElement>'". Dropping `li` does not help; `HTMLDivElement` and
+ *      `<Component {...props} />` does not type-check. The JSX tag then has the
+ *      literal union type, so React demands props assignable to EVERY member at
+ *      once, and `ref` is invariant: `Ref<HTMLDivElement>` is not assignable to
+ *      `Ref<HTMLLIElement>`. Dropping `li` does not help; `HTMLDivElement` and
  *      `HTMLElement` collide the same way.
  *   2. `const Component: ElementType = as;` does not help either. The
  *      annotation is discarded by control-flow analysis, which narrows the const
@@ -130,9 +133,10 @@ type CardElement = 'div' | 'article' | 'section' | 'li';
  * A member access on a module-level constant is a STATIC component lookup, which
  * that rule accepts, and it is opaque to control-flow narrowing so the JSX tag
  * really does have type `ElementType`. It costs no cast, no `any` and no
- * suppression comment, the public `as` prop stays strictly checked, and
- * `Record<CardElement, ElementType>` is exhaustive - adding a member to
- * `CardElement` fails to compile until it is added here too.
+ * suppression comment, the public `as` prop stays strictly checked by the union,
+ * and `Record<CardElement, ElementType>` is exhaustive - adding a member to
+ * `CardElement` fails to compile until it is added here AND given a branch in
+ * `CardProps`.
  */
 const CARD_ELEMENTS: Record<CardElement, ElementType> = {
   div: 'div',
@@ -153,10 +157,38 @@ const CARD_BASE = cn(
   'wrap-break-word',
 );
 
-interface CardProps extends ComponentProps<'div'> {
-  /** Element to render. Defaults to `'div'`. @see {@link CardElement} */
-  as?: CardElement;
-}
+/**
+ * The public props of {@link Card}: one branch per element it may render as.
+ *
+ * A discriminated union rather than `ComponentProps<'div'> & { as?: CardElement }`,
+ * and the difference is not academic. The intersection form types every branch as
+ * a `div`, so `<Card as="li" value={3} />` is REJECTED even though `value` is a
+ * real `li` attribute, and `<Card as="li" ref={liRef} />` is rejected too because
+ * the prop's `ref` is `Ref<HTMLDivElement>` - while a `ref` that IS accepted
+ * arrives typed as a div and hands the caller the wrong element type. The union
+ * below discriminates on the `as` literal, so each branch carries exactly that
+ * element's attributes and exactly that element's `ref`.
+ *
+ * `as` is optional only on the `div` branch, which is what makes `<Card />`
+ * resolve to that branch and every other branch require the discriminant.
+ */
+type CardProps =
+  | (ComponentProps<'div'> & {
+      /** Element to render. Omit for the default `div`. @see {@link CardElement} */
+      as?: 'div';
+    })
+  | (ComponentProps<'article'> & {
+      /** Element to render. @see {@link CardElement} */
+      as: 'article';
+    })
+  | (ComponentProps<'section'> & {
+      /** Element to render. @see {@link CardElement} */
+      as: 'section';
+    })
+  | (ComponentProps<'li'> & {
+      /** Element to render. @see {@link CardElement} */
+      as: 'li';
+    });
 
 /**
  * A raised surface. The container for the four slots below.
@@ -186,14 +218,21 @@ interface CardProps extends ComponentProps<'div'> {
  *   <CardHeader>
  *     <CardTitle>Published posts</CardTitle>
  *   </CardHeader>
- *   <CardContent>{stats.publishedPosts}</CardContent>
+ *   <CardContent>{stats.post_count}</CardContent>
  * </Card>
  * ```
  *
- * Every other `div` prop is forwarded, `ref` included - React 19 passes it
- * through the spread, so no `forwardRef` is involved. To type a wrapper around
- * this component, derive from it with `ComponentProps<typeof Card>` rather than
- * restating the props, so the wrapper cannot drift.
+ * Field names in that example are the WIRE names. The API is snake_case
+ * throughout and this tier does no camelCase mapping, so an admin overview reads
+ * `stats.post_count` - the field `AdminStats` actually declares - and never an
+ * invented `stats.publishedPosts`.
+ *
+ * Every prop of the ELEMENT SELECTED BY `as` is forwarded, `ref` included - React
+ * 19 passes it through the spread, so no `forwardRef` is involved, and the `ref`
+ * a caller supplies is typed as that element rather than always as a `div`. To
+ * type a wrapper around this component, derive from it with
+ * `ComponentProps<typeof Card>` rather than restating the props, so the wrapper
+ * cannot drift.
  *
  * `className` is merged last through `cn`, so a caller's utility wins its own
  * property group: `className="rounded-none"` replaces `rounded-xl` and leaves
@@ -251,6 +290,18 @@ const CARD_TITLE_BASE = cn(
   'text-foreground',
 );
 
+/**
+ * Props of {@link CardTitle}.
+ *
+ * An intersection here, NOT a discriminated union like {@link CardProps} - and
+ * that difference is deliberate rather than an oversight. All four heading levels
+ * are `HTMLHeadingElement` in the DOM, so `ComponentProps<'h1'>`,
+ * `<'h2'>`, `<'h3'>` and `<'h4'>` are the same type: identical attributes and an
+ * identical `Ref<HTMLHeadingElement>`. There is nothing for a discriminant to
+ * distinguish, and adding one would cost four branches to express one type.
+ * `Card` needs the union precisely because its four tags are four different
+ * element interfaces.
+ */
 interface CardTitleProps extends ComponentProps<'h3'> {
   /** Heading level to render. Defaults to `'h3'`. @see {@link CardTitleLevel} */
   as?: CardTitleLevel;

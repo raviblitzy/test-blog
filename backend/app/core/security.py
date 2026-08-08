@@ -53,24 +53,32 @@ Nothing raises ``HTTPException`` and no ``PyJWT`` exception escapes. A decode fa
 Bearer`` challenge, for every one of them. That is what makes "an expired or revoked token
 yields 401" true uniformly rather than per call site.
 
-The two errors are distinguished so a client can tell "refresh me" from "sign in again", but
+The two errors are distinguished for the server's benefit, not the client's: they let this
+module raise precisely and let a log line or a traceback name the check that failed. On the
+wire they are one branch. Both carry ``type: /errors/unauthorized`` and the title
+``Unauthorized``, so the field a client switches on cannot tell them apart, and
 :class:`~app.core.exceptions.InvalidTokenError` is raised **bare**, always, with its class
 default detail. Every rejection reason - a forged signature, a truncated token, an
 unexpected algorithm, a missing claim, a refresh token presented as a bearer credential, a
 subject that is not a UUID - produces the same message on the wire, because telling a caller
-*which* check failed tells an attacker which one to fix next.
+*which* check failed tells an attacker which one to fix next. A client needs no distinction
+either way: it attempts one refresh on any 401 and falls back to sign-in if that is refused.
 
 Configuration
 -------------
 Every tunable comes from :data:`~app.core.config.settings`: the signing key, the algorithm,
 and both lifetimes. This module reads no environment variable, defines no fallback secret and
-holds no literal key. ``app.core.config`` has already refused to start the process if
-``JWT_SECRET_KEY`` is shorter than the 32 characters PyJWT requires of an HMAC key (RFC 7518
-section 3.2), so nothing here re-validates the key and nothing here compensates for a weak
-one. One consequence worth knowing rather than working around: PyJWT's recommended HMAC key
-length scales with the digest, so configuring ``HS384`` or ``HS512`` against a key near that
-32-character floor emits ``InsecureKeyLengthWarning`` on every ``encode``. The warning is
-correct and is deliberately neither silenced nor swallowed - the fix is a longer key.
+holds no literal key. ``app.core.config`` has already refused to start the process unless
+``JWT_SECRET_KEY`` is at least as long as the digest the configured ``JWT_ALGORITHM``
+produces - 32 bytes for ``HS256``, 48 for ``HS384``, 64 for ``HS512`` - which is the same
+comparison PyJWT makes internally before raising ``InsecureKeyLengthWarning``, citing RFC
+7518 section 3.2. Nothing here re-validates the key and nothing here compensates for a weak
+one, because by the time this module runs there is no weak-key configuration left to
+compensate for: the pairing is checked against the algorithm rather than against a single
+floor, so a 32-byte key configured with ``HS512`` stops the process at startup instead of
+signing tokens while PyJWT warns about them on every ``encode``. That warning is therefore
+unreachable in a running service rather than tolerated, and it is still neither silenced nor
+swallowed - if one is ever seen, the gate in ``app.core.config`` is what has regressed.
 
 Nothing is logged
 -----------------
@@ -613,8 +621,9 @@ def decode_access_token(token: str) -> AccessTokenClaims:
        ``exp`` is malformed rather than eternal.
     3. **Expiry**, translated to :class:`~app.core.exceptions.TokenExpiredError`. Caught before
        the general clause because ``ExpiredSignatureError`` is a subclass of
-       ``InvalidTokenError``: reversing the two would collapse "refresh me" into "sign in
-       again".
+       ``InvalidTokenError``: reversing the two would report every expiry as a generic invalid
+       token and lose the distinction a server-side log needs to tell a lapsed session apart
+       from a forged credential. Both are the same 401 to a client - see the module docstring.
     4. **Token type**, so a refresh token with a valid signature is not accepted as a bearer
        credential.
 

@@ -96,25 +96,30 @@ depth cap is a rule about what may be *created*, and rules about creation live i
 ``app.services.comment_service``.
 
 What a *response* actually nests is a different question, and it is settled one layer down by the
-eager loader rather than here. ``list_for_post`` loads one level of replies - with the caller's
-own status filter applied to the collection, so an unapproved reply cannot reach a public caller
-through an approved parent - which means a loaded reply's own ``replies`` collection is not
-populated.
+statement rather than here. ``comment_repository.list_for_post`` reads a thread with a recursive
+query over ``parent_id`` and nests the result **at every depth**, applying the caller's status
+filter to each level - so an unapproved reply cannot reach a public caller through an approved
+ancestor - and it populates the collection on every comment it returns, the deepest leaves included,
+with an empty list where there are no replies. A tree that arrives from that method is therefore
+complete and self-contained, and ``CommentPublic.model_validate(root)`` walks all of it::
 
-That matters to the service projecting these rows. Reading an unloaded attribute under an
-``AsyncSession`` raises ``MissingGreenlet`` at the point of access rather than returning empty -
-the same property recorded on ``app.models.comment.Comment`` - and ``default_factory`` is no
-defence, because attribute access is attempted before a default is considered. Worse, the symptom
-is disguised: measured on this stack, an attribute that raises during ``model_validate`` surfaces
+    page = [CommentPublic.model_validate(root) for root in roots]
+
+The obligation this module places on its caller is consequently narrow but absolute: **project only
+trees that came from a statement which populated them.** Reading an unloaded attribute under an
+``AsyncSession`` raises ``MissingGreenlet`` at the point of access rather than returning empty - the
+same property recorded on ``app.models.comment.Comment`` - and ``default_factory`` is no defence,
+because attribute access is attempted before a default is considered. Worse, the symptom is
+disguised: measured on this stack, an attribute that raises during ``model_validate`` surfaces
 *wrapped*, as a ``ValidationError`` of type ``get_attribute_error`` located at ``replies``, which
 FastAPI then reports as a response-validation failure rather than as the loading defect it is.
 
-So the obligation this module places on its caller is: **project only the levels the statement
-loaded.** Validating a parent whose ``replies`` were loaded is safe, and the leaf level is
-constructed with ``replies`` left out, where :attr:`CommentPublic.replies` falls back to its empty
-default instead of touching an unloaded collection::
+That is why a comment obtained some other way - the row ``add()`` just created, or one fetched by
+``get_by_id`` for an edit - must not be validated through this class as though it carried a thread.
+Give it an explicit projection, where ``replies`` is left out and falls back to its empty default
+instead of touching an unpopulated collection::
 
-    def project(comment: Comment, replies: list[Comment]) -> CommentPublic:
+    def project(comment: Comment) -> CommentPublic:
         return CommentPublic(
             id=comment.id,
             post_id=comment.post_id,
@@ -124,10 +129,9 @@ default instead of touching an unloaded collection::
             status=comment.status,
             created_at=comment.created_at,
             updated_at=comment.updated_at,
-            replies=[project(reply, []) for reply in replies],
         )
 
-Deepening the response is then a change to a loader and to nothing here.
+Which levels a response carries is then a property of the statement and of nothing here.
 
 What a client may not send, and why each refusal is load-bearing
 ----------------------------------------------------------------
@@ -150,13 +154,24 @@ setting.
 ``status``
     Never accepted anywhere, and its absence is the moderation guard. A comment is created
     ``PENDING`` by the column's own server default, and only ``PATCH
-    /api/v1/admin/comments/{id}/status`` - behind ``require_admin`` at router level - moves it on.
-    Accepting it on either input model would let a commenter approve their own comment, which is
-    a moderation bypass; accepting it on the *update* model would let them approve it afterwards,
-    which is the same bypass reached a second way. The administrative input model that does carry
-    it is ``app.schemas.admin.AdminCommentStatusUpdate``, and it is deliberately not declared in
-    this file: a body that changes a moderation state should not be importable from the module a
-    public router imports.
+    /api/v1/admin/comments/{id}/status`` - behind ``require_admin`` at router level - can move it
+    to ``APPROVED`` or ``REJECTED``. Accepting it on either input model would let a commenter
+    approve their own comment, which is a moderation bypass; accepting it on the *update* model
+    would let them approve it afterwards, which is the same bypass reached a second way. The
+    administrative input model that does carry it is
+    ``app.schemas.admin.AdminCommentStatusUpdate``, and it is deliberately not declared in this
+    file: a body that changes a moderation state should not be importable from the module a public
+    router imports.
+
+    Unsettable is not the same as unaffected, and the difference is a required service rule.
+    ``app.services.comment_service`` **must return an ``APPROVED`` comment to ``PENDING`` when its
+    author edits the body.** Without that, approval attaches to the row rather than to the text a
+    moderator actually read: an author submits something benign, waits for approval, then replaces
+    it through ``PATCH /api/v1/comments/{id}`` and the replacement is public unreviewed - a
+    moderation bypass that needs no privilege at all and leaves no trace in the queue. The
+    transition is the service's to apply and never the caller's to choose, so it is compatible with
+    ``status`` being absent from every model here; ``extra="forbid"`` keeps the caller out of the
+    decision while the service makes it unconditionally.
 ``id``, ``created_at``, ``updated_at``
     Server-owned throughout. ``id`` comes from PostgreSQL's ``gen_random_uuid()`` and both instants
     come from the database clock, so no input model has a member through which a caller could
@@ -253,8 +268,10 @@ from datetime import datetime
 from typing import Annotated, Final
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from app.models import CommentStatus
+from app.schemas.common import omit_null_default
 from app.schemas.user import UserPublic
 
 # The module's public contract is these three models, in the order RUF022 enforces. The two bounds
@@ -435,6 +452,20 @@ class CommentUpdate(BaseModel):
     turns into a ``422`` naming the key rather than a request that appears to succeed while the
     field is quietly discarded.
 
+    An edit re-opens moderation, and the service must apply that
+    ----------------------------------------------------------
+    Withholding ``status`` from the caller is only half of the guarantee. ``PATCH
+    /api/v1/comments/{id}`` **returns an ``APPROVED`` comment to ``PENDING``**, because approval
+    belongs to the text a moderator read rather than to the row that held it. The bypass this
+    closes needs no privilege: submit something innocuous, wait for approval, then swap the body -
+    and without the transition the replacement is public unreviewed, indistinguishable in the
+    thread from moderated text and absent from the queue an administrator works.
+    ``app.services.comment_service`` owns the rule and applies it on every accepted edit, whoever
+    made it; an administrator who wants the edited text public approves it again through the
+    administrative route. A comment already ``PENDING`` or ``REJECTED`` is unaffected, an edit that
+    changes nothing (an empty patch) is not an edit, and the caller never selects the outcome -
+    which is what keeps this compatible with ``status`` being unsettable here.
+
     ``parent_id`` is absent, and that keeps a thread's shape stable
     -------------------------------------------------------------
     :class:`CommentCreate` accepts it and this model does not. Re-parenting an existing comment
@@ -463,17 +494,25 @@ class CommentUpdate(BaseModel):
         },
     )
 
-    body: CommentBody | None = Field(
+    body: CommentBody | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             f"Replacement comment text, {BODY_MIN_LENGTH} to {BODY_MAX_LENGTH} characters after "
             "trimming. Omit the field to leave the comment unchanged; an empty patch is accepted "
             "and changes nothing. Null is NOT accepted, and neither is a whitespace-only value: "
-            "there is no state an empty comment would describe. Editing does NOT re-open "
-            "moderation and does NOT change the comment's status - only an administrator can do "
-            "that - and it does not move the comment within its thread."
+            "there is no state an empty comment would describe. Editing an APPROVED comment "
+            "returns it to PENDING, so replaced text is moderated before it is public again, and "
+            "it does not move the comment within its thread."
         ),
     )
+    """Replacement text, or omitted to leave the comment unchanged. Optional but not nullable.
+
+    ``SkipJsonSchema[None]`` keeps ``null`` out of the member's published type and
+    :func:`~app.schemas.common.omit_null_default` removes the ``default: null`` that the ``None``
+    default would otherwise advertise, so the document describes a plain optional string -
+    matching what :meth:`_reject_null_body` enforces.
+    """
 
     @field_validator("body")
     @classmethod
@@ -534,10 +573,12 @@ class CommentPublic(BaseModel):
     Every member below is named exactly as the column or relationship it reads, which is what makes
     that one call sufficient. It is safe after a commit because ``app.db.session`` builds the
     session factory with ``expire_on_commit=False``, and it is safe **to the depth the statement
-    loaded** - one level of replies, as ``comment_repository`` loads them. Beyond that depth the
-    caller constructs the leaf explicitly and leaves ``replies`` out, where the empty default
-    applies; the module docstring gives the projection in full and the reason reading further would
-    raise rather than return empty.
+    populated** - which, for a thread from ``comment_repository.list_for_post``, is the whole of it:
+    that method fills ``replies`` on every comment it returns at every level, leaves included. A
+    comment obtained any other way carries no thread and must be projected explicitly with
+    ``replies`` left out, where the empty default applies; the module docstring gives that
+    projection in full and the reason reading an unpopulated collection would raise rather than
+    return empty.
 
     ``status`` is published and unsettable
     ------------------------------------
@@ -546,6 +587,11 @@ class CommentPublic(BaseModel):
     what makes it read-only in effect rather than merely by convention. Publishing it is not a
     leak: a public caller only ever receives approved rows, because the repository scopes the query
     by status rather than trusting a consumer to filter this field.
+
+    Unsettable, note, does not mean unchanging in response to an author's request: an edit returns
+    an approved comment to ``PENDING``, and this member is where a client observes that - which is
+    exactly why the editor should render it rather than assume a successful ``PATCH`` leaves the
+    comment public.
 
     What this projection deliberately omits
     --------------------------------------
@@ -676,10 +722,12 @@ class CommentPublic(BaseModel):
             "Moderation state: PENDING while awaiting a decision, APPROVED once public, REJECTED "
             "once refused. Read-only in effect - it is published here so an author can see that "
             "their own comment is queued and so a moderation screen can render a state, and it is "
-            "accepted by no input model in this API. Only an administrator changes it, through "
-            "`PATCH /api/v1/admin/comments/{id}/status`. A public caller receives APPROVED rows "
-            "only, because the query scopes by status rather than relying on this field being "
-            "read."
+            "accepted by no input model in this API. Only an administrator can move a comment to "
+            "APPROVED or REJECTED, through `PATCH /api/v1/admin/comments/{id}/status`; editing the "
+            "body returns an APPROVED comment to PENDING, which is the one transition an author's "
+            "own request causes and it is applied by the server rather than requested. A public "
+            "caller receives APPROVED rows only, because the query scopes by status rather than "
+            "relying on this field being read."
         ),
     )
     created_at: datetime = Field(
@@ -695,8 +743,9 @@ class CommentPublic(BaseModel):
         description=(
             "Instant the comment was last modified, in the same form. Equal to `created_at` until "
             "the body is edited, so `updated_at > created_at` is a reliable 'edited' test a client "
-            "can render an indicator from. Editing does not change `status`, so an edit does not "
-            "re-open moderation."
+            "can render an indicator from. An edit re-opens moderation: an APPROVED comment "
+            "returns to PENDING when its body changes, so a row this member marks as edited was "
+            "approved after that edit rather than before it."
         ),
     )
     replies: list[CommentPublic] = Field(

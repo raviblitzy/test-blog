@@ -31,11 +31,13 @@ nobody reads rows from is work with no output.
 
 Index usage must be confirmed at volume, not on a probe
 ------------------------------------------------------
-``posts`` carries four access paths, and every predicate composed here is written to be served
+``posts`` carries six access paths, and every predicate composed here is written to be served
 by one of them: ``ix_posts_search_vector`` (GIN over the generated ``tsvector``) for ranked
 search, ``ix_posts_title_trgm`` (GIN with ``gin_trgm_ops``) for the near-miss fallback,
-``ix_posts_status_published_at`` for the default "recent published posts" ordering, and
-``ix_posts_author_id`` for the author-scoped listings.
+``ix_posts_status_published_at`` for the default "recent published posts" ordering,
+``ix_posts_author_id`` for the author-scoped listings, ``ix_posts_slug`` for resolving a
+canonical URL to a row, and ``ix_posts_slug_trgm`` (GIN over ``(slug::text)``) for the anchored
+slug-family scan that de-duplication runs before every insert and retitle.
 
 A known trap is recorded here so it is recognised rather than rediscovered: an ``EXPLAIN`` probe
 run against a single-row ``posts`` table chooses ``Seq Scan``. That is correct planner behaviour
@@ -114,13 +116,13 @@ import uuid
 from collections.abc import Sequence
 from typing import Any, Final, Literal
 
-from sqlalchemy import ColumnElement, Select, distinct, func, or_, select
+from sqlalchemy import ColumnElement, Select, Text, cast, distinct, func, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.functions import Function
 
 from app.models.category import Category, post_categories
 from app.models.post import Post, PostStatus
-from app.repositories.base import BaseRepository
+from app.repositories.base import UUIDPrimaryKeyRepository
 
 __all__ = ["PostRepository", "PostSort"]
 
@@ -559,7 +561,7 @@ def _restrict[SelectT: Select[Any]](
     return stmt
 
 
-class PostRepository(BaseRepository[Post]):
+class PostRepository(UUIDPrimaryKeyRepository[Post]):
     """Every query the ``posts`` relation needs, and no query anything else needs.
 
     Constructed per request from the session ``get_db`` yields, or in the suite from the
@@ -832,20 +834,38 @@ class PostRepository(BaseRepository[Post]):
             entry is created, and the wide ``posts`` row with its body and search vector never
             crosses the wire.
 
-            The pattern is anchored at the start, never with a leading wildcard, so a b-tree
-            index can serve it. ``posts.slug`` is ``CITEXT`` and its unique index carries the
-            default operator class, so whether PostgreSQL actually chooses that index for a
-            prefix ``LIKE`` depends on the operator class rather than on this statement; what
-            the anchoring guarantees is that the query is not *prevented* from using it. The
-            result set is a slug family - a handful of rows - so the plan is not on any hot
-            path either way.
+            The pattern is anchored at the start, never with a leading wildcard, so the scan is
+            bounded to one slug family however many posts exist.
+
+            **The column is cast to ``text`` and the operator is ``ILIKE``, and both are required
+            rather than preferences.** Anchoring alone does not buy an index: it means the query is
+            not *prevented* from using one, but ``ix_posts_slug`` carries the default operator class
+            over a ``citext`` column, which provides none for a pattern match - so this was a
+            sequential scan over every post whatever the unique index did. Measured on PostgreSQL
+            18.4 at twenty thousand posts: sequential scan on the bare column.
+            ``ix_posts_slug_trgm`` is a GIN trigram index over ``(slug::text)`` - it must be over
+            the cast, because
+            ``gin_trgm_ops`` is defined for ``text`` and citext's own ``~~``/``~~*`` operators are
+            not in that operator family - and over the cast the same query is a bitmap index scan on
+            it. The predicate is therefore spelled the way the index is.
+
+            ``ILIKE`` rather than ``LIKE`` because the cast discards exactly the property that made
+            the bare ``LIKE`` correct. On ``citext`` the comparison folded case for free, which is
+            what ``unique_slug`` relies on - it folds both sides, so a stored ``My-Post`` must rule
+            out a proposed ``my-post`` that PostgreSQL would reject at the unique index anyway. Over
+            ``text`` that folding is gone and ``ILIKE`` restores it, so the returned set is
+            identical to the pre-cast one.
+
+            This runs on the write path - once per create and once per retitle - which is what
+            makes an index worth having here even though the result set is only a handful of rows:
+            the cost being removed is the scan, not the rows.
 
             Slug **derivation** is ``app.core.slug``'s and is not imported here: this method
             reports what exists, and the service decides what to call the new post.
         """
         pattern = _escape_like_prefix(prefix) + "%"
         result = await self.session.execute(
-            select(Post.slug).where(Post.slug.like(pattern, escape=_LIKE_ESCAPE))
+            select(Post.slug).where(cast(Post.slug, Text).ilike(pattern, escape=_LIKE_ESCAPE))
         )
         return set(result.scalars().all())
 

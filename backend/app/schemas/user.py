@@ -137,8 +137,10 @@ from pydantic import (
     StringConstraints,
     field_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from app.models import UserRole
+from app.schemas.common import omit_null_default
 
 # The module's public contract is these three models, and the ordering is the one RUF022
 # enforces. The bounds and annotated aliases below are shared machinery - importable by a test
@@ -594,6 +596,13 @@ class UserUpdate(BaseModel):
     :meth:`reject_null_display_name` reports it as a ``422`` naming the field rather than letting
     it reach the column and surface as a ``500`` describing an integrity violation several layers
     from the request member that caused it.
+
+    The **published schema draws that same asymmetry**, which is the part a generated client
+    actually consumes: ``bio`` and ``avatar_url`` advertise ``null`` among their types because
+    they accept it, and ``display_name`` does not, because it does not. A member that offered
+    ``null`` and then answered ``422`` would put a request into ``/openapi.json`` and onto
+    ``/docs`` that this API refuses - see :func:`~app.schemas.common.omit_null_default` for the
+    two-part declaration that keeps the two in step.
     """
 
     model_config = ConfigDict(
@@ -611,8 +620,9 @@ class UserUpdate(BaseModel):
         },
     )
 
-    display_name: DisplayName | None = Field(
+    display_name: DisplayName | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             f"New display name, {DISPLAY_NAME_MIN_LENGTH} to {DISPLAY_NAME_MAX_LENGTH} characters "
             "after surrounding whitespace is removed. Omit the field to leave the current name "
@@ -622,6 +632,16 @@ class UserUpdate(BaseModel):
             "share a display name, because `username` is what distinguishes them."
         ),
     )
+    """New display name, or omitted to leave it unchanged. Optional but not nullable.
+
+    The declaration carries that distinction into the published schema rather than leaving it to
+    the description. ``SkipJsonSchema[None]`` keeps ``null`` out of the member's type and
+    :func:`~app.schemas.common.omit_null_default` removes the ``default: null`` the ``None``
+    default would otherwise advertise, so ``/openapi.json`` describes a plain optional string -
+    which is exactly what :meth:`reject_null_display_name` enforces at runtime. Before, the
+    schema said ``anyOf: [string, null]`` while the validator rejected null, so a generated
+    client and ``/docs`` both published a request this API answers with a 422.
+    """
     bio: OptionalBio = Field(
         default=None,
         description=(

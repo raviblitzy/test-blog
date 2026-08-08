@@ -40,6 +40,31 @@ No ``DISTINCT`` is needed and none is applied. ``post_categories`` is keyed on
 ``(post_id, category_id)``, so a post can be filed under a category at most once and the join
 cannot multiply a pair - the composite primary key is what makes the plain count exact.
 
+Deleting a term is a locked sequence, not a probe
+------------------------------------------------
+"A category in use may not be deleted" is a rule about two relations at once, so it cannot be
+enforced by a single statement and it cannot be enforced by a check alone.
+:meth:`~CategoryRepository.is_in_use` answers a question about ``post_categories``; the delete
+acts on ``categories``; and PostgreSQL's ``ON DELETE CASCADE`` on
+``post_categories.category_id`` means the delete *succeeds* even when the answer has changed
+since it was given, silently removing a filing that arrived in between. A post loses a category
+and nothing reports it.
+
+``app.services.category_service`` therefore performs three steps in one transaction, in this
+order, and this module exists to make each of them possible rather than to sequence them:
+
+1. :meth:`~CategoryRepository.get_for_update` - ``SELECT ... FOR UPDATE``, which takes the row
+   lock. A concurrent ``INSERT`` into ``post_categories`` needs ``FOR KEY SHARE`` on the same
+   row to validate its foreign key, and that conflicts with ``FOR UPDATE``, so the filing blocks
+   here rather than slipping between the next two steps.
+2. :meth:`~CategoryRepository.is_in_use` - asked under that lock, where its answer stays true
+   for as long as the transaction holds it.
+3. :meth:`~app.repositories.base.BaseRepository.delete` - reached only when the answer was
+   ``False``.
+
+Verified against PostgreSQL 18.4. Nothing here orders those steps or chooses the error when step
+two says ``True``; both belong to the service, for the reason the next section gives.
+
 Nothing here raises, and nothing here decides
 ---------------------------------------------
 Absence is reported as ``None`` (:meth:`~CategoryRepository.get_by_slug`,
@@ -99,9 +124,12 @@ addressed operation was a linear scan in which a miss always traversed the whole
 
 * :meth:`~CategoryRepository.get_by_slug` - the unique ``citext`` index ``ix_categories_slug``.
 * :meth:`~CategoryRepository.get_by_name` - the unique constraint ``uq_categories_name``.
-* :meth:`~CategoryRepository.slugs_starting_with` - ``ix_categories_slug`` again, through an
-  anchored prefix pattern rather than a containment one, so the comparison stays a prefix
-  comparison.
+* :meth:`~CategoryRepository.slugs_starting_with` - ``ix_categories_slug_trgm``, through an
+  anchored prefix pattern rather than a containment one, so the scan is bounded to one slug family.
+  Not ``ix_categories_slug``: that index carries the default operator class over a ``citext``
+  column, which serves equality and cannot serve a pattern however the pattern is anchored.
+* :meth:`~CategoryRepository.get_for_update` - ``pk_categories``, addressed for equality and
+  locked with ``FOR UPDATE``.
 * :meth:`~CategoryRepository.is_in_use` - ``ix_post_categories_category_id``, which exists for
   exactly this direction of the relation.
 * :meth:`~CategoryRepository.list_with_post_counts` - ``pk_post_categories`` and
@@ -109,8 +137,12 @@ addressed operation was a linear scan in which a miss always traversed the whole
   ``ix_posts_status_published_at`` for the status predicate on the joined side, which is the
   same composite index the home feed's "recent published posts" ordering is built on.
 * :meth:`~CategoryRepository.list_all` and :meth:`~CategoryRepository.list_paginated` sort by
-  ``name``, which has its own unique index; the administrative text filter is a containment
-  match and is knowingly a scan, on a relation bounded by editorial effort.
+  ``name``, which has its own unique index; the administrative text filter is a containment match,
+  served by the two GIN trigram indexes ``ix_categories_name_trgm`` and
+  ``ix_categories_slug_trgm``, which revision ``0002`` builds. Those two also serve the anchored
+  family scan in :meth:`~CategoryRepository.slugs_starting_with`, which no b-tree over a ``citext``
+  column can answer - see "Case sensitivity is the column's business" below for why the slug side
+  of both predicates is written against the text cast.
 
 Case sensitivity is the column's business
 -----------------------------------------
@@ -120,6 +152,19 @@ category. Nothing here lower-cases a value or wraps a column in SQL ``LOWER``, a
 correctness requirement rather than a preference: wrapping the column would make the predicate
 non-sargable and the unique index unusable, turning an index lookup into a sequential scan
 while duplicating a guarantee the column type already provides.
+
+The two **pattern** predicates are the exception, and they prove the rule rather than break it.
+:meth:`~CategoryRepository.list_paginated`'s containment search and
+:meth:`~CategoryRepository.slugs_starting_with`'s family scan compare ``slug::text``, not ``slug``,
+because ``ix_categories_slug_trgm`` is a GIN trigram index over that expression - and it has to be,
+since ``gin_trgm_ops`` is defined over ``text`` while citext's own ``~~``/``~~*`` operators are not
+in that operator family, so an index on the bare column would be accepted by PostgreSQL and never
+chosen. Neither predicate is an equality lookup, so neither had a usable index to give up; the cast
+is what gives them one. And because casting to ``text`` discards precisely the case-folding the
+column type was providing, both are written with ``ILIKE``, which restores it - so the result sets
+are identical to the pre-cast ones, verified on PostgreSQL 18.4 against mixed-case stored slugs.
+The equality lookups in :meth:`~CategoryRepository.get_by_slug` and
+:meth:`~CategoryRepository.get_by_name` compare the columns themselves and are untouched.
 
 Async only
 ----------
@@ -136,11 +181,11 @@ import uuid
 from collections.abc import Sequence
 from typing import Final
 
-from sqlalchemy import ColumnElement, and_, func, literal, or_, select
+from sqlalchemy import ColumnElement, Text, and_, cast, func, literal, or_, select
 
 from app.models.category import Category, post_categories
 from app.models.post import Post, PostStatus
-from app.repositories.base import BaseRepository
+from app.repositories.base import UUIDPrimaryKeyRepository
 
 __all__ = ["CategoryRepository"]
 
@@ -183,7 +228,7 @@ def _escape_like_wildcards(term: str) -> str:
     return escaped.replace("_", f"{_LIKE_ESCAPE_CHARACTER}_")
 
 
-class CategoryRepository(BaseRepository[Category]):
+class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
     """Data access for the ``categories`` taxonomy and its ``post_categories`` filings.
 
     Constructed per request from the session ``get_db`` yielded, and consumed only by
@@ -208,7 +253,8 @@ class CategoryRepository(BaseRepository[Category]):
     :meth:`~app.repositories.base.BaseRepository.add` creates,
     :meth:`~app.repositories.base.BaseRepository.save` renames,
     :meth:`~app.repositories.base.BaseRepository.delete` removes - relying on
-    ``ON DELETE CASCADE`` for the filings - and
+    ``ON DELETE CASCADE`` for the filings, which is exactly why it must be reached through
+    :meth:`get_for_update` and :meth:`is_in_use` rather than on its own - and
     :meth:`~app.repositories.base.BaseRepository.paginate` windows for
     :meth:`list_paginated`.
 
@@ -395,11 +441,15 @@ class CategoryRepository(BaseRepository[Category]):
             :meth:`~app.repositories.base.BaseRepository.paginate` is exact by construction.
 
             ``ILIKE`` is a native PostgreSQL operator, so nothing here renders as a SQL
-            ``LOWER`` call.
-            It is applied to ``slug`` as well as to ``name`` even though ``slug`` is already
-            ``CITEXT`` and therefore case-insensitive: one operator across both columns states
-            the intent - case-insensitive containment - in one place, and stays correct if
-            either column's type is ever revisited.
+            ``LOWER`` call - which matters, because wrapping either column in a function is what
+            would put the trigram indexes behind these two predicates out of reach.
+
+            It is applied to both columns, but for different reasons on each. On ``name`` it states
+            the case-insensitive intent over a plain ``TEXT`` column. On ``slug`` it is a
+            requirement: that column is ``CITEXT`` and folded case for free, but the predicate is
+            written against ``slug::text`` in order to match the expression
+            ``ix_categories_slug_trgm`` is built on, and the cast discards the folding, so ``ILIKE``
+            is what puts it back. The comment at each term records which case applies.
         """
         stmt = select(Category)
 
@@ -408,8 +458,17 @@ class CategoryRepository(BaseRepository[Category]):
             pattern = f"%{_escape_like_wildcards(term)}%"
             stmt = stmt.where(
                 or_(
+                    # `name` is TEXT, so `ix_categories_name_trgm` is declared straight on the
+                    # column and this predicate needs nothing added to reach it.
                     Category.name.ilike(pattern, escape=_LIKE_ESCAPE_CHARACTER),
-                    Category.slug.ilike(pattern, escape=_LIKE_ESCAPE_CHARACTER),
+                    # `slug` is CITEXT, and `ix_categories_slug_trgm` therefore indexes the text
+                    # CAST: `gin_trgm_ops` is defined over `text`, and citext's own `~~`/`~~*`
+                    # operators are not in that operator family, so an index on the bare column
+                    # would be accepted by PostgreSQL and never chosen. The predicate is spelled
+                    # the way the index is. `ilike` stays `ilike` and is now load-bearing rather
+                    # than merely expressive - the cast discards citext's case-folding, so `like`
+                    # here would silently become a case-sensitive search.
+                    cast(Category.slug, Text).ilike(pattern, escape=_LIKE_ESCAPE_CHARACTER),
                 )
             )
 
@@ -463,18 +522,106 @@ class CategoryRepository(BaseRepository[Category]):
             entry is created and no other column crosses the wire, which matters for a call
             made on the create-and-rename path.
 
-            The pattern is anchored - ``LIKE 'prefix%'`` - rather than written as a containment
-            or a regular expression, so the comparison stays a prefix comparison the index on
-            ``categories.slug`` can serve. Because that column is ``CITEXT``, the match is
-            case-insensitive, which is precisely what ``unique_slug`` needs: it compares
-            case-insensitively too, so a stored ``News-2`` correctly rules out a proposed
-            ``news-2`` that PostgreSQL would have rejected at the unique index anyway.
+            The pattern is anchored - ``'prefix%'`` - rather than written as a containment or a
+            regular expression, so the scan is bounded to one slug family however large the
+            taxonomy grows.
+
+            **The column is cast to ``text`` and the operator is ``ILIKE``, and both are required
+            rather than preferences.** Anchoring alone does not buy an index here: it means the
+            query is not *prevented* from using one, but the default operator class over a
+            ``citext`` column provides none for a pattern match, so this was a sequential scan over
+            every category whatever ``ix_categories_slug`` did. ``ix_categories_slug_trgm`` is a
+            GIN trigram index over ``(slug::text)`` - it has to be over the cast, because
+            ``gin_trgm_ops`` is defined for ``text`` and citext's own ``~~``/``~~*`` operators are
+            not in that operator family - and this predicate is spelled to match it.
+
+            Two different questions, measured separately on PostgreSQL 18.4, because conflating
+            them overstates what the index does. *Reachable*: over the cast this predicate plans as
+            an ``Index Cond`` on ``ix_categories_slug_trgm``, while on the bare column no spelling
+            reaches any index at all - and that holds at every size. *Preferred*: whether the
+            planner picks the index over reading the table is a cost decision that arrives with
+            volume. At five thousand terms it reads the table, which is the right call - scanning a
+            small relation beats building a bitmap - and by a hundred and twenty thousand it takes
+            the index.
+
+            ``ILIKE`` rather than ``LIKE`` because the cast discards exactly the property that made
+            the bare ``LIKE`` correct. On a ``citext`` column the match folded case for free, which
+            is what ``unique_slug`` needs - it compares case-insensitively too, so a stored
+            ``News-2`` must rule out a proposed ``news-2`` that PostgreSQL would reject at the
+            unique index anyway. Over ``text`` that folding is gone, and ``ILIKE`` is what restores
+            it: the returned set is identical to the pre-cast one, verified on 18.4 against
+            mixed-case stored slugs.
         """
         pattern = f"{_escape_like_wildcards(prefix)}%"
         result = await self.session.execute(
-            select(Category.slug).where(Category.slug.like(pattern, escape=_LIKE_ESCAPE_CHARACTER))
+            select(Category.slug).where(
+                cast(Category.slug, Text).ilike(pattern, escape=_LIKE_ESCAPE_CHARACTER)
+            )
         )
         return set(result.scalars().all())
+
+    async def get_for_update(self, category_id: uuid.UUID) -> Category | None:
+        """Fetch one category by primary key, holding a row lock until the transaction ends.
+
+        **The first step of the delete path, and it is required rather than defensive.** Deleting
+        a category is a check followed by a write - :meth:`is_in_use`, then
+        :meth:`~app.repositories.base.BaseRepository.delete` - and without this lock another
+        transaction can file a post under the category in the window between them. The check saw
+        an unused term, the delete proceeds, and PostgreSQL's ``ON DELETE CASCADE`` on
+        ``post_categories.category_id`` removes the filing that arrived in the meantime. Nothing
+        fails, nobody is told, and a post silently loses a category - which is precisely the data
+        loss the in-use check exists to prevent.
+
+        ``SELECT ... FOR UPDATE`` closes that window, and it does so through the foreign key
+        rather than through anything this repository writes. PostgreSQL takes ``FOR KEY SHARE``
+        on the referenced ``categories`` row while it validates an ``INSERT`` into
+        ``post_categories``, and ``FOR KEY SHARE`` conflicts with ``FOR UPDATE``. So a concurrent
+        filing blocks on this lock until the deleting transaction ends, and then either finds the
+        row gone - a foreign-key violation it can be told about - or proceeds against a category
+        the delete declined to remove. Verified against PostgreSQL 18.4.
+
+        Args:
+            category_id: The category's server-generated UUID.
+
+        Returns:
+            The locked category, or ``None`` when no row carries that key. Absence is not an
+            error here - the service turns it into a ``404``, which is also why the lookup and
+            the lock are one statement: a category that does not exist cannot be locked, and
+            distinguishing "absent" from "locked and unused" is the service's decision to make.
+
+        Note:
+            **Call this before :meth:`is_in_use`, and delete through the returned entity.** The
+            lock only covers what happens after it is taken; probing first and locking afterwards
+            reintroduces the same window one statement later.
+
+            **No loader options.** The point of the statement is a lock over one row of
+            ``categories``. Nothing on the delete path reads
+            :attr:`~app.models.category.Category.posts` - :meth:`is_in_use` asks
+            ``post_categories`` directly with an ``EXISTS`` and loads no collection - and widening
+            the locked footprint to the filings would serialise readers of the taxonomy against
+            each other for no gain.
+
+            **The row is re-read rather than served from the identity map.** ``populate_existing``
+            makes the returned entity reflect the row as it stands under the lock; without it a
+            caller could take the lock and then decide from a stale in-session copy, which is the
+            hazard the lock was acquired to remove.
+
+            :meth:`~app.repositories.base.BaseRepository.get_by_id` remains the right call for an
+            unlocked read - a rename, a single-category response - and this is not a second
+            identity predicate but that same lookup with a lock. It is spelled as a ``select()``
+            because :meth:`~sqlalchemy.ext.asyncio.AsyncSession.get` consults the identity map
+            first and can return without touching the database, which would take no lock at all.
+            ``app.repositories.post_repository`` carries the same method over ``posts`` for the
+            same reason, and the two are deliberately identical in shape.
+        """
+        statement = (
+            select(Category)
+            .where(Category.id == category_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(statement)
+        return result.scalars().first()
 
     async def is_in_use(self, category_id: uuid.UUID) -> bool:
         """Report whether any post is filed under this category.
@@ -484,9 +631,17 @@ class CategoryRepository(BaseRepository[Category]):
         silently unfiling a term from every post that used it is data loss dressed up as a
         successful delete. This method only answers.
 
+        **It must be asked under the lock :meth:`get_for_update` takes.** On its own this is a
+        non-locking probe, and a probe is a statement about the past: an association inserted
+        after it returns ``False`` is still there when the delete runs, and the cascade on
+        ``post_categories.category_id`` removes it without a word. The answer is only as current
+        as the lock held while it is acted on, so the delete path is
+        ``get_for_update`` -> ``is_in_use`` -> ``delete``, in that order, in one transaction.
+
         Args:
             category_id: The category to probe. A server-generated UUID, so it arrived either
-                from an earlier read or from a path segment a route already validated.
+                from an earlier read or from a path segment a route already validated. On the
+                delete path it is the identifier of the row already locked.
 
         Returns:
             ``True`` when at least one row in ``post_categories`` references the category,

@@ -97,11 +97,12 @@
 //      composition away and force a new prop for every future arrangement.
 //   2. `forwardRef`. On React 19 `ref` is an ordinary prop, so it rides the
 //      `...props` spread into the primitive with nothing to wrap.
-//   3. A hover state. No design source specifies one, the reference library
-//      this token layer is modelled on ships none, and inventing an
-//      interaction state that no design defines is out of bounds. The
-//      active-panel change is the affordance, and it is what
-//      `motion-safe:transition-colors` animates.
+//   3. A hover FILL on a trigger. The hover treatment this component does carry
+//      is a text-colour step on inactive triggers only (see TabsTrigger); a fill
+//      is deliberately not used, because any ground applied on hover approaches
+//      the active tab's own `bg-surface` and makes a hovered inactive tab read as
+//      the selected one. The state change between panels remains the primary
+//      affordance, and `motion-safe:transition-colors` animates both.
 //   4. Domain knowledge. The author workspace happens to group posts by the
 //      DRAFT/PUBLISHED/ARCHIVED lifecycle and the admin shell switches between
 //      sections, but those values are supplied by the caller. This primitive
@@ -197,6 +198,13 @@ function TabsList({ className, ...props }: ComponentProps<typeof TabsPrimitive.L
  * `whitespace-nowrap` keeps a label on one line; the list wraps whole triggers
  * instead of breaking their text.
  *
+ * Hovering an INACTIVE trigger lifts its label from the list's
+ * `text-muted-foreground` to the full-strength `text-foreground`, so a pointer
+ * user gets feedback that the tab is actionable before committing to it. The
+ * active trigger is unaffected: the rule is scoped to `data-state="inactive"`,
+ * which Radix sets on every unselected trigger, so hover can never imitate
+ * selection.
+ *
  * The colour transition is scoped by `motion-safe:`, which the engine compiles
  * to `@media (prefers-reduced-motion: no-preference)` - so a visitor who has
  * asked for reduced motion gets the state change instantly rather than animated,
@@ -220,6 +228,17 @@ function TabsTrigger({ className, ...props }: ComponentProps<typeof TabsPrimitiv
     <TabsPrimitive.Trigger
       className={cn(
         'focus-visible:outline-ring data-[state=active]:bg-surface data-[state=active]:text-foreground inline-flex items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:shadow-sm motion-safe:transition-colors',
+        // Hover, on the INACTIVE tabs only. Scoped by `data-[state=inactive]:`
+        // rather than by a bare `hover:`, which is what makes it impossible for
+        // this line to touch the selected tab: Radix marks every unselected
+        // trigger `data-state="inactive"`, so the active tab's own ground and
+        // foreground above are never in the same fight. It is a text-colour step
+        // to the full-strength foreground token, not a fill - a fill would
+        // approach the active tab's `bg-surface` and make a hovered inactive tab
+        // read as selected, which is the one thing a tab hover must not do.
+        // `disabled:` above sits later in the cascade and keeps a disabled
+        // trigger out of pointer reach, so it cannot pick this up either.
+        'data-[state=inactive]:hover:text-foreground',
         className,
       )}
       {...props}

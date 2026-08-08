@@ -642,12 +642,12 @@ export function SearchInput({
             // their first character.
             //
             // Measured against the primitives: the icon occupies 12px to 28px, so
-            // `ps-9` (36px) clears it; the clear button is 38px wide inset 4px
-            // from the trailing edge, so `pe-11` (44px) clears that. These
+            // `ps-9` (36px) clears it; the clear button is a 44px square inset 4px
+            // from the trailing edge, so `pe-13` (52px) clears that. These
             // override the field's own `px-3` deterministically - the engine emits
             // `padding-inline` before `padding-inline-start`/`-end`, so the more
             // specific pair wins.
-            'ps-9 pe-11',
+            'ps-9 pe-13',
 
             // WebKit and Chrome draw their OWN clear affordance inside a search
             // field, and the engine's preflight resets only
@@ -663,21 +663,42 @@ export function SearchInput({
          * Rendered only when there is something to clear, so the field is
          * uncluttered at rest.
          *
-         * BLITZY [A11Y]: `size="sm"` is a 32px-tall target, below the 44x44
-         * minimum. Specified as "the ghost variant at a small size" for this
-         * control, and a specification outranks the generic minimum, so it is
-         * implemented exactly as given and flagged here for designer review rather
-         * than silently enlarged. The `default` size would be 44px - the full
-         * height of the field it sits inside - which would leave no visible field
-         * edge around it. The affordance is also never the only way to clear the
-         * term: selecting the text and deleting it reaches the same state through
-         * the field itself, which is a full-size target.
+         * The control is a 44x44 square - the WCAG 2.5.5 target-size floor, and the
+         * size this control has to be: no design source exists for this project
+         * (zero attachments, zero Figma frames), so nothing authorises a smaller
+         * target and the accessible minimum governs. The 32px `sm` size exists for
+         * the dense admin row actions and is explicitly opt-in for them; a search
+         * field on a 375px viewport is the opposite case, a primary reader-facing
+         * affordance touched with a thumb.
+         *
+         * The square is composed rather than served by a fourth Button size. The
+         * size table is `sm` / `default` / `lg`, and the default variant is
+         * `h-11 px-5`, so `w-11 px-0` drops the inline padding and matches the
+         * width to the height - the 44x44 box an icon-only control needs, which is
+         * the composition that table prescribes. `[&_svg]:size-5` raises the glyph
+         * from the primitive's 16px default to the 20px a lone glyph needs inside a
+         * 44px box, and `tailwind-merge` resolves both against the variant's own
+         * `px-5` and `[&_svg]:size-4` in this file's favour, so the result is one
+         * class per property rather than a specificity fight. Every one of them is
+         * a token utility; none is a literal.
+         *
+         * The geometry is what makes a 44px control fit inside a 44px field without
+         * swallowing it. `rounded-full` plus `end-1` keeps the field's trailing
+         * border and its rounded corner fully visible - the circle is inset one
+         * spacing step from that edge and only tangent to the top and bottom
+         * borders, so the field still reads as a field rather than as a button with
+         * a text area attached. `inset-y-0 my-auto` centres the square in the
+         * field's own height, and the input's `pe-13` above reserves 52px so the
+         * search term can never run underneath it.
+         *
+         * The affordance is still not the only way to clear the term - selecting
+         * the text and deleting it reaches the same state through the field itself.
+         * That is a fallback, not a justification for a small target.
          */}
         {draft.length > 0 ? (
           <Button
-            className="absolute inset-y-0 end-1 my-auto"
+            className="absolute inset-y-0 end-1 my-auto w-11 rounded-full px-0 [&_svg]:size-5"
             onClick={handleClear}
-            size="sm"
             variant="ghost"
           >
             <X aria-hidden="true" />

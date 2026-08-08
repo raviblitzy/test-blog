@@ -101,6 +101,9 @@ from pydantic import (
     StringConstraints,
     field_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
+
+from app.schemas.common import omit_null_default
 
 # The module's public contract is these four models and nothing else. The two length constants
 # and the three annotated aliases below are shared machinery, importable by a test or by a
@@ -488,6 +491,11 @@ class CategoryUpdate(BaseModel):
     ``{"name": null}`` gets ``422`` naming the field, rather than a ``500`` from an integrity
     violation raised several layers away from the mistake that caused it.
 
+    The published schema draws the same line: ``description`` advertises ``null`` among its
+    types because it accepts one, and ``name`` does not, because it does not. That equality
+    between the document and the behaviour is what stops a generated client offering a request
+    the API answers with a ``422`` - see :func:`~app.schemas.common.omit_null_default`.
+
     Reused, not redeclared
     ----------------------
     ``app.schemas.admin`` imports this class rather than declaring an administrative variant.
@@ -505,8 +513,9 @@ class CategoryUpdate(BaseModel):
         },
     )
 
-    name: CategoryName | None = Field(
+    name: CategoryName | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             "New display label, 1 to "
             f"{NAME_MAX_LENGTH} characters after trimming. Omit it to leave the name unchanged. "
@@ -514,6 +523,14 @@ class CategoryUpdate(BaseModel):
             "the category's slug, so existing links keep resolving. Null is not accepted."
         ),
     )
+    """New label, or omitted to leave it unchanged. Optional but not nullable.
+
+    ``SkipJsonSchema[None]`` keeps ``null`` out of the member's published type and
+    :func:`~app.schemas.common.omit_null_default` removes the contradictory ``default: null``, so
+    the document describes a plain optional string - which is what :meth:`_reject_null_name`
+    enforces. The two agreed in prose before and disagreed in the schema, which is the form of
+    the mismatch a generated client actually consumes.
+    """
     description: OptionalCategoryDescription = Field(
         default=None,
         description=(

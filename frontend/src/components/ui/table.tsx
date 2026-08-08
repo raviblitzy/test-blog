@@ -81,11 +81,19 @@
  * non-portalled popover inside a card cannot be clipped by a scrollport that is
  * serving no purpose at that width.
  *
- * The wrapper carries no `tabIndex`. A keyboard user reaches the grid's contents
- * (a title link, a row-action trigger) directly and the browser scrolls the
- * container to reveal whichever cell receives focus, so the scrollport needs no
- * tab stop of its own - and adding one would trip
- * `jsx-a11y/no-noninteractive-tabindex`, which `npm run lint` treats as fatal.
+ * The wrapper carries no `tabIndex` BY DEFAULT, and that default is right for the
+ * grids this application actually renders: every admin row carries a link or a
+ * row-action trigger, a keyboard user reaches those directly, and the browser
+ * scrolls the container to reveal whichever cell takes focus - so a tab stop on
+ * the scrollport would be a stop that lands on nothing and has to be tabbed past.
+ *
+ * It is a default and not a prohibition, because a grid with NO focusable
+ * descendant is a real case - a read-only report, a wide reference table - and
+ * such a scrollport cannot be scrolled by keyboard at all: there is nothing
+ * inside it to focus, so the arrow keys have no scroll container to act on.
+ * `scrollRegionLabel` opts that grid into a focusable scroll region (`role`,
+ * accessible name, `tabIndex`, visible focus ring); see the prop's own
+ * documentation for when to pass it and when not to.
  *
  * ---------------------------------------------------------------------------
  * TOKEN VOCABULARY - the whole file
@@ -120,8 +128,9 @@
  *
  * `--color-border` measures below 3:1 by design. globals.css records the flagged
  * A11Y decision in full: 1.4.11 exempts decorative boundaries, and it names
- * table rules as an example. `--color-border-strong` exists for the boundary of
- * an interactive control; a table rule is not one, so it is not used here.
+ * table rules as an example. `--color-muted-foreground` is what that note
+ * composes an interactive control's boundary from; a table rule is not one, so
+ * the decorative hairline is what belongs here.
  *
  * The row hover fill is `--color-surface-muted` and NOT `--color-accent`.
  * `accent` is the saturated brand hue - the emphasis companion to `primary` -
@@ -201,6 +210,26 @@ import { cn } from '@/lib/utils';
 const TABLE_CONTAINER_BASE = cn('w-full min-w-0', 'max-md:overflow-visible md:overflow-x-auto');
 
 /*
+ * Added to the container only when `scrollRegionLabel` is supplied - the classes
+ * that make a focusable scrollport legible as one.
+ *
+ * The focus indicator is the point. A `tabIndex` with no visible ring produces a
+ * stop a sighted keyboard user cannot see they have landed on, which is worse
+ * than no stop at all. `outline-*` rather than `ring-*` for the same reason the
+ * field family uses it: an outline is not clipped by an ancestor's
+ * `overflow: hidden`, and `outline-2`/`outline-offset-2` are exactly what the
+ * `:focus-visible` floor in globals.css emits, so the indicator's thickness and
+ * position are unchanged from every other focusable thing in the product.
+ *
+ * `md:` on all three because the scrollport itself only exists past that
+ * breakpoint - below md the rows are cards and there is nothing to scroll, so a
+ * tab stop there would be a stop on a container that cannot move.
+ */
+const TABLE_SCROLL_REGION_BASE = cn(
+  'md:focus-visible:outline-ring md:focus-visible:outline-2 md:focus-visible:outline-offset-2',
+);
+
+/*
  * `caption-bottom` places a <caption> after the grid rather than above it. It is
  * kept on the base so the element is styled correctly if a caption is ever
  * needed for the accessible name; until then, name a grid with `aria-label`,
@@ -223,6 +252,32 @@ interface TableProps extends ComponentProps<'table'> {
    * (`max-h-*`). `className` reaches the <table> instead.
    */
   containerClassName?: string;
+
+  /**
+   * Accessible name for the scroll container, which OPTS THE CONTAINER INTO being
+   * a focusable scroll region: it gains `role="region"`, this name, `tabIndex={0}`
+   * and a visible focus ring past md.
+   *
+   * Pass it when the grid has NO focusable descendant. Such a table can be wider
+   * than the viewport and yet be unscrollable by keyboard, because scrolling a
+   * container with the arrow keys requires focus to be inside it and there is
+   * nothing inside to focus. A tab stop on the scrollport is the fix, and the
+   * `region` role plus a name is what tells a screen-reader user what they have
+   * landed on rather than announcing an unlabelled group.
+   *
+   * Do NOT pass it when rows carry links or row actions - which is every admin
+   * grid in this application. Focus already enters the container there, the
+   * browser scrolls it to reveal whichever cell is focused, and an extra stop in
+   * front of a table that is already reachable is one more thing to tab past on
+   * every pass. WCAG's own guidance on 2.1.1 is that a scrollable region needs a
+   * tab stop only when it is not otherwise keyboard operable.
+   *
+   * The name should say what the grid contains - "Comment moderation queue",
+   * "Users" - and may repeat the grid's own `aria-label`: the region names the
+   * scrollport, the table names the data, and a reader encounters them at
+   * different moments.
+   */
+  scrollRegionLabel?: string;
 }
 
 /**
@@ -247,11 +302,11 @@ interface TableProps extends ComponentProps<'table'> {
  *   <TableBody>
  *     {users.map((user) => (
  *       <TableRow key={user.username}>
- *         <TableCell label="User">{user.displayName}</TableCell>
+ *         <TableCell label="User">{user.display_name}</TableCell>
  *         <TableCell label="Role">
  *           <Badge>{user.role}</Badge>
  *         </TableCell>
- *         <TableCell label="Joined">{formatDate(user.createdAt)}</TableCell>
+ *         <TableCell label="Joined">{formatDate(user.created_at)}</TableCell>
  *       </TableRow>
  *     ))}
  *   </TableBody>
@@ -262,10 +317,31 @@ interface TableProps extends ComponentProps<'table'> {
  * ```tsx
  * <Table aria-label="Comment moderation queue" containerClassName="md:rounded-xl md:border">
  * ```
+ *
+ * @example A read-only grid with nothing focusable inside it, so the scrollport
+ * itself has to be reachable
+ * ```tsx
+ * <Table aria-label="Category post counts" scrollRegionLabel="Category post counts">
+ * ```
  */
-export function Table({ className, containerClassName, ...props }: TableProps) {
+export function Table({ className, containerClassName, scrollRegionLabel, ...props }: TableProps) {
+  // All three region attributes are applied together or not at all. A `tabIndex`
+  // without a role and a name is an unexplained stop; a role and a name without a
+  // `tabIndex` is a region a keyboard cannot enter. `undefined` omits each
+  // attribute outright rather than rendering it empty.
+  const isScrollRegion = scrollRegionLabel !== undefined && scrollRegionLabel.length > 0;
+
   return (
-    <div className={cn(TABLE_CONTAINER_BASE, containerClassName)}>
+    <div
+      className={cn(
+        TABLE_CONTAINER_BASE,
+        isScrollRegion && TABLE_SCROLL_REGION_BASE,
+        containerClassName,
+      )}
+      role={isScrollRegion ? 'region' : undefined}
+      aria-label={isScrollRegion ? scrollRegionLabel : undefined}
+      tabIndex={isScrollRegion ? 0 : undefined}
+    >
       <table className={cn(TABLE_BASE, className)} {...props} />
     </div>
   );

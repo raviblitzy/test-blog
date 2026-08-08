@@ -170,9 +170,10 @@ export default defineConfig({
      * because none of them begins with '@/'.
      *
      * Note that `@` reaches src/ ONLY. frontend/tests/ sits outside src/, so
-     * test-internal imports - frontend/vitest.setup.ts pulling in
-     * ./tests/msw/handlers, one component test importing a fixture from another
-     * - are relative, and `@/tests/...` resolves to nothing.
+     * test-internal imports - one component test importing a fixture from
+     * another, or the request-interception lifecycle the test-support boundary
+     * adds pulling in its own handler list - are relative, and `@/tests/...`
+     * resolves to nothing.
      *
      * vite-tsconfig-paths would also solve this. It is not used: it is not in
      * the declared dependency set, and adding an undeclared package to a tier
@@ -238,18 +239,59 @@ export default defineConfig({
     globals: true,
 
     /*
+     * The three public runtime values, pinned HERE and nowhere else.
+     *
+     * This is the single source of truth for what a component test sees in
+     * `process.env.NEXT_PUBLIC_*`, and the placement is load-bearing rather than
+     * a matter of taste. Vitest applies this block before a setup file or a test
+     * module is evaluated; an assignment written inside vitest.setup.ts could
+     * not, because ES module imports are hoisted, so every module that file
+     * imports - and every module those import - would already have evaluated
+     * against whatever the machine happened to have set. A module that reads a
+     * NEXT_PUBLIC_ value at its top level would therefore observe a developer's
+     * frontend/.env.local instead of the pinned value, and the gate's outcome
+     * would depend on ambient state.
+     *
+     * The values are the ones .env.example documents, not invented test
+     * hostnames, so a module that carries the documented default and a module
+     * that reads the environment agree. The base URL includes the /api/v1 prefix
+     * exactly as the contract requires: client code appends bare resource paths
+     * such as /posts and never repeats the prefix.
+     *
+     * Neither URL is reachable from a component test: both name a loopback port
+     * that nothing binds while this suite runs, so a component that fetched
+     * without being told what to answer fails on a refused connection rather
+     * than reaching a service. Request interception is not configured here or in
+     * vitest.setup.ts - the handler module and its `listen`/`resetHandlers`/
+     * `close` lifecycle arrive with the component suite that needs them, so this
+     * entry never depends on a module the setup file cannot see. `msw` is pinned
+     * in package.json ready for that suite.
+     */
+    env: {
+      NEXT_PUBLIC_API_BASE_URL: 'http://localhost:8000/api/v1',
+      NEXT_PUBLIC_SITE_URL: 'http://localhost:3000',
+      NEXT_PUBLIC_SITE_NAME: 'Modern Blog',
+      NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST:
+        'images.unsplash.com,picsum.photos,res.cloudinary.com,avatars.githubusercontent.com',
+    },
+
+    /*
      * The suite's bootstrap, resolved relative to this file's directory.
      *
      * frontend/vitest.setup.ts runs once per test file, before that file's own
-     * modules evaluate, and it is where five things happen that no test should
+     * modules evaluate, and it is where three things happen that no test should
      * have to repeat: the jest-dom matchers are registered (via the `/vitest`
-     * subpath, so they extend Vitest's `expect` rather than Jest's), the three
-     * NEXT_PUBLIC_* values are pinned so no developer's .env.local can move a
-     * gate, the MSW server is started with `onUnhandledRequest: 'error'` so an
-     * unmocked request fails loudly instead of opening a socket, every rendered
-     * tree is unmounted between tests, and the browser APIs jsdom omits are
-     * filled in - matchMedia, ResizeObserver, IntersectionObserver,
-     * scrollIntoView and pointer capture.
+     * subpath, so they extend Vitest's `expect` rather than Jest's), every
+     * rendered tree is unmounted between tests, and the browser APIs jsdom omits
+     * are filled in - matchMedia, ResizeObserver, IntersectionObserver,
+     * scrollIntoView and pointer capture. The public configuration is pinned by
+     * the `env` block above rather than in that file, for the ordering reason
+     * recorded there.
+     *
+     * Request interception is deliberately not among them. The Mock Service
+     * Worker server, its handler list and its lifecycle hooks arrive with the
+     * suite they serve, at the boundary that introduces tests/**, so this
+     * bootstrap imports nothing from tests/ and stays runnable on its own.
      *
      * That last group is what the Radix-backed primitives need. A dialog,
      * dropdown menu, select, tab set or avatar throws on `ResizeObserver is not
@@ -357,9 +399,9 @@ export default defineConfig({
      *     The defaults are correct here and tuning them without a measured
      *     problem trades real isolation guarantees for an imagined speed-up.
      *     The suite is per-file isolated as shipped.
-     *   - `testTimeout` / `hookTimeout` overrides. MSW answers in-process with
-     *     `onUnhandledRequest: 'error'`, so nothing in a component test waits
-     *     on a network round trip and the defaults have ample headroom.
+     *   - `testTimeout` / `hookTimeout` overrides. A component test renders in
+     *     jsdom against pinned loopback URLs nothing binds, so none of them
+     *     waits on a network round trip and the defaults have ample headroom.
      *   - Any snapshot or class-name serialiser. Assertions target accessible
      *     names and visible text; see the header.
      *   - Anything Playwright-related, including reporters and projects.

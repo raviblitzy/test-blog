@@ -48,7 +48,8 @@ in-process over an httpx ASGI transport with no live server: resolving ``app.db`
 to succeed with no database reachable and no environment configured, and it does,
 because it reads neither.
 
-``__version__`` is deliberately absent as well. It belongs to ``app/__init__.py``, the
-single source of the version ``app.main`` publishes in its OpenAPI document; a second
-declaration here would be a second source of truth.
+``__version__`` is deliberately absent as well, here and in every other package marker
+including ``app/__init__.py``. ``[project] version`` in ``backend/pyproject.toml`` is the
+single source of the version ``app.main`` publishes in its OpenAPI document, read from that
+project metadata; a declaration in any module would be a second source of truth.
 """

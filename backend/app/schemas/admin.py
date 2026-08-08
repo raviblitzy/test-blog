@@ -149,9 +149,11 @@ import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, ValidationInfo, field_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from app.models import CommentStatus, PostStatus, UserRole
 from app.schemas.category import CategoryCreate, CategoryUpdate
+from app.schemas.common import omit_null_default
 from app.schemas.user import UserPublic
 
 # The module's public contract: the seven models declared here, plus the two category inputs
@@ -384,7 +386,10 @@ class AdminUserUpdate(BaseModel):
     Both columns are ``NOT NULL``. Omission is the way to say "unchanged", so an explicit null is a
     third spelling of nothing, and honouring it would send ``NULL`` at a constraint and surface as
     a ``500`` describing a database error several layers from the member that caused it. The
-    validator below refuses it as a ``422`` instead.
+    validator below refuses it as a ``422`` instead, and neither member advertises ``null`` in
+    the published schema - so a generated client cannot offer a state this model refuses. See
+    :func:`~app.schemas.common.omit_null_default` for the declaration that keeps the document
+    and the behaviour identical.
     """
 
     model_config = ConfigDict(
@@ -405,8 +410,9 @@ class AdminUserUpdate(BaseModel):
         },
     )
 
-    role: UserRole | None = Field(
+    role: UserRole | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             "New authority for the account - READER, AUTHOR or ADMIN. Omit to leave it unchanged. "
             "Takes effect on the account's next request, because every authorisation decision "
@@ -416,8 +422,18 @@ class AdminUserUpdate(BaseModel):
             "the last remaining administrator may do so."
         ),
     )
-    is_active: bool | None = Field(
+    """New authority, or omitted to leave it unchanged. Optional but not nullable.
+
+    ``users.role`` is ``NOT NULL``, so omission is the only way to say "unchanged" and an explicit
+    null is a third spelling of nothing. :meth:`_reject_explicit_null` refuses it, and the
+    published member now says so too: ``SkipJsonSchema[None]`` keeps ``null`` out of the type and
+    :func:`~app.schemas.common.omit_null_default` removes the ``default: null`` that would
+    otherwise sit beside an enumeration of three values.
+    """
+
+    is_active: bool | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             "Whether the account may authenticate. Send false to suspend it, true to restore it, "
             "and omit the member to leave it as it is. Suspension is reversible and leaves the "
@@ -426,6 +442,13 @@ class AdminUserUpdate(BaseModel):
             "cannot be undone."
         ),
     )
+    """Whether the account may authenticate, or omitted to leave it unchanged.
+
+    The member where the mismatch was most misleading, because ``null`` on a boolean reads as a
+    third state. There is none: ``users.is_active`` is ``NOT NULL``, ``false`` suspends, ``true``
+    restores, and omission changes nothing. The published type is now a plain boolean, so a
+    generated client cannot offer a null it would receive a 422 for.
+    """
 
     @field_validator("role", "is_active")
     @classmethod
@@ -523,14 +546,17 @@ class AdminPost(BaseModel):
             # The same post and author the sibling modules use. PUBLISHED with a populated
             # `published_at`, because that pairing is the database CHECK constraint made visible:
             # the two members are never independently valid. Both spelled from the imported
-            # enumeration so the example cannot name a state the type does not have.
+            # enumeration so the example cannot name a state the type does not have. `view_count`
+            # is 0 because that is what every row of this table actually reports - no endpoint
+            # advances the counter - and an example an administrator's table can never match would
+            # be a claim about audience that the data does not support.
             "example": {
                 "id": "7c9e6a2b-4d81-4f3a-9c5e-2b8d1f0a6e34",
                 "title": "Scaling FastAPI",
                 "slug": "scaling-fastapi",
                 "status": PostStatus.PUBLISHED.value,
                 "published_at": "2026-02-03T08:15:00Z",
-                "view_count": 128,
+                "view_count": 0,
                 "author": {
                     "id": "7d4c2e91-3b58-4f6a-8c02-1e9b5a7d3f64",
                     "username": "example-author",
@@ -594,10 +620,12 @@ class AdminPost(BaseModel):
     view_count: int = Field(
         ...,
         description=(
-            "Number of times the post's detail page has been read. Maintained by the service on "
-            "each public read and accepted from no input model, so it cannot be set, reset or "
-            "back-dated through the API. Present here as the one signal in the table of whether a "
-            "post has an audience worth weighing before archiving it."
+            "The post's readership counter. Accepted from no input model, so it cannot be set, "
+            "reset or back-dated through the API - and **currently `0` for every post**, because "
+            "no endpoint in this API advances it: the column is provided so that counting reads "
+            "later needs no change to this contract. Do not present it as an audience signal or "
+            "sort the table by it while that holds; a column of zeroes reads as 'nobody has read "
+            "any of these' rather than as 'not measured yet'."
         ),
     )
     author: UserPublic = Field(
@@ -613,9 +641,12 @@ class AdminPost(BaseModel):
         ...,
         description=(
             "Instant the post was created, from the database clock, as a timezone-aware ISO 8601 "
-            "value in UTC. Distinct from `published_at` and always populated: a draft has a "
-            "creation instant and no publication instant, which is what makes this the sort key "
-            "that orders a table containing drafts sensibly."
+            "value in UTC. Distinct from `published_at` and, unlike it, always populated - a draft "
+            "has a creation instant and no publication instant - so this is the member to render "
+            "as a draft's age. It is not the table's sort key: the listing orders by "
+            "`published_at` descending with nulls last and `id` descending as the tiebreaker, "
+            "which groups the never-published rows together at the end rather than interleaving "
+            "them by an instant a reader never sees."
         ),
     )
     updated_at: datetime = Field(
@@ -719,8 +750,9 @@ class AdminComment(BaseModel):
     -----------------
     ``app.schemas.comment.CommentPublic`` owns the threaded shape and carries a recursive
     ``replies`` list, because a reader consumes a discussion. A queue is a work list: it is ordered
-    by state and age across every post in the system, and nesting would hide a pending reply
-    underneath an approved parent - which is the one row the moderator was looking for.
+    by submission instant, newest first, across every post in the system, and nesting would hide a
+    pending reply underneath an approved parent - which is the one row the moderator was looking
+    for.
     :attr:`parent_id` is retained, so a client that wants to show "this is a reply" still can, and a
     moderator can follow it to the comment being answered. A ``replies`` member here would also make
     the query recursive for no benefit, and it would raise a question this shape must not raise:
@@ -730,8 +762,8 @@ class AdminComment(BaseModel):
     ---------------------------------------------------------
     :attr:`post_id` is the whole of the relationship this row needs. Adding a title, or a nested
     post, would put a join into the one statement that most needs to stay narrow: the queue is
-    served by an index on ``comments.status`` and ordered by ``(post_id, created_at)``, and a join
-    per row buys text that the moderator can reach by following the identifier. It is also not
+    served by an index on ``comments.status`` and ordered by ``(created_at DESC, id DESC)``, and a
+    join per row buys text that the moderator can reach by following the identifier. It is also not
     specified - the requirement is a moderation queue with approve, reject and delete - so adding
     it would be inventing scope, and the cost would be paid on every page load forever.
 
@@ -824,17 +856,22 @@ class AdminComment(BaseModel):
         description=(
             "Moderation state: PENDING while awaiting a decision, APPROVED once public, REJECTED "
             "once refused. All three appear in this listing, unlike the public comment list, which "
-            "returns APPROVED rows only. Changed exclusively through "
+            "returns APPROVED rows only. APPROVED and REJECTED are reachable exclusively through "
             "`PATCH /api/v1/admin/comments/{id}/status` - no input model reachable by a comment's "
-            "own author carries it, which is what stops a commenter approving their own comment."
+            "own author carries this member, which is what stops a commenter approving their own "
+            "comment. PENDING is reachable a second way: editing an APPROVED comment returns it "
+            "here, so replaced text re-enters this queue instead of staying public unreviewed."
         ),
     )
     created_at: datetime = Field(
         ...,
         description=(
             "Instant the comment was written, from the database clock, as a timezone-aware ISO "
-            "8601 value in UTC - for example `2026-02-03T11:05:00Z`. The queue's sort key, so the "
-            "oldest undecided comment is the one that surfaces first."
+            "8601 value in UTC - for example `2026-02-03T11:05:00Z`. The queue's sort key, "
+            "**descending**: the most recent submission surfaces first, because the queue is "
+            "worked from the top. `id` descending is the tiebreaker, and it is required rather "
+            "than decorative - this instant comes from a per-transaction clock, so comments "
+            "written by one request share it."
         ),
     )
     updated_at: datetime = Field(
@@ -842,8 +879,10 @@ class AdminComment(BaseModel):
         description=(
             "Instant the comment was last modified, in the same form. Equal to `created_at` until "
             "the body is edited, so `updated_at > created_at` is a reliable 'edited' test. An edit "
-            "does not change `status`, so it does not re-open moderation - which makes a row whose "
-            "body changed after approval worth a second look, and this member is how it is found."
+            "re-opens moderation, so a comment whose body changed after approval is already back "
+            "in this queue as PENDING rather than needing to be hunted for; read this member "
+            "beside `created_at` to see that the text in front of you is a replacement, and judge "
+            "it on its own terms rather than on the earlier decision."
         ),
     )
 

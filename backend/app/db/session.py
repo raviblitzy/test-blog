@@ -87,14 +87,25 @@ ownership check and no domain rule.
 
 Observability
 -------------
-``echo`` follows ``settings.is_development``, so it is off in test, staging and production.
-It is never hard-coded ``True``: echoed SQL carries bound parameter values, which in this
-schema means email addresses and password hashes reaching the log stream. In development
-the statements are not loose text either - ``app.core.logging`` bridges the
-standard-library ``sqlalchemy.engine`` logger into the ``structlog`` chain, so they arrive
-as structured records like every other event. Logging is configured there and called once
-from the ``app.main`` lifespan, never here. ``echo_pool`` is left off: pool churn is not
-something a developer reads statement by statement.
+Two settings on the engine below decide what a statement can reveal, and both are fixed
+rather than staged.
+
+``hide_parameters=True``, always. SQLAlchemy otherwise renders the bound values into the
+line it logs, and in this schema those values are the data itself: an email address, a
+password hash, a refresh-token digest, the body of an unpublished draft. With it on the
+statement is still logged whole - which query, which table, how many parameters - and the
+values are replaced by a fixed marker, so the line keeps every property that makes it worth
+having and loses the one that makes it a liability.
+
+``echo`` is not set at all. Passing ``echo=True`` attaches a plain-text ``StreamHandler`` of
+SQLAlchemy's own to the ``sqlalchemy.engine.Engine`` logger, and because this engine is
+built at import time that handler predates ``configure_logging()`` and survives its bridge -
+producing two renderings of every statement, one structured and one not. Statement logging
+belongs to the log level instead: ``app.core.logging`` pins the SQLAlchemy namespace to
+``WARNING`` unless ``LOG_LEVEL`` is ``DEBUG``, and at ``DEBUG`` the statements travel the same
+processor chain as every other event. Logging is configured there and called once from the
+``app.main`` lifespan, never here. ``echo_pool`` is left off for the same reason: pool churn
+is not something a developer reads statement by statement.
 """
 
 from typing import Final
@@ -177,9 +188,31 @@ engine: AsyncEngine = create_async_engine(
     # postgresql+psycopg form. The synchronous URL Alembic drives is derived in
     # backend/migrations/env.py, so this project has one URL derivation, not two.
     settings.DATABASE_URL,
-    # Off everywhere but development. What does get echoed reaches the log stream through
-    # the structlog chain app.core.logging installs over the sqlalchemy.engine logger.
-    echo=settings.is_development,
+    # Parameters are NEVER rendered. SQLAlchemy interpolates the bound values into the line
+    # it logs unless told otherwise, and those values are the request's contents: a
+    # plaintext-adjacent password hash, an email address, a refresh-token digest, the body
+    # of somebody's draft. With this on, the statement is still logged in full and the
+    # values are replaced by a fixed marker, so a statement log keeps its diagnostic value -
+    # which query, against which table, with how many parameters - and stops being a copy of
+    # the data. It is set unconditionally, in every environment, because "development" is a
+    # laptop with a real database attached at least as often as it is a throwaway one.
+    hide_parameters=True,
+    # `echo` is deliberately NOT set, in any environment.
+    #
+    # Two reasons, and the second is the one that matters. Passing `echo=True` makes
+    # SQLAlchemy attach a StreamHandler of its own to the `sqlalchemy.engine.Engine` logger
+    # with its own plain-text formatter (`sqlalchemy.log._add_default_handler`), and this
+    # engine is constructed at import time - before `app.main`'s lifespan calls
+    # `configure_logging()`. The result is a handler the structlog bridge never gets the
+    # chance to detach, so every statement is written twice: once as unstructured text and
+    # once as JSON, which is exactly the state a single-owner logging design exists to
+    # prevent. And it makes statement logging a property of the deployment stage rather than
+    # of the log level, which is the wrong axis.
+    #
+    # Statement logging is therefore controlled by LOG_LEVEL alone. `app.core.logging` pins
+    # the SQLAlchemy namespace to WARNING unless LOG_LEVEL is DEBUG, and at DEBUG the
+    # statements flow through the same processor chain as everything else - one shape, one
+    # sink, parameters scrubbed by the line above.
     pool_pre_ping=POOL_PRE_PING,
     pool_size=POOL_SIZE,
     max_overflow=MAX_OVERFLOW,

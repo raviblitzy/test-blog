@@ -106,13 +106,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
-from sqlalchemy import select
+from sqlalchemy import Text, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
 from app.core.security import hash_password
-from app.core.slug import slugify_title, unique_slug
+from app.core.slug import DEFAULT_MAX_LENGTH, slugify_title, unique_slug
 from app.db.session import AsyncSessionLocal, engine
 from app.models import Category, Post, PostStatus, User, UserRole
 
@@ -1562,15 +1562,101 @@ def _resolve_categories(
     return resolved
 
 
-async def _taken_usernames(session: AsyncSession) -> set[str]:
-    """Read every handle currently in use, so a new one can be resolved against them.
+_HANDLE_SUFFIX_HEADROOM: Final[int] = 8
+"""Characters of the slug bound reserved for a collision suffix, in :func:`_taken_usernames`.
 
-    One column, one query, whatever the size of the table - the alternative, probing per
-    candidate, turns three inserts into six round trips and still races with itself. The values
-    come back in the case the database stored them; ``app.core.slug.unique_slug`` folds both
-    sides, so no normalisation is needed here.
+``unique_slug`` spends a suffix *from* the length budget rather than adding it on top, so a stem
+close to the bound gets shortened on a hyphen boundary to make room - and a shortened stem is no
+longer a prefix of what the caller asked for, which is precisely what the prefix lookup in
+:func:`_taken_usernames` relies on.
+
+Eight is a hyphen plus seven digits, so truncation stays unreachable until a base has collided
+millions of times. Deriving the exact threshold instead is not possible here: it depends on how wide
+the suffix has to grow, which depends on how many handles in the family are already taken, which is
+what the query is being built to find out. Reserving generously and failing loudly is the honest
+resolution of that circularity. The four bases this module actually uses are five to fourteen
+characters, so the guard has never been close to firing; it exists so that a future roster entry
+with a pathological display name fails at the guard rather than silently narrowing the query past
+correctness and colliding on the unique index at flush.
+"""
+
+
+def _handle_family_pattern(base: str) -> str:
+    """Build the anchored ``LIKE`` pattern matching one handle family.
+
+    ``slugify_title`` emits only lowercase alphanumerics and hyphens, so its output can carry no
+    ``LIKE`` metacharacter and this escaping is a no-op today. It is written anyway rather than
+    asserted, because the alternative is a silent dependency on another module's output alphabet:
+    were a ``_`` ever to become a legal slug character, an unescaped pattern would match any single
+    character in that position and over-report the taken set, which pushes a needlessly high suffix
+    onto a handle that then lives in a URL permanently.
+
+    Args:
+        base: An already-slugified handle stem.
+
+    Returns:
+        The stem with metacharacters neutralised, followed by ``%``.
     """
-    return set((await session.scalars(select(User.username))).all())
+    escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
+
+
+async def _taken_usernames(session: AsyncSession, *, bases: Sequence[str]) -> set[str]:
+    """Read the handles that could collide with *bases*, so a free one can be resolved.
+
+    Bounded to the handle *families* the caller is about to draw from rather than to the whole
+    relation, and the two are very different queries once the site has users: reading every handle
+    to place four of them is a sequential scan whose cost is the size of the user table, and the
+    seed is the one script guaranteed to run against a populated database on every re-run.
+
+    An anchored prefix per base is exactly the right bound, and it is complete rather than merely
+    cheap. ``app.core.slug.unique_slug`` resolves a collision by appending ``-2``, ``-3`` and so on
+    to the stem it was given, so every handle it can return for a base begins with that base - and
+    a handle that does not begin with any of *bases* cannot collide with anything this call is
+    about to hand out. That completeness argument is what the guard below protects: the one way
+    ``unique_slug`` can return a value not prefixed by its input is by shortening an over-long stem
+    on a hyphen boundary to make room for the suffix, so a base long enough for that to happen is
+    rejected here rather than allowed to silently narrow the query past correctness.
+
+    This is also the shape ``unique_slug`` documents for its callers - "the caller asks its
+    repository for the slugs already matching the base" - so the bound aligns the seed with the
+    contract the collision policy was written against.
+
+    Args:
+        session: The unit of work. Not committed here.
+        bases: The handle stems about to be resolved, pre-slugification. Empty yields an empty set
+            without a query, because a caller with nothing to place has nothing to avoid.
+
+    Returns:
+        Every handle in those families, in the case the database stored it.
+        ``unique_slug`` folds both sides, so no normalisation is needed here.
+
+    Raises:
+        ValueError: If a base is long enough that ``unique_slug`` could truncate it, which would
+            break the prefix-completeness argument above.
+    """
+    if not bases:
+        return set()
+
+    patterns = []
+    for base in bases:
+        stem = slugify_title(base)
+        if len(stem) + _HANDLE_SUFFIX_HEADROOM > DEFAULT_MAX_LENGTH:
+            msg = (
+                f"handle base {base!r} slugifies to {len(stem)} characters, leaving less than "
+                f"{_HANDLE_SUFFIX_HEADROOM} characters of the {DEFAULT_MAX_LENGTH}-character slug "
+                f"bound for a collision suffix; unique_slug would shorten the stem to make room "
+                f"and the prefix lookup in _taken_usernames would no longer be complete"
+            )
+            raise ValueError(msg)
+        patterns.append(cast(User.username, Text).ilike(_handle_family_pattern(stem), escape="\\"))
+
+    # `username` is citext, so the predicate is written against the text CAST to reach
+    # ix_users_username_trgm - gin_trgm_ops is defined over `text` and citext's own operators are
+    # not in that operator family. ILIKE rather than LIKE because casting away citext also casts
+    # away its case-folding, and folding is what makes `Admin` collide with `admin`.
+    statement = select(User.username).where(or_(*patterns))
+    return set((await session.scalars(statement)).all())
 
 
 # =======================================================================================
@@ -1588,7 +1674,11 @@ async def seed_categories(session: AsyncSession) -> tuple[dict[str, Category], T
     Existence is tested on the slug *and* on the name, because both are unique in the schema.
     Checking only the slug would leave the case where an operator renamed a category's slug: the
     slug lookup would miss, the insert would collide on the name, and an idempotent script would
-    fail on its second run. Both lookups fold case, because ``categories.slug`` is ``citext``.
+    fail on its second run. Both lookups fold case, by different means: ``categories.slug`` is
+    ``citext`` and folds itself, while the name is folded explicitly because ``categories.name`` is
+    plain ``TEXT``. Both are bounded to the eight reference values rather than reading the taxonomy
+    - see the comment on the query for why the name side is folded even though the constraint it
+    protects is case-sensitive.
 
     The returned mapping is keyed by the *reference* slug - the value :attr:`CategorySpec.slug`
     derives - whichever row ended up satisfying it, so :func:`seed_posts` can resolve a subject's
@@ -1602,7 +1692,30 @@ async def seed_categories(session: AsyncSession) -> tuple[dict[str, Category], T
     """
     logger = get_logger(__name__)
 
-    present = (await session.scalars(select(Category))).all()
+    # Bounded to the sixteen values this function could possibly match - eight reference slugs and
+    # eight reference names - rather than reading the taxonomy. The difference is not academic once
+    # an administrator has been creating categories: the unbounded form materialised every row in
+    # the relation as a full ORM entity to decide the fate of eight of them.
+    #
+    # The slug side is index-served: `categories.slug` is citext, so `IN` folds case for free and
+    # resolves through ix_categories_slug. The name side folds case in SQL instead, which is
+    # deliberately non-sargable and deliberately kept. `categories.name` is plain TEXT under a
+    # case-SENSITIVE unique constraint, so folding here is stricter than the constraint - a stored
+    # `python` is treated as satisfying a reference `Python` even though an insert would not
+    # actually collide. Stricter is the safe direction for an idempotent script: the failure it
+    # avoids is a second run raising IntegrityError, and the cost of being over-broad is a skip
+    # rather than a duplicate.
+    lowered_names = [spec.name.casefold() for spec in REFERENCE_CATEGORIES]
+    present = (
+        await session.scalars(
+            select(Category).where(
+                or_(
+                    Category.slug.in_([spec.slug for spec in REFERENCE_CATEGORIES]),
+                    func.lower(Category.name).in_(lowered_names),
+                )
+            )
+        )
+    ).all()
     by_slug = {category.slug.casefold(): category for category in present}
     by_name = {category.name.casefold(): category for category in present}
 
@@ -1642,17 +1755,43 @@ async def seed_categories(session: AsyncSession) -> tuple[dict[str, Category], T
 
 
 async def seed_administrator(session: AsyncSession) -> tuple[User, Tally]:
-    """Ensure the administrator account described by ``settings`` exists.
+    """Ensure a *usable* administrator exists at the configured email, or fail saying why.
 
     Both halves of the credential come from configuration - ``SEED_ADMIN_EMAIL`` and
     ``SEED_ADMIN_PASSWORD`` - with no in-code default for either, and the password is persisted
     only as an argon2id hash. The plaintext is never logged, never returned and never stored.
+    ``app.core.config`` holds it to the same policy the registration route applies, so this
+    function cannot hash a credential the API would have refused.
 
-    An existing account is returned untouched. That is a security property rather than an
+    This function performs no strength check of its own, and must not: the password reaching it
+    has already satisfied the registration policy - length, character variety and not being a
+    published placeholder - because ``app.core.config`` validates it while constructing
+    ``settings``, which happens at import time and therefore before this module can be called.
+    A weak or placeholder value stops the process rather than becoming the credential of the
+    most privileged account in the product, and checking it a second time here would put the
+    same policy in two places.
+
+    An existing account is returned **untouched**, and that is a security property rather than an
     optimisation: an operator who rotated this password must not have it reset by the next
     ``make seed``, and neither must a role or an active flag somebody changed on purpose.
 
-    The handle is resolved against the handles already in use rather than assumed free, because
+    Untouched is not the same as unchecked
+    --------------------------------------
+    Returning any row that happens to carry the configured email would let seeding report success
+    while leaving no administrator at all - the account might hold ``READER`` after a demotion, or
+    be deactivated after a suspension, and either way every ``/api/v1/admin`` route stays closed
+    and the dashboard the seed exists to make reachable is not reachable. Worse, the caller
+    receives that row as "the administrator" and attributes demonstration posts to it.
+
+    So an existing row is verified rather than trusted, and a row that is not an active ``ADMIN``
+    raises. The one thing this function will not do is silently elevate it: promoting an account
+    an operator deliberately demoted, or reactivating one they suspended, would be this process
+    quietly overruling a human decision about authority - which is exactly the class of change a
+    seed script must never make. Reporting the mismatch, naming the row's actual state and the
+    variable that selected it, leaves the decision where it belongs.
+
+    The handle is resolved against the handles already in use in its own family rather than assumed
+    free, because
     ``users.username`` is unique and ``citext`` - a pre-existing ``admin`` would otherwise turn a
     re-run into an ``IntegrityError``.
 
@@ -1660,21 +1799,52 @@ async def seed_administrator(session: AsyncSession) -> tuple[User, Tally]:
         session: The unit of work. Not committed here.
 
     Returns:
-        The administrator - existing or newly added - and a tally over that single row.
+        The administrator - existing or newly added, and in either case active and holding
+        ``ADMIN`` - and a tally over that single row.
+
+    Raises:
+        ValueError: An account already exists at ``SEED_ADMIN_EMAIL`` but is deactivated, or does
+            not hold ``ADMIN``. :func:`main` rolls the transaction back, logs the failure and
+            re-raises, so the process exits non-zero and nothing is written.
     """
     logger = get_logger(__name__)
 
     email = settings.SEED_ADMIN_EMAIL
     existing = await session.scalar(select(User).where(User.email == email))
     if existing is not None:
+        # Verified, not assumed. Both conditions are reported at once when both hold, so an
+        # operator fixes one round of configuration rather than two.
+        problems = []
+        if existing.role is not UserRole.ADMIN:
+            problems.append(f"its role is {existing.role.value} rather than {UserRole.ADMIN.value}")
+        if not existing.is_active:
+            problems.append("it is deactivated")
+        if problems:
+            # The email is the value SEED_ADMIN_EMAIL carries and is personal data; the username
+            # is a public handle that appears in URLs, so it is what identifies the row here.
+            msg = (
+                f"the account SEED_ADMIN_EMAIL selects (username {existing.username!r}) cannot "
+                f"act as an administrator: {' and '.join(problems)}. Seeding will not change a "
+                "role or an active flag that somebody set deliberately. Either grant that "
+                "account ADMIN and reactivate it, or point SEED_ADMIN_EMAIL at a different "
+                "address and seed again."
+            )
+            raise ValueError(msg)
+
+        # The address and the handle are deliberately absent from this line, and from the
+        # one below. A log line leaves the process - into a collector, a CI transcript, an
+        # aggregator someone else administers - and an administrator's email address and
+        # username are directly identifying and are half of a credential. What an operator
+        # needs from a seed run is whether the account was created or found, which is
+        # exactly what the event name and the role field say. Whoever needs to know WHICH
+        # account it is already has SEED_ADMIN_EMAIL in front of them.
         logger.info(
             "administrator already present, left untouched",
-            email=email,
-            username=existing.username,
+            role=UserRole.ADMIN.value,
         )
         return existing, Tally(skipped=1)
 
-    taken = await _taken_usernames(session)
+    taken = await _taken_usernames(session, bases=[_ADMINISTRATOR_USERNAME])
     administrator = User(
         email=email,
         username=_resolve_username(_ADMINISTRATOR_USERNAME, taken),
@@ -1690,10 +1860,12 @@ async def seed_administrator(session: AsyncSession) -> tuple[User, Tally]:
     session.add(administrator)
     await session.flush()
 
+    # The username rather than the email. `username` is a public handle - it is the path segment
+    # in /api/v1/users/{username} and in the client's /u/{username} route - whereas the email is
+    # the personal data SEED_ADMIN_EMAIL carries, and a log line leaves the process. It also
+    # identifies the row just as precisely, both columns being CITEXT UNIQUE.
     logger.info(
         "administrator created",
-        email=email,
-        username=administrator.username,
         role=UserRole.ADMIN.value,
     )
     return administrator, Tally(created=1)
@@ -1724,7 +1896,16 @@ async def seed_authors(session: AsyncSession) -> tuple[list[User], Tally]:
     present = (await session.scalars(select(User).where(User.email.in_(emails)))).all()
     by_email = {user.email.casefold(): user for user in present}
 
-    taken = await _taken_usernames(session)
+    # The administrator's family is included alongside the roster's, which keeps the ordering
+    # guarantee this function's docstring makes: called after `seed_administrator`, the handle that
+    # run placed is visible here. The three roster families happen to be disjoint from `admin`
+    # today, so nothing would collide if it were omitted - but that is a property of the current
+    # roster rather than of the code, and one renamed author should not quietly reintroduce a
+    # unique violation on a re-run.
+    taken = await _taken_usernames(
+        session,
+        bases=[_ADMINISTRATOR_USERNAME, *(spec.display_name for spec in AUTHOR_ROSTER)],
+    )
     authors: list[User] = []
     created = 0
     skipped = 0
@@ -1753,12 +1934,17 @@ async def seed_authors(session: AsyncSession) -> tuple[list[User], Tally]:
     if created:
         await session.flush()
 
+    # Counts and the role, never the handles. The roster's usernames are account identifiers
+    # for real rows in a real database, and emitting the whole list turns one seed run into a
+    # ready-made enumeration of every author account in whatever store collects these lines.
+    # The three numbers below answer the only questions a seed run raises - how many were
+    # added, how many were already there, and whether that accounts for the roster.
     logger.info(
         "demonstration authors seeded",
         created=created,
         skipped=skipped,
         total=len(AUTHOR_ROSTER),
-        usernames=[author.username for author in authors],
+        role=UserRole.AUTHOR.value,
     )
     return authors, Tally(created=created, skipped=skipped)
 
@@ -1817,7 +2003,19 @@ async def seed_posts(
         raise ValueError(msg)
 
     corpus = _compose_corpus(datetime.now(UTC))
-    present = {slug.casefold() for slug in (await session.scalars(select(Post.slug))).all()}
+    # Bounded to the ninety-six slugs this corpus could collide with, not every slug in the
+    # relation. On a site with real posts the unbounded form read the entire slug column to decide
+    # the fate of a fixed ninety-six, and it is the seed - the one script certain to be re-run
+    # against a populated database - that pays that cost. `posts.slug` is citext, so `IN` folds
+    # case exactly as the surrounding comparison does and resolves through ix_posts_slug.
+    present = {
+        slug.casefold()
+        for slug in (
+            await session.scalars(
+                select(Post.slug).where(Post.slug.in_([draft.slug for draft in corpus]))
+            )
+        ).all()
+    }
 
     created = 0
     skipped = 0

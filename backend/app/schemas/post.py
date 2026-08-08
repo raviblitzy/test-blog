@@ -77,8 +77,11 @@ keeps sending it.
     post without a publication instant is forbidden by a database ``CHECK`` constraint. Exposing
     either as a patchable member would let a general update path reach half of a paired change.
 ``view_count``
-    Server-maintained. It is advanced where a detail page is served, and a counter a client could
-    set is not a counter.
+    Server-owned: a counter a client could set is not a counter, so it appears on the projections
+    and on neither input model. Nothing advances it at present - no route in this surface
+    increments it - so it reads ``0`` on every post, which is why ``PostSortOption`` deliberately
+    offers no ``"popular"`` value. The column is published anyway so that counting reads later is a
+    service change behind an unchanged contract.
 ``author_id``
     Taken from the principal that ``app.core.dependencies`` resolved from the bearer token, never
     from a body. Reading ownership out of the request would let any authenticated caller publish
@@ -192,9 +195,11 @@ from pydantic import (
     ValidationInfo,
     field_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from app.models import PostStatus
 from app.schemas.category import CategorySummary
+from app.schemas.common import omit_null_default
 from app.schemas.user import UserPublic
 
 # The module's public contract is these four models, in the order RUF022 enforces. The bounds,
@@ -599,7 +604,7 @@ class PostCreate(BaseModel):
     #                              canonical URL a reader bookmarked has to keep resolving
     #   status, published_at       they change only through the publish and unpublish
     #                              transitions, which set both together
-    #   view_count                 server-maintained; a counter a client could set is not one
+    #   view_count                 server-owned; a counter a client could set is not one
     #   author_id                  taken from the resolved principal, never from a body
     #   search_vector              a column PostgreSQL generates on every write
     #   created_at, updated_at     stamped from the database clock
@@ -668,6 +673,14 @@ class PostUpdate(BaseModel):
     ``posts.title`` and ``posts.content`` are ``NOT NULL``, so there is no state for a null to
     mean: a caller who sends one gets a ``422`` naming the field, rather than a ``500`` from an
     integrity violation raised several layers away from the mistake that caused it.
+    ``category_ids`` is refused a null too, and for a third reason again: it has three states
+    that matter - omitted, an empty list, and a list of identifiers - and a null would be a
+    fourth spelling of one of the first two.
+
+    The published schema draws exactly that line rather than describing it: the two nullable
+    members advertise ``null`` among their types because they accept it, and the three that
+    refuse it do not advertise it - so ``/openapi.json`` and ``/docs`` cannot publish a request
+    this model rejects. See :func:`~app.schemas.common.omit_null_default`.
 
     Who may send this at all is not decided here
     -------------------------------------------
@@ -692,14 +705,22 @@ class PostUpdate(BaseModel):
         },
     )
 
-    title: PostTitle | None = Field(
+    title: PostTitle | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             f"New headline, {TITLE_MIN_LENGTH} to {TITLE_MAX_LENGTH} characters after trimming. "
             "Omit it to leave the title unchanged. Retitling does NOT change the post's slug, so "
             "existing links keep resolving. Null is not accepted."
         ),
     )
+    """New headline, or omitted to leave it unchanged. Optional but not nullable.
+
+    ``posts.title`` is ``NOT NULL``, so ``null`` describes no state and
+    :meth:`_reject_null_text` refuses it. The annotation now says the same thing:
+    ``SkipJsonSchema[None]`` keeps ``null`` out of the published type and
+    :func:`~app.schemas.common.omit_null_default` drops the contradictory ``default: null``.
+    """
     excerpt: OptionalPostExcerpt = Field(
         default=None,
         description=(
@@ -707,8 +728,9 @@ class PostUpdate(BaseModel):
             "leave the existing excerpt untouched; send null or an empty string to remove it."
         ),
     )
-    content: PostContent | None = Field(
+    content: PostContent | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             f"New Markdown body, 1 to {CONTENT_MAX_LENGTH} characters, carrying at least one "
             "non-whitespace character. Replaces the body in full - this member has no partial "
@@ -716,6 +738,11 @@ class PostUpdate(BaseModel):
             "is not accepted."
         ),
     )
+    """New body, or omitted to leave it unchanged. Optional but not nullable.
+
+    ``posts.content`` is ``NOT NULL`` and :meth:`_reject_null_text` refuses an explicit null, so
+    the published type carries no ``null`` branch and no ``default: null`` either.
+    """
     cover_image_url: OptionalCoverImageUrl = Field(
         default=None,
         description=(
@@ -725,8 +752,9 @@ class PostUpdate(BaseModel):
             "assigning it to the text column."
         ),
     )
-    category_ids: CategoryIdList | None = Field(
+    category_ids: CategoryIdList | SkipJsonSchema[None] = Field(
         default=None,
+        json_schema_extra=omit_null_default,
         description=(
             "The post's complete category set after the update, at most "
             f"{MAX_CATEGORIES_PER_POST} identifiers. REPLACES the current associations rather than "
@@ -735,6 +763,15 @@ class PostUpdate(BaseModel):
             "not accepted."
         ),
     )
+    """The complete category set after the update, or omitted to leave it alone.
+
+    The one member here where the three states a caller might reach for are genuinely distinct,
+    and the schema now states them exactly: **omitted** leaves the associations untouched, an
+    **empty list** unfiles the post, and **null** is not a spelling of either - so it is absent
+    from the published type rather than advertised and then refused.
+    :meth:`_reject_null_category_ids` enforces the same at runtime, and ``[]`` remains valid,
+    which is why the bound on :data:`CategoryIdList` is a maximum and not a minimum.
+    """
 
     @field_validator("title", "content")
     @classmethod
@@ -886,6 +923,11 @@ class PostSummary(BaseModel):
             # The same post, author and category the other three models in this module use, so
             # /docs reads as one worked example - and the difference between this example and
             # PostDetail's is exactly the two members that separate the projections.
+            #
+            # `view_count` is 0 rather than a plausible-looking figure because 0 is what this API
+            # actually returns for every post: nothing advances the counter. An example is a
+            # promise about the response, so an invented 128 would be the one line of this
+            # document that no response can match.
             "example": {
                 "id": "7c9e6a2b-4d81-4f3a-9c5e-2b8d1f0a6e34",
                 "title": "Scaling FastAPI",
@@ -894,7 +936,7 @@ class PostSummary(BaseModel):
                 "cover_image_url": "https://example.com/covers/scaling-fastapi.png",
                 "status": "PUBLISHED",
                 "published_at": "2026-02-03T08:15:00Z",
-                "view_count": 128,
+                "view_count": 0,
                 "created_at": "2026-02-01T17:42:00Z",
                 "author": {
                     "id": "3f1a9c74-6b0e-4d52-9a3f-71c2e8b45d10",
@@ -991,8 +1033,11 @@ class PostSummary(BaseModel):
         # correct response into a 500 - and no legitimate value here can.
         ge=0,
         description=(
-            "How many times the post's page has been served. Zero is a real value, returned as "
-            "`0` rather than omitted, and is the value every post starts at."
+            "The post's readership counter, and at present `0` on every post: no endpoint in this "
+            "API advances it, which is also why `sort` offers no `popular` value. Always present "
+            "rather than omitted, and never null. The member is published so that counting reads "
+            "later changes behaviour without changing this contract - so render it only where a "
+            "zero is honest, not as a popularity signal."
         ),
     )
     created_at: datetime = Field(
@@ -1083,7 +1128,8 @@ class PostDetail(PostSummary):
         json_schema_extra={
             # The parent's example, plus exactly the two members this projection adds - so the
             # difference between the two documents in /docs is the difference between the two
-            # models, rather than two unrelated posts a reader has to diff.
+            # models, rather than two unrelated posts a reader has to diff. `view_count` is 0 for
+            # the reason recorded on the parent's example: it is the value every response carries.
             "example": {
                 "id": "7c9e6a2b-4d81-4f3a-9c5e-2b8d1f0a6e34",
                 "title": "Scaling FastAPI",
@@ -1092,7 +1138,7 @@ class PostDetail(PostSummary):
                 "cover_image_url": "https://example.com/covers/scaling-fastapi.png",
                 "status": "PUBLISHED",
                 "published_at": "2026-02-03T08:15:00Z",
-                "view_count": 128,
+                "view_count": 0,
                 "created_at": "2026-02-01T17:42:00Z",
                 "author": {
                     "id": "3f1a9c74-6b0e-4d52-9a3f-71c2e8b45d10",

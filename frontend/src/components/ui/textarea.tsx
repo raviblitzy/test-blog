@@ -11,24 +11,26 @@
 // src/components/blog/post-editor.tsx and src/components/blog/comment-form.tsx
 // import `Textarea` instead of writing their own field.
 //
-// input.tsx IS THIS FILE'S SPECIFICATION, NOT MERELY ITS NEIGHBOUR.
+// input.tsx IS THIS FILE'S SPECIFICATION, AND NOW ITS SOURCE.
 //
-// Every token below - boundary colour, border width, radius, fill, text colour,
-// text size, placeholder colour, focus treatment, disabled treatment, invalid
-// treatment and transition - is the same choice input.tsx makes, class for class.
-// That is the requirement rather than a coincidence: a title field and a body
-// field stacked in one form have to read as one control family, and two
-// independently plausible sets of field tokens would read as two near-misses.
+// Boundary colour, border width, radius, inline padding, fill, text colour, text
+// size, focus treatment, disabled treatment, invalid treatment and transition are
+// not restated here: they are IMPORTED from input.tsx as FIELD_CONTROL_CLASSES
+// and FIELD_INVALID_CLASSES. A title field and a body field stacked in one form
+// have to read as one control family, and two independently plausible sets of
+// field tokens read as two near-misses - so the family has one definition and
+// this file consumes it.
 //
-// It is a deliberate copy and not an import. Each primitive in this directory
-// stands alone, so nothing is re-exported between them and there is no shared
-// field base to inherit from; the two files are instead kept in step by review,
-// and a field token changed in one has to change in the other in the same
-// commit. input.tsx says the same thing from its side.
+// That import replaces what used to be a deliberate copy kept in step by review.
+// The copy was the defect: nothing failed when the two drifted, so "change both in
+// the same commit" was an obligation with no enforcement behind it. select.tsx's
+// trigger consumes the same two constants, so all three controls now change
+// together by construction. input.tsx says the same thing from its side.
 //
-// Only the box geometry diverges, and only where a multi-line control genuinely
-// needs it: no fixed height, vertical padding to match, and a resize handle
-// constrained to one axis. Each of those three is justified at its class below.
+// Only what a multi-line control genuinely needs is declared below: no fixed
+// height, a minimum height, vertical padding to match input's optical inset, a
+// resize handle constrained to one axis, and its own `::placeholder` rule. Each is
+// justified at its class.
 //
 // DELIBERATELY ABSENT. Please do not add:
 //
@@ -81,6 +83,8 @@
 import type { ComponentProps } from 'react';
 
 import { cn } from '@/lib/utils';
+
+import { FIELD_CONTROL_CLASSES, FIELD_INVALID_CLASSES } from './input';
 
 type TextareaProps = ComponentProps<'textarea'> & {
   /**
@@ -173,113 +177,44 @@ export function Textarea({
       // not already say.
       aria-invalid={ariaInvalid ?? (invalid || undefined)}
       className={cn(
-        // --- Box -------------------------------------------------------------
-        // `block` because a <textarea> is inline-block by default, which leaves
-        // a baseline gap under it that reads as uneven spacing in a form column.
-        //
-        // `w-full min-w-0` is the pair that keeps the field off the horizontal
-        // scrollbar. A <textarea> carries an intrinsic minimum width from its
-        // `cols` attribute - twenty character columns even when nothing sets it
-        // - so without `min-w-0` a field inside a flex row refuses to shrink
-        // and forces overflow at the narrow viewport the responsive criteria
-        // test. This is the same reason input.tsx carries it.
+        // Surface, boundary, text, focus, disabled and motion - the shared field
+        // vocabulary declared in ./input, consumed identically by that control and
+        // by select.tsx's trigger.
+        FIELD_CONTROL_CLASSES,
+
+        // --- What is specific to a multi-line control -------------------------
+        // `block` because a <textarea> is inline-block by default, which leaves a
+        // baseline gap under it that reads as uneven spacing in a form column.
         //
         // `min-h-24` is the floor described in the sizing contract above, taken
-        // from the engine's `--spacing` scale rather than written as a length,
-        // and `rounded-md` from its radius scale. No `h-*`: a fixed height would
-        // override `rows` and make the resize handle pointless.
+        // from the engine's `--spacing` scale rather than written as a length. No
+        // `h-*`: a fixed height would override `rows` and make the resize handle
+        // pointless, which is why this control takes a minimum where Input takes
+        // `h-11`.
         //
-        // `px-3` is input.tsx's horizontal padding unchanged. `py-2.5` is the
-        // vertical half a single-line field has no need of, chosen so the first
-        // line of text lands where `Input` puts its own: that control centres a
-        // 1.5rem line box in a 2.75rem box, an optical inset of 10px, which is
-        // what this step of the spacing scale resolves to. A title field and a
-        // body field in one form therefore share a text edge.
-        //
-        // Both padding utilities emit LOGICAL properties - `padding-inline` and
-        // `padding-block` - so the field is correct under a right-to-left
-        // writing mode without a second declaration.
-        'block min-h-24 w-full min-w-0 rounded-md px-3 py-2.5',
+        // `py-2.5` is the vertical padding a single-line field has no need of,
+        // chosen so the first line of text lands where `Input` puts its own: that
+        // control centres a 1.5rem line box in a 2.75rem box, an optical inset of
+        // 10px, which is what this step of the spacing scale resolves to. A title
+        // field and a body field in one form therefore share a text edge. It emits
+        // `padding-block`, so it is correct under a right-to-left writing mode.
+        'block min-h-24 py-2.5',
 
-        // `resize-y`, not the browser's default `resize: both`. Horizontal drag
-        // is not a feature being withheld: it lets a visitor widen the field
-        // past its container and produce exactly the horizontal overflow the
-        // responsive criteria forbid at every width. Vertical growth is the axis
-        // a writer actually wants, and it costs the layout nothing.
+        // `resize-y`, not the browser's default `resize: both`. Horizontal drag is
+        // not a feature being withheld: it lets a visitor widen the field past its
+        // container and produce exactly the horizontal overflow the responsive
+        // criteria forbid at every width. Vertical growth is the axis a writer
+        // actually wants, and it costs the layout nothing.
         'resize-y',
 
-        // --- Surface, boundary and text --------------------------------------
-        // `border-border-strong`, NOT `border-border`. globals.css splits those
-        // two deliberately: `--color-border` is a decorative hairline (1.23:1 in
-        // light, 1.73:1 in dark) which WCAG 1.4.11 exempts for card outlines and
-        // table rules, whereas the boundary of an interactive control is what
-        // identifies the control and has to clear 3:1. `--color-border-strong`
-        // measures 4.77:1 on the light surface and 3.74:1 on the dark one, and
-        // that file names textarea among its intended consumers by name.
-        //
-        // `shadow-xs` is what keeps the field readable when it sits flush on a
-        // `bg-surface` card, where the fill alone cannot distinguish it.
-        //
-        // `text-base` is 1rem and is chosen over `text-sm` for the entire field
-        // family: iOS Safari zooms the viewport when a focused control's text is
-        // smaller than 16px, a real defect at the 375px viewport the responsive
-        // criteria test - and a body field is where a visitor spends the most
-        // time zoomed in.
-        'border-border-strong bg-surface text-foreground border text-base shadow-xs',
-
-        // --- Placeholder -----------------------------------------------------
         // A placeholder is a hint, not content, so it takes the secondary text
-        // token - which still clears 4.5:1 on every canvas, so the hint stays
-        // legible rather than merely faint.
+        // token - which still clears 4.5:1 on every canvas. This is the real
+        // `::placeholder` pseudo-element, which is why it is stated per control
+        // rather than shared: the select trigger has none and reaches the same
+        // intent through Radix's `data-placeholder` attribute.
         'placeholder:text-muted-foreground',
 
-        // --- Focus -----------------------------------------------------------
-        // An outline, not a `ring` box-shadow, and restated here rather than
-        // left to the `:focus-visible` floor in globals.css. Three reasons: the
-        // outline survives an ancestor's `overflow: hidden`; `outline-2` and
-        // `outline-offset-2` are exactly what that floor emits, so layering on
-        // the same mechanism cannot change the indicator's thickness or
-        // position; and utilities outrank the base layer, so the field keeps a
-        // visible indicator even if the document floor is ever narrowed.
-        //
-        // `focus-visible:border-ring` adds a second cue inside the control's own
-        // edge, so focus is legible even where an outline is clipped. No bare
-        // `outline-none` appears anywhere in this file - removing the indicator
-        // would breach the accessibility floor outright.
-        'focus-visible:border-ring focus-visible:outline-ring focus-visible:outline-2 focus-visible:outline-offset-2',
-
-        // --- Disabled --------------------------------------------------------
-        // Recessed fill plus a not-allowed cursor, so the state is readable from
-        // both the surface and the pointer rather than from opacity alone.
-        // WCAG 1.4.3 exempts inactive controls from the contrast minimum, which
-        // is what makes the dimming legitimate here and nowhere else.
-        'disabled:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-60',
-
-        // --- Motion ----------------------------------------------------------
-        // The border and outline colours ease between states instead of
-        // snapping. `motion-safe:` is the engine's own `prefers-reduced-motion:
-        // no-preference` variant, which is how the accessibility guidance
-        // requires transitions to be gated - this is not a hand-authored media
-        // query, and the file authors no responsive breakpoint at all.
-        //
-        // `transition-colors` and not `transition-all`: the field's height
-        // changes when the user drags the handle, and animating that would fight
-        // the pointer.
-        'motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out',
-
-        // --- Invalid ---------------------------------------------------------
-        // Danger border plus a soft halo of the same token, so the error reads
-        // at a glance without the field having to grow or move.
-        //
-        // The two `focus-visible:` entries are the point of this group: they
-        // override the brand-coloured focus treatment above, because a field
-        // that turned indigo the moment it was focused would drop its error
-        // signal exactly when the user arrived to fix it. `--color-danger`
-        // measures 6.42:1 on the light surface and 6.97:1 on the dark one, so a
-        // red indicator still clears the 3:1 non-text floor and focus stays as
-        // visible as it is on a valid field.
-        invalid &&
-          'border-danger ring-danger/20 focus-visible:border-danger focus-visible:outline-danger ring-2',
+        invalid && FIELD_INVALID_CLASSES,
 
         // Last, so a caller's class wins its Tailwind group. That determinism is
         // `cn()`'s whole purpose and is what keeps consumers from reaching for an

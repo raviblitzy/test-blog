@@ -23,9 +23,14 @@ const DEFAULT_DEBOUNCE_DELAY_MS = 300;
  * returns and pushes `q` into the URL itself.
  *
  * Returns `T`, never `T | undefined` — the first render emits `value` synchronously, so a
- * consumer never handles an empty first frame. Intended for UI values (strings, numbers, plain
- * objects); a function-typed `T` is outside the supported domain, because React reserves a
- * function argument to `useState` and to its setter for lazy-initialiser and updater semantics.
+ * consumer never handles an empty first frame.
+ *
+ * `T` is genuinely unconstrained, function types included. React reserves a function argument to
+ * `useState` and to its setter for lazy-initialiser and updater semantics, so a function-typed
+ * value passed to either would be *called* rather than stored, and this hook would return whatever
+ * it returned. Both writes below therefore go through a lambda, which is what makes the generic
+ * honest: `useState(() => value)` treats the lambda as the initialiser and stores `value` itself,
+ * and `setDebouncedValue(() => value)` treats it as the updater and does the same.
  *
  * @typeParam T - Type of the debounced value. Unconstrained, and preserved exactly on the way out.
  * @param value - The value to debounce, typically a controlled input's current value.
@@ -43,11 +48,20 @@ const DEFAULT_DEBOUNCE_DELAY_MS = 300;
 export function useDebouncedValue<T>(value: T, delayMs: number = DEFAULT_DEBOUNCE_DELAY_MS): T {
   // Seeded with `value` rather than left empty, so first render returns the current value
   // synchronously and the return type stays `T` instead of widening to `T | undefined`.
-  const [debouncedValue, setDebouncedValue] = useState<T>(value);
+  //
+  // The lambda is the lazy-initialiser form, and it is required rather than stylistic: React calls
+  // a function passed here to obtain the initial state, so a function-typed `T` handed over
+  // directly would be invoked instead of stored. Returning it from a lambda stores the value
+  // itself, whatever its type. It costs one closure on the first render only.
+  const [debouncedValue, setDebouncedValue] = useState<T>(() => value);
 
   useEffect(() => {
     const timer = setTimeout(() => {
-      setDebouncedValue(value);
+      // The updater form, for the same reason as the initialiser above: React calls a function
+      // passed to a setter with the previous state and stores the result, so `value` is returned
+      // from a lambda rather than passed directly. The previous state is deliberately unused - a
+      // debounce emits the latest value, never a function of the last one.
+      setDebouncedValue(() => value);
     }, delayMs);
 
     // The cleanup IS the debounce. React runs it before every re-run of this effect and once

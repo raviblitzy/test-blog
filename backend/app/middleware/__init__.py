@@ -8,19 +8,22 @@ runs a query, resolves a principal or decides authority; those belong to ``app.r
 ``app.core.dependencies`` and ``app.services`` respectively.
 
 Registration order is load-bearing, and this is the first file in the package a reader opens, so
-it is stated here rather than left to be inferred. ``app.main`` registers
-:class:`SecurityHeadersMiddleware` **first** and :class:`RequestContextMiddleware` **last**;
-``Starlette.add_middleware`` inserts at the front of the chain, so first-registered ends up
-innermost and last-registered outermost::
+it is stated here rather than left to be inferred. ``Starlette.add_middleware`` inserts at the
+front of the chain, so first-registered ends up innermost and last-registered outermost.
+``app.main`` must register ``CORSMiddleware`` **first**, :class:`SecurityHeadersMiddleware`
+**second** and :class:`RequestContextMiddleware` **last**, producing::
 
     RequestContextMiddleware       <- registered last, so outermost: correlates and logs
-      CORSMiddleware
-        SecurityHeadersMiddleware  <- registered first, so innermost: hardens the response
+      SecurityHeadersMiddleware    <- hardens every response, preflights included
+        CORSMiddleware
           ExceptionMiddleware -> Router -> endpoint
 
-Innermost is what puts :class:`SecurityHeadersMiddleware` just outside ``ExceptionMiddleware``, so
-every problem document ``app.core.exceptions`` renders is hardened exactly like a 200; registering
-it further out would silently strip those headers from every error response.
+:class:`SecurityHeadersMiddleware` has to be outside ``ExceptionMiddleware``, so that every
+problem document ``app.core.exceptions`` renders is hardened exactly like a 200, **and** outside
+``CORSMiddleware``, because that middleware answers an ``OPTIONS`` preflight itself without
+calling anything beneath it - so anything registered inside it never runs for a preflight at
+all. This one position satisfies both; the ordering that puts it innermost leaves every
+preflight response unhardened.
 
 Both import forms are correct and resolve to the same objects - this barrel for the usual case,
 the module path when a single member is wanted::
@@ -39,12 +42,35 @@ from __future__ import annotations
 # `app.models`; a convenience re-export in either of those two markers would therefore
 # construct the async engine and pull in the whole declarative model tree as a side effect
 # of every `alembic upgrade`, `alembic downgrade` and `alembic check`, before any migration
-# was asked for. Resolving this package costs nothing comparable: its two members reach only
-# `app.core` (config, logging, exceptions), the standard library and Starlette's types - no
-# `app.db`, no `app.models`, no engine, no connection, and no logging configuration, which
-# `app.main` still owns as the single `configure_logging()` call in its lifespan. So importing
-# `app.middleware` stays free, and the names below are re-exports and nothing else: this
-# module declares no class, function or constant of its own and has no import-time effect.
+# was asked for. Resolving this package costs nothing comparable, and the two members below
+# are held to that: between them they reach `app.core.exceptions` (for REQUEST_ID_HEADER),
+# `app.core.logging` (for get_logger), the standard library and Starlette's types - no
+# `app.db`, no `app.models`, no engine, no connection, no logging configuration, which
+# `app.main` still owns as the single `configure_logging()` call in its lifespan, and NO
+# SETTINGS CONSTRUCTION.
+#
+# That last one is a live constraint rather than a description, and it is worth naming what
+# enforces it, because the chain is easy to re-break with a single convenience import:
+#
+#   * `app.core.logging` reads LOG_LEVEL and the development predicate inside
+#     `configure_logging()`, not at module scope, so importing it constructs no settings.
+#   * `app.core.exceptions` imports only `get_logger` from it, so it inherits that property.
+#   * `SecurityHeadersMiddleware` takes its HSTS decision as a required argument instead of
+#     reading `settings.is_production` itself, so it needs no settings either.
+#   * `security_headers.resolved_security_headers()` - the shared resolver `app.core.exceptions`
+#     uses to harden the one response the middleware cannot reach - imports settings INSIDE the
+#     function, and only on the branch where the caller passed no explicit decision.
+#
+# The consequence is the property that matters: `import app.middleware` succeeds on a machine
+# with no JWT_SECRET_KEY and no .env file at all. Configuration failures then surface where
+# they can be reported usefully - in `app.main`, or at the first `Settings()` construction -
+# rather than as an import error part-way through resolving the module graph. Adding
+# `from app.core.config import settings` to either sibling module, at module scope, is what
+# would undo it.
+#
+# So importing `app.middleware` stays free, and the names below are re-exports and nothing
+# else: this module declares no class, function or constant of its own and has no import-time
+# effect.
 # ---------------------------------------------------------------------------------------
 from app.middleware.request_context import (
     REQUEST_ID_HEADER,

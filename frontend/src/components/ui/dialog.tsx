@@ -91,11 +91,11 @@
 // this file changes nothing.
 //
 // The panel is `bg-surface` (the raised canvas, lighter than `background` in
-// both themes). Its hairline is the decorative `border-border`, not
-// `border-border-strong`: the A11Y note in globals.css reserves the stronger
-// token for the boundary of an interactive control, where the border is what
-// identifies the control at all. A dialog panel is an outline around content,
-// the same case as a card, so the hairline is correct here.
+// both themes). Its hairline is the decorative `border-border`, not the
+// `border-muted-foreground` composition: the A11Y note in globals.css reserves
+// that stronger treatment for the boundary of an interactive control, where the
+// border is what identifies the control at all. A dialog panel is an outline
+// around content, the same case as a card, so the hairline is correct here.
 
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { X } from 'lucide-react';
@@ -150,12 +150,14 @@ export const DialogClose = DialogPrimitive.Close;
  * hand-composed panels only. Rendering both yields two stacked scrims and a
  * visibly doubled wash.
  *
- * The wash is `bg-foreground/60` - a semantic token carrying an opacity
- * modifier, never a literal `rgba()`. That indirection matters: because
- * `--color-foreground` points at `var(--app-foreground)` rather than at a
- * literal, the engine cannot fold the value at build time and instead emits
- * `color-mix(in oklab, var(--color-foreground) 60%, transparent)`, which
- * re-resolves per theme at use time.
+ * The wash is `bg-scrim` - the dedicated non-inverting token declared in
+ * src/app/globals.css, never a literal `rgba()` and never an opacity modifier on
+ * some other token. Two properties follow from that and both are deliberate. The
+ * token is dark in BOTH themes, so the scrim dims the page in dark mode instead
+ * of brightening it, and this component needs no `dark:` conditional. And the
+ * alpha lives inside the token, so `bg-scrim` is the whole class: a consumer
+ * cannot thin the wash from a call site, and the one place its strength is
+ * decided is the token layer.
  *
  * @param className - Merged after the base classes, so it wins its own Tailwind
  *   group.
@@ -166,40 +168,21 @@ export function DialogOverlay({
 }: ComponentProps<typeof DialogPrimitive.Overlay>): JSX.Element {
   return (
     <DialogPrimitive.Overlay
-      /* BLITZY [COLOR]: The scrim INVERTS between themes, and that is a known
-         limitation of the token catalogue rather than an oversight here.
-         Measured in the browser: over the light canvas it composites to
-         rgb(108,114,127), an 82% drop in luminance - a textbook dimming scrim.
-         Over the dark canvas it composites to rgb(150,152,161), a ~150x RISE in
-         luminance - a pale wash that brightens roughly 91% of the viewport
-         instead of dimming it, which also inverts this system's "raised is
-         lighter" elevation metaphor.
+      /* `bg-scrim`, and no opacity modifier: `--color-scrim` is the one token in
+         globals.css that deliberately does not invert, and it carries its own
+         alpha so the wash cannot be diluted here. It dims in BOTH themes, which
+         an inverting token cannot do - measured in globals.css' A11Y note, the
+         light canvas drops 85.6% in luminance and a raised dark surface drops
+         51.7%, while foreground text behind the scrim falls from 17.05:1 to
+         3.46:1 against its own dimmed ground. That is the whole point of the
+         separate token: this file needs no `dark:` conditional and carries none.
 
-         Why it is written this way anyway: none of the semantic tokens is dark
-         in BOTH themes. `foreground` / `muted-foreground` are dark in light and
-         light in dark; `background` / `surface` / `surface-muted` /
-         `primary-foreground` are the reverse - and `bg-background/*` produces no
-         visible dimming at all in light mode, because the scrim and the page
-         canvas are then the same token. The only theme-invariant colour is
-         `--color-border-strong`, which is reserved for interactive control
-         boundaries and would be a semantic misuse here. A `dark:` conditional is
-         not permitted in this layer.
-
-         The fix belongs one level down, in the token layer, and is deliberately
-         NOT applied here because that file is outside this component's scope:
-         add a non-inverting `--color-scrim` to src/app/globals.css carrying a
-         DARK value in BOTH the `:root` and `.dark` blocks - a token is not
-         obliged to invert - then change `bg-foreground/60` below to `bg-scrim`.
-         That keeps zero `dark:` conditionals and zero literals while fixing both
-         the glare and the elevation inversion. Flagged for design-system review
-         rather than silently worked around.
-
-         Not in question: all four text pairs clear WCAG AA in both themes (title
-         17.83:1 light / 17.04:1 dark, description 7.58:1 / 6.78:1), and backdrop
-         contrast collapses in both themes, so the scrim does still function as a
-         de-emphasis device today. */
+         Not in question either way: all four text pairs on the panel clear WCAG
+         AA in both themes (title 17.83:1 light / 17.04:1 dark, description
+         7.58:1 / 6.78:1), because the panel sits above the scrim and keeps its
+         full contrast. */
       className={cn(
-        'bg-foreground/60 fixed inset-0 z-50',
+        'bg-scrim fixed inset-0 z-50',
         'motion-safe:transition-opacity motion-safe:ease-out motion-safe:starting:opacity-0',
         className,
       )}

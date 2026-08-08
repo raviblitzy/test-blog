@@ -194,10 +194,16 @@ export interface ValidationErrorItem {
  */
 export interface ProblemDetail {
   /**
-   * Stable, machine-readable identifier for the *kind* of problem, for example
-   * `https://blog.example/problems/not-found`. This is the value to branch on: it is part of the
-   * contract, where {@link ProblemDetail.title} and {@link ProblemDetail.detail} are prose and may
-   * be reworded.
+   * Stable, machine-readable identifier for the *kind* of problem. The service's namespace is
+   * `/errors/` followed by a kebab-case name - `/errors/not-found`, `/errors/unauthorized`,
+   * `/errors/forbidden`, `/errors/conflict`, `/errors/validation-error`,
+   * `/errors/rate-limit-exceeded`.
+   *
+   * This is the value to branch on, and the only member of this document that is safe to branch
+   * on: it is part of the contract, where {@link ProblemDetail.title} and
+   * {@link ProblemDetail.detail} are prose and may be reworded. Compare it against the literal the
+   * service emits - a relative reference, not an absolute URL - because a consumer matching on an
+   * invented absolute form would silently never match.
    */
   type: string;
   /** Short human-readable summary of the problem kind. Constant for a given `type`. */
@@ -215,11 +221,23 @@ export interface ProblemDetail {
    */
   instance: string;
   /**
-   * Per-field detail, present only on a request-validation failure. The service omits the key
-   * entirely otherwise, so this is absent rather than `null` on every other failure path - test it
-   * with a presence check, never against `null`.
+   * Correlation identifier for the request that failed, identical to the `X-Request-ID` header on
+   * the same response - the service writes both from one value, so they cannot disagree. Present
+   * on every failure path, which is what makes it safe to render in an error surface and quote in
+   * a support report: every structured log line for that request carries the same value, so one
+   * string is enough to find the failure server-side.
    */
-  errors?: ValidationErrorItem[];
+  request_id: string;
+  /**
+   * Per-field detail, carried only by a request-validation failure.
+   *
+   * The service omits the key entirely on every other failure path - it never sends `null` and
+   * never sends `[]` - so `undefined` is what a consumer actually sees. `null` is admitted here
+   * anyway because both mean the same thing, "no per-field detail", and a mirror that forbade it
+   * would make a defensive read a type error. Test it for content - `errors?.length` - never for
+   * the presence of the key alone.
+   */
+  errors?: ValidationErrorItem[] | null;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -323,14 +341,20 @@ export type CommentStatus = (typeof COMMENT_STATUSES)[number];
 /* -------------------------------------------------------------------------------------------------
  * Authentication - POST /api/v1/auth/{register,login,refresh,logout} and GET /api/v1/auth/me
  *
- * Bearer-token authentication, held entirely in these four shapes plus {@link UserMe}. The password
- * policy the client must mirror lives in `@/lib/validation/auth`; this module carries the wire
- * shapes only, because a length or character-class rule expressed as a type would go stale the
- * moment the service tightened it.
+ * Bearer-token authentication, held entirely in these four shapes plus the two user projections:
+ * registration answers with {@link UserPublic}, and `GET /api/v1/auth/me` answers with
+ * {@link UserMe}. The password policy the client must mirror lives in `@/lib/validation/auth`; this
+ * module carries the wire shapes only, because a length or character-class rule expressed as a type
+ * would go stale the moment the service tightened it.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Body of `POST /api/v1/auth/register`. Returns {@link UserMe}.
+ * Body of `POST /api/v1/auth/register`. Returns {@link UserPublic}, not {@link UserMe}.
+ *
+ * That distinction is contractual and worth stating at the call site, because assuming otherwise
+ * is a runtime error rather than a type error: the registration response carries no `email`, no
+ * `role`, no `is_active` and no `updated_at`. A client that needs the full self-view calls
+ * `GET /api/v1/auth/me` after logging in, which is the route that answers with {@link UserMe}.
  *
  * Note what is **absent**: there is no role field, and adding one would turn account creation into
  * privilege escalation. Every account is created as `READER`; only an administrator can change a

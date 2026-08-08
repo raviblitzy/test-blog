@@ -31,12 +31,48 @@ both are load-bearing:
   in the retired implementation performed. Normalising the *argument* instead is no better: it
   would have to be applied on every write path and every lookup path, and the first path that
   forgot would silently admit the duplicate this design forbids.
+
+  The one place a column is wrapped at all is the administrative containment search in
+  :func:`_search_criteria`, which casts both columns to ``text``. That is the opposite case and
+  it is deliberate: it is not an *equality* predicate, so it never had an index to lose, and the
+  cast is what gives it one - ``ix_users_username_trgm`` and ``ix_users_email_trgm`` are GIN
+  trigram indexes over exactly that expression, because ``gin_trgm_ops`` is defined over ``text``
+  and cannot be applied to a citext column usefully. The operator becomes ``ILIKE`` in the same
+  breath, because casting away citext casts away its case-folding too. The reasoning is recorded
+  at that call site.
 * **Nothing here pre-checks uniqueness as a guarantee.**
   :meth:`UserRepository.get_by_email_or_username` exists to make a registration conflict
   *friendly*, not to make it *safe*. Between that SELECT and the INSERT another transaction can
   claim the same address, so the unique index is what actually closes the window and
   ``app.services.auth_service`` must still translate the resulting
   :class:`~sqlalchemy.exc.IntegrityError` into its conflict error.
+
+Rotation is one atomic claim
+---------------------------
+A refresh token is single-use, and "single-use" is a concurrency claim rather than a naming
+convention. :meth:`RefreshTokenRepository.claim` therefore tests and spends a row in **one**
+statement - ``UPDATE ... WHERE token_hash = :h AND revoked_at IS NULL AND expires_at > :now
+RETURNING ...`` - so the liveness conditions are evaluated by PostgreSQL under the row lock
+that the same statement takes to write. A row comes back only to the transaction that spent it.
+
+Spelling that as a SELECT followed by an UPDATE would not be single-use at all. Two requests
+presenting the same digest both read ``revoked_at IS NULL``, both conclude the token is good,
+both revoke it and both commit, so one token mints two replacements - and a *replayed* token,
+which is the observable signature of a leak, becomes indistinguishable from a legitimate first
+use. Verified on PostgreSQL 18.4 by releasing two independent transactions onto one digest from
+a barrier: exactly one received a row, and ``revoked_at`` was stamped once.
+
+The two lookups are consequently not interchangeable, and the order is part of the contract:
+
+1. :meth:`RefreshTokenRepository.claim` - the decision. A row means the caller may issue a
+   replacement through :meth:`RefreshTokenRepository.create` in the same transaction.
+2. :meth:`RefreshTokenRepository.get_by_hash` - the *diagnosis*, and only after a failed claim.
+   It filters nothing, so a revoked row is visible as revoked, which is what lets
+   ``app.services.auth_service`` tell a replayed token from an unknown one and respond to the
+   former by revoking every token the account holds.
+
+:meth:`RefreshTokenRepository.revoke` remains the logout path, where revoking twice is the same
+outcome as revoking once and no replacement is minted.
 
 Only hashed token values cross this boundary
 --------------------------------------------
@@ -94,7 +130,11 @@ from typing import Any, Final, cast
 from sqlalchemy import (
     ColumnExpressionArgument,
     CursorResult,
+    Text,
     UpdateBase,
+    # Aliased because `typing.cast` is already imported above under the bare name, and the two
+    # do entirely different things: one narrows a type for mypy, the other renders a SQL CAST.
+    cast as sql_cast,
     delete,
     or_,
     select,
@@ -103,7 +143,7 @@ from sqlalchemy import (
 
 from app.models.refresh_token import RefreshToken
 from app.models.user import User, UserRole
-from app.repositories.base import BaseRepository
+from app.repositories.base import UUIDPrimaryKeyRepository
 
 __all__ = ["RefreshTokenRepository", "UserRepository"]
 
@@ -166,7 +206,7 @@ def _containment_pattern(term: str) -> str:
     return f"%{escaped}%"
 
 
-class UserRepository(BaseRepository[User]):
+class UserRepository(UUIDPrimaryKeyRepository[User]):
     """Queries over the ``users`` relation: natural-key lookup, and the administrative table.
 
     Every method is a single composed statement, and the inherited helpers cover the rest of
@@ -345,20 +385,38 @@ class UserRepository(BaseRepository[User]):
 
         term = q.strip() if q is not None else ""
         if term:
-            # `ilike` rather than a plain `like`, though both would work: measured on
-            # PostgreSQL 18.4, `LIKE` against a CITEXT column already folds case, so the two
-            # are equivalent *here*. `ilike` is chosen because it states the intent at the call
-            # site - a reader need not know the column type declared two modules away to see
-            # that the match is case-insensitive - and because it stays correct if the column
-            # is ever redeclared. It costs no index either: a leading-wildcard containment
-            # cannot use the b-tree unique index whatever operator is used, and unlike
-            # `func.lower()` this leaves the column expression itself untouched, so the
-            # equality lookups in `get_by_email` and `get_by_username` are unaffected.
+            # Both columns are matched through an explicit cast to `text`, and both with `ilike`.
+            # Neither choice is stylistic - together they are what makes this containment search
+            # index-served rather than a sequential scan over every account in the system.
+            #
+            # THE CAST. `ix_users_username_trgm` and `ix_users_email_trgm` are GIN trigram indexes
+            # over `(column::text)`, and they are declared that way because they must be:
+            # `gin_trgm_ops` is defined over `text`, while citext's own `~~`/`~~*` operators are
+            # not in that operator family, so an index declared directly on a citext column is
+            # accepted by PostgreSQL and then never chosen by the planner - at any size, because
+            # the operator family never matches. Measured on 18.4: a leading-wildcard containment
+            # on the bare column is a sequential scan even with the unique index present, while
+            # over the cast the same predicate plans as an `Index Cond` on both indexes under a
+            # BitmapOr. Whether the planner PREFERS that bitmap to reading the table is a separate
+            # cost question that arrives with volume - it still scans at thirty thousand accounts
+            # and takes both indexes at three hundred thousand - but reachability is the part this
+            # spelling controls. The predicate has to be spelled the way the index is, so the cast
+            # is here rather than only there.
+            #
+            # THE OPERATOR. `ilike` is now load-bearing rather than merely expressive: casting a
+            # citext value to `text` also casts away its case-insensitivity, so `LIKE` over the
+            # cast would silently become a case-SENSITIVE search - an administrator typing `alice`
+            # would stop finding `Alice`. `ILIKE` restores the folding the column type was
+            # providing, so the result set is identical to the pre-cast predicate.
+            #
+            # Only this containment predicate is cast. The equality lookups in `get_by_email` and
+            # `get_by_username` compare the columns themselves, so they keep using the unique
+            # citext indexes and are unaffected by anything here.
             pattern = _containment_pattern(term)
             criteria.append(
                 or_(
-                    User.username.ilike(pattern, escape=_LIKE_ESCAPE),
-                    User.email.ilike(pattern, escape=_LIKE_ESCAPE),
+                    sql_cast(User.username, Text).ilike(pattern, escape=_LIKE_ESCAPE),
+                    sql_cast(User.email, Text).ilike(pattern, escape=_LIKE_ESCAPE),
                 )
             )
 
@@ -371,13 +429,19 @@ class UserRepository(BaseRepository[User]):
         return criteria
 
 
-class RefreshTokenRepository(BaseRepository[RefreshToken]):
-    """Queries over the ``refresh_tokens`` relation: issuance, lookup, revocation and sweeping.
+class RefreshTokenRepository(UUIDPrimaryKeyRepository[RefreshToken]):
+    """Queries over the ``refresh_tokens`` relation: issuance, claiming, revocation, sweeping.
 
     The whole point of the relation is that a signed access token cannot be withdrawn, so the
     long-lived half of the pair is recorded as a row that can be marked spent. These methods are
-    the four things ``app.services.auth_service`` needs in order to do that: record an issuance,
-    find a presented token, withdraw one or all of them, and clear away what has lapsed.
+    what ``app.services.auth_service`` needs in order to do that: record an issuance, **claim a
+    presented token exactly once**, look one up whatever state it is in, withdraw one or all of
+    them, and clear away what has lapsed.
+
+    :meth:`claim` and :meth:`get_by_hash` are two different questions about one digest and the
+    order they are asked in is the whole of rotation's correctness - see "Rotation is one atomic
+    claim" in the module docstring. :meth:`claim` is the only method that decides a token is
+    spent; :meth:`get_by_hash` never does.
 
     Every value handled here is already a digest. Nothing in this class hashes, generates,
     compares or judges a token - see "Only hashed token values cross this boundary" in the
@@ -419,8 +483,98 @@ class RefreshTokenRepository(BaseRepository[RefreshToken]):
             RefreshToken(user_id=user_id, token_hash=token_hash, expires_at=expires_at)
         )
 
+    async def claim(self, token_hash: str, *, now: datetime | None = None) -> RefreshToken | None:
+        """Spend one refresh token, atomically, and return it - or return ``None``.
+
+        **This is the only correct entry point for rotation**, and it is one statement rather
+        than a read followed by a write:
+
+        .. code-block:: sql
+
+            UPDATE refresh_tokens SET revoked_at = :now
+             WHERE token_hash = :hash AND revoked_at IS NULL AND expires_at > :now
+            RETURNING ...
+
+        The conditions and the revocation are evaluated by PostgreSQL in the same statement, so
+        the row is tested and spent under one row lock. Two concurrent requests presenting the
+        same digest therefore cannot both succeed: the second blocks on the first's lock, then
+        re-evaluates ``revoked_at IS NULL`` against the *committed* value, finds it set, matches
+        nothing and returns ``None``. Verified on PostgreSQL 18.4 by racing two independent
+        transactions on one digest from a barrier - exactly one received a row, and
+        ``revoked_at`` was stamped once.
+
+        Doing this as :meth:`get_by_hash` then :meth:`revoke` cannot give that guarantee however
+        the calls are ordered. Both readers observe ``revoked_at IS NULL``, both decide the token
+        is good, both write, and both commit - so one presented token mints two refresh tokens,
+        single-use rotation is not single-use, and the replay of a leaked token is
+        indistinguishable from its legitimate first use.
+
+        Args:
+            token_hash: The digest of the presented token, computed by the caller through
+                ``app.core.security.hash_refresh_token``. Matched against the UNIQUE column, so
+                at most one row can qualify.
+            now: Optional timezone-aware instant, used both as the expiry cutoff and as the
+                recorded revocation instant. Defaults to :func:`_utc_now`. One value serves both
+                so the row cannot be judged live against one clock and stamped from another; a
+                test pins it the same way :meth:`delete_expired` allows.
+
+        Returns:
+            The row, with ``revoked_at`` now set, when the digest named a token that was
+            unrevoked and unexpired at *now*. ``None`` in every other case - no such digest, one
+            already spent, one past its expiry, or one another transaction claimed first.
+
+        Note:
+            **``None`` is not an error and not a diagnosis.** Rotation needs to tell "never
+            issued" from "already spent" from "expired", because the middle case is evidence a
+            token leaked, and this method deliberately collapses all three. The caller resolves
+            them by asking :meth:`get_by_hash` *after* a failed claim: that read is unfiltered,
+            so a revoked row is visible as such and reuse detection becomes possible one layer
+            up, where "revoke every token this account holds" is a decision rather than a query.
+
+            **The replacement is a separate call.** :meth:`create` records the new token, and the
+            service performs both inside one transaction, so the claim and the issuance commit
+            together or not at all.
+
+            ``populate_existing`` is passed so the returned entity reflects the row as the UPDATE
+            left it even when this unit of work already held a copy - without it the identity map
+            would keep a stale ``revoked_at`` of ``None`` on the very object the caller is about
+            to act on. ``synchronize_session=False`` is passed for the reason
+            :meth:`_execute_bulk` records, and is safe here precisely because ``RETURNING``
+            refreshes the affected row directly rather than leaving the session to guess which
+            objects a set-based write touched. ``"fetch"`` is not an option: measured against
+            SQLAlchemy 2.0.51, it issues its reconciling SELECT outside the async bridge and
+            raises ``MissingGreenlet``.
+
+            Both execution options are passed as an ``execute()`` keyword rather than chained
+            onto the statement. Chaining returns a plain ``Executable`` and drops the
+            ``ReturningUpdate`` generic, which is what lets ``result.scalars().first()`` type as
+            ``RefreshToken | None`` here instead of ``Any``.
+        """
+        instant = _utc_now() if now is None else now
+        statement = (
+            update(RefreshToken)
+            .where(
+                RefreshToken.token_hash == token_hash,
+                # The two liveness conditions, evaluated by the database at the moment of the
+                # write rather than by Python at the moment of an earlier read. This is the
+                # entire difference between this method and the sequence it replaces.
+                RefreshToken.revoked_at.is_(None),
+                RefreshToken.expires_at > instant,
+            )
+            .values(revoked_at=instant)
+            .returning(RefreshToken)
+        )
+        result = await self.session.execute(
+            statement,
+            execution_options={"synchronize_session": False, "populate_existing": True},
+        )
+        return result.scalars().first()
+
     async def get_by_hash(self, token_hash: str) -> RefreshToken | None:
         """Fetch the row carrying this digest, **whatever state it is in**.
+
+        The **diagnostic** read, and it is deliberately not the rotation path. Rotation spends a
+        token through :meth:`claim`; this method exists to explain a claim that came back empty.
 
         Served by the UNIQUE constraint on ``token_hash``, which guarantees at most one match,
         so rotation is never forced to choose between candidates.
@@ -441,11 +595,19 @@ class RefreshTokenRepository(BaseRepository[RefreshToken]):
         Returns:
             The row - active, revoked or expired - or ``None`` when no token was ever issued with
             that digest.
+
+        Note:
+            **This method must not be used to decide that a token may be exchanged.** Reading a
+            row here and revoking it afterwards is two statements with a window between them, and
+            two concurrent requests both pass through that window; :meth:`claim` closes it by
+            testing and spending the row in one statement. Ask this question only *after* a claim
+            has already failed, when the row's state is settled and the only remaining question is
+            which of "never issued", "already spent" or "expired" the caller is looking at.
         """
         return await self.get_or_none(RefreshToken.token_hash == token_hash)
 
     async def revoke(self, token: RefreshToken, *, now: datetime | None = None) -> RefreshToken:
-        """Withdraw one token, idempotently.
+        """Withdraw one token, idempotently. The **logout** path, not the rotation path.
 
         ``revoked_at`` is stamped only when it is currently ``NULL``, so revoking an
         already-revoked token leaves the original instant intact. That matters beyond tidiness:
@@ -454,7 +616,8 @@ class RefreshTokenRepository(BaseRepository[RefreshToken]):
         detection reads.
 
         Args:
-            token: A persistent row, typically the one :meth:`get_by_hash` just returned.
+            token: A persistent row the caller already holds, typically the one
+                :meth:`get_by_hash` just returned.
             now: Optional timezone-aware instant to record. Defaults to :func:`_utc_now`, so the
                 specified ``revoke(token)`` call is exactly what a service writes; supplying it
                 explicitly lets a test pin the instant, matching how
@@ -462,6 +625,14 @@ class RefreshTokenRepository(BaseRepository[RefreshToken]):
 
         Returns:
             The same row, flushed and reloaded, with ``revoked_at`` set.
+
+        Note:
+            Logout is the use case this serves, and the difference from :meth:`claim` is that
+            logout has nothing to lose to a race: revoking a token twice is the same outcome as
+            revoking it once, and the idempotent guard above preserves the first instant either
+            way. Rotation is not like that - it *mints a replacement*, so it must establish that
+            it alone spent the token, which a read followed by this write cannot do. Never build
+            rotation out of ``get_by_hash`` plus ``revoke``; call :meth:`claim`.
         """
         if token.revoked_at is None:
             token.revoked_at = _utc_now() if now is None else now

@@ -51,7 +51,7 @@
 // No literal colour, length, radius or shadow appears below - the tokens live in
 // src/app/globals.css and this file only names them. The semantic mapping used:
 //
-//   field boundary     --color-border-strong       border-border-strong
+//   field boundary     --color-muted-foreground    border-muted-foreground
 //   field + panel fill --color-surface             bg-surface
 //   panel hairline     --color-border              border-border
 //   body text          --color-foreground          text-foreground
@@ -64,18 +64,21 @@
 //
 // TWO OF THOSE CHOICES ARE EASY TO "CORRECT" INTO A BUG, so both are stated outright.
 //
-// `border-border-strong` on the TRIGGER, not `border-border`. globals.css splits the two
+// `border-muted-foreground` on the TRIGGER, not `border-border`. globals.css splits the two
 // deliberately and names this file in the split: `--color-border` is a decorative hairline that
 // measures 1.23:1 on the light surface and 1.73:1 on the dark one, which WCAG 1.4.11 exempts for
 // card outlines and table rules; the boundary of an interactive control is what IDENTIFIES the
-// control and has to clear 3:1. `--color-border-strong` (slate-500, and theme-invariant, so it
-// is absent from the `.dark` block) measures 4.77:1 and 3.74:1. That file's A11Y note lists
-// "input, textarea, select and checkbox" as its consumers by name.
+// control and has to clear 3:1. The token catalogue holds no boundary token of its own, so the
+// treatment composes from `--color-muted-foreground` - the one neutral guaranteed legible on
+// every canvas, measured at 7.23:1 and 6.90:1 in light and 7.68:1 and 5.58:1 in dark. That
+// file's A11Y note lists "input, textarea, the select trigger and the secondary button" as the
+// consumers of the composition, and the trigger inherits it here through
+// FIELD_CONTROL_CLASSES rather than restating it.
 //
 // `border-border` on the PANEL, for the mirror-image reason, matching dropdown-menu.tsx. A
 // floating panel's outline is decorative - the options inside are identified by their own text -
-// so the decorative hairline is correct there and the strong token would put a mid-grey rule
-// around every open picker.
+// so the decorative hairline is correct there, and the stronger treatment would put a mid-grey
+// rule around every open picker.
 //
 // The highlight pair is the one globals.css sanctions explicitly: it records
 // primary-foreground over accent at 8.07:1 in light and 10.04:1 in dark, both clear of the
@@ -189,71 +192,44 @@
 
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from 'lucide-react';
-import type { ComponentProps, JSX } from 'react';
+import { Children, isValidElement, type ComponentProps, type JSX } from 'react';
 
 import { cn } from '@/lib/utils';
 
-/**
- * Gap between the trigger and the panel, in CSS pixels, used only in `popper` positioning.
- *
- * Radix's positioning props are numbers, not class names, so this is the one value in the file
- * that cannot be a utility. It is still traceable to the scale rather than invented: 4 is exactly
- * one step of the engine's `--spacing` unit (0.25rem = 4px), the same step `p-1` applies inside
- * the panel, and the same constant dropdown-menu.tsx uses so the two floating surfaces sit at an
- * identical distance from their triggers. Callers override it with the `sideOffset` prop.
- */
-const CONTENT_SIDE_OFFSET = 4;
+import { FIELD_CONTROL_CLASSES, FIELD_INVALID_CLASSES } from './input';
 
 /**
  * Trigger classes - the field half of this primitive.
  *
- * Group for group this is input.tsx's vocabulary, and the two must be changed together. Reading
- * top to bottom:
+ * The surface, boundary, text, focus, disabled and motion treatment is not restated here: it is
+ * IMPORTED from `./input` as `FIELD_CONTROL_CLASSES`, the one definition the whole field family
+ * shares, so a picker and a text field in the same form row cannot drift apart. `h-11` matches
+ * Input's height exactly, which is what makes them line up. Everything below is what a
+ * <button>-shaped field needs and an <input> does not:
  *
- *   `flex w-full min-w-0 items-center justify-between gap-2` - the value on one side, the chevron
- *     on the other. `w-full` so the picker fills its form row; `min-w-0` so it can also SHRINK
- *     inside a flex row, without which a field in a flex container forces horizontal overflow at
- *     narrow viewports - which the responsive criteria forbid at every width. `gap-2` keeps the
- *     value clear of the chevron when the two nearly meet.
- *   `h-11 rounded-md px-3` - 2.75rem is 44px, the WCAG 2.5.5 target-size floor. No design source
- *     exists for this project (zero attachments, zero Figma frames), so nothing authorises a
- *     smaller target and the accessible minimum governs. Identical to input.tsx, which is what
- *     makes a picker and a text field line up in the same row.
- *   `border-border-strong bg-surface text-foreground border text-base shadow-xs` - see section 2
- *     of the header for why the boundary is the STRONG token, and section 3 for why the text is
- *     `text-base` rather than `text-sm`. `shadow-xs` is what keeps the field readable when it
- *     sits flush on a `bg-surface` card, where the fill alone cannot distinguish it.
+ *   `flex items-center justify-between gap-2` - the value on one side, the chevron on the other,
+ *     with `gap-2` keeping the value clear of the chevron when the two nearly meet.
  *   `text-start` - a <button> centres its text; an <input> does not. Without this the selected
  *     value would sit in the middle of the field while the sibling text input's value sits at the
  *     start, which is the most visible way these two could fail to look like one family.
- *   `data-[placeholder]:text-muted-foreground` - Radix sets `data-placeholder` on the trigger
- *     while nothing is selected, so an empty picker reads as a hint rather than as a value. This
- *     is the exact counterpart of input.tsx's `placeholder:text-muted-foreground`; the token
- *     still clears 4.5:1 on every canvas, so the hint stays legible rather than merely faint.
+ *   `data-[placeholder]:text-muted-foreground` - Radix sets `data-placeholder` on the trigger while
+ *     nothing is selected, so an empty picker reads as a hint rather than as a value. This is the
+ *     exact counterpart of input.tsx's `placeholder:text-muted-foreground`, and the reason the
+ *     placeholder rule is stated per control instead of being shared: a <button> has no
+ *     `::placeholder` pseudo-element to tint. The token still clears 4.5:1 on every canvas, so the
+ *     hint stays legible rather than merely faint.
  *   `[&>span]:min-w-0 [&>span]:truncate` - SelectValue renders a <span>, and a long option label
  *     ("Software Architecture and Systems Design") would otherwise push the chevron out of the
  *     field or force the trigger to overflow. Truncation needs BOTH: `min-w-0` because a flex
  *     item's automatic minimum size is min-content and would refuse to shrink, and `truncate` for
  *     the ellipsis. The chevron carries `shrink-0` from the other side of the same problem.
- *   the `focus-visible:` group - an outline rather than a `ring` box-shadow, restated here rather
- *     than left to the `:focus-visible` floor in globals.css. Three reasons, all from input.tsx:
- *     an outline survives an ancestor's `overflow: hidden`; `outline-2` and `outline-offset-2` are
- *     exactly what that floor emits, so layering the same mechanism cannot change the indicator's
- *     thickness or position; and utilities outrank the base layer, so the field keeps a visible
- *     indicator even if the document floor is ever narrowed. `focus-visible:border-ring` adds a
- *     second cue inside the control's own edge. No bare `outline-none` appears on the trigger -
- *     removing the indicator would breach the accessibility floor outright.
- *   `disabled:*` - Radix forwards `disabled` to the real <button>, so these native variants apply
- *     directly. A recessed fill plus a not-allowed cursor makes the state readable from both the
- *     surface and the pointer rather than from opacity alone; WCAG 1.4.3 exempts inactive
- *     controls from the contrast minimum, which is what makes the dimming legitimate here.
- *   `motion-safe:*` - the border and outline colours ease between states instead of snapping.
- *     `motion-safe:` is the engine's own `prefers-reduced-motion: no-preference` variant, which
- *     is how transitions are required to be gated; it is not a hand-authored media query, and
- *     this file authors no responsive breakpoint at all.
  */
-const TRIGGER_CLASSES =
-  'flex h-11 w-full min-w-0 items-center justify-between gap-2 rounded-md px-3 border-border-strong bg-surface text-foreground border text-base text-start shadow-xs data-[placeholder]:text-muted-foreground [&>span]:min-w-0 [&>span]:truncate focus-visible:border-ring focus-visible:outline-ring focus-visible:outline-2 focus-visible:outline-offset-2 disabled:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-60 motion-safe:transition-colors motion-safe:duration-150 motion-safe:ease-out';
+const TRIGGER_CLASSES = cn(
+  FIELD_CONTROL_CLASSES,
+  'flex h-11 items-center justify-between gap-2 text-start',
+  'data-[placeholder]:text-muted-foreground',
+  '[&>span]:min-w-0 [&>span]:truncate',
+);
 
 /**
  * The chevron that marks the trigger as a picker.
@@ -267,24 +243,18 @@ const TRIGGER_CLASSES =
 const TRIGGER_ICON_CLASSES = 'size-4 shrink-0 opacity-60';
 
 /**
- * Trigger classes added when the `invalid` prop is set - again byte-identical to input.tsx's.
+ * Trigger classes added when the `invalid` prop is set.
  *
- * A danger border plus a soft halo of the same token, so the error reads at a glance without the
- * field having to grow or move.
- *
- * The two `focus-visible:` entries are the point of this group rather than an afterthought: they
- * OVERRIDE the brand-coloured focus treatment in TRIGGER_CLASSES, because a picker that turned
- * indigo the moment it was focused would drop its error signal exactly when the user arrived to
- * fix it. globals.css measures `--color-danger` at 6.42:1 on the light surface and 6.97:1 on the
- * dark one, so a red indicator still clears the 3:1 non-text floor and focus stays as visible as
- * it is on a valid field.
+ * Imported from `./input` rather than restated, for the same reason as the base set: the danger
+ * border, the soft halo and the two `focus-visible:` overrides that keep an errored field red
+ * while it is focused are one decision, and one decision belongs in one place. The measured
+ * figures and the full rationale are on `FIELD_INVALID_CLASSES` itself.
  *
  * Colour is never the only signal. `invalid` supplies the programmatic half by mirroring itself
  * into `aria-invalid`; the owning form supplies the visible half by rendering its message and
  * pointing `aria-describedby` at it, so the reason is readable rather than merely implied by a hue.
  */
-const TRIGGER_INVALID_CLASSES =
-  'border-danger ring-danger/20 focus-visible:border-danger focus-visible:outline-danger ring-2';
+const TRIGGER_INVALID_CLASSES = FIELD_INVALID_CLASSES;
 
 /**
  * Panel classes, applied in both positioning modes.
@@ -497,9 +467,9 @@ const SelectValue = SelectPrimitive.Value;
  * name is empty, typing its first letters jumps nowhere, and the trigger shows a blank value
  * after selection. Nothing warns.
  *
- * `SelectItem` wraps its children in this part automatically, so the common case needs no thought.
- * Reach for it explicitly when an option's content is not a single run of text - an icon or a
- * badge beside the label - so that the TEXT is registered and the decoration is not:
+ * `SelectItem` wraps plain children in this part for you, so the common case needs no thought.
+ * Reach for it explicitly when an option's content is NOT a single run of text - an icon or a badge
+ * beside the label - so that the TEXT is registered and the decoration is not:
  *
  * ```tsx
  * <SelectItem value="published">
@@ -508,8 +478,12 @@ const SelectValue = SelectPrimitive.Value;
  * </SelectItem>
  * ```
  *
- * Nesting it inside an item that already received plain children is harmless - Radix tolerates
- * the extra level - but there is no reason to.
+ * That composition works because `SelectItem` DETECTS this part among its direct children and then
+ * adds no wrapper of its own. Without that detection the example above would nest one ItemText
+ * inside another and the outer one would register "Published live" as the option's text - so the
+ * badge would join the accessible name, the typeahead target and the value the trigger shows, all
+ * silently. Compose it as a DIRECT child for that reason: an ItemText hidden inside a fragment or
+ * another component cannot be seen, and the wrapper is added around it.
  */
 const SelectItemText = SelectPrimitive.ItemText;
 
@@ -629,9 +603,16 @@ function SelectScrollDownButton(): JSX.Element {
  * `item-aligned` overlays the panel so the selected option lands on the trigger, which reads as a
  * native platform picker and is deliberately not this product's idiom.
  *
- * `align`, `side`, `alignOffset`, `collisionPadding`, `avoidCollisions` and every other
- * positioning prop reach the primitive through the spread; `sideOffset` is the only one given a
- * default, which a caller can still override.
+ * NO positioning prop is given a default here, `sideOffset` included: `align`, `side`,
+ * `alignOffset`, `collisionPadding`, `avoidCollisions` and the rest all reach the primitive
+ * through the spread and keep Radix's own defaults, so the panel sits flush against the field
+ * unless a caller asks otherwise. That is a deliberate change from a four-pixel gap. Radix takes
+ * the offset as a NUMBER rather than a class, so any non-zero default would be a raw dimension
+ * literal in a component - which the project's token rule does not permit, and which no scale
+ * lookup can launder, because the value has to cross from CSS into JavaScript. A flush panel needs
+ * no literal, and it still reads as a distinct surface: `CONTENT_CLASSES` gives it the raised fill,
+ * the hairline and the elevation shadow. A caller that genuinely wants the panel detached from its
+ * trigger passes `sideOffset` itself and owns that number.
  *
  * The two scroll buttons and the viewport are composed here rather than left to the caller,
  * because a panel missing them is not a styling difference but a list that cannot be scrolled by
@@ -655,14 +636,12 @@ function SelectContent({
   className,
   children,
   position = 'popper',
-  sideOffset = CONTENT_SIDE_OFFSET,
   ...props
 }: SelectContentProps): JSX.Element {
   return (
     <SelectPrimitive.Portal>
       <SelectPrimitive.Content
         position={position}
-        sideOffset={sideOffset}
         className={cn(
           CONTENT_CLASSES,
           // Only in `popper` mode does `--radix-select-trigger-width` exist to be read.
@@ -686,10 +665,12 @@ function SelectContent({
  * signal that clears the selection back to the placeholder, so an "any"/"all" option needs a real
  * sentinel of its own.
  *
- * Children are wrapped in `SelectItemText` automatically, which is what registers the option's
- * text for typeahead, for the trigger's displayed value, and for its own accessible name - see
- * the note on `SelectItemText` for why that wrapping is load-bearing rather than convenience, and
- * for the case where you should reach for the part explicitly instead.
+ * Plain children are wrapped in `SelectItemText` for you, which is what registers the option's text
+ * for typeahead, for the trigger's displayed value, and for its own accessible name. Compose that
+ * part yourself when the option carries decoration as well as a label - a badge, an icon - and this
+ * component adds no wrapper of its own, so only the text you marked is registered and the
+ * decoration is not. See the note on `SelectItemText` for the full contract and for why an
+ * unconditional wrapper would silently fold decoration into the option's name.
  *
  * The check indicator is rendered for you in the gutter the base classes reserve, so a caller
  * never has to think about the selected state. Radix mounts it only for the selected option.
@@ -709,6 +690,23 @@ function SelectContent({
  * rendered unconditionally for the selected option rather than being treated as decoration.
  */
 function SelectItem({ className, children, ...props }: SelectItemProps): JSX.Element {
+  // Wrap the children in ItemText ONLY when the caller has not composed one themselves.
+  //
+  // This is the whole of the composition contract, and getting it wrong is silent. Wrapping
+  // unconditionally nests ItemText inside ItemText, and the OUTER one then registers everything
+  // inside it as the option's text - so a badge or an icon placed beside the label becomes part of
+  // the option's accessible name, part of what typeahead matches, and part of what the trigger
+  // displays after selection. The nesting is invalid composition too: Radix documents ItemText as
+  // the single run of text an item is named by and shown as.
+  //
+  // Detection is on the DIRECT children, by element type, which is exact rather than heuristic -
+  // `SelectItemText` IS `SelectPrimitive.ItemText`, so both spellings are recognised. A caller who
+  // hides an ItemText inside a fragment or a wrapper component is outside what this can see and
+  // gets the wrapper; the doc comment above states the direct-child requirement for that reason.
+  const composesItemText = Children.toArray(children).some(
+    (child) => isValidElement(child) && child.type === SelectPrimitive.ItemText,
+  );
+
   return (
     <SelectPrimitive.Item className={cn(ITEM_CLASSES, className)} {...props}>
       <SelectPrimitive.ItemIndicator className={ITEM_INDICATOR_CLASSES}>
@@ -716,7 +714,11 @@ function SelectItem({ className, children, ...props }: SelectItemProps): JSX.Ele
             tick as well would say it twice. Sized by ITEM_CLASSES' nested-SVG rule. */}
         <Check aria-hidden="true" />
       </SelectPrimitive.ItemIndicator>
-      <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+      {composesItemText ? (
+        children
+      ) : (
+        <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+      )}
     </SelectPrimitive.Item>
   );
 }

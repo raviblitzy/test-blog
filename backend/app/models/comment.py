@@ -97,7 +97,7 @@ the time mappers are configured.
 
 Access paths
 ------------
-Two indexes serve this relation, and each exists for a query the product actually issues:
+Five indexes serve this relation, and each exists for a query the product actually issues:
 
 * ``ix_comments_post_id_created_at`` over ``(post_id, created_at)`` - the public thread read,
   "this post's comments in the order they were written", which is the most-issued query
@@ -106,18 +106,34 @@ Two indexes serve this relation, and each exists for a query the product actuall
   separate sort step.
 * ``ix_comments_status`` - the administrative moderation queue, which selects by state across
   every post rather than within one.
+* ``ix_comments_parent_id_status`` over ``(parent_id, status)`` - the recursive descent that
+  builds a thread of any depth. ``app.repositories.comment_repository`` walks the tree with a
+  recursive common table expression whose every step asks "the replies to these comments, in the
+  states this caller may see", so the join column leads and the filter column follows and one
+  index satisfies both halves at every level. Measured on PostgreSQL 18.4 at twenty thousand
+  comments: the recursive term plans as an index scan on this index with
+  ``Index Cond: ((parent_id = ...) AND (status = ...))``.
+* ``ix_comments_author_id`` - the referencing side of the ``users`` foreign key, so removing an
+  account locates the comments it wrote by index rather than by scanning the relation, and an
+  administrator moderating one account rather than one post has an access path.
+* ``ix_comments_body_trgm`` - a GIN trigram index over ``body``, for the moderation queue's
+  optional text search. That predicate is ``ILIKE '%term%'``, which no B-tree can serve at any
+  size, so this is the only index that can answer it. ``body`` is plain ``TEXT``, so the operator
+  class sits directly on the column and the repository needs no cast.
 
-Two columns are deliberately **not** indexed, and the omission is a decision rather than an
-oversight. PostgreSQL does not index a foreign key automatically, so ``author_id`` and
-``parent_id`` carry no index: neither has a query in the product's surface that addresses this
-relation by that column alone - a profile lists an author's *posts*, not their comments, and a
-thread is assembled from one post's rows in memory rather than by walking parents one level at
-a time - and the cascades that scan them run at deletion time, which is rare and already
-inside a transaction that is rewriting rows. The authoritative index inventory for the schema
-lists exactly the two indexes above for this relation, and this module is the reference side of
-``alembic check``, so adding a third here would be reported as drift against revision ``0001``
-rather than silently tolerated. Adding one later is a revision, which is the correct way for an
-access path to appear.
+Two of those five cover a **referencing** foreign-key column, and that is the reason they exist
+rather than an afterthought: PostgreSQL indexes a *referenced* key automatically and a
+referencing column not at all. Left undeclared, ``parent_id`` would make every level of a
+thread a sequential scan over the whole relation - one per level of depth, on the busiest public
+surface in the product - and ``author_id`` would make deleting a single account scan every
+comment in the system.
+
+This module is the reference side of ``alembic check``, so every index above has a counterpart in a
+revision and the two sides must be edited together; a sixth declared here alone would be reported
+as drift that no schema change caused. Adding an access path later is a revision, which is the
+correct way for one to appear. The counterpart is not always the same revision: the four B-tree
+indexes are built by ``0001``, while ``ix_comments_body_trgm`` is built by ``0002``, where every GIN
+index in this schema lives so that the expensive half of the build stays replayable on its own.
 
 What is deliberately not here
 -----------------------------
@@ -133,7 +149,9 @@ behaviour from three directions at once - authorship, moderation and threading:
   no ``approve()`` method and no ``is_visible`` property: a state machine that lives on the
   mapped class is a state machine that runs wherever the class happens to be loaded, and a
   visibility predicate on the class is a predicate every query is then free to forget.
-  ``app.services.comment_service`` performs the transitions and
+  ``app.services.comment_service`` performs all three transitions - an administrator's approval,
+  an administrator's rejection, and the return to :attr:`CommentStatus.PENDING` that an author's
+  edit of an approved comment requires - and
   ``app.repositories.comment_repository`` filters on :attr:`CommentStatus.APPROVED`
   explicitly, which is what makes public visibility a property of the query.
 * **No sanitisation.** :attr:`Comment.body` is a column. Reader-authored text is cleaned on
@@ -168,7 +186,7 @@ have a counterpart in a revision.
 
 * ``migrations/versions/0001_initial_blog_schema.py`` creates the ``comment_status``
   enumerated type with the three labels below **in this order**, and renders the table, its
-  primary key, all three ``ON DELETE CASCADE`` foreign keys and both B-tree indexes. The
+  primary key, all three ``ON DELETE CASCADE`` foreign keys and all four B-tree indexes. The
   ``name="comment_status"`` passed below must be spelled exactly as the revision spells it,
   because a mismatch is an ``alembic check`` drift report that no schema change caused.
 * ``app.models.__init__`` re-exports both :class:`Comment` and :class:`CommentStatus`; a
@@ -239,12 +257,16 @@ class CommentStatus(enum.StrEnum):
     """
 
     PENDING = "PENDING"
-    """Submitted but not yet moderated: the state every comment is created in.
+    """Awaiting a decision: the state every comment is created in, and returns to when edited.
 
     Invisible to the public thread, and visible to an administrator as the moderation queue -
     which is the whole reason this state is distinct from :attr:`REJECTED`. A comment sits here
     until an administrator moves it on, and its author can still see and edit it, because
     authorship and visibility are separate questions.
+
+    Reachable a second way, and that is deliberate: editing an :attr:`APPROVED` comment returns it
+    here. So this state means "unreviewed text", whether the text is new or replaced, rather than
+    only "newly submitted".
     """
 
     APPROVED = "APPROVED"
@@ -253,6 +275,10 @@ class CommentStatus(enum.StrEnum):
     The only state a public caller ever sees. ``app.repositories.comment_repository`` filters on
     this member explicitly rather than excluding the other two, so a fourth state added later
     would default to invisible instead of silently appearing in every thread.
+
+    Approval attaches to the text that was reviewed, not to the row: an author who edits an
+    approved comment returns it to :attr:`PENDING`, because approval of what a moderator read is
+    not approval of whatever replaces it.
     """
 
     REJECTED = "REJECTED"
@@ -300,12 +326,13 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     which is the state a newly submitted comment must be in: recorded, readable by its author
     and by an administrator, and absent from the public thread until it is approved.
 
-    Reading a relationship requires it to have been loaded by the statement that fetched the row
-    - ``selectinload(Comment.replies)`` and ``joinedload(Comment.author)``, in
-    ``app.repositories.comment_repository``. All four relationships keep SQLAlchemy's default
-    lazy strategy on purpose: under an ``AsyncSession`` a lazy load raises ``MissingGreenlet`` at
-    the point of access, which surfaces a missing eager-load option immediately instead of
-    hiding an N+1 behind a thread that still renders.
+    Reading a relationship requires it to have been populated by the statement that fetched the
+    row - ``selectinload(Comment.author)``, and for :attr:`replies` the recursive descent and
+    in-memory assembly in ``app.repositories.comment_repository``, which fills the collection at
+    every level of a thread. All four relationships keep SQLAlchemy's default lazy strategy on
+    purpose: under an ``AsyncSession`` a lazy load raises ``MissingGreenlet`` at the point of
+    access, which surfaces a missing eager-load option immediately instead of hiding an N+1 behind
+    a thread that still renders.
 
     Nothing on this class is a method. It is a mapped shape, three database-enforced cascades
     and four relationship declarations - all of which are schema. Every behaviour that reads
@@ -356,10 +383,10 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         # leave text behind attributed to a principal that no longer resolves.
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
-        # Unindexed on purpose; see "Access paths" in the module docstring. No surface addresses
-        # this relation by author alone - a public profile lists an author's posts, not their
-        # comments - and the authoritative index inventory lists exactly the two indexes in
-        # __table_args__ for this relation.
+        # Deliberately NOT index=True, but it IS indexed: ix_comments_author_id is declared in
+        # __table_args__ below alongside the other three, so the whole access-path inventory for
+        # this relation reads in one place and matches revision 0001 object for object. Declaring
+        # it here as well would create a duplicate index the revision could not reproduce.
     )
     """The account that wrote this comment. ``NOT NULL``, so every comment is attributable.
 
@@ -384,6 +411,11 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         # missing data: NULL is a top-level comment, a value is a reply to the comment it names.
         # A NOT NULL column here would leave no way to express the root of a thread.
         nullable=True,
+        # Deliberately NOT index=True. This column LEADS the composite
+        # ix_comments_parent_id_status declared in __table_args__ below, which serves both the
+        # recursive descent that builds a thread and the moderation filter applied at every level
+        # of it; a single-column index over the same leading column would be redundant with it
+        # and would put this model out of step with revision 0001.
     )
     """The comment this one replies to, or ``None`` when it is top-level.
 
@@ -451,21 +483,36 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     The public thread filters on :attr:`CommentStatus.APPROVED` explicitly in
     ``app.repositories.comment_repository``, which is what makes moderation a property of every
-    query rather than of remembering to add a predicate. ``app.services.comment_service`` owns
-    the transitions between the three states, and only an administrator may request one.
+    query rather than of remembering to add a predicate.
+
+    ``app.services.comment_service`` owns every transition between the three states, and the
+    authority is asymmetric by design: an administrator is the only principal who can move a
+    comment *into* :attr:`CommentStatus.APPROVED` or :attr:`CommentStatus.REJECTED`, and no input
+    model reachable by a comment's author carries this column. An author's edit nonetheless moves
+    it, in the one safe direction - editing an approved comment returns it to
+    :attr:`CommentStatus.PENDING`, so the replaced text is reviewed before it is public again. That
+    transition is applied by the service, never chosen by the caller, which is what stops approval
+    of benign text from becoming standing approval of whatever replaces it.
     """
 
     # ---------------------------------------------------------------------------------
     # Access paths
     #
-    # Two explicitly named indexes, matching the schema's authoritative index inventory for
-    # this relation. Neither is also expressed as `index=True` on its column: declaring an
-    # index twice creates a duplicate object that revision 0001 could not reproduce.
+    # Four explicitly named indexes, matching the schema's authoritative index inventory for
+    # this relation, and each one exists for a query this product actually issues. None is also
+    # expressed as `index=True` on its column: declaring an index twice creates a duplicate
+    # object that revision 0001 could not reproduce.
     #
     # The names are spelled out rather than left to the `ix_%(column_0_label)s` convention in
-    # app.db.base, which app.db.base itself asks for on composite indexes - naming this one
+    # app.db.base, which app.db.base itself asks for on composite indexes - naming one of these
     # among its examples - because the derived name would describe only the first of two
     # columns and would collide with any future single-column index on that column.
+    #
+    # Two of the four cover columns that carry a foreign key, and that is not incidental.
+    # PostgreSQL creates an index on a REFERENCED key automatically and none at all on a
+    # REFERENCING column, so `parent_id` and `author_id` are unindexed unless said so here -
+    # which would leave the recursive descent below and every ON DELETE CASCADE from `users`
+    # scanning the whole relation once per level and once per deleted account respectively.
     # ---------------------------------------------------------------------------------
     __table_args__ = (
         Index(
@@ -485,6 +532,56 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             # filtered inside a post's thread.
             "ix_comments_status",
             "status",
+        ),
+        Index(
+            # The thread's recursive descent, and the one index a threaded discussion cannot be
+            # read without. app.repositories.comment_repository walks the tree with a recursive
+            # CTE whose every step is "the replies to these comments, in the states this caller
+            # may see" - `parent_id = ? AND status IN (...)` - so leading with the join column
+            # and following with the filter column lets one index satisfy both halves at every
+            # level. Measured on PostgreSQL 18.4 at 20k comments: the recursive term plans as
+            # `Index Scan using ix_comments_parent_id_status` with
+            # `Index Cond: ((parent_id = ...) AND (status = ...))`. Without it each level is a
+            # sequential scan over the whole relation, and a thread costs one such scan per
+            # level of depth.
+            #
+            # It also serves the self-referencing ON DELETE CASCADE: removing a comment makes
+            # PostgreSQL find the rows referencing it, at every level of the subtree.
+            "ix_comments_parent_id_status",
+            "parent_id",
+            "status",
+        ),
+        Index(
+            # The referencing side of the users foreign key. Its first job is the cascade:
+            # deleting an account removes the comments it wrote, and PostgreSQL locates them by
+            # this column, so without the index removing one account scans every comment in the
+            # system. Its second is any author-scoped listing - "everything this principal has
+            # written" is the shape an administrator reaches for when moderating a single
+            # account rather than a single post.
+            "ix_comments_author_id",
+            "author_id",
+        ),
+        Index(
+            # The moderation queue's optional body search. `body` is unbounded TEXT and the match
+            # is `ILIKE '%term%'`, which no b-tree can serve at all, so without this index every
+            # keystroke in that search box is a sequential scan over every comment in the system -
+            # the largest relation in this schema by row count.
+            #
+            # `body` is TEXT, so the operator class goes straight on the column and
+            # app.repositories.comment_repository needs no cast: `Comment.body.ilike(...)` uses
+            # this index directly. Verified on PostgreSQL 18.4: the predicate plans as an
+            # `Index Cond` on it at any size, and the planner prefers it to reading the relation
+            # once the relation is big enough for that to pay - a scan still wins at twenty
+            # thousand comments, the index wins at two hundred thousand.
+            #
+            # GIN rather than b-tree because gin_trgm_ops indexes the
+            # three-character substrings of the value, which is what makes a leading wildcard
+            # answerable at all. The index build belongs to revision 0002, where every GIN index
+            # in this schema lives.
+            "ix_comments_body_trgm",
+            "body",
+            postgresql_using="gin",
+            postgresql_ops={"body": "gin_trgm_ops"},
         ),
     )
 
@@ -564,9 +661,17 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     """The direct replies to this comment, in any moderation state and in no guaranteed order.
 
-    One level only - a reply's own replies are reached through *its* collection - and
-    deliberately unfiltered: this is the ownership edge, not a public projection. A reader sees
-    only approved replies, ordered, which are both properties of the query behind that view in
-    ``app.repositories.comment_repository``. ``app.schemas.comment`` projects this attribute as
-    the nested reply list on the public representation.
+    One generation only, and deliberately unfiltered: this is the ownership edge, not a public
+    projection. Depth is unbounded - a reply's own replies hang off *its* collection, and nothing
+    in the schema caps how far that goes - which is precisely why
+    ``app.repositories.comment_repository`` reads a thread with a recursive query over
+    :attr:`parent_id` rather than through this relationship. A loader can follow one generation;
+    a thread can be deeper than one.
+
+    That module then populates this collection at every level with
+    :func:`~sqlalchemy.orm.attributes.set_committed_value`, which is the only safe way to write a
+    collection carrying ``delete-orphan``: a plain assignment would emit removal events and delete
+    the very replies being nested. A reader sees only approved replies, ordered, and both are
+    properties of that query rather than of this declaration. ``app.schemas.comment`` projects this
+    attribute as the recursive reply list on the public representation.
     """

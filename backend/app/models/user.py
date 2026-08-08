@@ -118,6 +118,10 @@ it exactly or ``alembic check`` reports drift that no schema change caused:
   ``unique=True`` and ``index=True`` together emit a single ``CREATE UNIQUE INDEX``; the
   naming convention in :mod:`app.db.base` derives ``ix_users_email`` and ``ix_users_username``,
   so no name is written by hand here and none should be written by hand there;
+* the two GIN trigram indexes in :attr:`User.__table_args__` - ``ix_users_username_trgm`` and
+  ``ix_users_email_trgm``, both over the text cast of their citext column - are built by revision
+  ``0002``, not ``0001``, which is where every GIN index in this schema lives; their names,
+  expressions and operator classes are spelled identically on both sides;
 * the two server defaults are ``'READER'::user_role`` and ``true``, which is the spelling
   PostgreSQL reflects back, so ``compare_server_default`` finds them equal.
 """
@@ -127,7 +131,7 @@ from __future__ import annotations
 import enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, Text, text
+from sqlalchemy import Boolean, Index, Text, literal_column, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import CITEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -311,6 +315,59 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     deleting it and without cascading away the posts and comments it owns. Deletion remains
     available and remains irreversible.
     """
+
+    # ---------------------------------------------------------------------------------
+    # Access paths
+    #
+    # Two unique indexes come from `unique=True, index=True` on `email` and `username` above,
+    # and they serve the equality lookups - sign-in, registration conflict detection, and
+    # resolving /u/{username} to a row in one probe.
+    #
+    # The two declared here serve a different question, and they exist because the first two
+    # cannot answer it. GET /api/v1/admin/users takes a `?q=` term and matches it against handle
+    # and address as a CONTAINMENT search, and a leading-wildcard pattern cannot use a b-tree at
+    # all. Left unindexed, every keystroke in that search box is a sequential scan over every
+    # account in the system.
+    #
+    # Both index the TEXT CAST of a citext column rather than the column, and that is forced
+    # rather than stylistic: gin_trgm_ops is defined over `text`, and citext's own `~~`/`~~*`
+    # operators are not in that operator family, so an index declared directly on the column is
+    # accepted by PostgreSQL and then never chosen by the planner - at any size, because the
+    # operator family never matches.
+    #
+    # Over the cast, two separate things are true and only one of them is about this index being
+    # correct. REACHABLE: the predicate plans as an `Index Cond` on these two under a BitmapOr,
+    # measured on 18.4, and that holds at every row count. PREFERRED: whether the planner picks
+    # them over reading the table is a cost decision that arrives with volume - at thirty
+    # thousand accounts it still scans, at three hundred thousand it takes both indexes. The
+    # second is not a defect in the first: an index that is never reachable is a wasted write,
+    # while an index the planner declines on a small relation is simply not needed yet.
+    #
+    # app.repositories.user_repository therefore writes
+    # the predicate as `cast(User.username, Text).ilike(...)` to match this expression - and as
+    # ILIKE rather than LIKE, because casting away citext also casts away its case-folding.
+    #
+    # The expression is a LABELLED literal_column with the operator class in `postgresql_ops`,
+    # not one `text("(username::text) gin_trgm_ops")` string. Both render the same DDL, but
+    # Alembic warns `Expression ... detected to include an operator clause. Expression compare
+    # cannot proceed` on the inline form and then stops comparing the index at all - an object
+    # silently unguarded by the drift gate. Revision 0002 builds both, alongside every other GIN
+    # index in this schema.
+    # ---------------------------------------------------------------------------------
+    __table_args__ = (
+        Index(
+            "ix_users_username_trgm",
+            literal_column("(username::text)").label("username_text"),
+            postgresql_using="gin",
+            postgresql_ops={"username_text": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_users_email_trgm",
+            literal_column("(email::text)").label("email_text"),
+            postgresql_using="gin",
+            postgresql_ops={"email_text": "gin_trgm_ops"},
+        ),
+    )
 
     # ---------------------------------------------------------------------------------
     # Relationships

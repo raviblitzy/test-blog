@@ -22,7 +22,8 @@ report. The shape is fixed; it is not extended per call site.
       "title": "Not Found",
       "status": 404,
       "detail": "Post not found",
-      "instance": "/api/v1/posts/does-not-exist"
+      "instance": "/api/v1/posts/does-not-exist",
+      "request_id": "b3d0f7a19c4e4f0d8a1c2e5b7d9f0a13"
     }
 
 ``type``
@@ -49,13 +50,20 @@ report. The shape is fixed; it is not extended per call site.
     ``request.url.path``. The path only - the query string is deliberately excluded on every
     path, both because a filter expression is not part of the failure's identity and because
     a query string is a place credentials get pasted by mistake.
+``request_id``
+    The correlation identifier for the request that failed, read from
+    ``request.state.request_id`` where ``app.middleware.request_context`` put it. Present on
+    every error, and always equal to the :data:`REQUEST_ID_HEADER` value on the same response,
+    because :func:`_problem_response` writes the body field and the header from one value.
+    Correlation is therefore reportable by someone who can quote only what is on screen, while
+    remaining machine-readable for anyone joining a response to the structured log lines that
+    share the identifier.
 ``errors``
     Present **only** for a validation failure, and then always non-empty. A list of
     ``{"field": ..., "message": ..., "type": ...}`` objects - see :class:`FieldError`.
     Omitted entirely, rather than sent as ``null``, for every other error.
 
-There is deliberately no ``request_id`` field. Correlation belongs in a header, and travels
-in :data:`REQUEST_ID_HEADER`; the document itself stays at five fields plus ``errors``.
+The document is therefore six fields plus ``errors``.
 
 Media type
 ----------
@@ -140,6 +148,7 @@ close a cycle. The handlers here build the body as a plain dict instead, which i
 there is exactly one function in the codebase that assembles a problem document.
 """
 
+import re
 from collections.abc import Mapping, Sequence
 from http import HTTPStatus
 from types import MappingProxyType
@@ -161,11 +170,19 @@ from fastapi.responses import ORJSONResponse
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.logging import get_logger
+from app.core.logging import (
+    HTTP_LOG_FIELD_METHOD,
+    HTTP_LOG_FIELD_PATH,
+    HTTP_LOG_FIELD_STATUS,
+    get_logger,
+    log_safe_text,
+)
 
 __all__ = [
     "PROBLEM_JSON_MEDIA_TYPE",
+    "REQUEST_ID_CONTEXT_KEY",
     "REQUEST_ID_HEADER",
+    "REQUEST_ID_MAX_LENGTH",
     "AppError",
     "AppValidationError",
     "ConflictError",
@@ -175,6 +192,7 @@ __all__ = [
     "NotFoundError",
     "TokenExpiredError",
     "UnauthorizedError",
+    "is_usable_request_id",
     "register_exception_handlers",
 ]
 
@@ -198,11 +216,51 @@ REQUEST_ID_HEADER: Final[str] = "X-Request-ID"
 """Response header carrying the per-request correlation identifier.
 
 ``app.middleware.request_context`` owns this header for every ordinary response and should
-import the name from here rather than repeat the literal, so the two cannot drift apart. This
-module needs it for one case the middleware cannot reach: Starlette dispatches a handler
-registered for bare ``Exception`` through ``ServerErrorMiddleware``, which wraps the *outside*
-of the stack - outside everything added with ``add_middleware`` - so the 500 handler below sets
-the header itself. See :func:`_unhandled_exception_handler`.
+import the name from here rather than repeat the literal, so the two cannot drift apart.
+
+Every error response sets it here as well, in :func:`_problem_response`, from the same value it
+writes into the document's ``request_id`` member - which is what makes the header and the body
+provably equal rather than coincidentally equal. It also covers the one case the middleware
+cannot reach: Starlette dispatches a handler registered for bare ``Exception`` through
+``ServerErrorMiddleware``, which wraps the *outside* of the stack - outside everything added
+with ``add_middleware`` - so on that path nothing else would attach the header.
+"""
+
+_REQUEST_ID_STATE_KEY: Final[str] = "request_id"
+"""Name of the request-scope state attribute holding the correlation identifier.
+
+Private, and the only spelling of the attribute on this side of the boundary.
+``app.middleware.request_context`` writes it under its own public ``REQUEST_ID_CONTEXT_KEY``,
+which is the same string; the two are not shared through an import because that module already
+imports :data:`REQUEST_ID_HEADER` from here and the dependency has to stay one-way. See
+:func:`_request_id`.
+"""
+
+REQUEST_ID_CONTEXT_KEY: Final[str] = "request_id"
+"""Key the identifier is bound under, in *structlog*'s context and in ``scope["state"]`` alike.
+
+Declared here for the same reason as the header name, and it is the same contract seen from a
+different side. ``app.middleware.request_context`` binds it with ``bind_contextvars`` - which is
+what puts it on every line every layer writes during a request - and writes it into
+``scope["state"]``; this module reads it back off ``request.state`` for the one response
+rendered outside that middleware, and uses it as the field name when it logs, so the middleware's
+access record and this module's 500 record carry the identifier under one key.
+"""
+
+REQUEST_ID_MAX_LENGTH: Final[int] = 128
+"""Longest identifier accepted, inbound or read back out of request state.
+
+Generous for any real tracing scheme - a UUID, a hex string, a W3C trace identifier all fit -
+and bounded, because the value is echoed into a response header and written into a log field.
+"""
+
+_REQUEST_ID_ALLOWED: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9._-]+")
+"""Characters an identifier may consist of, and implicitly that it must be non-empty.
+
+Deliberately narrower than either grammar strictly requires, because the value ends up in two
+places where a control character does damage: a response header value, where a carriage return
+or newline lets a caller inject a header of their choosing, and a log line, where the same
+characters let them forge a record.
 """
 
 
@@ -289,6 +347,21 @@ _DETAIL_RATE_LIMITED: Final[str] = (
 # The 500 body, in every environment including development. A caller learns that the request
 # failed and nothing more; the exception itself goes to the structured log.
 _DETAIL_INTERNAL: Final[str] = "An unexpected error occurred."
+
+# Substituted for the `detail` of ANY raised HTTPException whose status is 5xx, in every
+# environment, so that the "a server error reveals nothing" guarantee holds for the whole
+# 5xx range rather than only for an exception that reached the handler of last resort.
+#
+# It has to be a substitution rather than a pass-through because `HTTPException.detail` is
+# caller-supplied text, and on a 5xx the caller is not a route in this API - no route here
+# raises a framework exception - but the framework, a dependency, or an operational probe.
+# `/readyz` raising `HTTPException(503, str(error))` after a failed connection attempt is the
+# concrete case: psycopg's message names the host, the port, the database and the user it
+# tried, which is a topology and credential disclosure served to an unauthenticated caller.
+# Distinct from _DETAIL_INTERNAL so that the two paths remain legible in a log and to a
+# client: this one is a deliberate refusal at a known status, that one is an unanticipated
+# failure. Neither carries anything the caller can learn from.
+_DETAIL_SERVER_ERROR: Final[str] = "The server could not complete the request."
 
 # Substituted when a validation entry carries no usable message, so `errors` is never empty
 # and never carries `None`. It quotes nothing the caller submitted.
@@ -587,10 +660,19 @@ class UnauthorizedError(AppError):
 class TokenExpiredError(UnauthorizedError):
     """401 - the presented token was valid but its lifetime has elapsed.
 
-    Distinguished from :class:`InvalidTokenError` so that ``app.core.security`` can be precise
-    about which decode failure occurred and the client can tell "refresh me" apart from "sign
-    in again". The ``type`` and ``title`` stay those of :class:`UnauthorizedError`: a client
-    branches on ``type``, and every 401 means the same thing to that branch.
+    A distinct class so that ``app.core.security`` can raise precisely, and so that a reader of
+    a traceback or a server-side log line knows which decode check failed. It is **not** a
+    distinct branch for a client, and that is worth stating plainly because it would be easy to
+    assume otherwise: ``type`` stays ``/errors/unauthorized`` and ``title`` stays
+    ``Unauthorized``, exactly as for :class:`InvalidTokenError`, so the two are
+    indistinguishable to the one field a client is documented to switch on. Only the human
+    prose in ``detail`` differs.
+
+    Every 401 is therefore a single machine branch, and the client behaviour it drives is
+    uniform: ``frontend/src/lib/api/client.ts`` attempts a refresh once on any 401 and falls
+    back to sign-in if that attempt is itself refused. Nothing has to guess from prose whether
+    refreshing is worth trying, which is the only reason a caller would have wanted the
+    distinction - and publishing it would tell an attacker which check their token failed.
     """
 
     detail: str = _DETAIL_TOKEN_EXPIRED
@@ -618,6 +700,34 @@ class InvalidTokenError(UnauthorizedError):
 # ---------------------------------------------------------------------------------------
 
 
+def _request_id(request: Request) -> str:
+    """Read the correlation identifier ``app.middleware.request_context`` bound to the request.
+
+    That middleware resolves one identifier per request - echoing a usable inbound
+    :data:`REQUEST_ID_HEADER` or generating a fresh value - binds it for structured logging and
+    writes it into the request scope's state before forwarding. Reading it back here is what
+    lets the document's ``request_id`` member and the response header carry the identifier that
+    every log line for the same request already carries.
+
+    The state attribute is read by name rather than imported: ``app.middleware.request_context``
+    imports :data:`REQUEST_ID_HEADER` from this module, so the dependency runs in that direction
+    only and importing its ``REQUEST_ID_CONTEXT_KEY`` back would make the pair circular.
+    :data:`_REQUEST_ID_STATE_KEY` is the single spelling of the attribute on this side.
+
+    Args:
+        request: The request being answered.
+
+    Returns:
+        The identifier, or ``""`` when no middleware bound one. Empty is unreachable in the
+        assembled application - ``app.main`` installs the middleware for every route - so it
+        covers only a ``Request`` constructed directly, as a unit test does.
+    """
+    # `object` rather than an inferred `Any`: `starlette.datastructures.State.__getattr__`
+    # returns `Any`, and pinning the type here keeps the narrowing below honest.
+    bound: object = getattr(request.state, _REQUEST_ID_STATE_KEY, None)
+    return bound if isinstance(bound, str) else ""
+
+
 def _problem_response(
     *,
     request: Request,
@@ -635,18 +745,25 @@ def _problem_response(
     whose ``title`` held its ``detail``.
 
     Args:
-        request: The request being answered. Only ``request.url.path`` is read, which becomes
-            the ``instance`` field.
+        request: The request being answered. Two things are read from it: ``request.url.path``,
+            which becomes the ``instance`` field, and the bound correlation identifier, which
+            becomes the ``request_id`` field and the :data:`REQUEST_ID_HEADER` value.
         status: HTTP status for both the response and the document's ``status`` field, so the
             two cannot disagree - they are the same argument.
         error_type: Stable ``/errors/...`` URI reference for the ``type`` field.
         title: Stable human-readable summary of the error class.
         detail: Instance-specific message. Must already be safe to show a client.
-        errors: Per-field detail. When ``None`` the ``errors`` key is omitted entirely rather
-            than serialised as ``null``, which keeps the key set of a non-validation document
-            at exactly five.
+        errors: Per-field detail. When ``None`` **or empty** the ``errors`` key is omitted
+            entirely rather than serialised as ``null`` or as ``[]``, which keeps the key set
+            of a non-validation document at exactly six. Both absences are normalised here, at
+            the single assembly site, so ``app.schemas.common.ProblemDetail`` can declare the
+            member as optional-but-never-null-and-never-empty and have that be the exact
+            emitted contract rather than a superset of it: an empty list would otherwise be a
+            self-contradictory validation document that a client could iterate and find nothing
+            in.
         headers: Response headers to attach - a ``WWW-Authenticate`` challenge, an ``Allow``
-            list preserved from a 405, a ``Retry-After`` window, or a correlation identifier.
+            list preserved from a 405, or a ``Retry-After`` window. A caller never has to pass
+            the correlation header: this function attaches it.
 
     Returns:
         An :class:`ORJSONResponse` carrying the document at :data:`PROBLEM_JSON_MEDIA_TYPE`.
@@ -658,8 +775,13 @@ def _problem_response(
     # value by construction rather than by two callers agreeing.
     status_code = int(status)
 
+    # Read once, then written to two places. The body member and the header are therefore the
+    # same value by construction: a support request that quotes what is on screen and a log
+    # query that filters on the header cannot land on different requests.
+    request_id = _request_id(request)
+
     # Insertion order is the wire order, and it is the order the document is documented in:
-    # type, title, status, detail, instance, then errors.
+    # type, title, status, detail, instance, request_id, then errors.
     body: dict[str, object] = {
         "type": error_type,
         "title": title,
@@ -669,16 +791,29 @@ def _problem_response(
         # uniformly - because it is not part of the failure's identity and is a place stray
         # credentials end up.
         "instance": request.url.path,
+        "request_id": request_id,
     }
-    if errors is not None:
+    # Truthiness rather than `is not None`, so an empty sequence is normalised away exactly as
+    # `None` is. See the `errors` argument above for why an empty list must never be emitted.
+    if errors:
         body["errors"] = list(errors)
+
+    # Copied rather than mutated: `headers` belongs to the caller, and several call sites pass
+    # a mapping built from an exception's own attributes.
+    response_headers = dict(headers) if headers else {}
+    if request_id:
+        # Assigned here for every error response, which covers the 500 path that
+        # `RequestContextMiddleware` cannot reach - see :data:`REQUEST_ID_HEADER` - and makes
+        # the header equal to the body member everywhere else by construction rather than by
+        # two components agreeing.
+        response_headers[REQUEST_ID_HEADER] = request_id
 
     return ORJSONResponse(
         content=body,
         status_code=status_code,
         # `or None` so an empty mapping is normalised away rather than reaching Starlette as
         # an empty header block.
-        headers=headers or None,
+        headers=response_headers or None,
         media_type=PROBLEM_JSON_MEDIA_TYPE,
     )
 
@@ -796,7 +931,7 @@ def _retry_after_seconds(exc: RateLimitExceeded) -> int:
 
     ``exc.limit`` is the ``slowapi.wrappers.Limit`` wrapper, whose own ``limit`` is the parsed
     ``limits.RateLimitItem``, whose ``get_expiry()`` returns the window length in seconds - so
-    a configured ``10/minute`` yields ``60``. The attribute is genuinely optional rather than
+    a configured ``5/minute`` yields ``60``. The attribute is genuinely optional rather than
     defensively typed: ``RateLimitExceeded`` declares ``limit = None`` at class level, so an
     instance constructed without one is representable and must not crash the handler that is
     already responding to a failure.
@@ -911,6 +1046,26 @@ async def _http_exception_handler(request: Request, exc: Exception) -> ORJSONRes
     the router carrying ``Allow``, and dropping it would leave a method-not-allowed response
     that fails to say which methods *are* allowed.
 
+    A 5xx detail is discarded, not rendered
+    --------------------------------------
+    For any status of 500 or above, ``exc.detail`` is replaced by :data:`_DETAIL_SERVER_ERROR`
+    and the original is written to the structured log instead. This closes the one seam through
+    which the "a server error tells a caller nothing" guarantee could be bypassed:
+    :func:`_unhandled_exception_handler` protects an exception that *escaped*, but an
+    ``HTTPException(503, ...)`` never escapes - it is handled here, and its ``detail`` is
+    whatever string the raiser passed. On a 5xx that raiser is the framework, a dependency, or
+    an operational probe rather than a route in this API, so the text is not known to be
+    client-safe: a readiness probe that raises with a driver's connection message publishes the
+    database host, port, user and database name to an unauthenticated caller.
+
+    4xx details are preserved unchanged, and deliberately so. They come from the framework's
+    own status phrases - ``Not Found``, ``Method Not Allowed`` - or from a dependency reporting
+    something the caller can act on, and suppressing them would replace actionable text with
+    nothing at the one class of status where the caller is the party able to fix the problem.
+    ``type``, ``title`` and ``status`` are unaffected in both directions, so a client's branch
+    on ``type`` still distinguishes ``/errors/service-unavailable`` from
+    ``/errors/internal-server-error``.
+
     One boundary, named because it was considered and deliberately not special-cased. Starlette's
     own default handler branches on 204 and 304 to return a bodiless response, since those
     statuses may not carry one. This handler does not, because neither status can arrive here:
@@ -939,6 +1094,23 @@ async def _http_exception_handler(request: Request, exc: Exception) -> ORJSONRes
     # that mypy would consider unreachable; falling back to the title covers a deliberately
     # empty phrase, so `detail` is never blank.
     detail = str(error.detail) if error.detail else title
+
+    if error.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR:
+        # Logged before it is discarded, so the incident stays diagnosable at exactly the cost
+        # of the caller learning nothing. `get_logger` is called here rather than at module
+        # scope for the reason `_unhandled_exception_handler` records: a logger bound during
+        # import would memoise structlog's unconfigured defaults, because `configure_logging`
+        # runs in the application lifespan after every import has completed. The request
+        # identifier bound by `app.middleware.request_context` is already on the line, so an
+        # operator can move from a caller's correlation header to this entry.
+        get_logger(__name__).error(
+            "http_exception_detail_suppressed",
+            http_method=request.method,
+            http_path=request.url.path,
+            http_status=error.status_code,
+            suppressed_detail=detail,
+        )
+        detail = _DETAIL_SERVER_ERROR
 
     return _problem_response(
         request=request,
@@ -983,6 +1155,99 @@ async def _rate_limit_handler(request: Request, exc: Exception) -> ORJSONRespons
     )
 
 
+def is_usable_request_id(candidate: str) -> bool:
+    """Report whether an identifier may be trusted, echoed in a header and logged as-is.
+
+    The single definition of that question, used by ``app.middleware.request_context`` when it
+    decides whether to honour an inbound ``X-Request-ID`` and by this module when it reads the
+    identifier back out of request state. One predicate rather than two means the value a
+    caller sees on an ordinary response and the value they see on a 500 are validated
+    identically.
+
+    Length is checked first: it is the cheaper test, and it bounds the work the pattern does.
+
+    Args:
+        candidate: The identifier to check.
+
+    Returns:
+        Whether the value is non-empty, within :data:`REQUEST_ID_MAX_LENGTH`, and composed only
+        of the characters :data:`_REQUEST_ID_ALLOWED` permits.
+    """
+    return (
+        len(candidate) <= REQUEST_ID_MAX_LENGTH
+        and _REQUEST_ID_ALLOWED.fullmatch(candidate) is not None
+    )
+
+
+def _validated_request_id(request: Request) -> str | None:
+    """Read the correlation identifier off request state, or ``None`` if there is none to trust.
+
+    ``request.state`` is a view onto ``scope["state"]``, which
+    ``app.middleware.request_context`` writes a validated identifier into before forwarding the
+    request. Re-validating it here is not distrust of that middleware; it is the recognition
+    that this handler runs on the failure path, reads mutable state, and is about to put the
+    result into a response header and a log field. A value that reached the scope any other way
+    - a nested application, an ASGI server that pre-populated ``state``, a future caller - must
+    not be able to inject a header or forge a log line through either.
+
+    Rejected outright rather than repaired: trimming an unexpected value and trusting the
+    remainder is how a sanitiser becomes the vulnerability, and a correlation identifier has no
+    meaning worth salvaging once it is malformed. ``None`` is also the correct answer for a
+    failure raised before the middleware ran.
+
+    Args:
+        request: The request being answered.
+
+    Returns:
+        An identifier satisfying :func:`is_usable_request_id`, or ``None``.
+    """
+    # `object` rather than an inferred `Any`: `starlette.datastructures.State.__getattr__`
+    # returns `Any`, and pinning the type here keeps the narrowing below honest.
+    bound: object = getattr(request.state, REQUEST_ID_CONTEXT_KEY, None)
+    if isinstance(bound, str) and is_usable_request_id(bound):
+        return bound
+    return None
+
+
+def _outer_response_headers(request_id: str | None) -> dict[str, str] | None:
+    """Build the headers for a response rendered outside the middleware stack.
+
+    ``ServerErrorMiddleware`` sits outside everything registered with ``add_middleware``, so the
+    500 problem document reaches the client without passing through either
+    ``app.middleware.request_context`` or ``app.middleware.security_headers``. Left alone it
+    would be the one response class in the whole service with no correlation identifier and no
+    baseline hardening on it - and it is the response class a caller is most likely to be
+    holding when they report a bug.
+
+    Both are supplied here, from the definitions those modules own rather than from literals:
+    ``resolved_security_headers`` is the same function the middleware's constructor calls, so a
+    header added to the baseline appears here too, with no second list to remember.
+
+    Args:
+        request_id: The validated identifier, or ``None`` when the request has none.
+
+    Returns:
+        The header mapping to attach, or ``None`` when there is nothing to attach - which cannot
+        happen while the baseline is non-empty, and is handled anyway so this function stays
+        honest about its own contract.
+    """
+    # Imported inside the function, and this is the one deferred import in the module.
+    #
+    # `app/middleware/__init__.py` imports `request_context`, which imports THIS module, so a
+    # module-scope `from app.middleware.security_headers import ...` here would ask Python to
+    # initialise the `app.middleware` package while `app.core.exceptions` is still executing -
+    # and `request_context` would then fail to find the names it needs on a half-initialised
+    # module. Deferring the import to call time removes the cycle entirely: by the time a 500 is
+    # rendered every module involved is fully imported, and the cost is one dictionary lookup in
+    # `sys.modules` on a path that is already answering a failure.
+    from app.middleware.security_headers import resolved_security_headers
+
+    headers = dict(resolved_security_headers())
+    if request_id is not None:
+        headers[REQUEST_ID_HEADER] = request_id
+    return headers or None
+
+
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJSONResponse:
     """Last resort: render any unanticipated exception as a 500 that reveals nothing.
 
@@ -1023,23 +1288,54 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJS
     # calls `configure_logging` in its lifespan - after every import has already run.
     logger = get_logger(__name__)
 
-    # `exc_info=exc` is the explicit form of `exc_info=True`. Both work at this call site,
-    # since `ServerErrorMiddleware` awaits the handler from inside its own `except Exception as
-    # exc` block and `sys.exc_info()` is therefore populated - but passing the exception means
-    # the traceback still lands in the log if this is ever called from anywhere else. The
-    # configured JSON renderer serialises frames with `show_locals=False`, so a frame holding a
-    # password or a signing key cannot be written out with them.
+    # The identifier `app.middleware.request_context` left on the scope, validated against the
+    # same grammar that middleware accepts an inbound one under. Validated rather than trusted
+    # because it is read back out of mutable request state and is about to be written into a
+    # response header and a log field, which are the two places a control character does
+    # damage; `None` when the failure happened before the middleware ran.
+    request_id = _validated_request_id(request)
+
+    # No `exc_info`, and that omission is deliberate.
+    #
+    # `app.middleware.request_context` sits INSIDE `ServerErrorMiddleware`, so it has already
+    # seen this exception, logged it with its frames, and had the request identifier bound
+    # while it did. Repeating the traceback here would be the second serialisation of one
+    # exception, and uvicorn's re-raise would make a third - which is why
+    # `app.core.logging` filters that one out. One owner, one traceback: this record exists to
+    # say that a 500 problem document was RENDERED for that request, which is a fact the
+    # middleware cannot know.
+    #
+    # `exception_type` carries the class name and nothing else. The exception's own message is
+    # never placed in a field: a message is composed by whatever raised it and can quote a
+    # connection string, a row, or a value a user typed, and a field is indexed, retained and
+    # searched. The frames on the middleware's record are where a person reads the detail, and
+    # they are serialised with `show_locals=False`.
+    #
+    # The field NAMES come from `app.core.logging`, shared with that middleware, so the two
+    # records describing one request can be correlated on more than the identifier - and both
+    # values go through the same bounding and control-character normalisation.
     logger.error(
-        "unhandled_exception",
-        http_method=request.method,
-        http_path=request.url.path,
-        exc_info=exc,
+        "unhandled_exception_response",
+        **{
+            HTTP_LOG_FIELD_METHOD: log_safe_text(request.method),
+            HTTP_LOG_FIELD_PATH: log_safe_text(request.url.path),
+            HTTP_LOG_FIELD_STATUS: int(HTTPStatus.INTERNAL_SERVER_ERROR),
+            REQUEST_ID_CONTEXT_KEY: request_id,
+        },
+        exception_type=type(exc).__name__,
     )
 
-    # `object` rather than an inferred `Any`: `starlette.datastructures.State.__getattr__`
-    # returns `Any`, and pinning the type here keeps the two uses below honest.
-    request_id: object = getattr(request.state, "request_id", None)
-    headers = {REQUEST_ID_HEADER: str(request_id)} if request_id else None
+    # This response is rendered OUTSIDE both `app.middleware.request_context` and
+    # `app.middleware.security_headers`, so neither can reach it: the baseline security headers
+    # are attached here instead, from the same definition the header middleware uses. Without
+    # this, the one response class most likely to be seen by a caller chasing a bug would be
+    # the only one leaving the service unhardened.
+    #
+    # The correlation header is NOT a special case any more - `_problem_response` writes
+    # `X-Request-ID` on every error path from the same value it puts in the document, so this
+    # path inherits it under the general rule. `_outer_response_headers` still carries it for
+    # the same reason, and both write the identical value, so the two cannot drift.
+    headers = _outer_response_headers(request_id)
 
     return _problem_response(
         request=request,

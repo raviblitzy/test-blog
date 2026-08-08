@@ -40,23 +40,50 @@ contract that every list surface in this API shares would hold for three surface
 fourth. Filtering to the roots makes a page a set of *threads*, which is the unit a reader
 navigates.
 
-The reply loader carries the caller's status filter
----------------------------------------------------
-``selectinload(Comment.replies.and_(...))`` is given the *same* status predicate as the parent
-rows, built once by :func:`_status_criteria` and spread into both. Without it an unapproved reply
-would reach a public caller through an approved parent - the parent passes the ``WHERE`` clause,
-and an unfiltered collection loader then returns every child it has. That is the one leak this
-module has to be written to avoid, and it is closed in the statement rather than by a caller
-remembering to strip replies afterwards.
+A thread has no depth limit, so the descent is recursive
+-------------------------------------------------------
+Threading is ``comments.parent_id`` and nothing else, and nothing caps it: a reply names the
+comment it answers, that comment may itself be a reply, and
+:attr:`app.schemas.comment.CommentPublic.replies` is recursive without limit. A reply to a reply
+is therefore an ordinary comment that the create endpoint accepts and the moderation queue lists.
 
-Verified against the pinned SQLAlchemy 2.0.51 and PostgreSQL 18.4 rather than assumed, because
-the relationship is self-referential and the criteria therefore have to be adapted to the aliased
-target of the ``selectin`` load: with a parent carrying one ``APPROVED`` and one ``PENDING``
-reply, ``statuses=(CommentStatus.APPROVED,)`` returned the parent with exactly one reply loaded,
-and ``statuses=None`` returned it with both.
+A relationship loader cannot read that shape. ``selectinload(Comment.replies)`` follows exactly
+one generation, so a thread fetched through it stops at the first level and every deeper comment
+is absent from the response - present in the database, visible to an administrator, and
+permanently invisible to the reader it was written for, with nothing raised and nothing logged.
+Chaining the loader per level is not an answer either: the depth is not known when the statement
+is built, and reaching the next level through the attribute instead is a lazy load, which under
+an ``AsyncSession`` raises ``MissingGreenlet``.
 
-Note the asymmetry that follows from the ``and_()`` criteria being *only* the status filter:
-``parent_id IS NULL`` restricts the page, and it must not restrict the loader, or every replies
+:meth:`CommentRepository.list_for_post` therefore pages the roots and then hands their
+identifiers to :meth:`CommentRepository._descendants_of`, which walks ``parent_id`` in **one**
+``WITH RECURSIVE`` statement and returns every descendant at every depth.
+:func:`_attach_replies` nests them afterwards, in memory. Five statements serve a page of any
+size at any depth: the count, the roots, the roots' authors, the descent, and the descendants'
+authors.
+
+The caller's status filter is applied at every level
+----------------------------------------------------
+:func:`_status_criteria_on` builds the moderation predicate once, and it is applied to the roots,
+to the count, to the recursive statement's anchor term **and** to its recursive term. Without the
+last two an unapproved reply would reach a public caller through an approved ancestor: the
+ancestor passes the ``WHERE`` clause, and an unfiltered descent then returns every child it has.
+That is the one leak this module has to be written to avoid, and it is closed in the statements
+rather than by a caller remembering to strip replies afterwards.
+
+Two consequences are deliberate. Filtering the recursive term prunes whole **subtrees**: a reply
+whose parent the caller may not see is never reached, which is right, because rendering it would
+either place it under a parent that is not there or reparent it to the top of the thread and
+misstate what it answers. And the predicate has to be rebuilt for the recursive term against that
+term's alias - both ends of a self-reference are the same table - which is why
+:func:`_status_criteria_on` takes the column rather than assuming the unaliased entity.
+
+Verified against the pinned SQLAlchemy 2.0.51 and PostgreSQL 18.4 rather than assumed: over a
+four-deep chain with a ``PENDING`` comment carrying an ``APPROVED`` reply of its own,
+``statuses=(CommentStatus.APPROVED,)`` returned the three approved descendants and neither the
+pending comment nor the approved reply beneath it, while ``statuses=None`` returned all five.
+
+``parent_id IS NULL`` restricts the page, and it must not restrict the descent, or every replies
 collection would come back empty.
 
 The criteria alone are not sufficient, and that is the second half of the same guarantee. An eager
@@ -70,26 +97,31 @@ says is what the caller gets, in either order, and a security-relevant predicate
 a session's history. A request-scoped session reads a thread once, so the option costs nothing in
 practice; it is there because "in practice" is not a guarantee.
 
-Ordering the loaded replies
----------------------------
-``Comment.replies`` declares no ``order_by``, and a ``selectin`` load emits no ``ORDER BY`` of its
-own, so the order PostgreSQL returns the collection in is unspecified. A thread reads forwards, so
-the replies are put into ``(created_at, id)`` order by :func:`_sort_replies` after the window is
-fetched - in Python, over rows that are already in memory, costing no additional statement. The
-alternative would be one query per parent, which is precisely the N+1 pattern this layer exists to
-prevent.
+Nesting and ordering the fetched rows
+------------------------------------
+The recursive statement returns a post's descendants as one flat sequence, and the response shape
+is a tree, so :func:`_attach_replies` groups each row under the identifier in its own ``parent_id``
+and writes the result into every comment's ``replies`` collection. It runs entirely over rows that
+are already in memory and issues no statement at all. ``Comment.replies`` declares no ``order_by``
+and PostgreSQL returns the descendants in no defined order, so each group is sorted into
+``(created_at, id)`` order first - a thread reads forwards, and the identifier is what makes the
+order total when a per-transaction clock has stamped several rows the same instant.
 
-The sort is performed **in place with** :meth:`list.sort`, and that specific spelling is
-load-bearing. Read out of SQLAlchemy 2.0.51's own collection instrumentation, the decorated list
-methods are exactly ``__delitem__``, ``__iadd__``, ``__setitem__``, ``append``, ``clear``,
-``extend``, ``insert``, ``pop`` and ``remove``; ``sort`` is not among them
-(``InstrumentedList.sort is list.sort``), so an in-place sort produces no attribute history at
-all - measured, with ``history.has_changes()`` ``False`` before and after and ``session.dirty``
-empty, and the replies still present after a subsequent flush and commit. Slice assignment
-(``collection[:] = sorted(collection)``) must **not** be used in its place: ``__setitem__`` *is*
-instrumented, and :attr:`~app.models.comment.Comment.replies` carries
-``cascade="all, delete-orphan"``, so the removal events it emits would mark every reply an orphan
-and delete the thread on the next flush.
+**How that collection is written is load-bearing**, because
+:attr:`~app.models.comment.Comment.replies` carries ``cascade="all, delete-orphan"``.
+:func:`~sqlalchemy.orm.attributes.set_committed_value` is used, which records the value as though
+the database had just returned it: no attribute history, no load of the previous value, nothing
+dirty. A plain assignment or a slice assignment must **not** be used in its place - both go through
+the instrumented collection, whose removal events would mark every reply an orphan and delete the
+thread on the next flush, and both first load the existing collection to compute the difference,
+which under an ``AsyncSession`` raises ``MissingGreenlet``. Measured against SQLAlchemy 2.0.51:
+after assembling a four-level thread this way, ``session.dirty`` and ``session.deleted`` are both
+empty and a subsequent flush deletes nothing.
+
+Every comment in the returned tree is given a value, the leaves included - an empty list rather
+than nothing at all. "Nothing at all" means unloaded, and the first read of an unloaded collection
+is the lazy load this design exists to make impossible, reached one layer away from the query that
+forgot to ask.
 
 Deletion belongs to the database
 --------------------------------
@@ -127,27 +159,39 @@ transaction boundary and the test suite can roll each test back.
 
 Access paths
 ------------
-Two indexes serve this relation and each method is written to use one of them:
+Five indexes serve this relation and every statement below is written to use one of them:
 
 * :meth:`CommentRepository.list_for_post` filters ``post_id`` for equality and orders by
   ``created_at``, which ``ix_comments_post_id_created_at`` satisfies with one index - leading
   equality column, then sort column - so no separate sort step is needed for the leading keys.
+* :meth:`CommentRepository._descendants_of` filters ``parent_id`` for equality with the moderation
+  state alongside it, at every level of the descent, which is exactly the shape
+  ``ix_comments_parent_id_status`` was declared for. Measured on PostgreSQL 18.4 at twenty thousand
+  comments: the anchor term plans as a bitmap index scan on it and the recursive term as
+  ``Index Scan using ix_comments_parent_id_status`` with
+  ``Index Cond: ((parent_id = comment_descendants.id) AND (status = ...))``, so the cost of reading
+  a thread follows the size of that thread rather than the size of the relation.
 * :meth:`CommentRepository.list_moderation_queue` filters ``status``, served by
   ``ix_comments_status``. Measured on PostgreSQL 18.4: the planner takes a bitmap index scan on
   that index for the queue's shape.
+* :meth:`CommentRepository.list_moderation_queue` also accepts an optional body term, matched as
+  ``ILIKE '%term%'`` and served by ``ix_comments_body_trgm``. A leading wildcard cannot use a
+  B-tree at any size, so that GIN trigram index is the only thing that can answer it; ``body`` is
+  plain ``TEXT``, so the predicate reaches the index with no cast.
 * :meth:`CommentRepository.get_parent` and the inherited ``get_by_id`` address the primary key.
 
-No indexed column is ever wrapped in a function here. The one predicate with no index behind it is
-the optional ``ILIKE`` containment search in the queue, and it is confined to the administrative
-surface for exactly that reason - see :meth:`CommentRepository.list_moderation_queue`.
+``ix_comments_author_id`` is the remaining one, and no statement here uses it: it exists for the
+``ON DELETE CASCADE`` from ``users``, which locates an account's comments by that column when the
+account is removed.
+
+No indexed column is ever wrapped in a function here.
 
 Deliberately absent
 -------------------
-No recursive common table expression. The requirement is threaded replies through a
-self-referencing parent, and one eager-loaded level is that depth; a deeper level is reachable
-through the same relation from the reply itself, so a hierarchical query would add a second way to
-read the same edge. No reply-count aggregate: a count of a collection that is already loaded is
-``len()`` at the layer that renders it. No moderation policy, no ownership rule, no sanitisation,
+No reply-count aggregate: a count of a collection that is already loaded is ``len()`` at the layer
+that renders it. No depth cap: how deeply a reply may nest is a rule about what may be *created*,
+and rules about creation live in ``app.services.comment_service``, so this module reads whatever
+depth exists rather than truncating it. No moderation policy, no ownership rule, no sanitisation,
 no logging - request correlation is bound once by ``app.middleware.request_context`` and the
 services log against it. And no session or engine: a repository is *session-bound*, constructed
 with the ``AsyncSession`` that ``app.core.dependencies.get_db`` yielded, so ``app.db.session`` is
@@ -162,10 +206,11 @@ from datetime import datetime
 from typing import Final
 
 from sqlalchemy import ColumnElement, Select, func, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import QueryableAttribute, aliased, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.comment import Comment, CommentStatus
-from app.repositories.base import BaseRepository
+from app.repositories.base import UUIDPrimaryKeyRepository
 
 __all__ = ["CommentRepository"]
 
@@ -203,15 +248,21 @@ def _containment_pattern(term: str) -> str:
     return f"%{escaped}%"
 
 
-def _status_criteria(statuses: Sequence[CommentStatus] | None) -> list[ColumnElement[bool]]:
-    """Build the moderation-state predicate, or none at all.
+def _status_criteria_on(
+    column: QueryableAttribute[CommentStatus],
+    statuses: Sequence[CommentStatus] | None,
+) -> list[ColumnElement[bool]]:
+    """Build the moderation-state predicate over a given ``status`` column, or none at all.
 
-    Called once per listing and spread into every statement that listing builds - the rows select,
-    the count select and, in :meth:`CommentRepository.list_for_post`, the reply loader's own
-    criteria. One definition is what makes "the replies are filtered by the same statuses as their
-    parents" true by construction instead of true by inspection.
+    The single definition of "which moderation states are visible", expressed against whichever side
+    of a statement needs it. The parameter is not generality for its own sake: the recursive descent
+    in :meth:`CommentRepository._descendants_of` joins ``comments`` to itself, so its recursive term
+    filters an **alias** of the relation, and a predicate bound to the unaliased entity would
+    silently filter the wrong side of that join.
 
     Args:
+        column: The ``status`` column to constrain - :attr:`~app.models.comment.Comment.status`, or
+            the same attribute reached through an :func:`~sqlalchemy.orm.aliased` entity.
         statuses: The moderation states to include, or ``None`` for every state. ``None`` adds no
             predicate at all rather than a tautology for the planner to work around. An **empty**
             sequence is a different request and is honoured literally: ``IN ()`` renders as a
@@ -222,18 +273,37 @@ def _status_criteria(statuses: Sequence[CommentStatus] | None) -> list[ColumnEle
 
     Note:
         ``in_()`` on the native ``comment_status`` column, which leaves the column expression
-        untouched and therefore keeps ``ix_comments_status`` usable. A single-member sequence
-        renders as ``IN (...)`` rather than as ``=``; PostgreSQL plans the two identically.
+        untouched and therefore keeps both ``ix_comments_status`` and
+        ``ix_comments_parent_id_status`` usable. A single-member sequence renders as ``IN (...)``
+        rather than as ``=``; PostgreSQL plans the two identically.
+    """
+    if statuses is None:
+        return []
+    return [column.in_(statuses)]
 
+
+def _status_criteria(statuses: Sequence[CommentStatus] | None) -> list[ColumnElement[bool]]:
+    """Build the moderation-state predicate over the unaliased relation.
+
+    Called once per listing and spread into every statement that listing builds - the rows select,
+    the count select and, in :meth:`CommentRepository.list_for_post`, the anchor term of the
+    recursive descent. One definition is what makes "the replies are filtered by the same statuses
+    as their parents" true by construction instead of true by inspection.
+
+    Args:
+        statuses: The moderation states to include, or ``None`` for every state.
+
+    Returns:
+        Zero or one SQL boolean expression, to be combined with ``AND`` by the caller.
+
+    Note:
         Which states a caller asks for is never decided here. A public thread narrows to
         :attr:`~app.models.comment.CommentStatus.APPROVED`, an author viewing their own post's
         thread may ask for more, and the moderation queue asks for a state or for all of them.
         Choosing between those is authority, and authority lives in
         ``app.services.comment_service``.
     """
-    if statuses is None:
-        return []
-    return [Comment.status.in_(statuses)]
+    return _status_criteria_on(Comment.status, statuses)
 
 
 def _queue_criteria(
@@ -265,15 +335,22 @@ def _queue_criteria(
         Zero to three SQL boolean expressions, to be combined with ``AND`` by the caller.
 
     Note:
-        The ``ILIKE`` containment match is the one predicate in this module with no index behind
-        it: a leading wildcard cannot use a b-tree, and ``comments.body`` is unindexed ``TEXT``, so
-        this term implies a sequential scan over the relation. That is acceptable **only** because
-        it is reached by an authenticated administrator on a paginated table, and it must not be
-        copied into the reader-facing thread, which is a public and far busier surface.
+        The ``ILIKE`` containment match is served by ``ix_comments_body_trgm``, a GIN trigram index
+        over ``comments.body`` built by revision ``0002``. That index is what makes this predicate
+        affordable at all: a leading wildcard cannot use a b-tree, so without it every keystroke in
+        the moderation search box was a sequential scan over the largest relation in this schema.
+        Measured on PostgreSQL 18.4, and stated as two claims because they are two claims: the
+        predicate plans as an ``Index Cond`` on that index at any row count, and the planner
+        prefers it to reading the relation once the relation is large enough for that to pay - a
+        scan still wins at twenty thousand comments, the index wins at two hundred thousand.
+
+        ``body`` is plain ``TEXT``, so the operator class sits directly on the column and this
+        predicate needs no cast to reach the index - unlike the citext columns in
+        ``user_repository`` and ``category_repository``, which have to match an expression index.
 
         ``ilike`` rather than ``lower(body) LIKE lower(:term)``: wrapping the column in a function
-        is what would make an index on it unusable if one were ever added, and the operator states
-        the intent at the call site.
+        is what would make the trigram index unusable, so the operator is not merely more
+        expressive here, it is the difference between using the index and not.
     """
     criteria: list[ColumnElement[bool]] = _status_criteria(statuses)
 
@@ -307,31 +384,61 @@ def _thread_order(reply: Comment) -> tuple[datetime, uuid.UUID]:
     return reply.created_at, reply.id
 
 
-def _sort_replies(parents: Sequence[Comment]) -> None:
-    """Put each parent's already-loaded replies into thread order, in place.
+def _attach_replies(roots: Sequence[Comment], descendants: Sequence[Comment]) -> None:
+    """Assemble the fetched rows into trees by populating every ``replies`` collection.
 
-    Runs after the window has been fetched and touches nothing but memory: the collections were
-    populated by the ``selectinload`` in the statement, so this issues no SQL and cannot introduce
-    an N+1. A parent with no replies is a no-op.
+    The in-memory half of :meth:`CommentRepository.list_for_post`. The recursive statement returns
+    a post's descendants as one flat sequence, and this function turns that sequence into the
+    nested shape ``app.schemas.comment.CommentPublic`` serialises, by grouping each row under the
+    identifier in its own ``parent_id`` and sorting each group into thread order.
+
+    It issues **no SQL at all** and cannot: every value it reads - ``id``, ``parent_id``,
+    ``created_at`` - is a column of a row already fetched, and every value it writes is written
+    through :func:`~sqlalchemy.orm.attributes.set_committed_value`.
 
     Args:
-        parents: The page of top-level comments returned by
-            :meth:`~app.repositories.base.BaseRepository.paginate`, each with its ``replies``
-            collection already loaded. Mutated in place; nothing is returned, because the caller
-            already holds the rows.
+        roots: This page of top-level comments.
+        descendants: Every comment reachable from those roots through ``parent_id``, at any depth,
+            already narrowed to the caller's moderation states. Order is irrelevant - the grouping
+            below does not depend on it.
 
     Note:
-        :meth:`list.sort` is used deliberately and must not be replaced by slice assignment. The
-        module docstring records the measurement behind that: ``sort`` is not among the methods
-        SQLAlchemy 2.0.51 instruments on a collection, so it emits no attribute history, whereas
-        ``__setitem__`` is instrumented and would make ``cascade="all, delete-orphan"`` delete the
-        very replies being ordered.
+        :func:`~sqlalchemy.orm.attributes.set_committed_value` is the only safe way to do this, and
+        the reason is :attr:`~app.models.comment.Comment.replies` carrying
+        ``cascade="all, delete-orphan"``. A plain assignment (``comment.replies = [...]``) goes
+        through the instrumented collection, which does two things this must not do: it emits
+        attribute history, so every child *absent* from the new list is treated as an orphan and
+        deleted on the next flush; and it first loads the existing collection in order to compute
+        that difference, which under an ``AsyncSession`` raises ``MissingGreenlet``. Setting the
+        value as *committed* records it as though the database had just returned it - no history,
+        no load, nothing dirty. Verified against SQLAlchemy 2.0.51: after assembling a four-level
+        thread this way, ``session.dirty`` and ``session.deleted`` are both empty and a subsequent
+        ``flush()`` deletes nothing.
+
+        **Every comment gets a value, including the leaves.** A comment at the deepest level is
+        given an empty list rather than left alone, because "left alone" means unloaded, and the
+        first thing that reads ``leaf.replies`` - the response model walking the tree - would
+        trigger the lazy load this whole design exists to make impossible. Assigning to every node
+        is what makes the returned tree completely self-contained.
+
+        A descendant whose ``parent_id`` names a comment the status filter excluded contributes to
+        no group and simply does not appear, which is correct: a reply cannot be rendered beneath a
+        parent the caller may not see.
     """
-    for parent in parents:
-        parent.replies.sort(key=_thread_order)
+    children: dict[uuid.UUID, list[Comment]] = {}
+    for descendant in descendants:
+        # `parent_id` is never NULL on a descendant - the recursive statement starts from the
+        # roots' children - but the mapped type is optional, so the guard is what keeps this
+        # total rather than an assertion about a value the type system cannot narrow.
+        if descendant.parent_id is not None:
+            children.setdefault(descendant.parent_id, []).append(descendant)
+
+    for comment in (*roots, *descendants):
+        nested = sorted(children.get(comment.id, ()), key=_thread_order)
+        set_committed_value(comment, "replies", nested)
 
 
-class CommentRepository(BaseRepository[Comment]):
+class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
     """Data access for the ``comments`` relation: threaded reads, the queue, and one lookup.
 
     Four methods, and between them they back every comment-shaped surface in the API::
@@ -364,7 +471,7 @@ class CommentRepository(BaseRepository[Comment]):
         limit: int,
         offset: int,
     ) -> tuple[Sequence[Comment], int]:
-        """Window one post's thread: top-level comments, each with its replies already loaded.
+        """Window one post's thread: top-level comments, each carrying its **whole** reply tree.
 
         Backs ``GET /api/v1/posts/{id}/comments``. A page is a page of *threads*: the window and
         the count are both over comments whose ``parent_id`` is ``NULL``, and a reply reaches the
@@ -373,17 +480,27 @@ class CommentRepository(BaseRepository[Comment]):
         appear on two consecutive pages and would leave ``total`` describing a set the client
         cannot reconstruct.
 
+        **Depth is not capped.** ``comments.parent_id`` puts no bound on how deeply a reply may
+        nest, ``app.schemas.comment.CommentPublic.replies`` is recursive without limit, and a
+        reply to a reply is therefore an ordinary, storable comment. So this method returns the
+        entire subtree under each root: the descendants come from one recursive common table
+        expression over ``parent_id``, and :func:`_attach_replies` nests them. Loading only the
+        first level would drop every deeper reply from the response with nothing raised and
+        nothing logged - the comment would be in the database, visible in the moderation queue,
+        and permanently invisible to the reader it answers.
+
         Args:
             post_id: The post whose thread to read. Compared for equality against the leading
                 column of ``ix_comments_post_id_created_at``, which serves the filter and the
                 ordering together. A post that does not exist is not an error here - it simply has
                 no comments, and whether that should be a ``404`` is the service's question to
                 answer from the ``posts`` relation.
-            statuses: The moderation states to include, and **the same filter is applied to the
-                replies**. A public caller passes :attr:`~app.models.comment.CommentStatus.APPROVED`
-                alone; an administrator, or an author reading their own post's thread, passes
-                ``None`` for every state. ``None`` is the default because a repository must not be
-                the thing that decides a caller's visibility - that is authority, and it belongs to
+            statuses: The moderation states to include, and **the same filter is applied at every
+                level of the tree**. A public caller passes
+                :attr:`~app.models.comment.CommentStatus.APPROVED` alone; an administrator, or an
+                author reading their own post's thread, passes ``None`` for every state. ``None``
+                is the default because a repository must not be the thing that decides a caller's
+                visibility - that is authority, and it belongs to
                 ``app.services.comment_service``, which is also the only layer that knows who is
                 asking.
             limit: Rows per page. Non-positive yields no rows rather than an invalid ``LIMIT``;
@@ -394,42 +511,57 @@ class CommentRepository(BaseRepository[Comment]):
 
         Returns:
             ``(rows, total)`` - this page of top-level comments, each with ``author`` loaded and
-            ``replies`` loaded, ordered and themselves carrying their authors, plus the number of
-            top-level comments matching the filters. Deliberately not a ``Page``: the service
-            projects the rows and calls ``build_page(list(rows), total, page, page_size)``.
+            its complete ``replies`` tree loaded and ordered, every node in that tree also carrying
+            its own ``author`` and its own ``replies``, plus the number of top-level comments
+            matching the filters. Deliberately not a ``Page``: the service projects the rows and
+            calls ``build_page(list(rows), total, page, page_size)``.
 
         Note:
-            **One predicate set, three uses.** :func:`_status_criteria` is called once and spread
-            into the rows select, the count select and the reply loader's ``and_()`` criteria, so
-            the three cannot disagree about which states are visible. The count restates nothing.
+            **One predicate set, four uses.** :func:`_status_criteria` produces the moderation
+            filter once, and it is spread into the roots select, the count select, the recursive
+            statement's anchor term and its recursive term, so none of the four can disagree about
+            which states are visible. The count restates nothing.
 
-            **The reply loader carries the status filter but not the paging filter.**
-            ``parent_id IS NULL`` narrows the page; adding it to the loader would return every
-            replies collection empty, since a reply by definition has a parent.
+            **``parent_id IS NULL`` narrows the page and nothing else.** It appears in the roots
+            select and the count, and in neither half of the recursive statement - a descendant has
+            a parent by definition, so applying it there would return every tree empty.
 
-            **The filter holds regardless of what the session already loaded.** The rows statement
-            carries ``populate_existing``, so the loaders overwrite an existing instance's
-            collection instead of skipping it. Without that option the guarantee would depend on
-            the order of reads within one unit of work, and one of the two orders leaks - the
-            measurement is recorded beside the option.
+            **A hidden comment hides its subtree, and that is correct.** The status filter is
+            applied to the anchor and to the recursive step, so a reply whose parent the caller may
+            not see is never reached. The alternative - returning it anyway - would render a reply
+            under a parent that is not there, or reparent it to the root of the thread, which
+            misattributes what it is answering.
 
-            **Bounded statements, whatever the page size.** Measured against SQLAlchemy 2.0.51:
-            four statements for the rows path - the window, one batched ``selectin`` for the
-            replies, one for the parents' authors and one for the replies' authors - plus the
-            count, and none of them per row. ``selectinload`` is used for the many-to-one
-            ``author`` as well as for the ``replies`` collection: it keys its extra ``SELECT`` on
-            the parent identifiers, so it multiplies no rows, which is what lets the count be a
-            plain ``count(*)`` and the rows need no ``.unique()``.
+            **The filter holds regardless of what the session already loaded.** Both statements
+            carry ``populate_existing``, so the loaders overwrite an existing instance's attributes
+            rather than skipping it. Without that option the guarantee would depend on the order of
+            reads within one unit of work, and one of the two orders leaks: measured on SQLAlchemy
+            2.0.51, a session that read the thread unfiltered and then read it again through the
+            public filter got the FIRST result back, and the unapproved reply was returned to the
+            filtered caller.
 
-            **The replies are ordered after the fetch, not by a second query.**
-            :func:`_sort_replies` orders collections that are already in memory; the module
-            docstring records why the in-place :meth:`list.sort` spelling is the only safe one
-            against ``cascade="all, delete-orphan"``.
+            **Bounded statements, whatever the page size or the depth.** Measured against
+            SQLAlchemy 2.0.51: five in total - the count, the roots window, one batched
+            ``selectin`` for the roots' authors, one recursive statement returning every descendant
+            at every depth, and one batched ``selectin`` for those descendants' authors. None of
+            them is per row and none is per level, which is the property a recursive CTE buys over
+            walking :attr:`~app.models.comment.Comment.replies` one generation at a time - that
+            would be one statement per level, and under an ``AsyncSession`` each of those levels
+            would be a lazy load raising ``MissingGreenlet`` instead. ``selectinload`` is used for
+            the many-to-one ``author`` as well: it keys its extra ``SELECT`` on the fetched
+            identifiers, so it multiplies no rows, which is what lets the count be a plain
+            ``count(*)`` and the rows need no ``.unique()``.
+
+            **The tree is nested and ordered in memory, not by a further query.**
+            :func:`_attach_replies` groups the descendants under their parents and sorts each
+            group; it records why
+            :func:`~sqlalchemy.orm.attributes.set_committed_value` is the only safe way to write a
+            collection that cascades ``delete-orphan``.
         """
         status_criteria = _status_criteria(statuses)
         # `parent_id IS NULL` belongs to the PAGE, and only to the page. It is what makes a page
         # member a thread rather than a comment, so it goes into both statements below and into
-        # neither loader.
+        # neither half of the recursive descent.
         predicates: list[ColumnElement[bool]] = [
             Comment.post_id == post_id,
             Comment.parent_id.is_(None),
@@ -446,28 +578,19 @@ class CommentRepository(BaseRepository[Comment]):
             # LIMIT/OFFSET is how a row lands on two consecutive pages while another lands on
             # none.
             .order_by(Comment.created_at.asc(), Comment.id.asc())
-            .options(
-                selectinload(Comment.author),
-                # The same status criteria as the page, adapted by SQLAlchemy to the aliased
-                # target of the selectin load - which is what makes this correct on a
-                # self-referential relationship. Verified on PostgreSQL 18.4: an unapproved reply
-                # is absent from an approved parent's collection under a public status filter, and
-                # present when the caller asks for every state. `and_()` with zero criteria is
-                # legal and warning-free here (unlike the bare `sqlalchemy.and_()`, which is
-                # deprecated with no arguments), so `statuses=None` needs no separate branch.
-                selectinload(Comment.replies.and_(*status_criteria)).options(
-                    selectinload(Comment.author)
-                ),
-            )
+            # The byline every rendered comment needs. `replies` is deliberately NOT loaded here:
+            # a relationship loader can only follow one generation, and this thread has no depth
+            # limit, so the whole subtree is fetched by `_descendants_of` below instead.
+            .options(selectinload(Comment.author))
             # The status filter must hold whatever this unit of work has already loaded, so the
-            # loaders are told to overwrite rather than to skip. Measured on SQLAlchemy 2.0.51:
+            # loader is told to overwrite rather than to skip. Measured on SQLAlchemy 2.0.51:
             # without this option, a session that read the thread unfiltered and then read it
-            # again through the public filter got the FIRST result back - `replies` was already
-            # loaded, so the second statement's criteria were never applied and the unapproved
-            # reply was returned to the filtered caller. That is the very leak this method is
-            # written to prevent, so the guarantee must not depend on the order in which one
-            # session happens to issue its reads. Autoflush runs before the SELECT, so a pending
-            # modification is written and then read back rather than discarded.
+            # again through the public filter got the FIRST result back, so the second statement's
+            # criteria were never applied and the unapproved comment was returned to the filtered
+            # caller. That is the very leak this method is written to prevent, so the guarantee
+            # must not depend on the order in which one session happens to issue its reads.
+            # Autoflush runs before the SELECT, so a pending modification is written and then read
+            # back rather than discarded.
             .execution_options(populate_existing=True)
         )
 
@@ -479,11 +602,105 @@ class CommentRepository(BaseRepository[Comment]):
             select(func.count()).select_from(Comment).where(*predicates)
         )
 
-        parents, total = await self.paginate(
+        roots, total = await self.paginate(
             rows_stmt, limit=limit, offset=offset, count_stmt=count_stmt
         )
-        _sort_replies(parents)
-        return parents, total
+
+        # An empty page has no roots to descend from, so the recursive statement is skipped
+        # entirely rather than issued with an empty IN list. `_attach_replies` still runs, over two
+        # empty sequences, because it is a no-op there and a branch would be one more thing to
+        # keep in step.
+        descendants = (
+            await self._descendants_of([root.id for root in roots], statuses=statuses)
+            if roots
+            else ()
+        )
+        _attach_replies(roots, descendants)
+        return roots, total
+
+    async def _descendants_of(
+        self,
+        root_ids: Sequence[uuid.UUID],
+        *,
+        statuses: Sequence[CommentStatus] | None,
+    ) -> Sequence[Comment]:
+        """Fetch every comment below *root_ids*, at any depth, in one statement.
+
+        The recursive half of :meth:`list_for_post`, kept separate so that the paging statement and
+        the descent statement are each readable on their own. It renders as::
+
+            WITH RECURSIVE comment_descendants AS (
+                SELECT ... FROM comments
+                 WHERE parent_id IN (:roots) AND status IN (:states)      -- anchor
+                UNION ALL
+                SELECT reply.* FROM comments AS reply, comment_descendants
+                 WHERE reply.parent_id = comment_descendants.id
+                   AND reply.status IN (:states)                          -- recursive term
+            )
+            SELECT ... FROM comment_descendants
+
+        Args:
+            root_ids: The identifiers of this page's top-level comments. Never empty - the caller
+                skips the call rather than issuing an empty ``IN``.
+            statuses: Exactly what :meth:`list_for_post` received, so the tree and its roots cannot
+                disagree about what is visible. The predicate is built from it for **both** terms:
+                on the anchor it filters the first generation, and on the recursive term it filters
+                every generation after it and prunes whatever hangs below an excluded comment.
+
+        Returns:
+            The descendants as a flat sequence, each with ``author`` loaded, in no particular
+            order - :func:`_attach_replies` nests and sorts them. Empty when no root has a reply
+            the caller may see.
+
+        Note:
+            **The rows are hydrated straight out of the common table expression.** The anchor
+            selects the whole entity, so the expression carries every mapped column, and
+            :func:`~sqlalchemy.orm.aliased` maps it back onto :class:`~app.models.comment.Comment`.
+            That makes this one statement rather than two: selecting only identifiers here would
+            need a second pass over ``comments`` to fetch the rows behind them.
+
+            **The recursive term uses its own alias.** Both ends of a self-reference are the same
+            table, so the term needs a distinct name to join the working set against, and the status
+            predicate has to be built against that alias rather than reused from the anchor - a
+            predicate bound to the unaliased entity would filter the wrong side. That is what
+            :func:`_status_criteria_on` exists for, and why both call sites below go through it: one
+            definition of "which states are visible", applied to two different sides.
+
+            **The access path is ``ix_comments_parent_id_status``**, and this statement is why that
+            index exists. Measured on PostgreSQL 18.4 at twenty thousand comments: the anchor plans
+            as a bitmap index scan on it and the recursive term as
+            ``Index Scan using ix_comments_parent_id_status`` with
+            ``Index Cond: ((parent_id = comment_descendants.id) AND (status = ...))``, so the cost
+            follows the size of the thread rather than the size of the relation.
+
+            **Termination is structural.** ``comments.parent_id`` is acyclic in practice because a
+            reply names a comment that already existed when it was written, so the working set
+            shrinks to nothing and the expression stops. ``UNION ALL`` rather than ``UNION``
+            because the tree admits no duplicate - each comment has exactly one parent, so it is
+            reached exactly once - and ``UNION`` would pay for a de-duplication that can never
+            remove a row.
+        """
+        anchor = select(Comment).where(
+            Comment.parent_id.in_(root_ids),
+            *_status_criteria_on(Comment.status, statuses),
+        )
+        descent = anchor.cte("comment_descendants", recursive=True)
+
+        reply = aliased(Comment, name="reply")
+        descent = descent.union_all(
+            select(reply).where(
+                reply.parent_id == descent.c.id,
+                *_status_criteria_on(reply.status, statuses),
+            )
+        )
+
+        node = aliased(Comment, descent, name="descendant")
+        result = await self.session.execute(
+            select(node)
+            .options(selectinload(node.author))
+            .execution_options(populate_existing=True)
+        )
+        return result.scalars().all()
 
     async def get_parent(self, parent_id: uuid.UUID, *, post_id: uuid.UUID) -> Comment | None:
         """Fetch a candidate parent comment, but only if it belongs to the given post.
@@ -569,8 +786,11 @@ class CommentRepository(BaseRepository[Comment]):
             the statement. Under an ``AsyncSession`` a lazy access would raise ``MissingGreenlet``
             at render time, one layer away from the query that forgot to ask.
 
-            **The search term is the one unindexed predicate in this module**, and it is confined
-            here on purpose; :func:`_queue_criteria` records the reasoning at the call site.
+            **The search term is served by ``ix_comments_body_trgm``**, so the queue's text filter
+            is an index scan rather than a pass over every comment ever written;
+            :func:`_queue_criteria` records why the operator and the column type decide the
+            spelling. It remains confined to this administrative surface, and must not be copied
+            into the reader-facing thread, which is public and far busier.
         """
         predicates = _queue_criteria(statuses=statuses, q=q, post_id=post_id)
 

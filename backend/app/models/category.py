@@ -87,7 +87,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING, Final
 
-from sqlalchemy import Column, ForeignKey, Index, Table, Text
+from sqlalchemy import Column, ForeignKey, Index, Table, Text, literal_column
 from sqlalchemy.dialects.postgresql import CITEXT, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -232,9 +232,16 @@ class Category(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     Written from :mod:`app.core.slug`, whose title helper lower-cases, transliterates to ASCII,
     collapses separators and bounds the result at 80 characters, and whose
-    :func:`~app.core.slug.unique_slug` suffixes a collision. Stable once assigned: a canonical
-    URL that changes after publication is a broken link and a lost search ranking, so
-    ``app.services.category_service`` re-derives it only on an explicit rename.
+    :func:`~app.core.slug.unique_slug` suffixes a collision.
+
+    **Derived once, at creation, and never again.** A canonical URL that changes is a broken link
+    and a lost search ranking, so a rename is a change to :attr:`name` alone: the label a reader
+    sees moves and the address they bookmarked keeps resolving. Nothing in the backend recomputes
+    this value - :mod:`app.core.slug` ships no "re-slug from the new name" helper,
+    ``app.schemas.category.CategoryUpdate`` exposes no member that could ask for one and rejects a
+    submitted ``slug`` with ``422`` under ``extra="forbid"``, and no repository method assigns to
+    this column after the insert. A term whose address genuinely must change is a new category and
+    a redirect, which is a product decision rather than a side effect of an edit.
     """
 
     description: Mapped[str | None] = mapped_column(
@@ -245,6 +252,52 @@ class Category(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
     )
     """Optional prose shown on category listings and in the admin editor."""
+
+    # ---------------------------------------------------------------------------------
+    # Access paths
+    #
+    # `name` and `slug` already carry equality access paths from their declarations above -
+    # uq_categories_name and the unique index ix_categories_slug - and those serve the lookups
+    # that resolve a slug from a URL and detect a duplicate name on create.
+    #
+    # The two declared here serve the two PATTERN predicates in
+    # app.repositories.category_repository, neither of which an equality-oriented b-tree can
+    # answer:
+    #
+    #   containment   GET /api/v1/admin/categories takes a `?q=` term and matches it against
+    #                 name and slug together with a leading wildcard, which no b-tree can use.
+    #   slug family   slug de-duplication runs `slug LIKE 'base%'` before every category insert
+    #                 and rename. Anchoring the pattern means the query is not PREVENTED from
+    #                 using an index, but the default operator class over a citext column does
+    #                 not provide one, so it was a sequential scan regardless.
+    #
+    # The two spellings differ because the two column types do. `name` is TEXT, so the operator
+    # class goes straight on the column. `slug` is CITEXT, and gin_trgm_ops is defined over
+    # `text` while citext's own `~~`/`~~*` operators are not in that operator family - so an
+    # index declared directly on it is accepted and then never chosen by the planner. It
+    # therefore indexes the text cast, and category_repository writes the matching predicate as
+    # `cast(Category.slug, Text).ilike(...)`: ILIKE rather than LIKE, because casting away citext
+    # also casts away the case-folding that made `News-2` rule out a proposed `news-2`.
+    #
+    # The expression is a LABELLED literal_column with its operator class in `postgresql_ops`
+    # rather than one `text("(slug::text) gin_trgm_ops")` string: both render the same DDL, but
+    # Alembic warns on the inline form and then stops comparing the index, leaving it unguarded
+    # by the drift gate. Revision 0002 builds both, where every GIN index in this schema lives.
+    # ---------------------------------------------------------------------------------
+    __table_args__ = (
+        Index(
+            "ix_categories_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_categories_slug_trgm",
+            literal_column("(slug::text)").label("slug_text"),
+            postgresql_using="gin",
+            postgresql_ops={"slug_text": "gin_trgm_ops"},
+        ),
+    )
 
     posts: Mapped[list[Post]] = relationship(
         # String target, resolved against the declarative registry at mapper-configuration
