@@ -1,0 +1,777 @@
+"""Password hashing and token handling: the cryptographic primitives the auth flow rests on.
+
+Four responsibilities, and deliberately nothing beyond them:
+
+* **argon2id password hashing and verification**, through ``pwdlib``'s argon2 backend.
+* **Access-token issuance**, signed with the configured HMAC algorithm and carrying exactly
+  five claims - subject, role, issued-at, expiry and type.
+* **Refresh-token generation**, as an opaque high-entropy value, plus the SHA-256 digest
+  under which it is stored. Only the digest is ever persisted.
+* **Decoding, with explicit expiry handling**, so that every possible decode failure leaves
+  this module as a domain error and never as a ``PyJWT`` exception.
+
+Primitives only
+---------------
+This module is the bottom of the authentication stack: it computes, it does not decide. It
+imports no session, no repository, no model and no schema; its only ``app`` imports are
+``app.core.config`` and ``app.core.exceptions``. The *policies* built on top of these
+primitives live one layer up, in ``app.services.auth_service`` - refresh rotation, reuse
+detection, revocation on logout, and the decision to verify a candidate password against
+:func:`dummy_password_hash` when no account matches an email so that registration cannot be
+probed through a timing difference. None of that belongs here, and none of it is here.
+
+Consumers, all of them one layer up:
+
+* ``app.services.auth_service`` - registration, credential verification, token-pair
+  issuance, refresh rotation and revocation.
+* ``app.core.dependencies`` - ``get_current_user`` decodes the bearer credential.
+* ``app.db.seed`` - hashes ``settings.SEED_ADMIN_PASSWORD`` for the seeded administrator.
+
+Two hashes, two algorithms, on purpose
+--------------------------------------
+Passwords and refresh tokens are both "secrets we store a hash of", and they are hashed with
+deliberately different primitives. It looks inconsistent and it is not, so the reasoning is
+recorded here as well as on :func:`hash_refresh_token`:
+
+* A **password** is low-entropy, human-chosen and dictionary-attackable, so it gets argon2id -
+  salted, memory-hard and intentionally slow. A stolen ``users.password_hash`` is then
+  expensive to attack offline, and two accounts sharing a password do not share a hash.
+* A **refresh token** is 256 bits of CSPRNG output. It is not guessable, so a salt and a work
+  factor buy nothing - but it must be **findable**, because ``refresh_tokens.token_hash``
+  carries a ``UNIQUE`` index and rotation looks the presented token up by digest in a single
+  index probe. A salted argon2 hash is unqueryable by construction: it would force a
+  full-table scan with a per-row verify on every refresh. SHA-256 is the correct primitive
+  here; argon2 would be the wrong one.
+
+Every failure is a domain error
+-------------------------------
+Nothing raises ``HTTPException`` and no ``PyJWT`` exception escapes. A decode failure becomes
+:class:`~app.core.exceptions.TokenExpiredError` or
+:class:`~app.core.exceptions.InvalidTokenError` - both 401s in the
+:class:`~app.core.exceptions.UnauthorizedError` family - so the single registered handler in
+``app.core.exceptions`` renders the one problem document, with its ``WWW-Authenticate:
+Bearer`` challenge, for every one of them. That is what makes "an expired or revoked token
+yields 401" true uniformly rather than per call site.
+
+The two errors are distinguished so a client can tell "refresh me" from "sign in again", but
+:class:`~app.core.exceptions.InvalidTokenError` is raised **bare**, always, with its class
+default detail. Every rejection reason - a forged signature, a truncated token, an
+unexpected algorithm, a missing claim, a refresh token presented as a bearer credential, a
+subject that is not a UUID - produces the same message on the wire, because telling a caller
+*which* check failed tells an attacker which one to fix next.
+
+Configuration
+-------------
+Every tunable comes from :data:`~app.core.config.settings`: the signing key, the algorithm,
+and both lifetimes. This module reads no environment variable, defines no fallback secret and
+holds no literal key. ``app.core.config`` has already refused to start the process if
+``JWT_SECRET_KEY`` is shorter than the 32 characters PyJWT requires of an HMAC key (RFC 7518
+section 3.2), so nothing here re-validates the key and nothing here compensates for a weak
+one. One consequence worth knowing rather than working around: PyJWT's recommended HMAC key
+length scales with the digest, so configuring ``HS384`` or ``HS512`` against a key near that
+32-character floor emits ``InsecureKeyLengthWarning`` on every ``encode``. The warning is
+correct and is deliberately neither silenced nor swallowed - the fix is a longer key.
+
+Nothing is logged
+-----------------
+There is no logger in this module, and that is a security decision rather than an omission.
+Every value that passes through here is either a credential or a key: a plaintext password, a
+password hash, a raw refresh token, a token digest, a bearer token, the signing key itself.
+``app.core.logging`` names this module specifically when explaining why structured tracebacks
+are configured with ``show_locals=False``. A log statement here would have to be audited
+forever; having none is auditable in one line. Diagnostics belong to the caller, which logs
+the *outcome* - "credential verification failed" - and never the input.
+"""
+
+import hashlib
+import secrets
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from functools import cache
+from typing import Any, Final
+from uuid import UUID
+
+import jwt
+from pwdlib import PasswordHash
+from pwdlib.exceptions import UnknownHashError
+from pwdlib.hashers.argon2 import Argon2Hasher
+
+from app.core.config import settings
+from app.core.exceptions import InvalidTokenError, TokenExpiredError
+
+__all__ = [
+    "REFRESH_TOKEN_ENTROPY_BYTES",
+    "TOKEN_TYPE_ACCESS",
+    "AccessTokenClaims",
+    "access_token_expires_at",
+    "create_access_token",
+    "decode_access_token",
+    "dummy_password_hash",
+    "generate_refresh_token",
+    "hash_password",
+    "hash_refresh_token",
+    "refresh_token_expires_at",
+    "verify_and_update_password",
+    "verify_password",
+    "verify_refresh_token",
+]
+
+
+# ---------------------------------------------------------------------------------------
+# Public contract constants
+#
+# Exported because more than one module has to agree on them: `app.services.auth_service`
+# issues the tokens these describe and the test suite asserts against them. A duplicated
+# literal is how two modules stop agreeing without anyone noticing.
+# ---------------------------------------------------------------------------------------
+
+TOKEN_TYPE_ACCESS: Final[str] = "access"
+"""Value of the ``type`` claim on an access token.
+
+The claim exists for exactly one reason: to stop a refresh token being replayed as a bearer
+credential. :func:`decode_access_token` requires the claim to be present and to equal this
+value, so a token minted for any other purpose is rejected even though its signature is
+perfectly valid. Without that check the short access-token lifetime would be decorative,
+since the much longer-lived refresh token would open every protected route.
+
+Refresh tokens carry no claims at all - see :func:`generate_refresh_token` - so there is no
+matching ``TOKEN_TYPE_REFRESH`` constant to keep in step, and adding one would imply a
+symmetry that does not exist.
+"""
+
+REFRESH_TOKEN_ENTROPY_BYTES: Final[int] = 32
+"""Entropy, in bytes, behind every generated refresh token.
+
+Thirty-two bytes is 256 bits from the operating system's CSPRNG, which is what makes a
+refresh token unguessable and therefore what makes hashing it with a fast digest safe. The
+value is a module constant rather than an environment variable on purpose: it is a property
+of the security design, not of a deployment, and a deployment that could lower it is a
+deployment that could weaken every session.
+
+``secrets.token_urlsafe`` base64url-encodes those bytes, so the emitted string is 43
+characters, not 32 - see :func:`generate_refresh_token`.
+"""
+
+
+# ---------------------------------------------------------------------------------------
+# Access-token claim set
+#
+# Exactly five claims, listed once. `sub`, `iat` and `exp` are registered JWT claims;
+# `role` and `type` are private ones this service defines. Nothing else is minted: an
+# unused claim is payload every request pays for, and `jti`/`nbf`/`aud`/`iss` have no
+# consumer in a single-audience service with no revocation list.
+# ---------------------------------------------------------------------------------------
+
+_REQUIRED_CLAIMS: Final[tuple[str, ...]] = ("sub", "role", "iat", "exp", "type")
+"""Claims :func:`decode_access_token` requires to be present, handed to PyJWT's ``require``.
+
+Load-bearing, and the ``exp`` entry most of all. PyJWT's ``verify_exp`` option only checks an
+expiry that is *there*: verified against the pinned release, a token carrying no ``exp`` at
+all decodes successfully under ``{"verify_exp": True}`` alone, which would make a stolen
+token eternal. Listing every claim the payload is built from means a token missing any one of
+them is rejected as malformed instead of decoded into a half-populated principal.
+"""
+
+
+# ---------------------------------------------------------------------------------------
+# Password hashing backend
+# ---------------------------------------------------------------------------------------
+
+_PASSWORD_HASHER: Final[PasswordHash] = PasswordHash((Argon2Hasher(),))
+"""The single argon2id hasher, constructed once at import.
+
+Assembled explicitly from :class:`~pwdlib.hashers.argon2.Argon2Hasher` rather than through
+``PasswordHash.recommended()``. The two are equivalent in pwdlib 0.3.0 - ``recommended()``
+returns this exact construction - but the explicit form states the algorithm in the source
+instead of deferring it to a library default that a future release is free to change.
+``Argon2Hasher`` defaults to ``argon2.Type.ID``, so the produced hashes are argon2id, which
+is the variant this project specifies.
+
+``passlib`` and ``bcrypt`` are deliberately absent: pwdlib is passlib's maintained successor
+and provides argon2id directly, and argon2-cffi arrives underneath it as the ``pwdlib[argon2]``
+extra rather than as a direct dependency.
+
+Built at module scope because argon2 parameter setup is not free and this object sits on the
+login path. The hasher is stateless - the per-hash salt is generated inside each ``hash``
+call - so one instance is safe to share across requests, threads and workers.
+
+A single hasher also means the verification list has one entry, so a hash in any other format
+is unidentifiable rather than silently attempted; :func:`verify_password` turns that into a
+failed login. Adding a legacy hasher here, as a second tuple element, is how a migration from
+another scheme would work: ``verify`` would accept the old format while
+:func:`verify_and_update_password` re-hashed it with argon2id on next login.
+"""
+
+
+# ---------------------------------------------------------------------------------------
+# Decoded access-token claims
+# ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AccessTokenClaims:
+    """The validated content of an access token, as Python values rather than raw JSON.
+
+    Deliberately **not** a Pydantic model in ``app.schemas``. Schemas are the wire contract -
+    ``app.schemas.auth`` owns the token-pair response a client receives - whereas this is the
+    internal result of a decode that never leaves the process, and ``app.core`` may not import
+    ``app.schemas`` without closing an import cycle.
+
+    Frozen and slotted: a principal derived from a signed credential must not be mutated
+    downstream by the dependency that resolved it, and there are no dynamic attributes to
+    allow. Every value has already been validated by :func:`decode_access_token`, so a
+    consumer can use each field without re-checking it.
+
+    Attributes:
+        subject: The authenticated user's identifier, parsed from the ``sub`` claim.
+        role: The ``UserRole`` label the token was minted with - ``READER``, ``AUTHOR`` or
+            ``ADMIN``. A **convenience, not an authority**: it reflects the role held when the
+            token was issued, which a later promotion or demotion does not change.
+            ``app.core.dependencies.require_admin`` compares the role on the loaded ``User``
+            row, never this claim, so a revoked privilege takes effect immediately rather than
+            at the end of the token's lifetime.
+        issued_at: When the token was minted, as an aware UTC instant.
+        expires_at: When the token stops being accepted, as an aware UTC instant. Already
+            enforced - a token past this instant raises rather than returning claims - so the
+            field is for diagnostics and for a client deciding when to refresh, not for a
+            second expiry check.
+    """
+
+    subject: UUID
+    role: str
+    issued_at: datetime
+    expires_at: datetime
+
+
+# ---------------------------------------------------------------------------------------
+# Internal helpers
+#
+# Small, private and total: each either returns a validated value or raises the domain
+# error. Keeping the coercions here is what lets `decode_access_token` read as the policy it
+# is rather than as a sequence of defensive type checks.
+# ---------------------------------------------------------------------------------------
+
+
+def _utc_now() -> datetime:
+    """Return the current instant as a timezone-aware UTC :class:`~datetime.datetime`.
+
+    Every instant this module produces or compares goes through here, so "aware UTC, always"
+    is one line rather than a convention. ``datetime.utcnow()`` is deliberately not used
+    anywhere: it returns a *naive* value, which is deprecated, compares wrongly against an
+    aware one, and would shift every ``exp`` by the host's UTC offset - a bug that is
+    invisible on a machine set to UTC and silently issues expired or over-long tokens
+    everywhere else.
+
+    Returns:
+        The current UTC instant, with ``tzinfo`` set.
+    """
+    return datetime.now(tz=UTC)
+
+
+def _access_token_lifetime(expires_delta: timedelta | None = None) -> timedelta:
+    """Resolve how long an access token should live.
+
+    The single place the configured lifetime is read, so :func:`create_access_token` and
+    :func:`access_token_expires_at` cannot disagree about it.
+
+    Args:
+        expires_delta: An explicit lifetime, overriding configuration. A negative value is
+            accepted and is not a mistake: issuing an already-expired token is how the test
+            suite proves that expiry is rejected, and clamping it here would make that
+            behaviour unreachable.
+
+    Returns:
+        ``expires_delta`` when given, otherwise ``settings.ACCESS_TOKEN_EXPIRE_MINUTES``
+        expressed as a :class:`~datetime.timedelta`.
+    """
+    if expires_delta is not None:
+        return expires_delta
+    return timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+
+def _string_claim(value: object) -> str:
+    """Return ``value`` when it is a string, and reject the token otherwise.
+
+    PyJWT validates the *registered* claims it knows about and passes everything else through
+    exactly as JSON decoded it, so a hand-crafted token can carry ``role: 123`` or
+    ``role: ["ADMIN"]`` through a perfectly valid signature check. Verified against the pinned
+    release: both decode without complaint. Handing such a value to :class:`AccessTokenClaims`
+    would put a non-string where every consumer expects a role label, so it is rejected here.
+
+    Args:
+        value: A decoded claim value of unknown type.
+
+    Returns:
+        The value, narrowed to :class:`str`.
+
+    Raises:
+        InvalidTokenError: If the claim is absent or is not a string.
+    """
+    if not isinstance(value, str):
+        raise InvalidTokenError
+    return value
+
+
+def _subject_claim(value: object) -> UUID:
+    """Parse the ``sub`` claim into a :class:`~uuid.UUID`.
+
+    Identifiers in this system are database-generated UUIDs, and ``sub`` must be a string per
+    the JWT specification, so the claim is carried as text and parsed back here. A value that
+    is not a UUID is a malformed token, not a server fault: without this translation the
+    ``ValueError`` from :class:`~uuid.UUID` would escape as a 500 instead of the 401 it is.
+
+    Any spelling :class:`~uuid.UUID` accepts round-trips to the same identifier, so a token
+    minted from an uppercase or brace-wrapped string still resolves to the canonical value.
+
+    Args:
+        value: The decoded ``sub`` claim.
+
+    Returns:
+        The subject as a :class:`~uuid.UUID`.
+
+    Raises:
+        InvalidTokenError: If the claim is not a string, or is a string that is not a UUID.
+    """
+    try:
+        return UUID(_string_claim(value))
+    except ValueError as error:
+        raise InvalidTokenError from error
+
+
+def _instant_claim(value: object) -> datetime:
+    """Convert a numeric-date claim into an aware UTC instant.
+
+    Both guards below exist because a probe against the pinned PyJWT found real inputs that
+    survive its own validation and then break the conversion:
+
+    * PyJWT coerces ``exp`` and ``iat`` with ``int()`` while leaving the claim as decoded, so
+      a *numeric string* such as ``"1786162119"`` passes validation and then makes
+      :meth:`~datetime.datetime.fromtimestamp` raise :class:`TypeError`.
+    * A value far outside the platform's time range - ``1e30``, or ``NaN`` - also passes, then
+      raises :class:`OverflowError` or :class:`ValueError`.
+
+    A JSON boolean is rejected as well: :class:`bool` is a subclass of :class:`int`, so
+    ``iat: true`` would otherwise be read as one second past the epoch rather than as the
+    malformed claim it is.
+
+    Args:
+        value: The decoded ``iat`` or ``exp`` claim.
+
+    Returns:
+        The instant, with ``tzinfo`` set to UTC.
+
+    Raises:
+        InvalidTokenError: If the claim is not a finite number inside the representable range.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise InvalidTokenError
+    try:
+        return datetime.fromtimestamp(value, tz=UTC)
+    except (OSError, OverflowError, ValueError) as error:
+        raise InvalidTokenError from error
+
+
+# ---------------------------------------------------------------------------------------
+# Passwords
+# ---------------------------------------------------------------------------------------
+
+
+def hash_password(password: str) -> str:
+    """Hash a plaintext password with argon2id.
+
+    Produces the encoded string stored in ``users.password_hash``, which carries the variant,
+    the version, the cost parameters and a freshly generated random salt inline - so two
+    accounts with the same password have different hashes, and a future cost increase needs no
+    schema change. The column is unbounded ``TEXT`` for exactly that reason.
+
+    The password is passed through unmodified: argon2 has no bcrypt-style 72-byte input limit,
+    so there is no truncation and no pre-hashing here, and none is wanted - silently
+    truncating would make two different long passwords interchangeable. No maximum length is
+    imposed either; bounding the input is the registration schema's job in
+    ``app.schemas.auth``, where a rejection can be reported per field.
+
+    Args:
+        password: The plaintext password. Any Unicode string, including emoji, encoded as
+            UTF-8 by the hasher.
+
+    Returns:
+        The encoded argon2id hash, beginning ``$argon2id$``. Safe to store; never log it.
+
+    Examples:
+        >>> stored = hash_password("correct horse battery staple")
+        >>> verify_password("correct horse battery staple", stored)
+        True
+    """
+    return _PASSWORD_HASHER.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Check a candidate password against a stored argon2id hash.
+
+    Constant-time in the password, because argon2 verification compares digests rather than
+    strings: a wrong password costs the same as a right one, so nothing about the correct
+    value leaks through timing.
+
+    **Never raises for a bad stored value.** pwdlib raises ``UnknownHashError`` when no
+    configured hasher recognises the hash - an empty string, a truncated prefix, a bcrypt hash
+    left behind by another system - and that is caught and reported as a failed verification.
+    A corrupt row must present as a failed login, not as a 500 that tells an attacker they
+    found a broken account. Malformed values that *are* recognisably argon2 need no catch:
+    pwdlib's argon2 hasher already reports those as ``False``.
+
+    A ``TypeError`` from a non-string argument is deliberately **not** caught. That is a caller
+    defect rather than data corruption, mypy rejects it statically at every call site under
+    this project's strict configuration, and swallowing it would hide the bug behind a login
+    failure that looks like a wrong password.
+
+    Verifying an unknown email is the caller's problem, not this function's: see
+    :func:`dummy_password_hash`.
+
+    Args:
+        password: The plaintext password presented by the caller.
+        password_hash: The stored hash to verify against.
+
+    Returns:
+        ``True`` only if the password matches the hash. ``False`` for a wrong password and for
+        any hash this module cannot interpret.
+    """
+    try:
+        return _PASSWORD_HASHER.verify(password, password_hash)
+    except UnknownHashError:
+        return False
+
+
+def verify_and_update_password(password: str, password_hash: str) -> tuple[bool, str | None]:
+    """Verify a password and report a replacement hash when the stored one is outdated.
+
+    The upgrade path for argon2 cost parameters. When the tuned parameters change, existing
+    hashes stay valid but under-cost; calling this on the login path lets a service re-hash the
+    password it has just legitimately received - the only moment the plaintext is available -
+    and write the stronger hash back. No batch migration is possible or needed, because a
+    password cannot be re-hashed without the password.
+
+    Args:
+        password: The plaintext password presented by the caller.
+        password_hash: The stored hash to verify against.
+
+    Returns:
+        ``(matched, replacement)``. ``replacement`` is a new hash to persist when the stored
+        one was produced with outdated parameters, and ``None`` when it is already current or
+        the password did not match - so a caller writes it back only when it is not ``None``.
+
+    Examples:
+        >>> stored = hash_password("correct horse battery staple")
+        >>> verify_and_update_password("correct horse battery staple", stored)
+        (True, None)
+    """
+    try:
+        return _PASSWORD_HASHER.verify_and_update(password, password_hash)
+    except UnknownHashError:
+        return False, None
+
+
+@cache
+def dummy_password_hash() -> str:
+    """Return a valid argon2id hash of a random, unknowable password.
+
+    The material for closing a user-enumeration timing oracle. Login for an unknown email
+    would otherwise return in microseconds while login for a known one spends the argon2 work
+    factor, and that difference is measurable over a handful of requests - it turns the login
+    route into an "is this address registered?" API. A caller verifies against this hash when
+    no account matches, so both paths cost the same argon2 verification. In
+    ``app.services.auth_service`` - not here, and note that ``UnauthorizedError`` is imported
+    there rather than in this module:
+
+    .. code-block:: python
+
+        user = await repository.get_by_email(credentials.email)
+        stored = user.password_hash if user else dummy_password_hash()
+        if not verify_password(credentials.password, stored) or user is None:
+            raise UnauthorizedError("Incorrect email or password.")
+
+    The *policy* - that the two paths must be indistinguishable, and that both report the same
+    message - belongs to ``app.services.auth_service``. This function only supplies a hash that
+    cannot be matched: the password is drawn from the CSPRNG, is never returned, and is not
+    retained after the hash is computed.
+
+    Cached, so the argon2 cost is paid at most once per process and only if the unknown-account
+    path is ever taken. The value is stable for the process lifetime, which is what keeps the
+    timing profile of two consecutive unknown-email logins identical.
+
+    Returns:
+        An argon2id hash that no caller-supplied password can match.
+    """
+    # `secrets.DEFAULT_ENTROPY` is 32 bytes, the same 256-bit standard the refresh tokens
+    # use. The generated value is consumed immediately and never bound to a name that
+    # outlives this call.
+    return _PASSWORD_HASHER.hash(secrets.token_urlsafe())
+
+
+# ---------------------------------------------------------------------------------------
+# Access tokens
+# ---------------------------------------------------------------------------------------
+
+
+def access_token_expires_at() -> datetime:
+    """Return the instant an access token minted now would expire.
+
+    For a caller that has to report the lifetime it just handed out - the ``expires_at`` or
+    ``expires_in`` field of a token-pair response - without decoding its own token to find it.
+    Derived from the same :func:`_access_token_lifetime` :func:`create_access_token` uses, so
+    the two agree to within the sub-second cost of the two clock reads.
+
+    Returns:
+        An aware UTC instant, ``settings.ACCESS_TOKEN_EXPIRE_MINUTES`` from now.
+    """
+    return _utc_now() + _access_token_lifetime()
+
+
+def create_access_token(
+    *,
+    subject: UUID | str,
+    role: str,
+    expires_delta: timedelta | None = None,
+) -> str:
+    """Mint a signed access token for a principal.
+
+    The payload carries exactly five claims and nothing else:
+
+    ==========  ===========================================================================
+    ``sub``     The subject's UUID, as a **string**. The JWT specification requires a string
+                subject, and PyJWT refuses to serialise a :class:`~uuid.UUID` object outright
+                (``Object of type UUID is not JSON serializable``), so the value is
+                stringified here rather than at every call site.
+    ``role``    The ``UserRole`` label, as a plain string. ``str()`` is applied so a
+                :class:`~enum.StrEnum` member is carried as ``"AUTHOR"`` rather than as
+                anything enum-shaped.
+    ``iat``     Issued-at.
+    ``exp``     Expiry, ``iat`` plus the resolved lifetime.
+    ``type``    :data:`TOKEN_TYPE_ACCESS`, so a refresh token cannot be replayed here.
+    ==========  ===========================================================================
+
+    ``jti``, ``nbf``, ``aud`` and ``iss`` are deliberately absent: no consumer in this
+    single-audience service reads them, there is no access-token revocation list for a ``jti``
+    to key, and every unused claim is bytes on every subsequent request.
+
+    ``iat`` and ``exp`` are handed over as aware :class:`~datetime.datetime` values and PyJWT
+    normalises them to integer POSIX seconds, so the encoded instants are truncated to whole
+    seconds - the token's ``exp`` can be up to a second earlier than the value
+    :func:`access_token_expires_at` reports. Sub-second precision in an expiry is meaningless
+    against network latency, so this is recorded rather than corrected.
+
+    Keyword-only by design: ``(subject, role)`` are two values of compatible type, and a
+    positional call site that transposed them would mint a token whose role was a UUID and
+    whose subject was ``"ADMIN"``.
+
+    Args:
+        subject: The authenticated user's identifier. A :class:`~uuid.UUID` is the expected
+            form; a string is accepted for callers that already hold one.
+        role: The role label to carry - ``READER``, ``AUTHOR`` or ``ADMIN``. A ``UserRole``
+            member may be passed directly, since it is a string subclass. Typed as
+            :class:`str` so this module stays free of any import from ``app.models``.
+        expires_delta: Overrides the configured lifetime. Intended for tests, including the
+            negative delta that proves an expired token is rejected.
+
+    Returns:
+        The encoded, signed JWT.
+
+    Examples:
+        >>> from uuid import uuid4
+        >>> token = create_access_token(subject=uuid4(), role="AUTHOR")
+        >>> decode_access_token(token).role
+        'AUTHOR'
+    """
+    issued_at = _utc_now()
+    payload: dict[str, Any] = {
+        "sub": str(subject),
+        "role": str(role),
+        "iat": issued_at,
+        "exp": issued_at + _access_token_lifetime(expires_delta),
+        "type": TOKEN_TYPE_ACCESS,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_access_token(token: str) -> AccessTokenClaims:
+    """Verify an access token and return its validated claims.
+
+    The single decode path in the service tier. ``app.core.dependencies.get_current_user``
+    calls it with the value from an ``Authorization: Bearer`` header, and everything that can
+    go wrong leaves here as a 401 in the
+    :class:`~app.core.exceptions.UnauthorizedError` family - never as a ``PyJWT`` exception and
+    never as a 500.
+
+    Four checks, in this order, each of them load-bearing:
+
+    1. **Signature, against an explicit algorithm allowlist.** ``algorithms`` is always the one
+       configured algorithm, as a list, and never ``None``. Passing ``None`` would let the
+       token's own ``alg`` header choose the verification algorithm - the classic
+       algorithm-confusion vulnerability, where ``alg: none`` turns an unsigned token into a
+       valid one. Verified against the pinned release: both ``alg: none`` and a token signed
+       with a different HMAC algorithm are rejected.
+    2. **Presence of every claim**, through :data:`_REQUIRED_CLAIMS`, so a token without an
+       ``exp`` is malformed rather than eternal.
+    3. **Expiry**, translated to :class:`~app.core.exceptions.TokenExpiredError`. Caught before
+       the general clause because ``ExpiredSignatureError`` is a subclass of
+       ``InvalidTokenError``: reversing the two would collapse "refresh me" into "sign in
+       again".
+    4. **Token type**, so a refresh token with a valid signature is not accepted as a bearer
+       credential.
+
+    The final ``except`` catches ``jwt.PyJWTError`` rather than ``jwt.InvalidTokenError``, and
+    the difference matters: ``InvalidKeyError`` sits directly under ``PyJWTError``, *outside*
+    the ``InvalidTokenError`` branch, so the narrower clause would let it escape as a 500.
+    Catching the root of the hierarchy is what makes "no PyJWT exception leaves this module"
+    true by construction rather than by enumeration.
+
+    Args:
+        token: The encoded JWT, without the ``Bearer`` scheme prefix.
+
+    Returns:
+        The validated claims. Every field has been checked, so no consumer re-validates.
+
+    Raises:
+        TokenExpiredError: The signature was valid but ``exp`` has passed.
+        InvalidTokenError: Any other rejection - a bad signature, a malformed or truncated
+            token, an unexpected algorithm, a missing or non-conforming claim, a subject that
+            is not a UUID, or a token whose ``type`` is not :data:`TOKEN_TYPE_ACCESS`. Raised
+            bare, so every one of those produces the same message on the wire.
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            key=settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+            # A fresh dict per call. PyJWT merges options into its own defaults and mutates
+            # the mapping it is given when signature verification is disabled; building one
+            # here keeps the module constant beyond reach of that path.
+            options={
+                "require": list(_REQUIRED_CLAIMS),
+                "verify_signature": True,
+                "verify_exp": True,
+            },
+        )
+    except jwt.ExpiredSignatureError as error:
+        raise TokenExpiredError from error
+    except jwt.PyJWTError as error:
+        raise InvalidTokenError from error
+
+    if _string_claim(payload.get("type")) != TOKEN_TYPE_ACCESS:
+        raise InvalidTokenError
+
+    return AccessTokenClaims(
+        subject=_subject_claim(payload.get("sub")),
+        role=_string_claim(payload.get("role")),
+        issued_at=_instant_claim(payload.get("iat")),
+        expires_at=_instant_claim(payload.get("exp")),
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# Refresh tokens
+# ---------------------------------------------------------------------------------------
+
+
+def refresh_token_expires_at() -> datetime:
+    """Return the instant a refresh token generated now should expire.
+
+    Written to ``refresh_tokens.expires_at``, a ``timestamptz`` column, which is why the value
+    is aware rather than naive: handing psycopg a naive datetime would let the database apply
+    its own session time zone and silently shift every session's lifetime.
+
+    Refresh tokens rotate on use, so this bounds an *idle* session rather than an active one.
+
+    Returns:
+        An aware UTC instant, ``settings.REFRESH_TOKEN_EXPIRE_DAYS`` from now.
+    """
+    return _utc_now() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
+
+def generate_refresh_token() -> str:
+    """Generate a new opaque refresh token.
+
+    **Not a JWT, on purpose.** A refresh token has to be revocable - logout must invalidate it
+    immediately, and rotation must detect a replayed one - and revocation requires server-side
+    state, so the token is looked up as a row rather than trusted as a signed assertion. Given
+    that row, claims inside the token would add nothing and would cost something: a JWT's
+    payload is only base64, so anyone holding the token could read the subject out of it, and
+    it would still not be revocable.
+
+    Drawn from the operating system's CSPRNG through :func:`secrets.token_urlsafe`, so the
+    value is unpredictable even to a caller who has seen every token issued before it. That
+    unguessability is the premise :func:`hash_refresh_token` relies on.
+
+    The plaintext is returned to the caller exactly once, in the token-pair response, and is
+    never persisted, never logged and never recoverable: only
+    :func:`hash_refresh_token`'s digest reaches the database, so a database disclosure yields
+    no usable session.
+
+    Returns:
+        A URL-safe token carrying :data:`REFRESH_TOKEN_ENTROPY_BYTES` bytes of entropy - 43
+        characters, since base64url encodes three bytes as four characters. Safe in a JSON body
+        and in an ``Authorization`` header without escaping.
+    """
+    return secrets.token_urlsafe(REFRESH_TOKEN_ENTROPY_BYTES)
+
+
+def hash_refresh_token(token: str) -> str:
+    """Return the SHA-256 digest under which a refresh token is stored.
+
+    **SHA-256 here, argon2id for passwords, and the asymmetry is deliberate - please do not
+    "fix" it.** Two properties drive it:
+
+    * **Unguessability is already established.** The token is 256 bits of CSPRNG output from
+      :func:`generate_refresh_token`, not a human-chosen secret. There is no dictionary to try
+      and no rainbow table to build, so a salt and a work factor would protect against an
+      attack that cannot happen.
+    * **The digest must be findable.** ``refresh_tokens.token_hash`` carries a ``UNIQUE``
+      index, and rotation, revocation and reuse detection all locate the presented token by its
+      hash - one index probe. Argon2 embeds a fresh random salt in every hash, so the same
+      token hashes differently every time and the value is unqueryable by construction:
+      matching one would mean scanning every stored row and running the argon2 work factor
+      against each. That is a full-table scan with a memory-hard verify per row, on the hot
+      path of every refresh, and it gets worse as the table grows.
+
+    Deterministic across calls, processes and hosts - the same token always yields the same
+    64-character lowercase hex digest - which is precisely the property the unique index and
+    the lookup depend on.
+
+    Args:
+        token: The plaintext refresh token, as returned by :func:`generate_refresh_token`.
+
+    Returns:
+        The lowercase hexadecimal SHA-256 digest of the token's UTF-8 bytes: 64 characters.
+
+    Examples:
+        >>> hash_refresh_token("a-token") == hash_refresh_token("a-token")
+        True
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_refresh_token(token: str, token_hash: str) -> bool:
+    """Check a presented refresh token against a stored digest.
+
+    Used where a candidate has to be compared against a digest already in hand - reuse
+    detection during rotation, and revocation on logout - rather than fetched by it. The
+    comparison runs through :func:`secrets.compare_digest` instead of ``==`` so it takes the
+    same time whether the digests differ in the first character or the last: a plain string
+    comparison short-circuits, and that timing is enough to reconstruct a target digest one
+    character at a time.
+
+    Both values are compared as bytes rather than as text, because
+    :func:`secrets.compare_digest` refuses a :class:`str` containing any non-ASCII character.
+    A digest this module produced is always hexadecimal, but ``token_hash`` arrives from the
+    database, and a corrupt row must lose the comparison rather than raise.
+
+    Args:
+        token: The plaintext refresh token presented by the caller.
+        token_hash: The stored digest to compare against.
+
+    Returns:
+        ``True`` only if ``token`` hashes to ``token_hash``.
+    """
+    return secrets.compare_digest(
+        hash_refresh_token(token).encode("ascii"),
+        token_hash.encode("utf-8"),
+    )
