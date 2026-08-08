@@ -370,7 +370,10 @@ class CommentCreate(BaseModel):
     is a well-formed identifier whichever post its row belongs to. Both are creation rules, and
     ``app.services.comment_service`` enforces them through
     ``CommentRepository.get_parent(parent_id, post_id=...)``, translating a miss into the domain
-    error that renders as ``404`` rather than letting a foreign key raise it as a ``500``.
+    error that renders as ``422``, keyed to ``parent_id``, rather than letting a foreign key raise
+    it as a ``500``. ``app.core.exceptions.AppValidationError`` names this exact case as the rule it
+    exists for: the request addresses a post that does exist, and what is wrong is a member of the
+    submitted body, so the failure is reported against that member.
 
     Nor does it sanitise the body. Reader-authored text is cleaned on write by that same service
     and again at render by the client; a cleaner here would also run on every read.
@@ -407,10 +410,11 @@ class CommentCreate(BaseModel):
         description=(
             "Identifier of the comment this one replies to. Omit it - or send null - to post a "
             "top-level comment; that is the only difference between a comment and a reply. The "
-            "named comment must exist and must belong to the post in the path, both of which are "
-            "checked server-side: a parent that is missing, or that hangs off another post, is "
-            "reported as 404 rather than accepted. The post itself is NOT sent in the body; it "
-            "comes from the path."
+            "named comment must exist, must belong to the post in the path and must be a comment "
+            "you can see, all of which are checked server-side: a parent that is missing, that "
+            "hangs off another post, that is awaiting moderation or that already sits at the "
+            "maximum reply depth is reported as 422 against this field rather than accepted. The "
+            "post itself is NOT sent in the body; it comes from the path."
         ),
     )
 
