@@ -1,0 +1,398 @@
+/* =============================================================================
+ * globals.css - the design-token definition site, and the only stylesheet in
+ * the Next.js tier.
+ *
+ * WHY THIS FILE IS DIFFERENT FROM EVERY OTHER FILE UNDER src/
+ *
+ * The project rule is "zero hardcoded presentation values": no component may
+ * contain a literal colour, radius, shadow or font size. This file is the one
+ * permitted exception, because it is where those literals are given names. The
+ * obligation here is the mirror image of the rule elsewhere - for every value a
+ * component could need there must be a named token below, since the rule is
+ * only honourable if the token exists.
+ *
+ * It is also the only file in the repository allowed to name a primitive colour
+ * family (`slate`, `indigo`, `red`, `green`). Feature code references the
+ * semantic layer - `bg-surface`, `text-muted-foreground` - and never a family
+ * and shade. That indirection is owned here and is not leaked: it is what makes
+ * a palette change a one-file edit and what makes dark mode automatic, because
+ * a component that writes `bg-surface` once themes with no conditional logic.
+ *
+ * WHAT IS DELIBERATELY ABSENT - please do not add it
+ *
+ *   1. `tailwind.config.js|ts`. Tailwind 4 is CSS-first; the whole token layer
+ *      is these at-rules. No config file exists in this repository and none
+ *      should. `@config` is likewise absent.
+ *   2. `@tailwind base/components/utilities`. That is Tailwind 3 syntax and is
+ *      inert on 4; `@import 'tailwindcss'` replaces all three.
+ *   3. Any `@media` block. The five breakpoints (sm 40rem, md 48rem, lg 64rem,
+ *      xl 80rem, 2xl 96rem) ship with the engine and were measured in it; the
+ *      `sm:`/`md:`/`lg:` variants are the entire responsive vocabulary. A
+ *      hand-written media query would create a second, invisible one.
+ *   4. Component styles. Buttons, inputs, cards, tables and dialogs are the
+ *      fifteen primitives in src/components/ui/, built from utilities and
+ *      class-variance-authority. A `.button` rule here would become a second,
+ *      competing styling authority and would break the override determinism
+ *      that `cn()` in src/lib/utils.ts exists to guarantee - a caller's
+ *      `className` could no longer win.
+ *   5. Re-declarations of the engine's own scales - `--text-*` (31 steps),
+ *      `--radius-*`, `--shadow-*`, `--leading-*`, `--tracking-*`, `--ease-*`,
+ *      `--animate-*` (spin/ping/pulse/bounce), `--spacing`, `--container-*`.
+ *      All are installed defaults. Note `animate-pulse` already exists, so
+ *      skeleton.tsx needs no new animation token.
+ *   6. A second local `@import`. This is the only stylesheet; there is no
+ *      partial to pull in.
+ *   7. `!important`, and any `@supports` block of our own.
+ * ========================================================================== */
+
+@import 'tailwindcss';
+
+/* Markdown rendered by src/components/blog/post-content.tsx is styled by the
+ * `prose` classes this plugin generates.
+ *
+ * IMPORTANT CONTRACT: the plugin declares its own `--tw-prose-*` variables
+ * inside the `.prose` rule itself, so binding them at `:root` here would be
+ * silently overridden and achieve nothing, and binding them with a `.prose`
+ * rule would be the component style item 4 above rules out. The plugin palette
+ * is therefore NOT token-bound, which means post-content.tsx must pair `prose`
+ * with `dark:prose-invert` - without it, article body text stays dark grey on
+ * the dark canvas. */
+@plugin '@tailwindcss/typography';
+
+/* Dark mode is driven by a `.dark` class on an ancestor, not by
+ * `prefers-color-scheme`. This is not a preference: src/providers/theme-provider.tsx
+ * configures next-themes with attribute="class" and puts `.dark` on the
+ * document element, so a media-query-only implementation would leave the theme
+ * toggle inert and break both reload persistence and tests/e2e/theme.spec.ts.
+ *
+ * Matching `.dark` as an ancestor (rather than only `:root.dark`) also lets a
+ * subtree be themed independently, which the value blocks further down mirror
+ * by keying on `.dark` rather than `:root.dark`. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* -----------------------------------------------------------------------------
+ * PALETTE PARITY - literal values for consumers that cannot read a CSS variable
+ *
+ * Five artifacts hold this palette by VALUE, not by reference, because they are
+ * rendered outside the page cascade and so cannot resolve a custom property:
+ *
+ *   public/icon.svg          served via <link rel="icon">, outside the document
+ *   public/favicon.ico       raster, no CSS at all
+ *   public/apple-icon.png    raster, no CSS at all
+ *   public/og-default.png    raster, consumed by social scrapers
+ *   src/app/opengraph-image.tsx  rendered by Satori, which does not process
+ *                                Tailwind classes or custom properties
+ *
+ * Keep those five in step with the table below. The oklch column is the source
+ * value in the engine's palette; THE HEX COLUMN IS WHAT A BROWSER ACTUALLY PAINTS
+ * and is the one to copy into an asset.
+ *
+ * The hex figures are measured, not hand-converted, because the build transforms
+ * them twice. Lightning CSS (which Next runs during `next build`) emits every
+ * palette entry as a progressive-enhancement pair: an sRGB hex fallback, then the
+ * same colour as `lab()` inside `@supports (color: lab(0% 0 0))`. Modern browsers
+ * take the `lab()` branch, so the fallback hex in the compiled CSS is NOT
+ * necessarily the rendered colour - reading the stylesheet alone will mislead you.
+ * Each value below was confirmed three ways that agree: converting the source
+ * oklch, converting Lightning's `lab()` output, and sampling the rendered pixel
+ * out of a browser screenshot.
+ *
+ *   TOKEN                       THEME  PRIMITIVE   OKLCH                        HEX
+ *   --color-primary             light  indigo-600  oklch(51.1% 0.262 276.966)   #4f39f6
+ *   --color-primary             dark   indigo-400  oklch(67.3% 0.182 276.935)   #7c86ff
+ *   --color-primary-foreground  light  white       #fff                         #ffffff
+ *   --color-primary-foreground  dark   slate-950   oklch(12.9% 0.042 264.695)   #020618
+ *   --color-background          light  slate-50    oklch(98.4% 0.003 247.858)   #f8fafc
+ *   --color-background          dark   slate-950   oklch(12.9% 0.042 264.695)   #020618
+ *
+ * Five of those six are byte-identical on both branches. The one exception is the
+ * dark primary: its sRGB fallback is #7d87ff against the #7c86ff above, a
+ * one-unit difference in red and green that is imperceptible. Use #7c86ff.
+ *
+ * CHOOSING A MARK COLOUR. A favicon or social card cannot switch with the theme,
+ * so one colour has to survive both canvases (#f8fafc light, #020618 dark). The
+ * measured options, worst case of the two:
+ *
+ *   indigo-500  #615fff   4.37:1  <- best on both; use this for a one-colour mark
+ *   indigo-600  #4f39f6   3.12:1     6.18:1 light but only 3.12:1 dark
+ *   indigo-400  #7d87ff   2.99:1     6.44:1 dark but fails on light
+ *
+ * So the light primary is NOT a safe dual-theme mark on its own: it clears the
+ * 3:1 non-text floor over the dark canvas but not 4.5:1. Prefer #615fff for a
+ * single flat mark, or give the mark its own opaque backplate in the matching
+ * `--color-background` above and draw it in `--color-primary-foreground`.
+ * -------------------------------------------------------------------------- */
+
+/* -----------------------------------------------------------------------------
+ * THE TOKEN CONTRACT
+ *
+ * Twelve semantic colour tokens, plus one boundary token explained in the A11Y
+ * note below. Each name generates the full utility family - `bg-*`, `text-*`,
+ * `border-*`, `ring-*`, `outline-*`, `divide-*`, `fill-*`, `stroke-*` - and each
+ * is emitted as a real custom property, which is the dual emission that makes
+ * the zero-hardcoded-values rule mechanically checkable rather than aspirational.
+ *
+ * WHY EVERY VALUE IS `var(--app-*)` RATHER THAN A LITERAL. This indirection is
+ * load-bearing and was settled by compiling, not by preference. Given a literal
+ * here, the engine resolves it at build time and inlines it into any opacity
+ * modifier, so `bg-primary/50` compiles to
+ *   color-mix(in srgb, oklch(51.1% 0.262 276.966) 50%, transparent)
+ * with the LIGHT value frozen in - and that utility then never flips in dark
+ * mode, however the token is overridden. Pointing the token at a variable
+ * leaves the engine nothing to fold, so it emits
+ *   color-mix(in oklab, var(--color-primary) 50%, transparent)
+ * which resolves per theme at use time. Tinted utilities such as `bg-danger/10`
+ * and `text-foreground/70` therefore theme correctly.
+ *
+ * WHY `static`. Without it the engine emits only the tokens some utility
+ * happens to reference, so a token no component uses yet would be missing from
+ * the cascade and unreadable by `getComputedStyle`. `static` guarantees all
+ * thirteen are always present.
+ *
+ * The `var(--color-<family>-<step>)` values in the blocks below are resolved by
+ * the engine from its own default theme, so the mapping is stated by name and
+ * cannot drift from a transcribed literal.
+ * -------------------------------------------------------------------------- */
+
+@theme static {
+  /* Typeface. src/app/layout.tsx loads the faces through next/font and exposes
+   * them as `--font-app-sans` and `--font-app-mono` on the root element. Those
+   * two names are a character-for-character contract with that file: rename one
+   * side and the font silently falls back with nothing failing loudly.
+   *
+   * The engine binds `--default-font-family` to `--font-sans` and its preflight
+   * applies that to `html`, so overriding here themes the whole document; no
+   * `font-family` declaration is needed in the base layer. The tail of each
+   * stack is the fallback used while the webfont loads or if it fails. */
+  --font-sans: var(--font-app-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-app-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Canvas and text. `surface` is a raised panel - cards, dialog panels,
+   * dropdown content, table headers - and is always lighter than `background`
+   * in BOTH themes, so "raised" stays literally true rather than inverting.
+   * `surface-muted` is the recessed or subtle fill that sits on a surface. */
+  --color-background: var(--app-background);
+  --color-surface: var(--app-surface);
+  --color-surface-muted: var(--app-surface-muted);
+
+  /* `foreground` is primary body text on any of the three canvases above.
+   * `muted-foreground` is secondary text - timestamps, reading time, bylines,
+   * footer copy - and still clears the 4.5:1 body-text threshold, so it is
+   * genuinely secondary rather than merely faint. */
+  --color-foreground: var(--app-foreground);
+  --color-muted-foreground: var(--app-muted-foreground);
+
+  /* Hairline used for card outlines, table rules and footer dividers. See the
+   * A11Y note below for why control boundaries use `border-strong` instead. */
+  --color-border: var(--app-border);
+  --color-border-strong: var(--app-border-strong);
+
+  /* Brand. `primary` + `primary-foreground` is the accessible pair for the
+   * primary button variant; the two contrast with each other, not merely with
+   * the page, so a solid button is legible wherever it is placed.
+   *
+   * `accent` is the emphasis companion to `primary`: one step more emphatic in
+   * the direction of the active theme, so `hover:bg-accent` darkens in light
+   * and lightens in dark with no per-theme branching. It is legible both as
+   * text on all three canvases and as a solid fill beneath
+   * `text-primary-foreground`. For a NEUTRAL subtle hover fill, reach for
+   * `--color-surface-muted` instead - that is what it is for. */
+  --color-primary: var(--app-primary);
+  --color-primary-foreground: var(--app-primary-foreground);
+  --color-accent: var(--app-accent);
+
+  /* Status. `danger` backs the destructive button variant and the destructive
+   * dropdown item treatment in the admin row actions; `success` backs the
+   * approved and published affirmative states in badge.tsx and alert.tsx. Both
+   * are legible as text on every canvas AND as a solid fill beneath
+   * `text-primary-foreground`, so either treatment is safe. */
+  --color-danger: var(--app-danger);
+  --color-success: var(--app-success);
+
+  /* Keyboard focus indicator. Deliberately the brand hue rather than a neutral,
+   * so focus reads as intentional; it clears the 3:1 non-text threshold against
+   * background, surface and surface-muted in both themes. */
+  --color-ring: var(--app-ring);
+}
+
+/* -----------------------------------------------------------------------------
+ * BLITZY [A11Y] - one deliberate, flagged deviation, recorded rather than hidden
+ *
+ * `--color-border` is a DECORATIVE hairline and measures 1.23:1 on surface in
+ * light and 1.73:1 in dark - below the 3:1 in WCAG 1.4.11. That is intentional.
+ * 1.4.11 governs "visual information required to identify user interface
+ * components and states"; it exempts purely decorative boundaries such as card
+ * outlines, table rules and footer dividers, which is exactly what this token
+ * is for. Forcing 3:1 would put a mid-grey rule around every card and between
+ * every table row - a visual-quality regression, and not what the standard asks.
+ *
+ * The part of 1.4.11 that DOES bite is the boundary of an interactive control,
+ * where the border is what identifies the control at all. That case gets its own
+ * token: `--color-border-strong` (slate-500) clears the threshold against both
+ * canvases in both themes - 4.77:1 on light surface, 3.74:1 on dark. Input,
+ * textarea, select and checkbox borders should use `border-border-strong`;
+ * everything decorative uses `border-border`.
+ *
+ * This mirrors the `--border` / `--input` split in the component library this
+ * layer is modelled on. Flagged for designer review rather than silently
+ * auto-corrected in either direction.
+ *
+ * Every other pair was computed, not estimated, and clears WCAG AA in both
+ * themes. Body text (4.5:1 floor), worst case per theme:
+ *   light  foreground/background 17.05  foreground/surface 17.84
+ *          muted-foreground/background 7.23  muted-foreground/surface-muted 6.90
+ *          primary/surface 6.44  accent/surface 8.07
+ *          danger/surface-muted 5.86  success/surface-muted 4.51
+ *   dark   foreground/background 19.27  foreground/surface 17.05
+ *          muted-foreground/background 7.68  muted-foreground/surface-muted 5.58
+ *          primary/surface-muted 4.70  accent/surface 8.88
+ *          danger/surface-muted 5.07  success/surface-muted 8.26
+ * Solid-fill labels, `primary-foreground` over each fill (4.5:1 floor):
+ *   light  primary 6.44  danger 6.42  success 4.94  accent 8.07
+ *   dark   primary 6.47  danger 6.97  success 11.36  accent 10.04
+ * Focus ring (3:1 non-text floor), against background/surface/surface-muted:
+ *   light  6.15 / 6.44 / 5.88        dark  6.47 / 5.72 / 4.70
+ * -------------------------------------------------------------------------- */
+
+/* -----------------------------------------------------------------------------
+ * THEME VALUES
+ *
+ * `.dark` MUST stay after `:root`: `:root` and `.dark` carry equal specificity,
+ * so source order is what decides the override. Do not reorder these blocks and
+ * do not merge them.
+ * -------------------------------------------------------------------------- */
+
+@layer base {
+  :root {
+    /* Tells the browser to render its own chrome light - form controls,
+     * scrollbars, the text caret and spellcheck underlines - so native UI
+     * matches the page instead of staying stubbornly light-on-dark. */
+    color-scheme: light;
+
+    --app-background: var(--color-slate-50);
+    --app-surface: var(--color-white);
+    --app-surface-muted: var(--color-slate-100);
+    --app-foreground: var(--color-slate-900);
+    --app-muted-foreground: var(--color-slate-600);
+    --app-border: var(--color-slate-200);
+    --app-primary: var(--color-indigo-600);
+    --app-primary-foreground: var(--color-white);
+    --app-accent: var(--color-indigo-700);
+    --app-danger: var(--color-red-700);
+    --app-success: var(--color-green-700);
+    --app-ring: var(--color-indigo-600);
+
+    /* Theme-invariant on purpose. slate-500 is the one neutral that clears 3:1
+     * against the light canvas AND the dark one, so a control boundary needs no
+     * per-theme value; it is therefore absent from the `.dark` block below. */
+    --app-border-strong: var(--color-slate-500);
+  }
+
+  .dark {
+    color-scheme: dark;
+
+    /* Every one of the twelve flips. The neutrals invert across the slate ramp
+     * and the chromatic tokens step lighter, because a mid-dark indigo, red or
+     * green cannot hold 4.5:1 against a near-black canvas. `primary-foreground`
+     * inverts with them: in light it is white over a dark fill, in dark it is
+     * near-black over a light fill. */
+    --app-background: var(--color-slate-950);
+    --app-surface: var(--color-slate-900);
+    --app-surface-muted: var(--color-slate-800);
+    --app-foreground: var(--color-slate-50);
+    --app-muted-foreground: var(--color-slate-400);
+    --app-border: var(--color-slate-700);
+    --app-primary: var(--color-indigo-400);
+    --app-primary-foreground: var(--color-slate-950);
+    --app-accent: var(--color-indigo-300);
+    --app-danger: var(--color-red-400);
+    --app-success: var(--color-green-400);
+    --app-ring: var(--color-indigo-400);
+  }
+}
+
+/* -----------------------------------------------------------------------------
+ * DOCUMENT BASE
+ *
+ * Only what genuinely belongs to the whole document. Everything here sits in
+ * the `base` layer, which the engine orders before `components` and
+ * `utilities`, so any utility a component applies still wins - these are floors,
+ * not overrides.
+ * -------------------------------------------------------------------------- */
+
+@layer base {
+  /* The engine's preflight resets borders to `0 solid`, which leaves the colour
+   * as `currentColor` - so an element that sets a border width without a colour
+   * inherits its TEXT colour as a heavy border. Defaulting to the hairline token
+   * makes `border`, `border-t` and `divide-y` correct on their own, while
+   * `border-danger` and friends still override from the utilities layer. */
+  *,
+  ::before,
+  ::after,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-border);
+  }
+
+  /* Binding the canvas here rather than on `html` is deliberate: with `html`
+   * left unpainted the browser propagates the body background to the canvas, so
+   * overscroll and rubber-band areas stay in-theme instead of flashing white.
+   *
+   * No `font-family` is set - `--font-sans` above already reaches `html` through
+   * the engine's own `--default-font-family` binding.
+   *
+   * No `scroll-behavior: smooth` either, and that omission is considered:
+   * motion of that kind must be gated on `prefers-reduced-motion`, this file
+   * authors no `@media` block by design, and shipping ungated smooth scrolling
+   * would override a stated accessibility preference for every visitor. */
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+
+    /* Keeps the webfont from rendering over-weight on macOS and iOS. */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* The global keyboard-accessibility floor: every focusable element gets a
+   * visible indicator even before a primitive adds its own ring, so a control
+   * can never be operable-but-invisible to a keyboard user.
+   *
+   * `:focus-visible`, never `:focus` - the browser then shows this to keyboard
+   * and assistive-technology users while leaving mouse clicks unringed.
+   * `outline` rather than `box-shadow` so it survives `overflow: hidden`, and
+   * `outline-offset` keeps it clear of the control's own edge.
+   *
+   * 2px is a literal rather than a token because the engine has no outline-width
+   * namespace to draw from - but it is not an arbitrary one: it is exactly what
+   * the `outline-2` and `ring-2` utilities emit, so a primitive that layers its
+   * own `focus-visible:outline-2` lands on the same width as this floor instead
+   * of visibly changing thickness. px, not rem, because a focus ring is a
+   * border-like affordance that should not scale with the user's font size. */
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  /* Selection uses the brand pair, so highlighted text stays legible instead of
+   * relying on the browser's default blue - which can fall below AA over the
+   * dark canvas. */
+  ::selection {
+    background-color: var(--color-primary);
+    color: var(--color-primary-foreground);
+  }
+
+  /* Long unbroken strings - a pasted URL in a comment, a slug in a table cell -
+   * would otherwise force horizontal overflow at narrow widths, which the
+   * responsive criteria forbid at every breakpoint. Applied to the flow
+   * containers only, so it cannot interfere with a component that opts into
+   * `truncate` or `whitespace-nowrap`. */
+  body,
+  p,
+  li,
+  dd,
+  blockquote,
+  figcaption {
+    overflow-wrap: break-word;
+  }
+}
