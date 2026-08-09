@@ -105,9 +105,11 @@ from types import MappingProxyType
 from typing import Final
 
 import bleach
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.concurrency import run_cpu_bound
 from app.core.dependencies import PageParams, ensure_can_modify, is_admin
 from app.core.exceptions import (
     AppValidationError,
@@ -318,9 +320,8 @@ MAX_REPLY_DEPTH: Final[int] = 8
 """How deep a reply may sit, counting a top-level comment as depth ``0``.
 
 A rule about what may be **created**, which is why it lives here: ``comments.parent_id`` puts no
-bound on nesting, ``app.schemas.comment.CommentPublic.replies`` is recursive without limit, and
-``app.repositories.comment_repository`` reads whatever depth exists rather than truncating it -
-each of those three modules records that the cap belongs to this service.
+bound on nesting and ``app.schemas.comment.CommentPublic.replies`` is recursive without limit, so
+the constraint has to come from the layer that decides what an untrusted caller may write.
 
 Eight is generous for a discussion and finite for a machine, and finiteness is the point. Without
 a bound, a client that replies to its own reply in a loop builds an arbitrarily long chain, and
@@ -330,9 +331,19 @@ reach. Rejecting the ninth level costs a reader nothing: the comment is still wr
 up, in the position a reader would have chosen anyway once the indentation stopped conveying
 anything.
 
-Rows written outside this service - ``app.db.seed``, the test factories, a data migration - are
-not subject to the cap, and the read path handles any depth they produce. The cap constrains the
-request path, which is the only path an untrusted caller has.
+Rows written outside this service - ``app.db.seed``, the test factories, a data migration - are not
+subject to this cap, which is precisely why the read path carries its **own** bound rather than
+trusting this one: ``app.repositories.comment_repository.MAX_THREAD_DEPTH`` limits how far a thread
+response descends, and ``MAX_THREAD_DESCENDANTS`` limits how many rows it may carry in total. The
+two live in different modules because they answer different questions - this one is authority over
+input, that one is the size of a statement's result - and they carry the same depth on purpose, so a
+thread written entirely through the API is returned complete.
+
+The measurement itself is not performed here. :meth:`~app.repositories.comment_repository
+.CommentRepository.reply_depth_for_parent` derives it in one recursive statement, bounded by the cap
+passed to it; this module compares the answer against the cap and raises. Depth is not a stored
+column, so somebody has to walk ``parent_id`` - and walking it from a service, one round trip per
+ancestor, is the shape that was replaced.
 """
 
 
@@ -453,6 +464,34 @@ def _sanitize_body(raw: str) -> str:
     return trimmed
 
 
+async def _sanitize_body_off_loop(raw: str) -> str:
+    """Run :func:`_sanitize_body` in a worker thread, leaving the event loop free.
+
+    Sanitisation is a full HTML parse over untrusted reader input, which is pure CPU work, and
+    commenting is the highest-frequency write in the product: every reader on every article can
+    reach it, where authoring is a handful of people. Spending that parse on the event loop is
+    therefore the case where a burst is most likely and the stall most visible - a loop busy
+    cleaning one comment is serving neither the thread it belongs to nor anything else.
+
+    ``run_in_threadpool`` is FastAPI's own mechanism for running synchronous work off the loop,
+    so no dependency is added and cancellation behaves as it does everywhere else: a client that
+    disconnects mid-sanitisation cancels the awaiting task while the worker finishes, so the
+    bounded pool is never leaked to abandoned work.
+
+    Args:
+        raw: The submitted comment text.
+
+    Returns:
+        The cleaned body, exactly what :func:`_sanitize_body` returns.
+
+    Raises:
+        AppValidationError: Nothing visible survived. Raised inside the worker and propagated
+            here unchanged, because ``run_in_threadpool`` re-raises the exception in the awaiting
+            task - so the rejection reaches the route exactly as it did when the call was direct.
+    """
+    return await run_in_threadpool(_sanitize_body, raw)
+
+
 def _visible_comment_statuses(post: Post, viewer: User | None) -> tuple[CommentStatus, ...]:
     """Report which moderation states this viewer may see in this post's thread.
 
@@ -474,6 +513,13 @@ def _visible_comment_statuses(post: Post, viewer: User | None) -> tuple[CommentS
         somebody else's post.
 
     Note:
+        **A viewer that is not ``None`` is an ACTIVE account**, guaranteed by
+        ``app.core.dependencies.get_current_user_optional``, which resolves a deactivated
+        account as anonymous. This predicate therefore does not test ``is_active`` and must not
+        start to - a suspended post author arrives here as an anonymous caller and is shown the
+        public projection of their own thread, exactly as
+        ``app.services.post_service.visible_statuses_for`` treats their drafts.
+
         **The post's author sees the whole thread on their own post**, pending and rejected
         comments included, which is the reading
         ``app.repositories.comment_repository.CommentRepository.list_for_post`` documents for its
@@ -507,82 +553,6 @@ def _visible_comment_statuses(post: Post, viewer: User | None) -> tuple[CommentS
     if viewer.id == post.author_id:
         return ALL_COMMENT_STATUSES
     return PUBLIC_COMMENT_STATUSES
-
-
-async def _reply_depth(parent: Comment) -> int:
-    """Report how deep a reply to ``parent`` would sit, with a top-level comment at depth ``0``.
-
-    The measurement behind :data:`MAX_REPLY_DEPTH`. Walking ``parent_id`` upwards is the only way
-    to answer it from this layer: depth is not a stored column, and a recursive statement to
-    derive it would be SQL in a module that must contain none.
-
-    Args:
-        parent: The comment being replied to, freshly fetched, so its ``parent_id`` column is
-            populated.
-
-    Returns:
-        ``1`` when ``parent`` is top-level, ``2`` when it is a reply to a top-level comment, and
-        so on. The value is exact up to :data:`MAX_REPLY_DEPTH`; beyond that the walk stops early
-        and returns the first depth that exceeds the cap, because the only question asked of this
-        result is whether the cap has been passed.
-
-    Note:
-        **The walk is bounded by the cap, not by the thread.** It performs at most
-        :data:`MAX_REPLY_DEPTH` steps whatever the shape of the data, so the pathological chain
-        the cap exists to prevent cannot make this measurement expensive either.
-
-        Each step is a primary-key lookup through ``awaitable_attrs``, which is the accessor
-        ``app.db.base`` provides for reaching a relationship under an async session. Most steps
-        cost nothing: a reply is usually one or two levels down, and an ancestor already loaded in
-        this unit of work comes from the session's identity map with no round trip. The read path
-        never comes through here - it reads a whole thread in one recursive statement - so this is
-        a write-path cost only, paid once per reply.
-
-        The ``ancestor is None`` guard is unreachable in practice, because ``parent_id`` is a
-        foreign key and the row it names therefore exists; it is written rather than asserted so
-        the loop terminates on a value the type system admits instead of on one it does not.
-    """
-    depth = 1
-    ancestor: Comment | None = parent
-    while ancestor is not None and ancestor.parent_id is not None:
-        depth += 1
-        if depth > MAX_REPLY_DEPTH:
-            return depth
-        ancestor = await ancestor.awaitable_attrs.parent
-    return depth
-
-
-async def _load_author(comment: Comment) -> Comment:
-    """Load ``author`` on a comment returned from a write, so a response can be rendered.
-
-    ``BaseRepository.add`` and ``BaseRepository.save`` both refresh the instance, which reloads its
-    columns and leaves its relationships unloaded; a byline needs the account. ``awaitable_attrs``
-    is the accessor ``app.db.base`` provides for exactly this, used the way that module prescribes
-    - on a single entity after a write, never inside a loop over a listing.
-
-    Args:
-        comment: A persistent comment whose ``author`` may be unloaded.
-
-    Returns:
-        The same instance, with ``author`` loaded.
-
-    Note:
-        **``replies`` is deliberately left unloaded, and that is a security property.** The
-        relationship is the ownership edge: one generation, unfiltered by moderation state. A
-        single-resource response carries no thread, so loading it would serve no member of the
-        response - and handing a caller an unfiltered collection is precisely the leak
-        ``app.repositories.comment_repository`` builds its recursive, status-filtered descent to
-        prevent.
-
-        A router must therefore project a comment from any of the mutating methods with the
-        explicit constructor form ``app.schemas.comment`` documents, leaving ``replies`` out so
-        its empty default applies, rather than with ``CommentPublic.model_validate(comment)``.
-        Validating the whole model would touch the unloaded collection and fail loudly - as a
-        response-validation error - which is the intended outcome: a noisy failure beats a quiet
-        disclosure.
-    """
-    await comment.awaitable_attrs.author
-    return comment
 
 
 class CommentService:
@@ -692,7 +662,10 @@ class CommentService:
             comment_id: The comment's identifier, from the URL path.
 
         Returns:
-            The locked comment. Its own columns are populated; its relationships are not.
+            The locked comment, with ``author`` loaded by the repository so that the response the
+            caller renders needs no further read. ``replies`` is deliberately left unloaded - a
+            single-comment response carries no thread, and the relationship is unfiltered by
+            moderation state.
 
         Raises:
             NotFoundError: No comment carries that identifier.
@@ -712,7 +685,10 @@ class CommentService:
             than a guess - and it is why the mutating methods need no integrity guard of their own
             around their own writes.
         """
-        comment = await self._comments.get_by_id(comment_id, for_update=True)
+        # The byline is requested as part of the locked read rather than reached for afterwards:
+        # every caller of this method renders the comment, and a service that loaded a relationship
+        # itself would be issuing a query from a layer that owns none.
+        comment = await self._comments.get_with_author(comment_id, for_update=True)
         if comment is None:
             raise NotFoundError(_COMMENT_NOT_FOUND)
         return comment
@@ -783,7 +759,15 @@ class CommentService:
                 ],
             )
 
-        if await _reply_depth(parent) > MAX_REPLY_DEPTH:
+        # One statement, whatever the depth. The repository answers it with a recursive ascent over
+        # `parent_id`, bounded by the cap - which replaces the loop that used to follow the `parent`
+        # relationship one generation at a time, issuing a primary-key query per ancestor for every
+        # reply created. `None` cannot occur here: `get_parent` above already established that this
+        # row exists, and the whole sequence runs inside one transaction. It is folded into the
+        # comparison rather than asserted, so an impossible value fails the rule rather than the
+        # request.
+        depth = await self._comments.reply_depth_for_parent(parent.id, max_depth=MAX_REPLY_DEPTH)
+        if depth is None or depth > MAX_REPLY_DEPTH:
             raise AppValidationError(
                 _REPLY_TOO_DEEP,
                 errors=[
@@ -902,7 +886,8 @@ class CommentService:
 
         Returns:
             The persisted comment with ``author`` loaded and ``replies`` deliberately unloaded -
-            see :func:`_load_author` for how a router must project it.
+            see :meth:`~app.repositories.comment_repository.CommentRepository.get_with_author` for
+            why the collection is withheld and how a router must therefore project it.
 
         Raises:
             NotFoundError: No post carries that identifier, or it is not visible to this caller.
@@ -945,7 +930,13 @@ class CommentService:
         """
         post = await self._load_visible_post(post_id, author)
 
-        body = _sanitize_body(payload.body)
+        # Sanitised on a bounded worker thread rather than on this one. A comment is bounded at
+        # five thousand characters, so one call is cheaper than a post's, but the loop is shared
+        # with every other request this worker is serving and a public, high-frequency write is
+        # exactly where a per-call cost accumulates into a stall. Runs before the parent is
+        # resolved, so a body that sanitises away is refused without a further query - and after
+        # the post's visibility check, so a caller who may not see the post cannot spend the CPU.
+        body = await run_cpu_bound(_sanitize_body, payload.body)
 
         parent = (
             None
@@ -965,7 +956,12 @@ class CommentService:
         )
 
         try:
-            await self._comments.add(comment)
+            # Insert, flush, and load the byline the response needs - all inside the transaction, so
+            # the COMMIT below is the last database action this request takes. The ordering is the
+            # point: a load issued after the commit could fail on a comment that is already
+            # durable, and the client would then see an error for a comment that exists - which a
+            # retry would duplicate, because nothing about a comment is unique.
+            persisted = await self._comments.add_with_author(comment)
             await self._session.commit()
         except IntegrityError as error:
             # Rolled back first: the transaction is aborted, so anything else issued on this
@@ -973,18 +969,20 @@ class CommentService:
             await self._session.rollback()
             raise ConflictError(_THREAD_CHANGED) from error
 
+        await self._session.commit()
+
         get_logger(__name__).info(
             "comment created",
-            comment_id=str(comment.id),
+            comment_id=str(persisted.id),
             post_id=str(post.id),
             author_id=str(author.id),
             parent_id=None if parent is None else str(parent.id),
-            status=comment.status.value,
+            status=persisted.status.value,
             # The length, never the text. A comment body is untrusted reader input and has no place
             # in a log line; its size is what an operator actually wants to correlate.
-            body_length=len(comment.body),
+            body_length=len(persisted.body),
         )
-        return await _load_author(comment)
+        return persisted
 
     async def update(
         self,
@@ -1009,7 +1007,8 @@ class CommentService:
             actor: The resolved principal. Must own the comment or hold ``ADMIN``.
 
         Returns:
-            The updated comment with ``author`` loaded and ``replies`` deliberately unloaded.
+            The updated comment with ``author`` loaded and ``replies`` populated to the full depth
+            this actor may see - the shape ``CommentPublic.model_validate`` walks directly.
 
         Raises:
             NotFoundError: No comment carries that identifier.
@@ -1019,6 +1018,25 @@ class CommentService:
             AppValidationError: The replacement body sanitises to nothing.
 
         Note:
+            **The reply tree is returned, not defaulted away.** An edit changes one comment's text
+            and never a thread's shape, but the comment being edited may already have replies under
+            it - and a response reporting ``replies: []`` for a comment that has three of them is a
+            false statement about the thread, not a narrower true one. It is also actively
+            destructive to the client this API is built for: the discussion is rendered from a
+            cached tree, an edit replaces the edited node with this response, and a node whose
+            children were dropped takes its whole subtree out of the rendered thread with nothing
+            failing. So the subtree is loaded, through
+            :meth:`~app.repositories.comment_repository.CommentRepository.load_visible_replies`,
+            which is the same recursive descent and the same status filter the thread listing uses.
+
+            **The subtree is narrowed to what this actor could read anyway**, by
+            :func:`_visible_comment_statuses` against the owning post - so an administrator or the
+            post's author sees pending and rejected replies here exactly as they would in the
+            listing, and a comment's own author editing their comment on somebody else's post sees
+            approved replies only. Following
+            :attr:`~app.models.comment.Comment.replies` instead would have disclosed every state
+            and only one generation.
+
             **An accepted edit returns an ``APPROVED`` comment to ``PENDING``, whoever made it.**
             This is the second half of withholding ``status`` from the input model, and without it
             the first half is worthless: submit something innocuous, wait for approval, then swap
@@ -1052,26 +1070,60 @@ class CommentService:
         provided = payload.model_dump(exclude_unset=True)
 
         if payload.body is not None:
-            comment.body = _sanitize_body(payload.body)
+            # Off the event loop, for the reason `create` records. The comment is held under
+            # `FOR UPDATE` across the offload, which is the deliberate cost of sanitising after
+            # the ownership check rather than before it: an unauthorised caller must not be able
+            # to spend this worker's CPU. The lock is on one comment, so the only request it can
+            # delay is another edit of that same comment.
+            comment.body = await run_cpu_bound(_sanitize_body, payload.body)
             if comment.status is CommentStatus.APPROVED:
                 comment.status = CommentStatus.PENDING
 
         # No integrity guard here, unlike `create`: the row is held under `FOR UPDATE`, so it cannot
         # be deleted from beneath this transaction, and a row already deleted and committed was
         # reported as a 404 by the locked read above.
-        await self._comments.save(comment)
+        #
+        # Flushes the UPDATE and re-reads the row with its byline, inside the transaction, so the
+        # response is fully materialised before anything becomes durable and the COMMIT below is the
+        # last database action of the request.
+        edited = await self._comments.save_with_author(comment)
+
+        # The response describes a comment that may already have replies beneath it, so the visible
+        # subtree is attached rather than left to `replies`' empty default: a client renders the
+        # discussion from a cached tree and replaces the edited node with this answer, so a node
+        # whose children were dropped takes its whole subtree out of the thread with nothing
+        # failing.
+        #
+        # The post is fetched UNGUARDED, and deliberately so: the visibility-guarded loader would
+        # raise a 404 for a post that is no longer published, and a caller who legitimately
+        # corrected a comment on an article that has since been withdrawn would be told their
+        # successful edit failed. Visibility of the *post* was never this method's question -
+        # authority over the *comment* was, and `ensure_can_modify` answered it above. The row is
+        # read only to decide which moderation states this actor may see beneath the comment.
+        #
+        # Loaded BEFORE the commit, like every other read on this path, so the commit remains the
+        # last database action of the request.
+        post = await self._posts.get_by_id(edited.post_id)
+        edited = await self._comments.load_visible_replies(
+            edited,
+            statuses=(
+                _visible_comment_statuses(post, actor)
+                if post is not None
+                else PUBLIC_COMMENT_STATUSES
+            ),
+        )
         await self._session.commit()
 
         get_logger(__name__).info(
             "comment updated",
-            comment_id=str(comment.id),
-            post_id=str(comment.post_id),
+            comment_id=str(edited.id),
+            post_id=str(edited.post_id),
             actor_id=str(actor.id),
             changed=sorted(provided),
-            status=comment.status.value,
-            body_length=len(comment.body),
+            status=edited.status.value,
+            body_length=len(edited.body),
         )
-        return await _load_author(comment)
+        return edited
 
     async def delete(self, comment_id: uuid.UUID, *, actor: User) -> None:
         """Delete a comment for ``DELETE /api/v1/comments/{comment_id}``.
@@ -1184,16 +1236,19 @@ class CommentService:
         previous = comment.status
         comment.status = status
 
-        await self._comments.save(comment)
+        # Flushes the UPDATE and re-reads the row with its byline, inside the transaction; the
+        # COMMIT is then the last database action, so a moderation decision cannot become durable
+        # beside an error response.
+        moderated = await self._comments.save_with_author(comment)
         await self._session.commit()
 
         get_logger(__name__).info(
             "comment moderated",
-            comment_id=str(comment.id),
-            post_id=str(comment.post_id),
-            author_id=str(comment.author_id),
+            comment_id=str(moderated.id),
+            post_id=str(moderated.post_id),
+            author_id=str(moderated.author_id),
             actor_id=str(actor.id),
             previous_status=previous.value,
-            status=comment.status.value,
+            status=moderated.status.value,
         )
-        return await _load_author(comment)
+        return moderated

@@ -291,13 +291,20 @@ class ProfileService:
             author_id=author.id,
             statuses=PUBLIC_PROFILE_STATUSES,
             sort=_PROFILE_POST_SORT,
+            # The same compact projection the home feed uses, and named for the same reason: this
+            # surface serialises `PostSummary`, so fetching `posts.content` - up to 100,000
+            # characters per article - and the author's private columns would be work the response
+            # discards. A profile page renders cards, not documents.
+            projection="summary",
             limit=page_size,
             offset=(page - 1) * page_size,
         )
 
-        # `author` and `categories` were eagerly loaded by the statement above, so this
-        # projection issues no further query - a lazy load would raise MissingGreenlet under
-        # the async session rather than quietly becoming an N+1.
+        # `author` and `categories` were eagerly loaded by the statement above - narrowed to the
+        # columns `PostSummary` actually serialises - so this projection issues no further query.
+        # A lazy load would raise MissingGreenlet under the async session rather than quietly
+        # becoming an N+1, and so would reading a column the projection deferred, which is what
+        # makes the narrowing safe rather than merely thrifty.
         items = [PostSummary.model_validate(row) for row in rows]
 
         return build_page(items, total, page, page_size)

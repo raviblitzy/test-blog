@@ -586,6 +586,13 @@ class RequestContextMiddleware:
             # `app.core.logging` filters uvicorn's re-raised copy, so one unhandled exception
             # produces exactly one traceback in the stream - this one, with the request
             # identifier bound.
+            #
+            # The rendered traceback is REDACTED before it reaches either terminal renderer.
+            # `app.core.logging.redact_log_event` sits immediately after the exception renderer
+            # in both the development and the JSON chain, so a message that quoted a connection
+            # URL, an address, a bearer token or a PostgreSQL DETAIL line is stripped of it here
+            # too - not only on the shipping path. That is why handing the exception over whole
+            # is safe: nothing in this middleware has to know what a driver chose to say.
             fields["exc_info"] = failure
 
         logger.log(

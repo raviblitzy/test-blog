@@ -113,7 +113,6 @@ from app.schemas.admin import (
 from app.schemas.category import CategoryPublic
 from app.services.category_service import CategoryService
 from app.services.comment_service import CommentService
-from app.services.post_service import ALL_POST_STATUSES
 
 __all__ = ["AdminService"]
 
@@ -699,23 +698,36 @@ class AdminService:
         Note:
             **This deliberately bypasses the public status scope, and it is safe only because the
             surface is gated twice.** Every reader-facing listing narrows itself with
-            ``visible_statuses_for``; this one passes
-            :data:`~app.services.post_service.ALL_POST_STATUSES` instead. ``require_admin`` gates
-            the router and :meth:`_require_admin` re-checks here, so there is no path to this
-            breadth that has not already established the caller's authority. The tuple is imported
-            from ``post_service`` rather than re-spelled, so a fourth lifecycle state added there
-            appears here without a second edit - and cannot fail to.
+            ``visible_statuses_for``; this one passes ``statuses=None``, the repository's spelling
+            for "every lifecycle state". ``require_admin`` gates the router and
+            :meth:`_require_admin` re-checks here, so there is no path to this breadth that has
+            not already established the caller's authority.
+
+            **``None`` rather than an exhaustive tuple, and the difference is a query plan.**
+            Enumerating every enum value produces ``status IN ('DRAFT','PUBLISHED','ARCHIVED')``,
+            which is a predicate the planner has to satisfy - and one that no single index can
+            satisfy *in this listing's global order*. ``ix_posts_status_published_at`` leads with
+            ``status``, so it orders rows within a state; a three-value ``IN`` would have to merge
+            three ordered groups, so PostgreSQL sorts the whole relation before applying ``LIMIT``.
+            ``None`` emits no status predicate at all, which is what lets
+            ``ix_posts_published_at_id`` - declared ``(published_at DESC NULLS LAST, id DESC)``
+            for exactly this surface - supply the ordering directly. A tuple naming every state
+            and no tuple at all return identical rows; only one of them is answerable from an
+            index.
 
             **``statuses`` is an argument the caller decides, never a decision the repository
             takes.** That separation is what lets one composed query serve the public feed, an
             author's profile, the author workspace and this table, with the authority question
             answered once per surface in the service layer.
 
-            **The repository eager-loads ``author`` and ``categories``**, so
-            ``AdminPost.model_validate`` finds the byline already present. Nothing here loops to
-            fetch a relation, which under an async session would raise ``MissingGreenlet`` rather
-            than quietly issuing a query per row - an N+1 surfaces as a failure instead of as a
-            slow page.
+            **The repository eager-loads ``author`` and narrows every column to what this model
+            serialises**, so ``AdminPost.model_validate`` finds the byline already present and the
+            statement fetches no article body, no search vector and no private ``users`` column.
+            Nothing here loops to fetch a relation, which under an async session would raise
+            ``MissingGreenlet`` rather than quietly issuing a query per row - an N+1 surfaces as a
+            failure instead of as a slow page. ``categories`` is deliberately not loaded at all:
+            :class:`~app.schemas.admin.AdminPost` has no such member, and a relation nothing renders
+            is a statement with no consumer.
 
             **No ``sort`` argument.** The repository's default ordering is recency, which is what a
             management table wants: an administrator scanning for what changed recently is not
@@ -724,15 +736,21 @@ class AdminService:
         """
         self._require_admin(actor)
 
-        # `None` and the full tuple mean the same thing to the query; the explicit tuple is passed
-        # so that the breadth of this listing is legible at the call site rather than implied by an
-        # omitted argument.
-        statuses = ALL_POST_STATUSES if status is None else (status,)
+        # `None` is the repository's spelling for "every lifecycle state", and it is passed rather
+        # than an exhaustive tuple because the two are equivalent in rows and NOT equivalent in
+        # plan - see the note above. A single-status tab still passes its one state, which is an
+        # equality predicate ix_posts_status_published_at serves directly.
+        statuses = None if status is None else (status,)
 
         rows, total = await self._posts.list_posts(
             q=q,
             author_id=author_id,
             statuses=statuses,
+            # The administrative projection: the eight columns `AdminPost` declares plus the public
+            # author fields, and NO categories - that model does not carry them, so loading the
+            # association would be one extra statement and one extra entity per row for a column
+            # this table never renders. `content` and `search_vector` are not fetched either.
+            projection="admin",
             limit=page_size,
             offset=_offset(page, page_size),
         )
@@ -800,15 +818,23 @@ class AdminService:
             privilege, and ``ensure_can_modify`` would be the wrong predicate here because
             ownership is not a route to this operation.
 
-            **``author`` is loaded after the commit, on one entity.**
-            ``PostRepository.get_for_update`` attaches no loader options - its purpose is a lock
-            over exactly one row - and :class:`~app.schemas.admin.AdminPost` needs the byline.
-            ``awaitable_attrs`` is the accessor ``app.db.base`` provides for precisely this, used
-            as that module prescribes: a safety valve on a single entity, never inside a loop.
+            **``author`` is loaded by the repository, before the commit.**
+            :class:`~app.schemas.admin.AdminPost` needs the byline, so the locked read asks for it
+            with ``with_relations=True`` and the flush re-reads it - both statements issued by
+            ``PostRepository``, which is the layer entitled to issue them, and both inside this
+            transaction. Nothing is read after the ``COMMIT``: a load that failed there would leave
+            the status change durable while the client received an error, and there would be no
+            transaction left to roll back.
+
+            The lock still covers exactly one row of ``posts``. The relations arrive through
+            ``selectinload``'s separate unlocked statements, so no author account is held under a
+            write lock because a byline had to be rendered.
         """
         self._require_admin(actor)
 
-        post = await self._posts.get_for_update(post_id)
+        # `with_relations=True`: AdminPost renders the byline, so the author is requested as part
+        # of the locked read rather than reached for afterwards.
+        post = await self._posts.get_for_update(post_id, with_relations=True)
         if post is None:
             raise NotFoundError(_POST_NOT_FOUND)
 
@@ -823,24 +849,26 @@ class AdminService:
             post.published_at = _publication_instant()
         post.status = status
 
-        # `save` flushes the UPDATE and reloads the row, so `updated_at` on the returned entity is
-        # the value PostgreSQL just re-derived. With nothing dirty it flushes nothing.
-        await self._posts.save(post)
+        # Flushes the UPDATE and re-reads the row with its relations, so `updated_at` on the
+        # returned entity is the value PostgreSQL just re-derived and the byline is present. With
+        # nothing dirty it flushes nothing and simply re-reads.
+        updated = await self._posts.save_with_relations(post)
         await self.session.commit()
 
         get_logger(__name__).info(
             "admin post status changed",
-            post_id=str(post.id),
-            slug=log_safe_text(post.slug),
+            post_id=str(updated.id),
+            slug=log_safe_text(updated.slug),
             actor_id=str(actor.id),
-            author_id=str(post.author_id),
+            author_id=str(updated.author_id),
             previous_status=previous_status.value,
-            status=post.status.value,
-            published_at=None if post.published_at is None else post.published_at.isoformat(),
+            status=updated.status.value,
+            published_at=(
+                None if updated.published_at is None else updated.published_at.isoformat()
+            ),
         )
 
-        await post.awaitable_attrs.author
-        return post
+        return updated
 
     async def delete_post(self, post_id: uuid.UUID, *, actor: User) -> None:
         """Delete any author's post, and with it every comment and like it carried.
@@ -939,16 +967,20 @@ class AdminService:
             ValueError: Propagated from ``build_page`` if ``page_size`` is not positive.
 
         Note:
-            **The repository eager-loads ``author`` and ``post``, so nothing here loops.** This is
-            the busiest administrative screen in the product, and a query per row to fetch a
+            **The repository eager-loads ``author`` and nothing else, so nothing here loops.** This
+            is the busiest administrative screen in the product, and a query per row to fetch a
             commenter would be an N+1 on exactly the page that can least afford one. Under an async
             session it would not even be a slow page: a missing eager load raises
-            ``MissingGreenlet``, so the mistake fails loudly rather than degrading quietly.
+            ``MissingGreenlet``, so the mistake fails loudly rather than degrading quietly. The
+            byline itself is narrowed to the six public ``UserPublic`` fields, so no moderator's
+            page ever carries a commenter's email address, role or password hash.
 
-            **``AdminComment`` carries ``post_id`` rather than a nested post.** The projection is
-            the schema layer's decision and this method does not widen it; ``post`` is loaded
-            because the repository loads it for the whole administrative surface, not because this
-            model needs it.
+            **``AdminComment`` carries ``post_id`` rather than a nested post, and the statement now
+            matches that.** The projection is the schema layer's decision and this method does not
+            widen it - but the repository used to load the related ``Post`` anyway, which meant a
+            page of twenty comments fetched up to twenty whole articles, bodies and search vectors
+            included, in order to serialise a UUID that was already a column of the comment row. It
+            no longer does. An administrator who needs the article opens it by that identifier.
 
             **The body is returned as stored.** It was sanitised on write by ``comment_service``,
             which is the one place that policy is applied, and re-sanitising a stored value here
@@ -1090,10 +1122,17 @@ class AdminService:
     ) -> Page[CategoryPublic]:
         """Window the taxonomy for the administrative categories screen.
 
-        Behind ``GET /api/v1/admin/categories``. Delegated to
-        :meth:`~app.services.category_service.CategoryService.list_paginated` so the administrative
-        table and the public filter control agree on what a category looks like, down to the meaning
-        of ``post_count``.
+        Behind ``GET /api/v1/admin/categories``, the fourth administrative listing, which completes
+        the administrative namespace: it now exposes listing, state mutation and deletion for users,
+        posts, comments *and* categories, which is what the plan requires of the dashboard. The
+        route adds a ``q`` filter the public collection deliberately withholds - searching a
+        taxonomy is a management affordance rather than a reading one - and is otherwise the same
+        windowed read, so a management grid and the reader-facing filter control cannot disagree
+        about what a category looks like or how many posts are filed under it.
+
+        Delegated to :meth:`~app.services.category_service.CategoryService.list_paginated` so an
+        administrative table and the public filter control would agree on what a category looks
+        like, down to the meaning of ``post_count``.
 
         Args:
             actor: The resolved principal. Must hold ``ADMIN``.
@@ -1169,7 +1208,17 @@ class AdminService:
             only, so asking it to project keeps that meaning declared exactly once and keeps this
             surface reporting the same figure the home page's filter control shows.
 
-            The delegate commits, so this method issues no commit of its own.
+            **The projection comes back from the create call itself; nothing is read back
+            afterwards.** This method used to re-resolve the new category by slug in order to obtain
+            the tally, which meant two more statements - an indexed lookup and, at the time, an
+            aggregate over the whole taxonomy - issued *after* the delegate had already committed.
+            The category existed at that point, so a transient failure on either of them answered
+            with an error for a resource that had in fact been created. The delegate now builds the
+            projection inside its own transaction, where the count for a brand-new category is a
+            known zero rather than a question, and commits last.
+
+            The delegate commits, so this method issues no commit of its own, and no statement of
+            its own follows that commit.
         """
         self._require_admin(actor)
 
@@ -1181,7 +1230,7 @@ class AdminService:
             slug=log_safe_text(category.slug),
             actor_id=str(actor.id),
         )
-        return await self._category_service.get_public_by_slug(category.slug)
+        return category
 
     async def update_category(
         self,
@@ -1222,12 +1271,16 @@ class AdminService:
 
             **The projection is the delegate's, for the reason recorded on**
             :meth:`create_category`: ``post_count`` is an aggregate the entity does not carry, so a
-            mapped row cannot validate against the response model. Addressing the projection by
-            ``slug`` is sound precisely *because* a rename leaves the slug alone - the identifier
-            used to read the row back is the one the update could not have moved.
+            mapped row cannot validate against the response model. It arrives with the update's
+            return value rather than from a readback - this method used to re-resolve the row by
+            slug afterwards, which was sound in that a rename cannot move a slug, but it put an
+            indexed lookup and a taxonomy-wide aggregate after a commit that had already made the
+            change durable. The delegate now reads its own tally with one targeted count inside the
+            transaction it commits.
 
             The delegate commits when there is something to write, and writes and commits nothing
-            when the patch is empty. Either way this method does not commit on top of it.
+            when the patch is empty - in which case its single count is the only statement. Either
+            way this method does not commit on top of it, and issues nothing after it.
         """
         self._require_admin(actor)
 
@@ -1240,7 +1293,7 @@ class AdminService:
             actor_id=str(actor.id),
             changed=sorted(payload.model_dump(exclude_unset=True)),
         )
-        return await self._category_service.get_public_by_slug(category.slug)
+        return category
 
     async def delete_category(self, category_id: uuid.UUID, *, actor: User) -> None:
         """Delete a category, subject to the delegate's in-use guard.
@@ -1273,11 +1326,15 @@ class AdminService:
             check and the delete. Calling ``CategoryRepository.is_in_use`` from here instead would
             reproduce the check without the lock, which is a guard in appearance only.
 
-            The delegate commits, so this method issues no commit of its own.
+            **One transaction, committed here**, as on the other two administrative category
+            operations. There is no projection to read on a ``204``, so the delegate could have
+            committed safely - but the boundary is kept in the same place on all three so that
+            "who commits an administrative operation" has one answer rather than three.
         """
         self._require_admin(actor)
 
-        await self._category_service.delete(category_id)
+        await self._category_service.delete(category_id, commit=False)
+        await self.session.commit()
 
         get_logger(__name__).info(
             "admin category deleted",

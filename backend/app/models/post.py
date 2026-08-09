@@ -638,6 +638,33 @@ class Post(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             text("published_at DESC"),
         ),
         Index(
+            # The ALL-STATUS recency ordering, which ix_posts_status_published_at above cannot
+            # serve. That index leads with `status`, so it orders rows *within* a status - which
+            # is exactly right for the public feed, where `status = PUBLISHED` is an equality
+            # predicate. The administrative posts table has no status predicate at all: it reads
+            # every state in one window, ordered `published_at DESC NULLS LAST, id DESC`
+            # globally. A leading equality column provides no global order for that, and neither
+            # does enumerating every enum value into an `IN` list - the scan would still have to
+            # merge three ordered groups, so the planner sorts the whole relation before applying
+            # LIMIT. This index is the access path that ordering actually has.
+            #
+            # NULLS LAST is written into the index rather than left to the default, and the two
+            # spellings are not interchangeable to the planner. A DESC index column orders NULL
+            # *first* in PostgreSQL, so an index declared plain `published_at DESC` cannot satisfy
+            # `ORDER BY published_at DESC NULLS LAST` and forces a sort. Drafts carry no
+            # publication instant, so every surface that admits them needs the NULLS LAST form -
+            # see `_recency_ordering` in app.repositories.post_repository, which emits exactly
+            # this spelling whenever the status scope can yield a NULL.
+            #
+            # `id DESC` is the deterministic tiebreaker, in the index for the same reason it is in
+            # the query: `published_at` is stamped from a per-transaction clock, so a bulk publish
+            # gives many rows one instant, and an unspecified order under LIMIT/OFFSET is how a
+            # row lands on two consecutive pages while another lands on none.
+            "ix_posts_published_at_id",
+            text("published_at DESC NULLS LAST"),
+            text("id DESC"),
+        ),
+        Index(
             # The feed's primary search path: a GIN index over the generated column, which is
             # what makes ranked full-text search an index scan rather than a table scan.
             "ix_posts_search_vector",

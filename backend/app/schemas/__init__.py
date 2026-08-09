@@ -81,9 +81,9 @@ own bounds off their own public lists, so lifting one module's would advertise t
 place to find ``PASSWORD_MIN_LENGTH`` while ``BODY_MAX_LENGTH`` next door raised an attribute
 error. Every one of them stays reachable at its single address,
 ``from app.schemas.auth import PASSWORD_MIN_LENGTH``, which is where a bound belongs: beside the
-annotated type that enforces it. ``app.schemas.post.DEFAULT_POST_SORT_OPTION`` is excluded on the
-same ground: a route states its own default in its signature, so the vocabulary crosses the wire
-and the default does not.
+annotated type that enforces it. ``app.schemas.common.SearchTerm`` and its
+``MAX_SEARCH_TERM_LENGTH`` are reached the same way, from the module that declares them, by the
+two routers that accept a ``?q=``.
 
 *Mapped relations.* Nothing from the mapped-relation package is re-exported, and this is a
 boundary rather than a preference. An entity reachable as ``app.schemas.User`` would read as an

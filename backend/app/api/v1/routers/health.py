@@ -55,8 +55,10 @@ modules - ``auth``, ``user``, ``post``, ``category``, ``comment``, ``like``, ``a
 them because a probe is not an aggregate: neither shape has a database column behind it, a
 repository that returns it or a service that assembles it. Declaring them where they are
 served keeps the contract layer describing the domain and keeps this module readable on its
-own. The single shape this file does import is ``ProblemDetail``, because a readiness failure
-must be indistinguishable on the wire from every other error the API reports.
+own. The single failure shape this file declares comes from
+:func:`~app.api.v1.responses.problem_response` rather than being described here, because a
+readiness failure must be indistinguishable on the wire - body *and* media type - from every
+other error the API reports.
 
 Both models are minimal on purpose. Neither carries a version string, a hostname, a
 connection URL, an environment name, a commit hash, a dependency inventory or a latency
@@ -64,20 +66,35 @@ figure. Every one of those is a gift to somebody fingerprinting an unauthenticat
 and none of them helps the only two callers that exist - a container health check and an
 orchestrator - both of which decide on the status code alone.
 
-Nothing is logged here
-----------------------
-There is no logger in this module, and that is a decision rather than an omission.
-``app.middleware.request_context`` already emits one structured access record per request,
-and it treats these two paths specifically: ``QUIET_ACCESS_LOG_PATHS`` downgrades them to
-``debug`` **only** while they neither fail nor answer badly, so a readiness probe answering
-503 is logged at ``error`` with its status, its path, its duration and the bound
-``request_id``. The outcome is therefore already in the log stream without a line from here.
+Exactly one line is logged here, and only on failure
+----------------------------------------------------
+``app.middleware.request_context`` already emits one structured access record per request, and
+it treats these two paths specifically: ``QUIET_ACCESS_LOG_PATHS`` downgrades them to ``debug``
+**only** while they neither fail nor answer badly, so a readiness probe answering 503 is logged
+at ``error`` with its status, its path, its duration and the bound ``request_id``.
 
-The one thing a line here could add is the text of the exception :func:`readiness` catches,
-and ``app.core.exceptions`` documents exactly why that text is unwelcome: psycopg's
-connection-failure message names the host, the port, the database and the user it tried. It
-never reaches a response body, and there is no reason to start moving it around internally
-either.
+That record says the probe failed. It cannot say **why**, and the difference matters
+operationally: a refused connection, an unresolvable host, a rejected password, an exhausted
+pool and a statement failure all produce ``/readyz returned 503`` and nothing else, so an
+operator watching an instance drop out of rotation cannot tell a database that is down from a
+credential that was rotated without telling this deployment. The reason is not recoverable
+later either - :func:`readiness` chains the caught exception into a domain error, and the
+registered ``AppError`` handler renders that as a problem document without frames, so the
+middleware never sees an exception at all.
+
+:func:`readiness` therefore emits **one** record of its own, at ``error``, immediately before
+raising: :func:`_readiness_failure_fields` reduces the caught exception to a fixed
+classification, the exception class name, the originating driver class name and the SQLSTATE
+where the driver supplied one. Every one of those is a closed vocabulary or a type name.
+
+What is deliberately **not** on that line is the exception's own text. ``app.core.exceptions``
+documents exactly why: psycopg's connection-failure message names the host, the port, the
+database and the user it tried, which is a topology and credential disclosure. The record is
+built from attributes rather than from a message, and it is emitted with ``logger.error``
+rather than ``logger.exception`` so no traceback and no driver text is attached. The
+correlation identifier is not passed either - ``structlog.contextvars.merge_contextvars`` is
+the first processor in the configured chain, so the ``request_id`` the middleware bound is
+already on the line, and this record and the access record can be read together.
 
 Governing standards
 -------------------
@@ -93,15 +110,23 @@ is; and *blocking quality gates*, which is why ``ruff``, ``mypy`` and
 ``backend/tests/integration/test_health.py`` all have to pass on it.
 """
 
-from typing import Any, Final, Literal
+import re
+from typing import Final, Literal
 
 from fastapi import APIRouter, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
+from sqlalchemy.exc import (
+    DBAPIError,
+    InterfaceError,
+    OperationalError,
+    TimeoutError as PoolTimeoutError,
+)
 
+from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import DbSession
 from app.core.exceptions import AppError
-from app.schemas import ProblemDetail
+from app.core.logging import get_logger
 
 __all__ = ["LivenessResponse", "ReadinessResponse", "router"]
 
@@ -139,8 +164,115 @@ the document stable: two readiness failures for two different underlying reasons
 same ``detail``, so nothing downstream starts parsing it.
 
 It states the verdict rather than the cause on purpose. The verdict is what the caller acts
-on; the cause is an operator's concern and reaches them through the access log record that
-``app.middleware.request_context`` emits at ``error`` for this response."""
+on; the cause is an operator's concern and reaches them through the two log records this
+response produces - the access record ``app.middleware.request_context`` emits at ``error``,
+and the classified failure record :func:`readiness` emits beside it."""
+
+
+# ---------------------------------------------------------------------------------------
+# The readiness failure record
+#
+# A closed vocabulary and three type-derived fields. Nothing here is composed from an
+# exception's message, because a driver's message names the host, the port, the database and
+# the user it tried - see `_DETAIL_NOT_READY` above and `app.core.exceptions`.
+#
+# The classifications are the operational distinctions an operator acts on differently, and
+# no finer: a pool that ran out needs a capacity or leak investigation, a connection that
+# could not be made needs the database or the network looked at, a driver-level fault needs
+# the client library or the socket state looked at, and anything else needs a person. Adding
+# a member here is adding a distinction somebody would act on; anything else belongs in the
+# SQLSTATE, which is already carried.
+# ---------------------------------------------------------------------------------------
+
+ReadinessFailureClass = Literal[
+    "pool_timeout",
+    "connection_failure",
+    "driver_interface_failure",
+    "database_error",
+    "unexpected_failure",
+]
+"""The fixed vocabulary of readiness failure classifications.
+
+A named alias rather than an inline annotation so that the values a dashboard or an alert rule
+groups by are declared in one place, and so mypy rejects a classification this module never
+published.
+"""
+
+_READINESS_FAILURE_EVENT: Final[str] = "readiness_probe_failed"
+"""Event name of the failure record. Stable, so it is safe to alert on."""
+
+_LOG_FIELD_FAILURE_CLASS: Final[str] = "failure_class"
+_LOG_FIELD_EXCEPTION_TYPE: Final[str] = "exception_type"
+_LOG_FIELD_DRIVER_EXCEPTION_TYPE: Final[str] = "driver_exception_type"
+_LOG_FIELD_SQLSTATE: Final[str] = "sqlstate"
+
+_SQLSTATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9]{5}\Z")
+"""A SQLSTATE is exactly five alphanumeric characters - ``28P01``, ``08006``, ``53300``.
+
+Validated rather than trusted even though it arrives from the driver, because it is read off an
+arbitrary exception object through ``getattr`` and is about to become a log field. Anything that
+is not the documented shape is dropped rather than rendered: a five-character code is worth a
+field, and something else in its place is worth nothing at all.
+"""
+
+
+def _readiness_failure_fields(exc: BaseException) -> dict[str, str]:
+    """Reduce a caught database failure to the safe fields the failure record carries.
+
+    Built entirely from types and from one validated driver attribute. No message, no argument,
+    no statement, no parameters, no connection URL: the four things an operator needs to
+    distinguish one readiness failure from another are *which class of failure it was*, *which
+    exception SQLAlchemy raised*, *which driver exception it wrapped* and *what the database
+    server called it*.
+
+    ``sqlstate`` is where the real precision lives, and it costs nothing to carry: ``28P01`` is
+    an invalid password, ``08006`` a failed connection, ``3D000`` a missing database, ``53300``
+    too many clients. Those are exactly the cases that used to be indistinguishable, and the code
+    itself discloses nothing - it names a condition, not a host, a credential or a row.
+
+    Args:
+        exc: The exception :func:`readiness` caught. Any type, including one this module has
+            never heard of, which is what ``unexpected_failure`` exists for.
+
+    Returns:
+        A mapping of log fields. ``failure_class`` and ``exception_type`` are always present;
+        ``driver_exception_type`` and ``sqlstate`` appear only when the driver supplied them.
+    """
+    failure_class: ReadinessFailureClass
+    if isinstance(exc, PoolTimeoutError):
+        # Checked FIRST, and it must stay first: this is a pool-level failure raised without any
+        # connection attempt being made, so it carries no driver exception and no SQLSTATE, and
+        # it is the one classification whose remedy (capacity, or a session that is not being
+        # released) has nothing to do with the database being reachable.
+        failure_class = "pool_timeout"
+    elif isinstance(exc, OperationalError):
+        failure_class = "connection_failure"
+    elif isinstance(exc, InterfaceError):
+        failure_class = "driver_interface_failure"
+    elif isinstance(exc, DBAPIError):
+        failure_class = "database_error"
+    else:
+        failure_class = "unexpected_failure"
+
+    fields = {
+        _LOG_FIELD_FAILURE_CLASS: failure_class,
+        _LOG_FIELD_EXCEPTION_TYPE: type(exc).__name__,
+    }
+
+    # `DBAPIError.orig` is the driver's own exception, and its class name is the more specific
+    # of the two - SQLAlchemy's `OperationalError` wraps psycopg's `OperationalError`,
+    # `ConnectionTimeout` or `InvalidPassword` alike, and only the inner name says which.
+    driver_error = getattr(exc, "orig", None)
+    if driver_error is not None:
+        fields[_LOG_FIELD_DRIVER_EXCEPTION_TYPE] = type(driver_error).__name__
+        # psycopg 3 exposes `sqlstate`; the attribute is read defensively because `orig` is
+        # whatever the configured driver raised, and a driver that does not publish one simply
+        # contributes no field.
+        sqlstate = getattr(driver_error, "sqlstate", None)
+        if isinstance(sqlstate, str) and _SQLSTATE_PATTERN.match(sqlstate):
+            fields[_LOG_FIELD_SQLSTATE] = sqlstate
+
+    return fields
 
 
 # ---------------------------------------------------------------------------------------
@@ -271,21 +403,20 @@ these two paths must not have."""
 
 
 # One entry, declared as a constant so the annotation is explicit rather than inferred from a
-# literal nested in a decorator argument. `model` is what puts the 503 body into the generated
-# document: without it the failure mode is undocumented and a client generator emits no type
-# for it, which is precisely the gap the "every route declares its shapes" standard closes.
-_READINESS_FAILURE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_503_SERVICE_UNAVAILABLE: {
-        "model": ProblemDetail,
-        "description": (
-            "The database could not be reached, so this instance is not ready to serve "
-            "traffic. The body is the same problem document every other failure in this API "
-            "returns, with `type` set to `/errors/service-unavailable`. An orchestrator "
-            "should stop routing to this instance and keep polling; it should not restart it "
-            "on this signal alone, because the process itself is healthy - `/healthz` "
-            "continues to answer 200 throughout."
-        ),
-    }
+# literal nested in a decorator argument, and built by `app.api.v1.responses.problem_response`
+# - the single place in the API tier that names the problem document as a response model and
+# the single place its published media type is decided. Without a model the failure mode is
+# undocumented and a client generator emits no type for it, which is precisely the gap the
+# "every route declares its shapes" standard closes.
+_READINESS_FAILURE_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_503_SERVICE_UNAVAILABLE: problem_response(
+        "The database could not be reached, so this instance is not ready to serve "
+        "traffic. The body is the same problem document every other failure in this API "
+        "returns, served as `application/problem+json` with `type` set to "
+        "`/errors/service-unavailable`. An orchestrator should stop routing to this instance "
+        "and keep polling; it should not restart it on this signal alone, because the process "
+        "itself is healthy - `/healthz` continues to answer 200 throughout."
+    )
 }
 
 
@@ -377,7 +508,9 @@ async def readiness(db: DbSession) -> ReadinessResponse:
         _DatabaseUnavailableError: When the statement did not complete, for any reason. The
             registered ``AppError`` handler renders it as a 503 problem document carrying a
             fixed detail - the caught exception's own message names the host, the port, the
-            database and the user, and never reaches the response.
+            database and the user, and never reaches the response. One classified failure record
+            is written first; see "Exactly one line is logged here" in the module docstring for
+            what it carries and what it deliberately omits.
     """
     try:
         # The result is deliberately unused: a completed round trip is the whole assertion,
@@ -386,6 +519,16 @@ async def readiness(db: DbSession) -> ReadinessResponse:
         # and this route has no unit of work to close.
         await db.execute(select(1))
     except Exception as exc:
+        # ONE record, immediately before the raise, and this is the only place the cause can be
+        # described at all: the domain error below is rendered by the registered `AppError`
+        # handler, which reports a status and a fixed detail and never sees this exception, so
+        # after this line the reason is gone from the process. `logger.error` rather than
+        # `logger.exception` on purpose - no frames and no driver text, only the classified
+        # fields `_readiness_failure_fields` derives - and the logger is obtained here rather
+        # than at module scope because one built during import would memoise structlog's
+        # unconfigured defaults, `configure_logging` running in the application lifespan after
+        # every import has completed.
+        get_logger(__name__).error(_READINESS_FAILURE_EVENT, **_readiness_failure_fields(exc))
         # Chained rather than swallowed, so the cause is preserved on the traceback for
         # anything that inspects it, while the rendered document carries only the fixed
         # detail. `from exc` is also what keeps this raise honest about its origin.

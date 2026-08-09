@@ -356,6 +356,31 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # ---------------------------------------------------------------------------------
     __table_args__ = (
         Index(
+            # The administrative user table's DEFAULT ordering, and the only access path it has.
+            # `app.repositories.user_repository.list_users` windows the relation with
+            # `ORDER BY created_at DESC, id DESC` - newest accounts first, with the primary key
+            # as the deterministic tiebreaker that keeps page two disjoint from page one - and
+            # neither column was indexed. Without this index every page of that table sorts the
+            # whole `users` relation before applying LIMIT, so the cost of reading page one grows
+            # with the number of accounts ever registered rather than with the page size.
+            #
+            # Both columns are declared DESC so the index's own order matches the query's
+            # exactly; a b-tree can be walked backwards, but stating the direction is what lets
+            # the planner satisfy the ORDER BY with a plain forward scan and no sort node at all.
+            #
+            # `text()` is the string-safe spelling for a directional expression inside
+            # __table_args__: `created_at.desc()` is unavailable here because the mixin's column
+            # object is not in scope at class-body evaluation time. `id` is spelled the same way
+            # for consistency with it.
+            #
+            # The name is spelled out rather than left to the `ix_%(column_0_label)s` convention,
+            # which would derive `ix_users_created_at` - a name describing only the first of two
+            # columns. Built by revision 0004.
+            "ix_users_created_at_id",
+            text("created_at DESC"),
+            text("id DESC"),
+        ),
+        Index(
             "ix_users_username_trgm",
             literal_column("(username::text)").label("username_text"),
             postgresql_using="gin",

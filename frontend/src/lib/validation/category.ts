@@ -71,6 +71,8 @@
 
 import { z } from 'zod';
 
+import { codePointLength } from '@/lib/text';
+
 import type { CategoryCreate, CategoryUpdate } from '@/lib/types';
 
 /**
@@ -121,6 +123,26 @@ const DESCRIPTION_MAX_LENGTH = 500;
 type AssertAssignableTo<TActual extends TContract, TContract> = TActual;
 
 /**
+ * Why every bound in this file is applied through a refinement rather than through zod's `.max()`.
+ *
+ * `.min()`/`.max()` on a string read `String.prototype.length`, which counts UTF-16 **code units**.
+ * The service's constraints are Python `len()`, which counts **code points**. The two agree for ASCII
+ * and disagree for every character above `U+FFFF` - an emoji, a historic script, a rare ideograph -
+ * which each count as two units and one code point.
+ *
+ * That divergence breaks the mirror in the direction that matters most here: a ceiling written in code
+ * units rejects text the service would have accepted, at exactly half the length for astral text. A
+ * reader who writes in one of those scripts is told their perfectly valid comment, title or category
+ * name is too long, by a check whose only job was to save them a round trip. `@/lib/validation/auth`
+ * already measured this way for its own bounds and recorded two observed cases against the running
+ * service; `@/lib/text#codePointLength` is now that measurement, shared by all four validators and by
+ * `@/lib/seo`'s truncation, so one notion of length governs the tier.
+ *
+ * `abort: true` matches the convention in this tier: once a length has failed, later checks on the
+ * same field are not run, so one mistake produces one sentence.
+ */
+
+/**
  * A category's display label, validated as both request bodies accept it.
  *
  * Declared once and shared, so the create and update schemas cannot drift — the same reason
@@ -133,6 +155,13 @@ type AssertAssignableTo<TActual extends TContract, TContract> = TActual;
  * over-length name is measured after trimming, and `'   '` reaches `.min(1)` as `''` and is
  * rejected rather than being stored as a name that renders as a blank filter chip.
  *
+ * The ceiling is measured with `codePointLength` from `@/lib/text` inside a `.refine()` rather than
+ * with zod's `.max()`, because `.max()` reads `String.prototype.length` - UTF-16 code units - while
+ * the service's `max_length=80` counts Python code points. Without it an eighty-character name
+ * written in emoji or an astral script measures 160 here and is refused locally at half the bound
+ * the API would have accepted. The floor stays `.min(1)`: for a bound of one the two units cannot
+ * disagree, since a string has a code point exactly when it has a code unit.
+ *
  * The single message on `z.string()` covers three failures that are one mistake to a reader — the
  * field is missing, is explicitly `null`, or is not a string — which is what makes it correct for
  * both schemas: on a create the field is required, and on an update an explicit `null` is refused
@@ -141,9 +170,12 @@ type AssertAssignableTo<TActual extends TContract, TContract> = TActual;
 const categoryNameField = z
   .string({ error: 'Enter a category name.' })
   .trim()
+  // `.min(1)` stays a length check because "empty" is the same value in either unit; only the ceiling
+  // has to be measured the way the service measures it. See the note above.
   .min(1, { error: 'Enter a category name. A name of only spaces is not accepted.' })
-  .max(NAME_MAX_LENGTH, {
+  .refine((value) => codePointLength(value) <= NAME_MAX_LENGTH, {
     error: `Shorten the category name to ${NAME_MAX_LENGTH} characters or fewer.`,
+    abort: true,
   });
 
 /**
@@ -164,9 +196,12 @@ const categoryNameField = z
  * one: its blank-folding runs first too, so the bound is unreachable there as well. Adding one
  * here would reject the cleared textarea the API accepts.
  *
- * `.max()` sits before the transform, and the two orderings agree: `.trim()` has already collapsed
- * a whitespace-only value of any length to `''`, so a submission of six hundred spaces is folded
- * to `null` on both sides rather than being rejected on one of them.
+ * The ceiling check sits before the transform, and the two orderings agree: `.trim()` has already
+ * collapsed a whitespace-only value of any length to `''`, so a submission of six hundred spaces is
+ * folded to `null` on both sides rather than being rejected on one of them. It is a `.refine()` over
+ * `codePointLength` rather than zod's `.max()` for the reason {@link categoryNameField} gives: the
+ * service's `max_length=500` counts code points, and `.max()` would count UTF-16 code units and
+ * refuse prose the API accepts.
  *
  * `.nullish()` accepts an explicit `null` and an omitted field, and short-circuits on `null` so
  * the string checks never see it. On a create, absence means the category has no description; on
@@ -175,8 +210,9 @@ const categoryNameField = z
 const categoryDescriptionField = z
   .string({ error: 'Write the category description as text.' })
   .trim()
-  .max(DESCRIPTION_MAX_LENGTH, {
+  .refine((value) => codePointLength(value) <= DESCRIPTION_MAX_LENGTH, {
     error: `Shorten the category description to ${DESCRIPTION_MAX_LENGTH} characters or fewer.`,
+    abort: true,
   })
   .transform((value) => (value.length === 0 ? null : value))
   .nullish();

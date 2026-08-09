@@ -27,6 +27,33 @@ Consumers, all of them one layer up:
 * ``app.core.dependencies`` - ``get_current_user`` decodes the bearer credential.
 * ``app.db.seed`` - hashes ``settings.SEED_ADMIN_PASSWORD`` for the seeded administrator.
 
+Two forms of every argon2 primitive, and services must use the awaitable one
+----------------------------------------------------------------------------
+argon2id is deliberately expensive: the hasher is configured for ``time_cost=3`` and
+``memory_cost=65536`` KiB, so one hash or one verification spends tens of milliseconds of CPU.
+Called directly from a coroutine that would stop the event loop of its worker for that whole
+time, and with it every other request the worker is serving.
+
+So each of the three primitives on the login path exists twice - :func:`hash_password` and
+:func:`hash_password_async`, :func:`verify_password` and :func:`verify_password_async`,
+:func:`dummy_password_hash` and :func:`dummy_password_hash_async`. The pairs are not
+alternatives:
+
+* The **synchronous** function is the primitive. It is what the work actually is, it is
+  directly unit-testable and doctestable, and it is what a caller with no other work on its
+  event loop calls - ``app.db.seed``, a one-shot script whose loop serves no requests and whose
+  hashes are sequential by nature, and the test factories. Offloading there would add a thread
+  hop and a token acquisition to buy responsiveness nothing is waiting for.
+* The **awaitable** function is the only form a request path may use. It runs the primitive on
+  a bounded worker thread through ``app.core.concurrency.run_cpu_bound``, so the loop keeps
+  serving while the CPU work happens elsewhere, and the bound stops a flood of sign-ins from
+  becoming a flood of threads.
+
+``app.services.auth_service`` therefore awaits all three. :func:`verify_and_update_password`
+has no awaitable form, because nothing calls it - ``authenticate`` documents why it declines
+the re-hash-on-login upgrade - and adding a caller in a request path means adding that form
+rather than calling this one from a coroutine.
+
 Two hashes, two algorithms, on purpose
 --------------------------------------
 Passwords and refresh tokens are both "secrets we store a hash of", and they are hashed with
@@ -104,6 +131,7 @@ from pwdlib import PasswordHash
 from pwdlib.exceptions import UnknownHashError
 from pwdlib.hashers.argon2 import Argon2Hasher
 
+from app.core.concurrency import run_cpu_bound
 from app.core.config import settings
 from app.core.exceptions import InvalidTokenError, TokenExpiredError
 
@@ -115,12 +143,15 @@ __all__ = [
     "create_access_token",
     "decode_access_token",
     "dummy_password_hash",
+    "dummy_password_hash_async",
     "generate_refresh_token",
     "hash_password",
+    "hash_password_async",
     "hash_refresh_token",
     "refresh_token_expires_at",
     "verify_and_update_password",
     "verify_password",
+    "verify_password_async",
     "verify_refresh_token",
 ]
 
@@ -513,6 +544,86 @@ def dummy_password_hash() -> str:
     # use. The generated value is consumed immediately and never bound to a name that
     # outlives this call.
     return _PASSWORD_HASHER.hash(secrets.token_urlsafe())
+
+
+# ---------------------------------------------------------------------------------------
+# Passwords, off the event loop
+#
+# The three primitives above, each wrapped in the bounded offload that a request path must
+# use. Thin on purpose: no rule, no branch and no error translation lives here that is not
+# already in the function being wrapped, so the awaitable form and the synchronous form
+# cannot come to disagree about what they do. `app.core.concurrency` records why the offload
+# is bounded and what may not be sent through it.
+# ---------------------------------------------------------------------------------------
+
+
+async def hash_password_async(password: str) -> str:
+    """Hash a plaintext password with argon2id, off the event loop.
+
+    The form ``app.services.auth_service.register`` uses. Identical in result to
+    :func:`hash_password` - it *is* that function, executed on a bounded worker thread - so the
+    stored hash, the inline cost parameters and the freshly generated salt are all exactly as
+    that function documents them.
+
+    Args:
+        password: The plaintext password. Handed to the worker thread as a value and not
+            retained afterwards; the thread computes a hash and returns a string, so nothing
+            about the credential outlives the call.
+
+    Returns:
+        The encoded argon2id hash, beginning ``$argon2id$``. Safe to store; never log it.
+
+    Note:
+        The awaited call is the only thing between the plaintext arriving and the hash being
+        produced, so registration still holds the password for exactly one call - the thread hop
+        does not widen that window, it only moves where the cost is paid.
+    """
+    return await run_cpu_bound(hash_password, password)
+
+
+async def verify_password_async(password: str, password_hash: str) -> bool:
+    """Check a candidate password against a stored argon2id hash, off the event loop.
+
+    The form ``app.services.auth_service.authenticate`` uses. :func:`verify_password` runs whole
+    inside the worker thread, so its ``UnknownHashError`` handling happens there too and a
+    corrupt stored value still presents as a failed verification rather than as an exception
+    crossing the thread boundary.
+
+    Args:
+        password: The plaintext password presented by the caller.
+        password_hash: The stored hash to verify against. May equally be the value
+            :func:`dummy_password_hash_async` returns, which is how the unknown-account path
+            pays the same cost as a real one.
+
+    Returns:
+        ``True`` only if the password matches the hash. ``False`` for a wrong password and for
+        any hash this module cannot interpret.
+
+    Note:
+        The timing property this function exists to preserve is unaffected by the offload,
+        because the offload is on **both** paths: a known account and an unknown one each pay one
+        token acquisition plus one argon2 verification. What would break it is offloading only
+        one of them, or letting a token shortage on one path be answered from a cache on the
+        other - neither of which can happen, because both paths reach the same limiter through
+        the same function.
+    """
+    return await run_cpu_bound(verify_password, password, password_hash)
+
+
+async def dummy_password_hash_async() -> str:
+    """Return the cached argon2id hash of a random, unknowable password, off the event loop.
+
+    The form ``app.services.auth_service.authenticate`` uses for the unknown-account path.
+    :func:`dummy_password_hash` is cached, so the argon2 cost is paid inside a worker thread on
+    the first unknown-email attempt this process sees and every later one returns the cached
+    string; the thread hop remains on every call, which keeps the two paths' shapes identical.
+
+    Returns:
+        An argon2id hash that no caller-supplied password can match. The same value for the life
+        of the process, which is what makes two consecutive unknown-email attempts
+        indistinguishable from each other as well as from a real one.
+    """
+    return await run_cpu_bound(dummy_password_hash)
 
 
 # ---------------------------------------------------------------------------------------

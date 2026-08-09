@@ -93,6 +93,8 @@
 
 import type { Metadata } from 'next';
 
+import { encodePathSegment } from '@/lib/paths';
+import { codePointLength, sliceByCodePoints } from '@/lib/text';
 import type {
   CategoryPublic,
   CategorySummary,
@@ -337,7 +339,7 @@ function toRootRelative(path: string): string {
 }
 
 /**
- * Encode a single path segment, rejecting an empty one.
+ * Encode a single path segment, rejecting the values that cannot be one.
  *
  * Slugs and usernames are URL-safe by construction - the service derives slugs through its slug
  * deriver and constrains usernames on registration - so encoding is a no-op for every legitimate
@@ -345,22 +347,29 @@ function toRootRelative(path: string): string {
  * segment containing a slash or a question mark would silently restructure the canonical URL into a
  * different route, and a canonical link is precisely the wrong place to discover that.
  *
- * An empty segment is a caller defect rather than a value to encode - `/blog/` is a different route
- * from `/blog/{slug}` and would be published as the canonical URL of a post that has none - so it
- * throws instead of degrading.
+ * Three refusals, applied by `@/lib/paths` so this module and the seven request-path composers under
+ * `@/lib/api` share one rule rather than seven approximations of it:
+ *
+ * - An empty segment is a caller defect rather than a value to encode - `/blog/` is a different route
+ *   from `/blog/{slug}` and would be published as the canonical URL of a post that has none.
+ * - `.` and `..` are refused even though they need no escaping, which is exactly the problem:
+ *   `encodeURIComponent` returns them unchanged and the URL grammar then resolves them, so a slug of
+ *   `..` publishes `/blog/..` - normalising to `/` - as a post's canonical URL. A crawler would take
+ *   that at its word and record the home page as the address of every such post.
+ * - The padding on a value is discarded here rather than sent, which is the one place in the tier
+ *   where `'trim'` is the right policy. A request path is a lookup, so `@/lib/api/*` sends a padded
+ *   value verbatim and lets the service answer 404; a canonical URL is *published output*, and
+ *   `/blog/%20my-post` is a URL a reader could copy and a crawler will index.
  */
 function encodeSegment(value: string, label: string): string {
-  const segment = value.trim();
-
-  if (segment.length === 0) {
-    throw new Error(
-      `Cannot build a canonical path from an empty ${label}. The service generates one for every ` +
-        `record and constrains it UNIQUE, so a blank value means the record was not the one the ` +
-        `caller believed it had.`,
-    );
-  }
-
-  return encodeURIComponent(segment);
+  return encodePathSegment(value, {
+    operation: 'buildCanonicalPath',
+    parameterName: label,
+    whitespace: 'trim',
+    hint:
+      'The service generates one for every record and constrains it UNIQUE, so a blank or ' +
+      'relative value means the record was not the one the caller believed it had.',
+  });
 }
 
 /**
@@ -589,18 +598,39 @@ const ELLIPSIS = '\u2026';
  * instead, which keeps a truncated but informative string rather than a tidy but empty one.
  *
  * The returned string is always at most `limit` characters, ellipsis included.
+ *
+ * **Every measurement and every cut here is in code points, never in UTF-16 code units**, which is
+ * what `String.prototype.length` and `String.prototype.slice` work in. The difference is invisible
+ * for ASCII and produces broken published output the moment it is not: an emoji or a historic script
+ * character occupies two code units, so a code-unit cut can land *between* its halves and leave the
+ * string ending in an unpaired surrogate. That string is not well-formed UTF-8 when serialised, and
+ * this is metadata - it goes into a `<meta name="description">`, an OpenGraph tag and a social card,
+ * where a reader and a crawler both see the replacement character. Code points are also the unit the
+ * service counts in, so a limit expressed here means the same thing it means there.
  */
 function clip(value: string, limit: number): string {
   const text = collapseWhitespace(value);
 
-  if (text.length <= limit) {
+  if (codePointLength(text) <= limit) {
     return text;
   }
 
-  const room = limit - ELLIPSIS.length;
-  const clipped = text.slice(0, room);
+  // `ELLIPSIS` is one code point (U+2026), measured rather than assumed so the arithmetic stays
+  // right if the character ever changes.
+  const room = limit - codePointLength(ELLIPSIS);
+  const clipped = sliceByCodePoints(text, room);
+
+  // A space is a BMP character, so an index found in `clipped` is already on a code-point boundary
+  // and slicing there cannot split a pair. The "keeps most of the room" test measures the candidate
+  // in code points too, so both sides of the comparison are in the same unit as `room` - a UTF-16
+  // index would overstate the length of any text containing an astral character and would honour a
+  // word boundary the rule is meant to reject.
   const lastSpace = clipped.lastIndexOf(' ');
-  const body = lastSpace >= Math.floor(room / 2) ? clipped.slice(0, lastSpace) : clipped;
+  const atWordBoundary = clipped.slice(0, Math.max(lastSpace, 0));
+  const body =
+    lastSpace > 0 && codePointLength(atWordBoundary) >= Math.floor(room / 2)
+      ? atWordBoundary
+      : clipped;
 
   return `${body.replace(/[\s.,;:!?-]+$/, '')}${ELLIPSIS}`;
 }

@@ -2,7 +2,7 @@
  * Typed wrapper over the administrator-only `/admin` namespace.
  *
  * The transport half of the administrative dashboard - "manage users, posts, comments and
- * categories" - and the largest of the seven wrappers beside `@/lib/api/client` at thirteen
+ * categories" - and the largest of the seven wrappers beside `@/lib/api/client` at fourteen
  * operations. Nothing here renders; the screens under `src/app/(admin)/` and the components under
  * `src/components/admin/` do that, and they reach the service only through the functions below.
  *
@@ -61,7 +61,7 @@
  * `require_admin` is applied **once**, as a router-level dependency on the administrative include -
  * one `dependencies=[Depends(require_admin)]` for the whole namespace - precisely so that no
  * individual route can omit the gate. Authority is therefore already established before any handler
- * runs, on every one of these thirteen endpoints, without exception.
+ * runs, on every one of these fourteen endpoints, without exception.
  *
  * So this module inspects no privilege, decodes no token, reads no backend configuration and throws
  * nothing early. `src/middleware.ts` keeps an unauthenticated visitor out of `/admin/*` and the
@@ -78,18 +78,19 @@
  *
  * ## Naming: every export is prefixed `Admin`
  *
- * Deliberate, and not merely for tidiness. Three of these operations have a same-named counterpart
+ * Deliberate, and not merely for tidiness. Four of these operations have a same-named counterpart
  * elsewhere in this folder that does something materially different, and the pairs are easy to
  * confuse precisely because they read alike:
  *
- * | This module                    | Elsewhere                | The difference that matters                     |
- * | ------------------------------ | ------------------------ | ----------------------------------------------- |
- * | {@link updateAdminPostStatus}  | `posts.ts` `updatePost`  | Forces a lifecycle state vs. edits own content  |
- * | {@link deleteAdminPost}        | `posts.ts` `deletePost`  | Any post vs. only the caller's own              |
- * | {@link listAdminPosts}         | `posts.ts` `listPosts`   | Every state vs. published only                  |
+ * | This module                    | Elsewhere                       | The difference that matters                    |
+ * | ------------------------------ | ------------------------------- | ---------------------------------------------- |
+ * | {@link updateAdminPostStatus}  | `posts.ts` `updatePost`         | Forces a lifecycle state vs. edits own content |
+ * | {@link deleteAdminPost}        | `posts.ts` `deletePost`         | Any post vs. only the caller's own             |
+ * | {@link listAdminPosts}         | `posts.ts` `listPosts`          | Every state vs. published only                 |
+ * | {@link listAdminCategories}    | `categories.ts` `listCategories`| Accepts a search term vs. the window alone     |
  *
  * A bare `updatePost` is therefore **not** exported here, and neither is a bare `listPosts` or
- * `deletePost`. A screen that imports from both wrappers gets thirteen unambiguous names and needs
+ * `deletePost`. A screen that imports from both wrappers gets fourteen unambiguous names and needs
  * no aliasing to disambiguate them. Named exports only; this folder has no barrel, so consumers
  * import `@/lib/api/admin` directly.
  *
@@ -118,6 +119,16 @@ import {
   type QueryParams,
   type RequestOptions,
 } from '@/lib/api/client';
+import { encodePathSegment } from '@/lib/paths';
+import {
+  adminCommentSchema,
+  adminPostSchema,
+  adminStatsSchema,
+  adminUserSchema,
+  categoryPublicSchema,
+  pageOf,
+} from '@/lib/types';
+import { MAX_SEARCH_TERM_LENGTH } from '@/lib/types';
 import type {
   AdminComment,
   AdminCommentStatusUpdate,
@@ -160,7 +171,10 @@ const ADMIN_POSTS_PATH = '/admin/posts';
 /** Comment collection - the moderation queue. Also the base of the per-comment paths. */
 const ADMIN_COMMENTS_PATH = '/admin/comments';
 
-/** Category collection. The only place in the API where the taxonomy can be mutated. */
+/**
+ * Category collection: the searchable management listing, and the only place in the API where the
+ * taxonomy can be mutated.
+ */
 const ADMIN_CATEGORIES_PATH = '/admin/categories';
 
 /* -------------------------------------------------------------------------------------------------
@@ -187,45 +201,53 @@ const ADMIN_CATEGORIES_PATH = '/admin/categories';
  * segment or a query delimiter into the path, which would turn a lookup failure into a request
  * against a different endpoint entirely.
  */
-function pathSegment(identifier: string): string {
-  return encodeURIComponent(identifier);
+function pathSegment(identifier: string, operation: string, parameterName: string): string {
+  // Through the tier's ONE encoder. Percent-encoding alone is not enough: `.` and `..` are
+  // already URL-safe, so `encodeURIComponent` returns them unchanged and the URL grammar then
+  // resolves `/admin/users/../../auth/me` against the surrounding path - a successful request
+  // against a route this wrapper never named, carrying an administrator's bearer.
+  return encodePathSegment(identifier, {
+    operation,
+    parameterName,
+    hint: 'Pass the UUID the administrative listing returned for the row.',
+  });
 }
 
 /** `/admin/users/{id}` - the account itself, for the role and activity update and for removal. */
-function adminUserPath(userId: string): string {
-  return `${ADMIN_USERS_PATH}/${pathSegment(userId)}`;
+function adminUserPath(userId: string, operation: string): string {
+  return `${ADMIN_USERS_PATH}/${pathSegment(userId, operation, 'userId')}`;
 }
 
 /** `/admin/posts/{id}` - the post itself, for removal. */
-function adminPostPath(postId: string): string {
-  return `${ADMIN_POSTS_PATH}/${pathSegment(postId)}`;
+function adminPostPath(postId: string, operation: string): string {
+  return `${ADMIN_POSTS_PATH}/${pathSegment(postId, operation, 'postId')}`;
 }
 
 /** `/admin/posts/{id}/status` - the lifecycle sub-resource, and **not** the post itself. */
-function adminPostStatusPath(postId: string): string {
-  return `${adminPostPath(postId)}/status`;
+function adminPostStatusPath(postId: string, operation: string): string {
+  return `${adminPostPath(postId, operation)}/status`;
 }
 
 /** `/admin/comments/{id}` - the comment itself, for removal. */
-function adminCommentPath(commentId: string): string {
-  return `${ADMIN_COMMENTS_PATH}/${pathSegment(commentId)}`;
+function adminCommentPath(commentId: string, operation: string): string {
+  return `${ADMIN_COMMENTS_PATH}/${pathSegment(commentId, operation, 'commentId')}`;
 }
 
 /** `/admin/comments/{id}/status` - the moderation sub-resource, and **not** the comment itself. */
-function adminCommentStatusPath(commentId: string): string {
-  return `${adminCommentPath(commentId)}/status`;
+function adminCommentStatusPath(commentId: string, operation: string): string {
+  return `${adminCommentPath(commentId, operation)}/status`;
 }
 
 /** `/admin/categories/{id}` - the category itself, for update and removal. */
-function adminCategoryPath(categoryId: string): string {
-  return `${ADMIN_CATEGORIES_PATH}/${pathSegment(categoryId)}`;
+function adminCategoryPath(categoryId: string, operation: string): string {
+  return `${ADMIN_CATEGORIES_PATH}/${pathSegment(categoryId, operation, 'categoryId')}`;
 }
 
 /* -------------------------------------------------------------------------------------------------
  * Listing parameters
  *
  * `@/lib/types` mirrors the service's request and response *bodies*; query parameters are not
- * bodies, so the three filter shapes are declared here, beside the operations that send them,
+ * bodies, so the four filter shapes are declared here, beside the operations that send them,
  * rather than imported from somewhere they are not.
  *
  * Every member is optional and every name is the wire name. Values left unset are omitted from the
@@ -244,7 +266,7 @@ function adminCategoryPath(categoryId: string): string {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The page window shared by all three administrative listings.
+ * The page window shared by all four administrative listings.
  *
  * Both members are validated server-side and **not** adjusted: `page` must be at least 1 with no
  * upper bound, `page_size` must be between 1 and 100, and an out-of-range value is answered with a
@@ -311,6 +333,22 @@ export interface AdminCommentListParams extends AdminPageParams {
 }
 
 /**
+ * Query parameters of {@link listAdminCategories}.
+ *
+ * One filter beyond the window, and that single term is the whole difference between this listing and
+ * the public one in `@/lib/api/categories.ts`: searching a controlled vocabulary is a management
+ * affordance, so the term lives here rather than on the read every home-feed render performs. What
+ * the two return is identical, down to the meaning of `post_count`.
+ */
+export interface AdminCategoryListParams extends AdminPageParams {
+  /**
+   * Free-text term matched case-insensitively against **both** the name and the slug, so a term is
+   * findable by either spelling. A blank or whitespace-only value is treated as no filter.
+   */
+  q?: string;
+}
+
+/**
  * Merge a listing's typed filters into the caller's per-request options.
  *
  * The typed parameter object is the only supported way to filter a listing, so a `query` supplied
@@ -356,7 +394,7 @@ function listRequestOptions(
  * receives, which surfaces rather than resolving to zeroed counts.
  */
 export function getAdminStats(options?: RequestOptions): Promise<AdminStats> {
-  return apiGet<AdminStats>(ADMIN_STATS_PATH, options);
+  return apiGet(ADMIN_STATS_PATH, adminStatsSchema, options);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -368,6 +406,33 @@ export function getAdminStats(options?: RequestOptions): Promise<AdminStats> {
  * even to an administrator, because a screen that can display a credential is a screen that can
  * leak one.
  * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Refuse a search term longer than the service accepts, before a request is spent on it.
+ *
+ * Mirrors the service's own bound rather than restating its policy: the number is
+ * {@link MAX_SEARCH_TERM_LENGTH}, imported from the contract types, and the service publishes it as
+ * `maxLength` on all four `q` parameters. Absence and a blank term are left alone - the client
+ * module's query builder drops them and the service treats a whitespace-only term as no filter - so
+ * this checks exactly one thing, for all four administrative listings.
+ *
+ * Thrown rather than truncated, and thrown rather than sent, because the service refuses an
+ * over-long term with the uniform problem document: shortening it would answer a question the
+ * administrator did not ask, and sending it would spend a round trip to be told so.
+ *
+ * @param term - The caller's `q`, or `undefined`/`null` when no term was supplied.
+ * @param caller - The exported function's name, so the message names the call the author wrote.
+ * @throws {RangeError} When the term is longer than {@link MAX_SEARCH_TERM_LENGTH} characters.
+ */
+function assertSearchTermLength(term: string | null | undefined, caller: string): void {
+  if (term !== undefined && term !== null && term.length > MAX_SEARCH_TERM_LENGTH) {
+    throw new RangeError(
+      `${caller}: q must be at most ${String(MAX_SEARCH_TERM_LENGTH)} characters, received ` +
+        `${String(term.length)}. The service refuses a longer term with 422 rather than ` +
+        `truncating it, so cap the search input at that length instead of sending it.`,
+    );
+  }
+}
 
 /**
  * List accounts for the user management table.
@@ -385,6 +450,8 @@ export function listAdminUsers(
   params: AdminUserListParams = {},
   options?: RequestOptions,
 ): Promise<Page<AdminUser>> {
+  assertSearchTermLength(params.q, 'listAdminUsers');
+
   const query: QueryParams = {
     page: params.page,
     page_size: params.page_size,
@@ -392,7 +459,7 @@ export function listAdminUsers(
     role: params.role,
     is_active: params.is_active,
   };
-  return apiGet<Page<AdminUser>>(ADMIN_USERS_PATH, listRequestOptions(query, options));
+  return apiGet(ADMIN_USERS_PATH, pageOf(adminUserSchema), listRequestOptions(query, options));
 }
 
 /**
@@ -422,7 +489,7 @@ export function updateAdminUser(
   payload: AdminUserUpdate,
   options?: RequestOptions,
 ): Promise<AdminUser> {
-  return apiPatch<AdminUser>(adminUserPath(userId), payload, options);
+  return apiPatch(adminUserPath(userId, 'updateAdminUser'), adminUserSchema, payload, options);
 }
 
 /**
@@ -440,9 +507,8 @@ export function updateAdminUser(
  * @throws The client's normalised error.
  */
 export function deleteAdminUser(userId: string, options?: RequestOptions): Promise<void> {
-  return apiDeleteNoContent(adminUserPath(userId), options);
+  return apiDeleteNoContent(adminUserPath(userId, 'deleteAdminUser'), options);
 }
-
 
 /* -------------------------------------------------------------------------------------------------
  * Posts
@@ -475,6 +541,8 @@ export function listAdminPosts(
   params: AdminPostListParams = {},
   options?: RequestOptions,
 ): Promise<Page<AdminPost>> {
+  assertSearchTermLength(params.q, 'listAdminPosts');
+
   const query: QueryParams = {
     page: params.page,
     page_size: params.page_size,
@@ -482,7 +550,7 @@ export function listAdminPosts(
     status: params.status,
     author_id: params.author_id,
   };
-  return apiGet<Page<AdminPost>>(ADMIN_POSTS_PATH, listRequestOptions(query, options));
+  return apiGet(ADMIN_POSTS_PATH, pageOf(adminPostSchema), listRequestOptions(query, options));
 }
 
 /**
@@ -517,7 +585,12 @@ export function updateAdminPostStatus(
   payload: AdminPostStatusUpdate,
   options?: RequestOptions,
 ): Promise<AdminPost> {
-  return apiPatch<AdminPost>(adminPostStatusPath(postId), payload, options);
+  return apiPatch(
+    adminPostStatusPath(postId, 'updateAdminPostStatus'),
+    adminPostSchema,
+    payload,
+    options,
+  );
 }
 
 /**
@@ -536,7 +609,7 @@ export function updateAdminPostStatus(
  * @throws The client's normalised error.
  */
 export function deleteAdminPost(postId: string, options?: RequestOptions): Promise<void> {
-  return apiDeleteNoContent(adminPostPath(postId), options);
+  return apiDeleteNoContent(adminPostPath(postId, 'deleteAdminPost'), options);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -566,6 +639,8 @@ export function listAdminComments(
   params: AdminCommentListParams = {},
   options?: RequestOptions,
 ): Promise<Page<AdminComment>> {
+  assertSearchTermLength(params.q, 'listAdminComments');
+
   const query: QueryParams = {
     page: params.page,
     page_size: params.page_size,
@@ -573,7 +648,11 @@ export function listAdminComments(
     q: params.q,
     post_id: params.post_id,
   };
-  return apiGet<Page<AdminComment>>(ADMIN_COMMENTS_PATH, listRequestOptions(query, options));
+  return apiGet(
+    ADMIN_COMMENTS_PATH,
+    pageOf(adminCommentSchema),
+    listRequestOptions(query, options),
+  );
 }
 
 /**
@@ -602,7 +681,12 @@ export function updateAdminCommentStatus(
   payload: AdminCommentStatusUpdate,
   options?: RequestOptions,
 ): Promise<AdminComment> {
-  return apiPatch<AdminComment>(adminCommentStatusPath(commentId), payload, options);
+  return apiPatch(
+    adminCommentStatusPath(commentId, 'updateAdminCommentStatus'),
+    adminCommentSchema,
+    payload,
+    options,
+  );
 }
 
 /**
@@ -621,17 +705,29 @@ export function updateAdminCommentStatus(
  * @throws The client's normalised error.
  */
 export function deleteAdminComment(commentId: string, options?: RequestOptions): Promise<void> {
-  return apiDeleteNoContent(adminCommentPath(commentId), options);
+  return apiDeleteNoContent(adminCommentPath(commentId, 'deleteAdminComment'), options);
 }
-
 
 /* -------------------------------------------------------------------------------------------------
  * Categories - the whole lifecycle lives here
  *
- * The taxonomy is administrative reference data, so these three functions are the *only* way it
- * changes. `src/lib/api/categories.ts` is read-only by design and the service's public category router
- * declares no mutation at all: an author files a post under existing terms rather than inventing
- * them, which is what keeps the taxonomy a controlled vocabulary instead of a free-text field.
+ * The taxonomy is administrative reference data, so the three mutating functions below are the *only*
+ * way it changes. `src/lib/api/categories.ts` is read-only by design and the service's public category
+ * router declares no mutation at all: an author files a post under existing terms rather than
+ * inventing them, which is what keeps the taxonomy a controlled vocabulary instead of a free-text
+ * field.
+ *
+ * The fourth function, {@link listAdminCategories}, is the management table those three act on. It
+ * exists beside the public listing rather than in place of it because it accepts a search term, and
+ * only because of that - both answer the identical page envelope of the identical item type, and both
+ * reach one service method behind the API, so the management table and the home page's filter control
+ * cannot disagree about what a category is. It reads a category rather than mutating one, and is
+ * grouped here so that the four operations over one resource are read together.
+ *
+ * There is no administrative *projection* of a category, and none is missing: a category has no owner,
+ * no address, no credential and no moderation state, so `CategoryPublic` already carries every member
+ * this screen shows. That is why this is the one family on the namespace whose listing does not return
+ * an `Admin`-prefixed type.
  *
  * Neither input accepts an identifier or a slug, and the request types make that structural rather
  * than merely conventional. Identity is generated by the database. The slug is derived from the name
@@ -640,6 +736,46 @@ export function deleteAdminComment(commentId: string, options?: RequestOptions):
  * every published link and every crawled page pointing at it. A client-supplied slug could also
  * collide with an existing category. So neither field is sent, and there is no way to send one.
  * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * List categories for the category management table.
+ *
+ * `GET /admin/categories` &rarr; `200` with a {@link Page} of {@link CategoryPublic}.
+ *
+ * **The item type is the public one**, not an `Admin`-prefixed projection, and that is deliberate -
+ * see this section's header. A screen may therefore render a row from this listing with the same
+ * component that renders the home page's filter option.
+ *
+ * `q` is the one thing this adds over `listCategories` in `@/lib/api/categories.ts`. Everything else
+ * is the same: the same five envelope fields, the same item type, and a `post_count` that counts
+ * PUBLISHED posts on both, so a moderator reads the figure a reader would see. A term with nothing
+ * filed under it is present with a `post_count` of `0` rather than omitted, which is how the table
+ * shows an unused category - and how {@link deleteAdminCategory} becomes available for it, since that
+ * deletion is refused while any post is still filed.
+ *
+ * @param params - Window and search term. Omit entirely for the first page of the whole taxonomy.
+ * @param options - Per-request controls, forwarded untouched. A `query` here is superseded by
+ * `params` - see {@link listRequestOptions}.
+ * @returns One page of categories, its five envelope fields exactly as the service sent them.
+ * @throws The client's normalised error.
+ */
+export function listAdminCategories(
+  params: AdminCategoryListParams = {},
+  options?: RequestOptions,
+): Promise<Page<CategoryPublic>> {
+  assertSearchTermLength(params.q, 'listAdminCategories');
+
+  const query: QueryParams = {
+    page: params.page,
+    page_size: params.page_size,
+    q: params.q,
+  };
+  return apiGet(
+    ADMIN_CATEGORIES_PATH,
+    pageOf(categoryPublicSchema),
+    listRequestOptions(query, options),
+  );
+}
 
 /**
  * Create a category.
@@ -664,7 +800,7 @@ export function createAdminCategory(
   payload: CategoryCreate,
   options?: RequestOptions,
 ): Promise<CategoryPublic> {
-  return apiPost<CategoryPublic>(ADMIN_CATEGORIES_PATH, payload, options);
+  return apiPost(ADMIN_CATEGORIES_PATH, categoryPublicSchema, payload, options);
 }
 
 /**
@@ -694,7 +830,12 @@ export function updateAdminCategory(
   payload: CategoryUpdate,
   options?: RequestOptions,
 ): Promise<CategoryPublic> {
-  return apiPatch<CategoryPublic>(adminCategoryPath(categoryId), payload, options);
+  return apiPatch(
+    adminCategoryPath(categoryId, 'updateAdminCategory'),
+    categoryPublicSchema,
+    payload,
+    options,
+  );
 }
 
 /**
@@ -718,6 +859,5 @@ export function updateAdminCategory(
  * @throws The client's normalised error.
  */
 export function deleteAdminCategory(categoryId: string, options?: RequestOptions): Promise<void> {
-  return apiDeleteNoContent(adminCategoryPath(categoryId), options);
+  return apiDeleteNoContent(adminCategoryPath(categoryId, 'deleteAdminCategory'), options);
 }
-

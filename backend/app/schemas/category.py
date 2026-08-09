@@ -35,28 +35,28 @@ and declares no category shape of its own.
 
 No collection wrapper is declared here, and that is deliberate
 --------------------------------------------------------------
-Two collections are served over this taxonomy, and neither needs a wrapper declared here.
-``GET /api/v1/admin/categories`` returns the generic page envelope re-exported from
-``app.schemas.common``, parameterised at the route with :class:`CategoryPublic` as its item
-type. ``GET /api/v1/categories`` - the public read the home page's filter control is built from
-- returns a **bare JSON array** of :class:`CategoryPublic` instead, and is the single
-sanctioned exception to the envelope rule in this API: the taxonomy is administrator-curated
-and bounded, and a filter offering only some of its terms would silently hide every post filed
-exclusively under the rest, so the whole set is returned in one request.
+Two collections are served over this taxonomy and both answer with the **same** shape: the
+generic page envelope re-exported from ``app.schemas.common``, parameterised at the route with
+:class:`CategoryPublic` as its item type. ``GET /api/v1/categories`` is the public read the home
+page's filter control is built from, and ``GET /api/v1/admin/categories`` is the
+administrator-only management table, which additionally admits a ``q`` search term. Both reach
+one service method, ``CategoryService.list_paginated``, so a page of categories has one
+definition.
 
-``app.services.category_service.CategoryService`` publishes that split directly - a
-``list[CategoryPublic]`` from ``list_with_post_counts`` for the filter control, a windowed page
-from ``list_paginated`` for the administrative table - and ``app.api.v1.routers.categories``
-declares the array shape with a comment recording why it must not be normalised. Do not
-"correct" either surface to match the other; they answer different questions.
+The public collection used to return a **bare JSON array** as a sanctioned exception, on the
+grounds that a curated taxonomy is bounded and a partially-offered filter would silently hide
+posts. That reasoning did not survive the requirement it was weighed against: every list
+endpoint in this API returns ``items``, ``total``, ``page``, ``page_size`` and ``pages``, and
+that uniformity is an acceptance criterion rather than a convention, so one exception makes the
+guarantee false for every client. The filter control gets its complete list from
+``listAllCategories`` in ``frontend/src/lib/api/categories.ts``, which walks the pages - and
+``total`` and ``pages`` are what let it know when it has them all, which an array never did.
 
 So there is no ``CategoryList``, no ``CategoriesResponse``, and above all no
 ``{"message": ..., "data": ...}`` wrapper: ``app.schemas.common`` permits exactly three
 response shapes - a page envelope for a collection, a bare representation for a single read, a
-problem document for a failure - and forbids a fourth. An array of bare representations is the
-second of those three repeated, not a new envelope, which is why the public collection needs no
-declaration of its own either. Nor is there a delete-response model, because deleting a
-category answers ``204 No Content``, which has no body for one to describe.
+problem document for a failure - and forbids a fourth. Nor is there a delete-response model,
+because deleting a category answers ``204 No Content``, which has no body for one to describe.
 
 Neither input model accepts an identifier or a slug
 --------------------------------------------------
@@ -309,12 +309,12 @@ class CategorySummary(BaseModel):
 class CategoryPublic(CategorySummary):
     """A category as its own resource: the summary, plus the description, tally and age.
 
-    The declared ``response_model`` of ``GET /api/v1/categories/{slug}``, the element type of the
-    bare array ``GET /api/v1/categories`` returns, and the item type of the page
-    ``GET /api/v1/admin/categories`` returns. Paths are relative in the decorators below because
-    ``app.api.v1.router`` attaches the ``/categories`` prefix::
+    The declared ``response_model`` of ``GET /api/v1/categories/{slug}`` and the item type of both
+    paged collections over this taxonomy - the public ``GET /api/v1/categories`` and the
+    administrator-only ``GET /api/v1/admin/categories``. Paths are relative in the public
+    decorators below because ``app.api.v1.router`` attaches the ``/categories`` prefix::
 
-        @router.get("", response_model=list[CategoryPublic])
+        @router.get("", response_model=Page[CategoryPublic])
         @router.get("/{slug}", response_model=CategoryPublic)
 
     It inherits :class:`CategorySummary` rather than restating ``id``, ``name`` and ``slug``, so

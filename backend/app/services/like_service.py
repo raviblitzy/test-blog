@@ -329,8 +329,13 @@ class LikeService:
     # Writes
     #
     # Both are idempotent, and neither checks first. The composite primary key on
-    # `(post_id, user_id)` is what makes them so, which is why each is a single statement between
-    # a visibility gate and a commit.
+    # `(post_id, user_id)` is what makes them so, which is why each is a single write statement
+    # after a visibility gate.
+    #
+    # Both follow the same four steps, in this order: gate the post, write, read the summary the
+    # response carries, commit. The commit is last on purpose - the write and the figure the caller
+    # is told about are then one atomic decision, and no failure can arrive after the row is
+    # durable. Each method's own Note records what reading after the commit cost.
     # -----------------------------------------------------------------------------------
 
     async def like(self, post_id: uuid.UUID, *, user: User) -> LikeSummary:
@@ -348,8 +353,8 @@ class LikeService:
                 client to name an account in.
 
         Returns:
-            The post's like count and ``liked_by_caller=True``, read after the commit so the values
-            are the ones the database holds. Answering with the summary rather than an
+            The post's like count and ``liked_by_caller=True``, read inside the same transaction as
+            the write and therefore consistent with it. Answering with the summary rather than an
             acknowledgement is what lets the client settle its optimistic update in one round trip.
 
         Raises:
@@ -377,18 +382,35 @@ class LikeService:
             indistinguishable in the data - and it is genuinely useful in a log, where it separates
             a new like from a resend without a second query. It decides nothing here.
 
+            **The summary is read before the commit, and the commit is the last database action.**
+            The write, the read that describes it and the transaction boundary are therefore one
+            atomic decision: either the like and the count the caller is told about both hold, or
+            neither does. Reading afterwards - which is what this method used to do - meant a
+            transient failure on the count returned an error for a like that had already been made
+            durable, with no transaction left to undo it and a client left holding an optimistic
+            state the server had in fact accepted. The read sees this transaction's own uncommitted
+            row, so the figure reported is the figure the commit makes durable.
+
             ``debug`` rather than ``info``, unlike the post lifecycle's transitions: a like is a
             high-frequency, low-consequence event, and one record per reader interaction at
-            ``info`` would bury the lines an operator actually reads. Logging follows the commit,
-            so a transaction that failed on the way out is never reported as a durable like, and
-            the logger is fetched inside the method because one created at import time can capture
-            *structlog*'s unconfigured defaults and keep them.
+            ``info`` would bury the lines an operator actually reads. Logging still follows the
+            commit, so a transaction that failed on the way out is never reported as a durable
+            like, and the logger is fetched inside the method because one created at import time
+            can capture *structlog*'s unconfigured defaults and keep them.
         """
         await self._load_visible_post(post_id, user)
 
         # One statement, no pre-check. The key decides whether this creates a row; `created` says
         # which happened, and is reported rather than branched on.
         created = await self._likes.like(post_id=post_id, user_id=user.id)
+
+        # The response is read and materialised BEFORE the commit, so the commit is the last
+        # database action this request takes. Reading afterwards was the defect: a transient failure
+        # on the count would have returned an error for a like that was already durable, leaving the
+        # client's optimistic state and the database's disagreeing with nothing left to roll back.
+        # The read sees this transaction's own uncommitted insert, so the count it reports is the
+        # count the commit makes durable a moment later.
+        summary = await self._summary(post_id, user_id=user.id)
         await self._session.commit()
 
         get_logger(__name__).debug(
@@ -396,8 +418,9 @@ class LikeService:
             post_id=str(post_id),
             user_id=str(user.id),
             created=created,
+            like_count=summary.like_count,
         )
-        return await self._summary(post_id, user_id=user.id)
+        return summary
 
     async def unlike(self, post_id: uuid.UUID, *, user: User) -> LikeSummary:
         """Withdraw an account's like of a post, treating a missing like as a no-op.
@@ -414,7 +437,8 @@ class LikeService:
                 structural here rather than a rule to enforce.
 
         Returns:
-            The post's like count and ``liked_by_caller=False``, read after the commit.
+            The post's like count and ``liked_by_caller=False``, read inside the same transaction as
+            the removal and therefore consistent with it.
 
         Raises:
             NotFoundError: No post carries that identifier, or it is an unpublished post this
@@ -442,6 +466,10 @@ class LikeService:
         await self._load_visible_post(post_id, user)
 
         removed = await self._likes.unlike(post_id=post_id, user_id=user.id)
+
+        # Materialised before the commit, exactly as in `like` and for the same reason: the commit
+        # is the last database action, so no failure can arrive after the removal is durable.
+        summary = await self._summary(post_id, user_id=user.id)
         await self._session.commit()
 
         get_logger(__name__).debug(
@@ -449,8 +477,9 @@ class LikeService:
             post_id=str(post_id),
             user_id=str(user.id),
             removed=removed,
+            like_count=summary.like_count,
         )
-        return await self._summary(post_id, user_id=user.id)
+        return summary
 
     # -----------------------------------------------------------------------------------
     # Read

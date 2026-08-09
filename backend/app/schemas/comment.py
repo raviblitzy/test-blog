@@ -96,14 +96,25 @@ depth cap is a rule about what may be *created*, and rules about creation live i
 ``app.services.comment_service``.
 
 What a *response* actually nests is a different question, and it is settled one layer down by the
-statement rather than here. ``comment_repository.list_for_post`` reads a thread with a recursive
-query over ``parent_id`` and nests the result **at every depth**, applying the caller's status
-filter to each level - so an unapproved reply cannot reach a public caller through an approved
-ancestor - and it populates the collection on every comment it returns, the deepest leaves included,
-with an empty list where there are no replies. A tree that arrives from that method is therefore
-complete and self-contained, and ``CommentPublic.model_validate(root)`` walks all of it::
+statement rather than here. Two repository methods populate a tree, and they share one recursive
+descent over ``parent_id`` and one status filter applied at **every depth** - so an unapproved reply
+cannot reach a public caller through an approved ancestor:
 
+``comment_repository.list_for_post``
+    A page of threads. It populates the collection on every comment it returns, the deepest leaves
+    included, with an empty list where there are no replies.
+``comment_repository.load_visible_replies``
+    One comment's subtree, for a mutating route that has to answer with a comment which may already
+    have replies beneath it. Same descent, same filter, same completeness.
+
+A tree that arrives from either is therefore complete and self-contained, and
+``CommentPublic.model_validate(root)`` walks all of it::
+
+    # From list_for_post: a page of threads.
     page = [CommentPublic.model_validate(root) for root in roots]
+
+    # From load_visible_replies: one comment and its subtree.
+    edited = CommentPublic.model_validate(comment)
 
 The obligation this module places on its caller is consequently narrow but absolute: **project only
 trees that came from a statement which populated them.** Reading an unloaded attribute under an
@@ -114,8 +125,8 @@ disguised: measured on this stack, an attribute that raises during ``model_valid
 *wrapped*, as a ``ValidationError`` of type ``get_attribute_error`` located at ``replies``, which
 FastAPI then reports as a response-validation failure rather than as the loading defect it is.
 
-That is why a comment obtained some other way - the row ``add()`` just created, or one fetched by
-``get_by_id`` for an edit - must not be validated through this class as though it carried a thread.
+That is why a comment obtained some other way - the row ``add()`` just created, whose ``replies``
+nothing has populated - must not be validated through this class as though it carried a thread.
 Give it an explicit projection, where ``replies`` is left out and falls back to its empty default
 instead of touching an unpopulated collection::
 
@@ -131,7 +142,10 @@ instead of touching an unpopulated collection::
             updated_at=comment.updated_at,
         )
 
-Which levels a response carries is then a property of the statement and of nothing here.
+Which levels a response carries is then a property of the statement and of nothing here. The
+distinction is per operation rather than per model: creation answers with the explicit projection,
+because a comment that has just been written genuinely has no replies, while an edit answers with
+the validated tree, because the comment it describes may have had replies for weeks.
 
 What a client may not send, and why each refusal is load-bearing
 ----------------------------------------------------------------
@@ -216,10 +230,11 @@ transition, no tree assembly, no status code and no error construction anywhere 
   validator would run on every *read* as well, so the stored value and the served value would
   become two different strings, and a schema is the wrong layer to decide which markup a product
   permits.
-* **No parent validation.** That ``parent_id`` names a comment that exists *and* hangs off the same
-  post is checked by ``app.services.comment_service`` through
-  ``CommentRepository.get_parent(parent_id, post_id=...)``. This module cannot know either fact -
-  it has no session, and the second is not a property of the submitted value at all.
+* **No parent validation.** That ``parent_id`` names a comment that exists, hangs off the same post
+  and is visible to *this* caller is checked by ``app.services.comment_service`` through
+  ``CommentRepository.get_parent(parent_id, post_id=...)`` and ``_visible_comment_statuses``. This
+  module cannot know any of the three - it has no session, the second is not a property of the
+  submitted value at all, and the third depends on who is asking.
 * **No ownership check.** "A non-owner cannot edit another's comment" lives in that same service,
   so one rule holds whichever entry point invokes it and is unit-testable without an HTTP request.
 * **No non-emptiness beyond the field.** A whitespace-only body is rejected by the bound on
@@ -367,13 +382,18 @@ class CommentCreate(BaseModel):
     It does not check that ``parent_id`` names a real comment, and it could not: that requires a
     session, which a schema module must not have. It does not check that the named comment hangs
     off the *same post* either, which is not a property of the submitted value at all - the value
-    is a well-formed identifier whichever post its row belongs to. Both are creation rules, and
-    ``app.services.comment_service`` enforces them through
-    ``CommentRepository.get_parent(parent_id, post_id=...)``, translating a miss into the domain
-    error that renders as ``422``, keyed to ``parent_id``, rather than letting a foreign key raise
-    it as a ``500``. ``app.core.exceptions.AppValidationError`` names this exact case as the rule it
-    exists for: the request addresses a post that does exist, and what is wrong is a member of the
-    submitted body, so the failure is reported against that member.
+    is a well-formed identifier whichever post its row belongs to. Nor does it check that the
+    named comment is one the **caller** may see, which is a property of neither the value nor the
+    post but of the principal: a pending comment is a legitimate parent for the post's own author
+    and for an administrator, and not for a reader who cannot see it. All three are creation
+    rules, and ``app.services.comment_service`` enforces them through
+    ``CommentRepository.get_parent(parent_id, post_id=...)`` and the same
+    ``_visible_comment_statuses`` predicate the thread listing uses, translating any of the three
+    into one indistinguishable domain error that renders as ``422``, keyed to ``parent_id``,
+    rather than letting a foreign key raise it as a ``500``.
+    ``app.core.exceptions.AppValidationError`` names this exact case as the rule it exists for:
+    the request addresses a post that does exist, and what is wrong is a member of the submitted
+    body, so the failure is reported against that member.
 
     Nor does it sanitise the body. Reader-authored text is cleaned on write by that same service
     and again at render by the client; a cleaner here would also run on every read.
@@ -410,11 +430,19 @@ class CommentCreate(BaseModel):
         description=(
             "Identifier of the comment this one replies to. Omit it - or send null - to post a "
             "top-level comment; that is the only difference between a comment and a reply. The "
-            "named comment must exist, must belong to the post in the path and must be a comment "
-            "you can see, all of which are checked server-side: a parent that is missing, that "
-            "hangs off another post, that is awaiting moderation or that already sits at the "
-            "maximum reply depth is reported as 422 against this field rather than accepted. The "
-            "post itself is NOT sent in the body; it comes from the path."
+            "named comment must exist, must belong to the post in the path, must be a comment "
+            "**you** can see, and must not already sit at the maximum reply depth. All four are "
+            "checked server-side and a failure is reported as 422 against this field rather than "
+            "accepted.\n\n"
+            "Visibility is the caller's own, not a fixed rule about moderation state: you may "
+            "reply to any comment the thread would show you. For a reader that means an approved "
+            "comment only - a pending one is invisible to them, so it is refused with the same "
+            "answer a missing identifier earns, and reporting it any differently would turn this "
+            "field into a way of discovering that a comment is awaiting moderation. For the "
+            "post's own author and for an administrator, who both see the whole thread, it means "
+            "anywhere in it, pending replies included. The first three failures are therefore "
+            "deliberately indistinguishable from one another.\n\n"
+            "The post itself is NOT sent in the body; it comes from the path."
         ),
     )
 
@@ -577,12 +605,12 @@ class CommentPublic(BaseModel):
     Every member below is named exactly as the column or relationship it reads, which is what makes
     that one call sufficient. It is safe after a commit because ``app.db.session`` builds the
     session factory with ``expire_on_commit=False``, and it is safe **to the depth the statement
-    populated** - which, for a thread from ``comment_repository.list_for_post``, is the whole of it:
-    that method fills ``replies`` on every comment it returns at every level, leaves included. A
-    comment obtained any other way carries no thread and must be projected explicitly with
-    ``replies`` left out, where the empty default applies; the module docstring gives that
-    projection in full and the reason reading an unpopulated collection would raise rather than
-    return empty.
+    populated** - which, for a thread from ``comment_repository.list_for_post`` or a subtree from
+    ``comment_repository.load_visible_replies``, is the whole of it: both fill ``replies`` on every
+    comment they return at every level, leaves included. A comment obtained any other way - the row
+    a creation just wrote - carries no thread and must be projected explicitly with ``replies`` left
+    out, where the empty default applies; the module docstring gives that projection in full and the
+    reason reading an unpopulated collection would raise rather than return empty.
 
     ``status`` is published and unsettable
     ------------------------------------

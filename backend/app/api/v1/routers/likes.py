@@ -106,8 +106,9 @@ It declares routes, wires dependencies, and returns what a service handed back. 
   declared once in ``app.services.post_service``, and reports it as ``404`` rather than ``403`` so
   that a draft's presence is never disclosed.
 * **No request model, and no model declared here at all.** ``LikeSummary`` comes from the
-  ``app.schemas`` barrel and :class:`~app.schemas.common.ProblemDetail` beside it; this file
-  declares no wire shape of its own.
+  ``app.schemas`` barrel, and the failure shape comes from
+  :func:`~app.api.v1.responses.problem_response` rather than being named here; this file declares
+  no wire shape of its own.
 * **No sharing endpoint.** Social sharing is the third element of R4 and needs no route: the
   client builds every share target from the post's canonical URL. There is nothing to add for it
   here, and nothing to add for it anywhere.
@@ -128,52 +129,102 @@ Governing standards
 self-imposed standards the repository holds itself to stand in their place, and six of them decide
 the shape of this module: *layered separation of concerns*, which is why no statement and no
 session call appears below; *explicit API contracts*, which is why all three routes declare a
-``response_model`` and name :class:`~app.schemas.common.ProblemDetail` for every failure they can
-produce; *API versioning*, which is why :data:`router` is bare and the version namespace is
-attached by the aggregate that includes it; *secure-by-default authentication*, which is why the
-two writes require a principal and the read deliberately does not; *server-owned identity*, which
-is why no route here accepts a body; and *blocking quality gates*, which is why ``ruff``, ``mypy``
-and ``tests/integration/test_likes_api.py`` all have to pass on it.
+``response_model`` and declare every failure they can produce - each one against the single
+problem document, through the shared helper; *API versioning*, which is why :data:`router` is
+bare and the version namespace is attached by the aggregate that includes it;
+*secure-by-default authentication*, which is why the two writes require a principal and the read
+deliberately does not; *server-owned identity*, which is why no route here accepts a body; and
+*blocking quality gates*, which is why ``ruff``, ``mypy`` and
+``tests/integration/test_likes_api.py`` all have to pass on it.
 """
 
-from typing import Any, Final
+from typing import Final
 from uuid import UUID
 
 from fastapi import APIRouter, status
 
+from app.api.v1.responses import OPTIONAL_AUTHENTICATION, ProblemResponses, problem_response
 from app.core.dependencies import CurrentUser, DbSession, OptionalUser
-from app.schemas import LikeSummary, ProblemDetail
+from app.schemas import LikeSummary
 from app.services import LikeService
 
 __all__ = ["router"]
 
 
 # ---------------------------------------------------------------------------------------
-# The two failure documents these routes can produce
+# The failure documents these routes can produce
 #
 # The wording lives in a named constant rather than inline in a decorator argument, because
 # the 404 description is used by all three operations and three copies of a sentence is how
-# two of them stop matching. `model` is what puts the failure body into /openapi.json:
-# without it the failure mode is undocumented and a generated client emits no type for it,
-# which is precisely the gap the "every route declares its shapes" standard closes.
+# two of them stop matching. Every entry is built by
+# `app.api.v1.responses.problem_response`, which is the one place in this package that names
+# the problem document and the one place its published media type is decided: without a model
+# the failure mode is undocumented and a generated client emits no type for it, which is
+# precisely the gap the "every route declares its shapes" standard closes.
+#
+# The declared set per route is exactly what that route can PRODUCE - which means a reachable
+# status is never omitted on the grounds that it is unusual. All three operations declare 422,
+# because `post_id` is a validated path parameter and an unnamed 422 is generated against
+# FastAPI's own `HTTPValidationError` shape rather than this API's. The two mutations declare
+# 403, because a deactivated account is refused by the shared principal dependency. And the
+# read declares 401, because an optional principal tolerates an ABSENT credential and not an
+# unusable one.
 # ---------------------------------------------------------------------------------------
 
 _UNAUTHORIZED_DESCRIPTION: Final[str] = (
     "No usable bearer credential was presented, so there is no account to attribute the like to. "
     "Absent, malformed, expired and wrong-type credentials are all reported this way. The body is "
     "the same problem document every other failure in this API returns, with `type` set to "
-    "`/errors/unauthorized`, and the response carries a `WWW-Authenticate: Bearer` challenge. Only "
-    "the two mutations can answer this: reading a post's like count needs no credential at all."
+    "`/errors/unauthorized`, and the response carries a `WWW-Authenticate: Bearer` challenge."
 )
 """``description`` of the 401 on the two mutations, published verbatim in the generated document.
 
 It names the condition rather than which of its causes applied, matching the credential resolver's
 own contract: a client that cannot authenticate has one remedy - obtain a fresh credential - and
 telling it *why* the presented one was unusable narrows an attacker's search without helping a
-legitimate caller. The deactivated-account rejection is a 403 rather than a 401 and is raised by
-the shared principal dependency, so it is not enumerated per route here; it is rendered by the same
-handler as the same :class:`~app.schemas.common.ProblemDetail` shape, so no response *shape* on
-these routes is left undocumented by the omission.
+legitimate caller.
+"""
+
+_UNAUTHORIZED_ON_READ_DESCRIPTION: Final[str] = (
+    "A credential was presented and could not be used - malformed, expired, of the wrong token "
+    "type, or naming an account that no longer exists. Omitting the `Authorization` header "
+    "entirely is **not** an error here: an anonymous caller receives the count with "
+    "`liked_by_caller` set to `false`. An unusable credential is refused rather than degraded to "
+    "anonymous, because degrading it would report `liked_by_caller: false` to a caller who has "
+    "in fact liked the post and would hide the expired session from the client that must renew "
+    "it. Refresh the access token and retry, or omit the header."
+)
+"""``description`` of the 401 on the read.
+
+Declared rather than dismissed as a client defect. The status is reachable, its body is the
+problem document, and a client that cannot tell "your token has expired" from "this post has no
+likes" cannot recover from the first.
+"""
+
+_FORBIDDEN_DESCRIPTION: Final[str] = (
+    "The account has been deactivated. Liking requires no role - any authenticated principal may "
+    "like any post it can see - so deactivation is the only state that produces this status here, "
+    "and it is raised by the shared principal dependency before the handler is entered. "
+    "Re-authenticating will not clear it."
+)
+"""``description`` of the 403 on the two mutations.
+
+Reachable and therefore declared. It was previously left to prose on the grounds that the *shape*
+was documented elsewhere, which is not the same thing: a client branches on status codes, and an
+undeclared status is one it was never written to handle.
+"""
+
+_VALIDATION_FAILED_DESCRIPTION: Final[str] = (
+    "`post_id` is not a UUID. That is the only input any of these three operations takes - none "
+    "of them accepts a body or a query parameter - so it is the only way a request here fails "
+    "validation. The problem document's `errors` array names the offending path parameter."
+)
+"""``description`` of the 422 shared by all three operations.
+
+Named here rather than left to the framework, whose generated entry points at its own
+``HTTPValidationError`` shape - a body this service never returns, because
+``register_exception_handlers`` renders a request-validation failure as the same problem document
+as every other failure.
 """
 
 _NOT_FOUND_DESCRIPTION: Final[str] = (
@@ -196,42 +247,38 @@ descriptions would imply three separately reachable states.
 # ---------------------------------------------------------------------------------------
 # The response mappings
 #
-# Two, not three: the read can only fail with a 404, while the two mutations can also fail
-# with a 401 before their handler body is entered. Typed explicitly rather than inferred, so
-# a wrong shape is a type error here instead of a startup assertion inside the framework.
+# Two, not three: the two mutations fail identically to each other, and the read differs from
+# them in exactly two places - its 401 tolerates an absent credential, and it has no 403
+# because it requires no principal at all. Typed explicitly rather than inferred, so a wrong
+# shape is a type error here instead of a startup assertion inside the framework.
 # ---------------------------------------------------------------------------------------
 
-_MUTATION_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_401_UNAUTHORIZED: {
-        "model": ProblemDetail,
-        "description": _UNAUTHORIZED_DESCRIPTION,
-    },
-    status.HTTP_404_NOT_FOUND: {
-        "model": ProblemDetail,
-        "description": _NOT_FOUND_DESCRIPTION,
-    },
+_MUTATION_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_401_UNAUTHORIZED: problem_response(_UNAUTHORIZED_DESCRIPTION),
+    status.HTTP_403_FORBIDDEN: problem_response(_FORBIDDEN_DESCRIPTION),
+    status.HTTP_404_NOT_FOUND: problem_response(_NOT_FOUND_DESCRIPTION),
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(_VALIDATION_FAILED_DESCRIPTION),
 }
 """Documented failures of ``PUT`` and ``DELETE`` on ``/{post_id}/like``.
 
-One mapping shared by both, because the two operations fail in exactly the same two ways and for
-exactly the same two reasons. Note what is *not* in it: no ``409``, because a repeated like is
+One mapping shared by both, because the two operations fail in exactly the same four ways and for
+exactly the same four reasons. Note what is *not* in it: no ``409``, because a repeated like is
 absorbed by the composite primary key rather than reported as a conflict, and no ``204``, because
 both operations answer with the settled :class:`~app.schemas.like.LikeSummary`.
 """
 
-_READ_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_404_NOT_FOUND: {
-        "model": ProblemDetail,
-        "description": _NOT_FOUND_DESCRIPTION,
-    },
+_READ_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_401_UNAUTHORIZED: problem_response(_UNAUTHORIZED_ON_READ_DESCRIPTION),
+    status.HTTP_404_NOT_FOUND: problem_response(_NOT_FOUND_DESCRIPTION),
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(_VALIDATION_FAILED_DESCRIPTION),
 }
-"""Documented failures of ``GET /{post_id}/likes``, which is exactly one.
+"""Documented failures of ``GET /{post_id}/likes``.
 
-No ``401`` entry, and its absence is the contract rather than an omission: the read resolves an
-*optional* principal, so a caller presenting no credential receives ``200`` with
-``liked_by_caller`` set to ``False``. A 401 is reachable here only by presenting a credential that
-is itself unusable, which is a defect in the client rather than a documented outcome of asking a
-public question.
+No ``403``, and that absence *is* the contract: the read resolves an **optional** principal, so a
+deactivated account is served as an anonymous caller rather than refused, and no role is
+consulted. The ``401`` present beside it is not a contradiction - see
+:data:`_UNAUTHORIZED_ON_READ_DESCRIPTION` for why an absent credential succeeds where an unusable
+one is refused.
 """
 
 
@@ -366,6 +413,11 @@ async def unlike_post(post_id: UUID, db: DbSession, user: CurrentUser) -> LikeSu
     response_model=LikeSummary,
     status_code=status.HTTP_200_OK,
     responses=_READ_RESPONSES,
+    # Anonymous OR bearer, in that order. `OptionalUser` puts the bearer scheme in this
+    # operation's dependency tree, and without this marker the framework would publish it as
+    # REQUIRED - turning a public like count into a signed-in-only figure as far as a generated
+    # client or the interactive documentation is concerned. See `app.api.v1.responses`.
+    openapi_extra=OPTIONAL_AUTHENTICATION,
     summary="Read a post's like count",
     description=(
         "Reports how many distinct accounts have liked this post, and whether the caller is one "

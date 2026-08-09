@@ -72,14 +72,31 @@ time this script runs those rows therefore usually exist already, including on t
 against a freshly upgraded database. That is the ordinary direction, and :func:`seed_categories`
 handles it by looking each specification up by slug and by folded name and reporting eight skips.
 
-The reverse direction is reachable too - a database left at ``0002`` and seeded before it reached
-``head`` - and it is the revision, not this module, that has to absorb it: at that point ``0003``
-has never run, so the next ``alembic upgrade head`` does run it against rows this script wrote.
-Revision ``0003`` therefore carries the same reconciliation rule in SQL, as a
-``WHERE NOT EXISTS`` on each row's own slug and folded name. Both writers consequently agree on
-what "already present" means, and whichever gets there first, the other inserts nothing. Keep the
-two predicates in step: this module's lookup is the one ``0003`` mirrors, so a change to the match
-key here needs the same change there.
+The reverse direction - a database left at ``0002`` and seeded before it reached ``head`` - is
+**not** a supported state, and neither side absorbs it. Revision ``0003`` inserts its eight rows
+unconditionally, so the next ``alembic upgrade head`` against rows this script wrote aborts on
+``uq_categories_name`` with the database atomically still at ``0002``. That is deliberate: an
+unconditional insert is what entitles ``0003``'s downgrade to delete those eight slugs, because
+every row it leaves behind is a row it wrote itself. A guarded insert that adopted a pre-existing
+category instead would leave the downgrade deleting rows the upgrade never created - along with
+their ``post_categories`` associations, through ``ON DELETE CASCADE`` - and ``categories`` carries
+no provenance column that could tell the two apart. The revision's own docstring works through
+that trade in full.
+
+So the ordering is a requirement rather than a convention: **migrate to ``head``, then seed.** The
+backend container's start command, ``make migrate`` before ``make seed``, and the
+continuous-integration job all establish it. Idempotency is this module's obligation alone - it is
+the writer expected to run repeatedly, and Alembic's ``alembic_version`` row already guarantees
+``0003`` runs at most once per database.
+
+**The rows this module writes keep server-generated identifiers, and that is load-bearing rather
+than incidental.** ``0003`` gives the rows *it* inserts a deterministic identifier derived from the
+slug, and its ``downgrade`` deletes by exactly those identifiers - which is how a downgrade removes
+only what the revision itself wrote. A category this script created is therefore adopted on the way
+up and left untouched on the way down. Deriving the same identifiers here would hand this module's
+rows the revision's provenance mark and put them back in the blast radius of a downgrade, so
+``seed_categories`` constructs each :class:`~app.models.category.Category` without an ``id`` and
+lets the ``gen_random_uuid()`` default supply one, exactly as an administrative create does.
 
 :data:`REFERENCE_CATEGORIES` is public for exactly that reason - it is the single canonical
 statement of the taxonomy, and revision ``0003`` must insert the same names, the same derived
@@ -2286,6 +2303,16 @@ async def main() -> None:
                 raise
         logger.info("seed committed")
     except Exception:
+        # `logger.exception` attaches the frames, and this is the one place in the seeding path
+        # that does. Safe for the same two structural reasons the request path relies on:
+        # `app.core.logging` constructs its traceback renderer with `show_locals=False`, so the
+        # locals of `seed_all` - which include `settings.SEED_ADMIN_PASSWORD` and the argon2id
+        # hash derived from it - are never serialised; and `redact_log_event` runs in both
+        # terminal chains immediately after the exception renderer, so a driver message quoting
+        # the connection URL, the administrator's address or a PostgreSQL DETAIL line is stripped
+        # of it whether this ran with development or JSON logging. The message itself names no
+        # value: it says what failed and what was NOT written, which is the only thing an
+        # operator needs before re-running this command.
         logger.exception("seed failed; the transaction was rolled back and nothing was written")
         raise
     finally:

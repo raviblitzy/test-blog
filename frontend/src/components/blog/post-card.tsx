@@ -72,6 +72,15 @@
 //      surface those came from is retired; `post.id` is a real UUID on a real blog entity.
 //   8. An upload control. `cover_image_url` is a URL reference - this product has no upload,
 //      image-processing or object-storage pipeline at all.
+//   9. A view tally, or any other reading of `post.view_count`. The field is on the wire and the
+//      card deliberately ignores it: NO endpoint in this product increments it. `posts.view_count`
+//      is a column nothing measures - `backend/app/models/post.py` says so in as many words, and
+//      `backend/app/schemas/post.py` gives the same fact as the reason `PostSortOption` offers no
+//      "popular" value - so the only values it can ever hold are the zero the column defaults to
+//      and whatever the demonstration seeder wrote. Rendering either beside a title states an
+//      audience figure that no read produced, which is worse than showing none: a reader cannot
+//      tell an unmeasured number from a measured one. If reads are ever counted, the counter path
+//      lands in the service first and this card follows it - not the other way round.
 //
 // ---------------------------------------------------------------------------
 // 5. THE COVER IMAGE IS THE ONE PLACE THIS COMPONENT CAN FAIL AT RUNTIME
@@ -95,13 +104,11 @@ import Image from 'next/image';
 import Link from 'next/link';
 import type { ComponentProps, JSX } from 'react';
 
-import { Eye } from 'lucide-react';
-
 import { AuthorByline } from '@/components/blog/author-byline';
-import { Badge, badgeVariants, POST_STATUS_BADGE_VARIANTS } from '@/components/ui/badge';
+import { Badge, POST_STATUS_BADGE_VARIANTS } from '@/components/ui/badge';
+import { BadgeLink } from '@/components/ui/badge-link';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
-import { EMPTY_VALUE, formatCount } from '@/lib/format';
 import { categoryFeedPath, postPath } from '@/lib/seo';
 import type { PostStatus, PostSummary } from '@/lib/types';
 import { allowedImageUrl, cn } from '@/lib/utils';
@@ -185,38 +192,6 @@ const POST_STATUS_LABELS: Readonly<Record<PostStatus, string>> = {
   PUBLISHED: 'Published',
   ARCHIVED: 'Archived',
 };
-
-/* -------------------------------------------------------------------------------------------------
- * View count
- * ---------------------------------------------------------------------------------------------- */
-
-/** The figure that reads as one. Compared against the RENDERED string, not the raw number. */
-const SINGULAR_VIEW_COUNT = '1';
-
-/** Unit for a tally of exactly one. */
-const VIEW_UNIT_SINGULAR = 'view';
-
-/** Unit for every other tally, `0` included - "0 views" is the correct English for none. */
-const VIEW_UNIT_PLURAL = 'views';
-
-/**
- * The accessible label for the view tally: `'1 view'`, `'0 views'`, `'1.2K views'`.
- *
- * The bare figure is not enough on its own. A screen reader reaching a lone "1.2K" beside a title
- * has no way to know what was counted, and the icon that gives a sighted reader that context is
- * decorative and hidden. So the visible glyph stays the figure and this label is announced in its
- * place.
- *
- * Pluralisation is decided by the FORMATTED value rather than the raw count, so the word always
- * agrees with the digit on screen: `formatCount` floors its input, and a raw `1.4` that renders as
- * "1" must read "1 view", not "1 views".
- *
- * @param formatted - The output of `formatCount`, already known to be non-empty.
- * @returns The figure followed by its unit.
- */
-function viewCountLabel(formatted: string): string {
-  return `${formatted} ${formatted === SINGULAR_VIEW_COUNT ? VIEW_UNIT_SINGULAR : VIEW_UNIT_PLURAL}`;
-}
 
 /* -------------------------------------------------------------------------------------------------
  * Class recipes
@@ -321,87 +296,6 @@ const TITLE_LINK_CLASSES = cn(
  */
 const EXCERPT_CLASSES = 'text-muted-foreground line-clamp-3 text-sm';
 
-/**
- * A category chip: the badge's own appearance on an element that navigates.
- *
- * `ui/badge.tsx` exports `badgeVariants` for exactly this and is explicit that a chip which
- * navigates should BE the link rather than nest a `Badge` inside one - the pill itself is not
- * interactive and must not become so, and a `<span>` inside an `<a>` would put the shape on one
- * element and the focus ring on another. This spelling gives one element that is the pill, is the
- * link, is focusable and is crawlable.
- *
- *   * `min-w-0 overflow-hidden` is the overflow guard. The pill sets `whitespace-nowrap`, and
- *     `ui/badge.tsx` places an unbounded label on the caller: as a flex item its automatic minimum
- *     size is its unbreakable content, so a pathologically long category name would push past the
- *     card and put the document into horizontal scroll at 375px, which the responsive criteria
- *     forbid at every width. `min-w-0` removes that floor and `overflow-hidden` clips the remainder
- *     inside the card. Both are inert for the short labels the seeded taxonomy actually produces -
- *     measured at 375px, a 55-character label clips at the card's content edge while an ordinary
- *     one is untouched.
- *
- *     The clip carries no ellipsis, and that is a decision rather than an oversight. `text-overflow`
- *     is INERT here: `ui/badge.tsx` measured that the label sits in an anonymous flex item of an
- *     `inline-flex` box, where the property does not apply, so `text-ellipsis` would generate a
- *     class that changes nothing and only looks like a safeguard. Producing a real ellipsis would
- *     take an inner block wrapper on every chip of every card - a wrapper that adds no visual
- *     behaviour, which the design system's flatten-wrappers rule rules out - to improve a case the
- *     taxonomy cannot produce. Nothing is lost to assistive technology or to a crawler either way:
- *     clipping is visual only, so the full category name stays in the DOM, in the accessible name
- *     and in the server-rendered HTML.
- *
- *     Overriding the pill's `whitespace-nowrap` to let a long label WRAP instead was the other
- *     candidate and is worse: `ui/badge.tsx` chose `nowrap` precisely so a two-word state cannot
- *     break across lines and read as two pills, and a call site should not reverse that.
- *   * `hover:border-accent hover:text-accent` steps to the emphasis token `globals.css` defines as
- *     the one `primary` hovers to, so the chip brightens rather than changing hue, and
- *     `hover:underline` means the affordance is not carried by colour alone.
- *   * The focus and motion groups match {@link TITLE_LINK_CLASSES}; the pill's own `rounded-full`
- *     shapes the outline.
- */
-/* BLITZY [A11Y]: the category chip is an interactive target 22px tall - the pill geometry
- * `ui/badge.tsx` specifies (`text-xs` 16px line box + `py-0.5` 4px + 2px borders). That is 2px below
- * WCAG 2.5.8 AA's 24x24 minimum and 22px below the 44x44 figure. Implemented at the design system's
- * size and flagged for designer review rather than silently corrected, because the alternatives are
- * all worse than the finding: padding this chip up to 44px would make the one pill that navigates
- * visibly unlike every other pill in the product, which is a real design-system violation traded for
- * a notional one; and expanding the hit area with a pseudo-element would overlap the excerpt above,
- * the card edge below and - across a `gap-3` row - the adjacent chip, turning a small target into a
- * mis-tapped one. The fix belongs in `ui/badge.tsx`'s scale, where it would apply to every pill at
- * once. Mitigations already in place: the chip is a real `<a>` reachable and operable by keyboard
- * with a 2px focus ring at 6.46:1, it is never the only route to that content (the filter control
- * and the category page reach it too), and its full name is always in the accessible tree.
- * Horizontal extent is unaffected - every real category label exceeds 44px wide. */
-const CATEGORY_CHIP_CLASSES = cn(
-  badgeVariants({ variant: 'category' }),
-  'min-w-0 overflow-hidden',
-  'hover:border-accent hover:text-accent hover:underline',
-  'focus-visible:outline-ring focus-visible:outline-2 focus-visible:outline-offset-2',
-  'motion-safe:transition-colors motion-safe:ease-out',
-);
-
-/**
- * The view tally, pushed to the far end of the footer row.
- *
- * `ms-auto` is the LOGICAL margin (`margin-inline-start: auto`), so the tally sits at the end of the
- * row in either writing direction. `auto` is one of the explicitly permitted literals.
- *
- * `tabular-nums` fixes every digit to the same advance width, so tallies line up down a column of
- * cards instead of jittering as the figures change.
- */
-const VIEW_COUNT_CLASSES = cn(
-  'text-muted-foreground ms-auto inline-flex items-center gap-1',
-  'text-xs tabular-nums',
-);
-
-/**
- * The decorative view icon.
- *
- * Sized with `size-3.5` from the `--spacing` scale and never with lucide's own `size` prop - that
- * prop takes a NUMBER OF PIXELS, which would be exactly the hardcoded presentation value the token
- * discipline forbids. `shrink-0` stops a long tally squashing it.
- */
-const VIEW_COUNT_ICON_CLASSES = 'size-3.5 shrink-0';
-
 /* -------------------------------------------------------------------------------------------------
  * PostCard
  * ---------------------------------------------------------------------------------------------- */
@@ -455,16 +349,15 @@ interface PostCardProps {
  *
  * Renders an `<article>` - a post card is independently distributable, which is exactly what that
  * element means - containing an optional cover image, the title as the card's heading and only
- * link into the post, the author byline, the excerpt, the lifecycle pill when it is not published,
- * its category chips and its view tally.
+ * link into the post, the author byline, the excerpt, the lifecycle pill when it is not published
+ * and its category chips. It renders no readership figure; note 9 in the module header records why.
  *
  * ### What a screen reader hears
  *
  * The heading and its link named exactly by the post title; then the byline as
  * `"{author}, link"` followed by the publication date; then the excerpt; then the lifecycle pill's
- * word if there is one, each category as a link named by the category, and the tally as
- * `"1.2K views"`. The cover image and the view icon contribute nothing - both are decorative and
- * explicitly hidden.
+ * word if there is one, and each category as a link named by the category. The cover image
+ * contributes nothing - it is decorative and explicitly hidden.
  *
  * ### What it renders in the initial HTML
  *
@@ -535,17 +428,11 @@ export function PostCard({
   const showStatus = post.status !== UNLABELLED_STATUS;
   const hasCategories = post.categories.length > 0;
 
-  // `EMPTY_VALUE` is `@/lib/format`'s documented placeholder, returned only for genuinely absent,
-  // negative or non-finite input - a real tally of zero formats as '0' and IS rendered, because "no
-  // views yet" is information. Comparing against the module's own constant rather than a bare `''`
-  // pins this guard to that convention.
-  const viewCount = formatCount(post.view_count);
-  const hasViewCount = viewCount !== EMPTY_VALUE;
-
   // The footer is omitted entirely when it would be empty, rather than rendered as a blank band of
   // padding at the bottom of the card. The slot above it already pays its own bottom inset, so the
-  // card closes cleanly either way.
-  const hasFooter = showStatus || hasCategories || hasViewCount;
+  // card closes cleanly either way. `post.view_count` is deliberately not a third condition here -
+  // see note 9 in the module header.
+  const hasFooter = showStatus || hasCategories;
 
   return (
     // `article`, not the default `div`: one card is one self-contained, independently distributable
@@ -627,31 +514,20 @@ export function PostCard({
            * its own - its page IS the filtered feed - so the href comes from `categoryFeedPath`,
            * which is the same builder the filter control and the sitemap use. Keyed by `id`, the
            * server-generated identifier, rather than by an array index or by the slug.
+           *
+           * `BadgeLink` is the design system's pill-shaped link, and reaching for it here rather than
+           * composing `badgeVariants` into a local class list is what makes this footer and the post
+           * page's own category row the SAME affordance. The three things this file used to decide for
+           * itself now belong to that primitive and are decided once: an over-long category name wraps
+           * inside the pill instead of being clipped without an ellipsis, the interactive target meets
+           * WCAG 2.5.8's 24px minimum instead of sitting 2px under it, and the hover step is the same
+           * colour-plus-underline pair on both surfaces.
            */}
           {post.categories.map((category) => (
-            <Link
-              className={CATEGORY_CHIP_CLASSES}
-              href={categoryFeedPath(category)}
-              key={category.id}
-            >
+            <BadgeLink href={categoryFeedPath(category)} key={category.id}>
               {category.name}
-            </Link>
+            </BadgeLink>
           ))}
-
-          {hasViewCount ? (
-            <p className={VIEW_COUNT_CLASSES}>
-              {/* Decorative: the label below says in words what this glyph says in a picture. */}
-              <Eye aria-hidden="true" className={VIEW_COUNT_ICON_CLASSES} />
-              {/*
-               * Two nodes, because the visible form is incomplete on its own: the glyph shows the
-               * figure and the hidden twin supplies the unit that gives it meaning. Rendering one
-               * node would either announce a bare number with no context or print the word "views"
-               * beside an icon that already says it.
-               */}
-              <span aria-hidden="true">{viewCount}</span>
-              <span className="sr-only">{viewCountLabel(viewCount)}</span>
-            </p>
-          ) : null}
         </CardFooter>
       ) : null}
     </Card>
@@ -676,8 +552,11 @@ export function PostCard({
  *   excerpt      three `h-4` bars with `gap-1.5` = 3.75rem, against three `text-sm` lines at
  *                3 x 1.25rem = 3.75rem exactly, which is the height `line-clamp-3` caps the real
  *                excerpt at
- *   footer       two `h-5` pills and a short tally bar, against a 1.375rem badge and a `text-xs`
- *                figure
+ *   footer       two `h-6` chips, against the 1.5rem interactive minimum `ui/badge-link.tsx`
+ *                sets for a category chip (`min-h-6`), which is what makes the real footer row 24px
+ *                tall whether or not the lifecycle badge is rendered beside it - that badge is
+ *                1.375rem and shorter, so the chips govern the height - and nothing else, because
+ *                the real footer holds only a lifecycle pill and category chips
  *
  * The tiny gaps between bars are deliberate rather than parity error: with none, adjacent
  * placeholders merge into one block and stop reading as lines of text. Each gap is a `--spacing`
@@ -702,10 +581,14 @@ const SKELETON_EXCERPT_BLOCK_CLASSES = 'flex flex-col gap-1.5';
 const SKELETON_EXCERPT_LINE_CLASSES = 'h-4';
 const SKELETON_EXCERPT_LAST_LINE_CLASSES = 'h-4 w-4/5';
 
-/** Two category pills and the tally, mirroring the footer's wrapping row. */
-const SKELETON_CHIP_CLASSES = 'h-5 w-20 rounded-full';
-const SKELETON_CHIP_NARROW_CLASSES = 'h-5 w-16 rounded-full';
-const SKELETON_VIEW_COUNT_CLASSES = 'ms-auto h-4 w-12';
+/**
+ * Two category chips, mirroring the footer's wrapping row.
+ *
+ * `h-6` is the real chip's own `min-h-6` from `ui/badge-link.tsx`, so the placeholder row and the
+ * loaded row are the same height to the pixel and nothing below the card moves when the posts arrive.
+ */
+const SKELETON_CHIP_CLASSES = 'h-6 w-20 rounded-full';
+const SKELETON_CHIP_NARROW_CLASSES = 'h-6 w-16 rounded-full';
 
 /**
  * Props for {@link PostCardSkeleton}.
@@ -793,7 +676,6 @@ export function PostCardSkeleton({ className }: PostCardSkeletonProps): JSX.Elem
       <CardFooter>
         <Skeleton className={SKELETON_CHIP_CLASSES} />
         <Skeleton className={SKELETON_CHIP_NARROW_CLASSES} />
-        <Skeleton className={SKELETON_VIEW_COUNT_CLASSES} />
       </CardFooter>
     </Card>
   );

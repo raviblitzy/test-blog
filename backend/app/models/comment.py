@@ -534,6 +534,30 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "status",
         ),
         Index(
+            # The moderation queue's DEFAULT ordering, which the status index above cannot serve.
+            # `app.repositories.comment_repository.list_moderation_queue` windows comments with
+            # `ORDER BY created_at DESC, id DESC` across every post, and the status filter is
+            # OPTIONAL - the unfiltered queue is the ordinary first view, so the common case has
+            # no equality predicate for ix_comments_status to lead with. Without this index each
+            # page sorts the whole `comments` relation before applying LIMIT, on what is the
+            # largest relation in this schema by row count.
+            #
+            # Descending both columns, matching the query exactly: a queue is worked from the top,
+            # which is the inverse of ix_comments_post_id_created_at's ascending thread order and
+            # inverted for the same reason. `id DESC` is the deterministic tiebreaker - a batch of
+            # comments written by one request shares a per-transaction `created_at` instant, and
+            # an unspecified order under LIMIT/OFFSET is how a row appears on two consecutive
+            # pages while another appears on none.
+            #
+            # `text()` is the string-safe spelling for a directional expression inside
+            # __table_args__, exactly as ix_posts_status_published_at uses it: `created_at.desc()`
+            # is unavailable here because the mixin's column object is not in scope at class-body
+            # evaluation time. Built by revision 0004.
+            "ix_comments_created_at_id",
+            text("created_at DESC"),
+            text("id DESC"),
+        ),
+        Index(
             # The thread's recursive descent, and the one index a threaded discussion cannot be
             # read without. app.repositories.comment_repository walks the tree with a recursive
             # CTE whose every step is "the replies to these comments, in the states this caller

@@ -113,9 +113,10 @@
 //   7. Upload, cropping or object-storage behaviour. Avatars are URL references;
 //      this product has no image pipeline.
 //   8. A host list of this file's own, or an `unsafeAllowAnyHost` escape hatch.
-//      The policy has exactly one definition, in `@/lib/utils`, and it is
-//      configured through NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST rather than edited in
-//      a component. A second list here is the drift this design exists to remove.
+//      The policy has exactly one definition, the source-code constant
+//      `IMAGE_HOST_ALLOWLIST` in `@/lib/utils`, and widening it is a reviewed
+//      change there rather than an edit in a component. A second list here is the
+//      drift this design exists to remove.
 //
 // TESTING NOTE. jsdom never fetches an image, so `image.complete` stays false
 // and no `load` event ever fires - which means `AvatarImage` renders null and
@@ -199,8 +200,8 @@ export function Avatar({ className, ...props }: AvatarProps): JSX.Element {
  * becomes `undefined`, and Radix keeps `AvatarFallback` mounted - so a
  * user-supplied host that the policy excludes never causes a request from a
  * reader's browser, and the reader sees initials rather than a broken image.
- * Admitting a host is a change to `NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST`, not to this
- * file.
+ * Admitting a host is a change to `IMAGE_HOST_ALLOWLIST` in `@/lib/utils`, not to
+ * this file.
  *
  * @param className - Extra utilities, merged last so they win their group.
  * @param src - The stored avatar URL. Dropped when the shared host policy denies

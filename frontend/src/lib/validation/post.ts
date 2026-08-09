@@ -63,6 +63,8 @@
 
 import * as z from 'zod';
 
+import { codePointLength } from '@/lib/text';
+
 import type { PostCreate, PostUpdate } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
@@ -123,6 +125,27 @@ const EXCERPT_MAX_LENGTH = 500;
 const CONTENT_MAX_LENGTH = 100_000;
 
 /**
+ * The schemes a cover image address may use: `http` and `https`, and nothing else.
+ *
+ * Matched against the URL's protocol with its trailing colon removed, which is what
+ * `z.url({ protocol })` compares. Anchored at both ends so `javascript:` cannot satisfy it by
+ * containing `http` anywhere, and `s?` rather than two alternatives so the pattern reads as the one
+ * rule it is. See {@link optionalCoverImageUrl} for why the scheme is restricted here while the host
+ * allow-list is not.
+ */
+const HTTP_SCHEME_PATTERN = /^https?$/;
+
+/**
+ * The longest cover image address the service will store: 2083 code points.
+ *
+ * Not a number chosen here. `pydantic.HttpUrl` carries this ceiling inherently and publishes it as
+ * `maxLength` in the generated schema, so it is the service's constraint restated - which is the whole
+ * job of this module. Without it a longer address is a `422` that arrives only after the author has
+ * submitted a finished post.
+ */
+const COVER_IMAGE_URL_MAX_LENGTH = 2083;
+
+/**
  * Most categories one submission may file a post under.
  *
  * A cap rather than a limit anyone reaches: a post genuinely belongs to one to three categories.
@@ -151,6 +174,26 @@ const MAX_CATEGORIES_PER_POST = 10;
  * ---------------------------------------------------------------------------------------------- */
 
 /**
+ * Why every bound in this file is applied through a refinement rather than through zod's `.max()`.
+ *
+ * `.min()`/`.max()` on a string read `String.prototype.length`, which counts UTF-16 **code units**.
+ * The service's constraints are Python `len()`, which counts **code points**. The two agree for ASCII
+ * and disagree for every character above `U+FFFF` - an emoji, a historic script, a rare ideograph -
+ * which each count as two units and one code point.
+ *
+ * That divergence breaks the mirror in the direction that matters most here: a ceiling written in code
+ * units rejects text the service would have accepted, at exactly half the length for astral text. An
+ * author who writes in one of those scripts is told a perfectly valid title or body is too long, by a
+ * check whose only job was to save them a round trip. `@/lib/validation/auth` already measured this
+ * way and recorded two observed cases against the running service;
+ * `@/lib/text#codePointLength` is now that measurement, shared by all four validators and by
+ * `@/lib/seo`'s truncation, so one notion of length governs the tier.
+ *
+ * `abort: true` matches the convention in this tier: once a length has failed, later checks on the
+ * same field are not run, so one mistake produces one sentence.
+ */
+
+/**
  * The post's headline: required, trimmed, and bounded.
  *
  * `.trim()` is applied before the length checks, which is both the server's order and the one that
@@ -167,13 +210,23 @@ const MAX_CATEGORIES_PER_POST = 10;
  * derives the post's permanent URL from this value, so leading whitespace would be one more thing
  * that derivation had to defend against — and an empty or whitespace-only title would produce a
  * degenerate canonical URL for a post that can never be renamed out of it.
+ *
+ * The ceiling is a `.refine()` over `codePointLength` from `@/lib/text`, not zod's `.max()`, and the
+ * three bounded fields in this module share that treatment for one reason: the server's
+ * `StringConstraints` count Python code points, while `.max()` reads `String.prototype.length` and
+ * scores every character above `U+FFFF` twice. A 120-character headline containing emoji or an
+ * astral script measures up to 240 there, so `.max()` would refuse a title the API accepts — and
+ * refuse it at roughly half the advertised bound, in a message that names the bound it just
+ * contradicted. The floor stays `.min()` because {@link TITLE_MIN_LENGTH} is `1`, where the two units
+ * cannot disagree.
  */
 const postTitle = z
   .string({ error: 'Enter a title for this post.' })
   .trim()
   .min(TITLE_MIN_LENGTH, { error: 'Enter a title for this post.' })
-  .max(TITLE_MAX_LENGTH, {
+  .refine((value) => codePointLength(value) <= TITLE_MAX_LENGTH, {
     error: `Title must be ${String(TITLE_MAX_LENGTH)} characters or fewer.`,
+    abort: true,
   });
 
 /**
@@ -205,12 +258,17 @@ const postTitle = z
  *
  * `.nullable()` wraps the whole chain rather than sitting inside it, so a submitted `null`
  * short-circuits to `null` instead of being measured as a string.
+ *
+ * The ceiling is measured in code points for the reason {@link postTitle} sets out, and it sits
+ * before the fold so that ordering is unchanged: a whitespace-only value of any length has already
+ * become `''` and folds to `null` rather than being reported as too long.
  */
 const optionalPostExcerpt = z
   .string({ error: 'Excerpt must be text. Leave it empty if this post does not need one.' })
   .trim()
-  .max(EXCERPT_MAX_LENGTH, {
+  .refine((value) => codePointLength(value) <= EXCERPT_MAX_LENGTH, {
     error: `Excerpt must be ${String(EXCERPT_MAX_LENGTH)} characters or fewer.`,
+    abort: true,
   })
   .transform((value) => (value === '' ? null : value))
   .nullable();
@@ -231,11 +289,17 @@ const optionalPostExcerpt = z
  * Nothing here sanitises, escapes or parses. Markup in the body is expected and is cleaned at the
  * two boundaries named in the module header, so `'<script>alert(1)</script>'` passes this schema
  * unchanged — by design, not by omission.
+ *
+ * The ceiling is measured in code points for the reason {@link postTitle} sets out, and this is the
+ * field where the divergence bites hardest: a hundred thousand code points of Latin prose and a
+ * hundred thousand of an astral script are the same length to the service and differ by a factor of
+ * two to `String.prototype.length`.
  */
 const postContent = z
   .string({ error: 'Enter the post content.' })
-  .max(CONTENT_MAX_LENGTH, {
+  .refine((value) => codePointLength(value) <= CONTENT_MAX_LENGTH, {
     error: `Content must be ${String(CONTENT_MAX_LENGTH)} characters or fewer.`,
+    abort: true,
   })
   .refine((value) => value.trim() !== '', {
     error: 'Enter the post content. It cannot be empty or only spaces.',
@@ -248,30 +312,54 @@ const postContent = z
  * cover image is a link an author pastes, and `null` is the ordinary case rather than an
  * exceptional one — a post without one gets the generated default social card.
  *
- * `z.httpUrl()` is used rather than `z.url()`, and the difference is a security boundary rather
- * than a matter of taste. `z.url()` accepts any parseable URL, including `javascript:alert(1)` and
- * `data:` URLs; this value is interpolated into an image source on every card and every post page,
- * so the scheme allow-list is the control that keeps an author-supplied field from becoming a
- * script vector. It is also what the server enforces, so anything else here would disagree with it.
- * Verified identical to the server's `HttpUrl` for every case:
+ * **The scheme allow-list is a security boundary, not a matter of taste.** This value is interpolated
+ * into an image source on every card and every post page, so restricting it to `http` and `https` is
+ * what keeps an author-supplied field from becoming a script vector: a bare `z.url()` accepts
+ * `javascript:alert(1)` and `data:` URLs. The server enforces the same two schemes through
+ * `pydantic.HttpUrl`, so anything else here would disagree with it.
+ *
+ * It is expressed as `z.url({ protocol: /^https?$/ })` rather than as `z.httpUrl()`, and that choice
+ * is the correction to a real divergence. `z.httpUrl()` restricts the scheme AND requires a DNS-style
+ * domain, which `HttpUrl` does not: verified against the installed zod 4.4.3, `z.httpUrl()` rejects
+ * `http://localhost:3000/cover.png`, `http://127.0.0.1/cover.png` and `http://[::1]/cover.png`, all
+ * three of which the service accepts. Every one of those is a real address in this project's own
+ * development and container environments, so the stricter rule refuses a value the API would have
+ * stored - the "stricter than the API" failure this module exists to avoid. Restricting the protocol
+ * alone keeps every rejection the security boundary needs while dropping the host restriction that
+ * was never part of the contract.
+ *
+ * **The 2083-code-point ceiling is the server's, restated.** `pydantic.HttpUrl` carries an inherent
+ * limit of 2083 characters and publishes it as `maxLength`, so a longer URL is a `422` - and without
+ * this check it would be a `422` arriving after a full submission of a post the author had finished
+ * writing. Measured in code points for the reason given above the title field, and applied to the
+ * trimmed value the way the server applies it to what it receives.
+ *
+ * Verified equivalent to the server's `HttpUrl` for every case:
  *
  * | Submitted                            | Result                                  |
  * | ------------------------------------ | --------------------------------------- |
  * | omitted / `null` / `''` / `'   '`    | `null` — no cover image                 |
  * | `'https://example.com/cover.png'`    | accepted                                |
  * | `'  https://example.com/cover.png '` | accepted, trimmed                       |
+ * | `'http://localhost:3000/cover.png'`  | accepted — a host, just not a domain    |
+ * | `'http://127.0.0.1/cover.png'`       | accepted — same reason                  |
  * | `'javascript:alert(1)'`              | rejected — scheme not allowed           |
  * | `'data:image/png;base64,…'`          | rejected — scheme not allowed           |
  * | `'ftp://example.com/cover.png'`      | rejected — scheme not allowed           |
  * | `'/covers/cover.png'`                | rejected — not absolute                 |
  * | `'http://'`                          | rejected — no host                      |
+ * | 2084 code points                     | rejected — the server's own ceiling     |
  *
- * The host allow-list is deliberately **not** checked here. `frontend/next.config.ts` derives the
- * image optimiser's `remotePatterns` from the policy in `src/lib/utils.ts`, and restating it here
- * would create a second copy to keep in step with it.
+ * The **host allow-list** is deliberately not checked here, and the ownership is worth stating because
+ * this is the field it applies to. `src/lib/utils.ts` holds that policy - `IMAGE_HOST_ALLOWLIST` and
+ * `isAllowedImageUrl` - `frontend/next.config.ts` derives the image optimiser's `remotePatterns` from
+ * it, and it is enforced where the URL is RENDERED. Restating it in this schema would create a second
+ * copy to keep in step, and would refuse to save a post whose cover host an operator is about to add
+ * to the allow-list. Nor is reachability checked: that would be an HTTP request this module may not
+ * make, and a URL that is briefly unreachable is not an invalid URL.
  *
- * The fold runs before the URL rules so a cleared input becomes `null` rather than failing them,
- * and `.pipe()` carries the folded value into the URL check so the non-null branch is still fully
+ * The fold runs before the URL rules so a cleared input becomes `null` rather than failing them, and
+ * `.pipe()` carries the folded value into the URL check so the non-null branch is still fully
  * validated. As with the excerpt, the outer `.nullable()` lets a submitted `null` short-circuit.
  */
 const optionalCoverImageUrl = z
@@ -282,9 +370,14 @@ const optionalCoverImageUrl = z
   .transform((value) => (value === '' ? null : value))
   .pipe(
     z
-      .httpUrl({
+      .url({
+        protocol: HTTP_SCHEME_PATTERN,
         error:
           'Enter the full web address of the cover image, starting with http:// or https:// — for example https://example.com/cover.png.',
+      })
+      .refine((value) => codePointLength(value) <= COVER_IMAGE_URL_MAX_LENGTH, {
+        error: `Shorten the cover image address to ${String(COVER_IMAGE_URL_MAX_LENGTH)} characters or fewer.`,
+        abort: true,
       })
       .nullable(),
   )

@@ -264,8 +264,10 @@ class Category(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # app.repositories.category_repository, neither of which an equality-oriented b-tree can
     # answer:
     #
-    #   containment   GET /api/v1/admin/categories takes a `?q=` term and matches it against
-    #                 name and slug together with a leading wildcard, which no b-tree can use.
+    #   containment   CategoryRepository.list_paginated takes a `?q=` term and matches it
+    #                 against name and slug together with a leading wildcard, which no b-tree
+    #                 can use. (That surface is reached from the service layer; no route
+    #                 publishes it - see the method's own docstring.)
     #   slug family   slug de-duplication runs `slug LIKE 'base%'` before every category insert
     #                 and rename. Anchoring the pattern means the query is not PREVENTED from
     #                 using an index, but the default operator class over a citext column does

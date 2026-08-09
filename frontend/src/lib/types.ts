@@ -96,6 +96,8 @@
  * @module
  */
 
+import { z } from 'zod';
+
 /* -------------------------------------------------------------------------------------------------
  * Shared envelopes
  *
@@ -107,21 +109,19 @@
 /**
  * One window onto a larger collection, plus the counts needed to navigate it.
  *
- * Every collection endpoint returns this envelope, with exactly one documented exception: the home
- * feed (`GET /api/v1/posts`), an author's published posts (`GET /api/v1/users/{username}/posts`), a
- * post's comment thread (`GET /api/v1/posts/{id}/comments`) and each administrative table
- * (`GET /api/v1/admin/{users,posts,comments}`) all arrive as a page. That uniformity is the reason
- * one pagination component can drive all of them.
+ * **Every collection endpoint returns this envelope, without exception.** The home feed
+ * (`GET /api/v1/posts`), an author's published posts (`GET /api/v1/users/{username}/posts`), a
+ * post's comment thread (`GET /api/v1/posts/{id}/comments`), the category taxonomy
+ * (`GET /api/v1/categories`) and each administrative table
+ * (`GET /api/v1/admin/{users,posts,comments,categories}`) all arrive as a page. That uniformity is
+ * the reason one pagination component can drive all of them, and it is an acceptance criterion
+ * rather than a convention - so a client may assume it, and a route that broke it would be the
+ * defect rather than the exception.
  *
- * **The one exception is the category taxonomy, and it is specified rather than accidental.**
- * `GET /api/v1/categories` returns a **bare JSON array** of {@link CategoryPublic} at the top level
- * - the service declares that route's response model as a plain list, and `app.schemas.category`
- * records it as "the single sanctioned exception to the envelope rule in this API". The taxonomy is
- * administrator-curated and bounded, and a filter offering only some of its terms would silently
- * hide every post filed exclusively under the rest, so the whole set is returned in one request.
- * `@/lib/api/categories` therefore returns `CategoryPublic[]`; reading an `items` member off that
- * answer yields `undefined` while type-checking cleanly, because the mismatch is with the wire shape
- * rather than with any signature. See {@link CategoryPublic}.
+ * The taxonomy was briefly an exception, answering with a bare JSON array on the grounds that a
+ * curated set is bounded and a filter control needs all of it at once. It answers with a page now:
+ * `@/lib/api/categories` exposes `listCategories` for one page and `listAllCategories`, which walks
+ * `pages` and hands a filter control the complete set. See {@link CategoryPublic}.
  *
  * **Exactly five fields.** `has_next`, `has_prev`, `offset`, cursors and hypermedia links are all
  * absent and must stay absent: every one is computable from the five values here, and a sixth
@@ -419,14 +419,19 @@ export interface RegisterRequest {
 /**
  * Body of `POST /api/v1/auth/login`. Returns {@link TokenPair}.
  *
- * **Wire note, worth reading before "fixing" anything here.** This shape is the documented JSON
- * contract of the route, and `@/lib/api/auth` sends it as JSON. The same route *additionally*
- * accepts the OAuth 2 password-grant form, `application/x-www-form-urlencoded`, which is what makes
- * the **Authorize** control on the service's generated documentation usable for exploring protected
- * routes. That form's field is named `username` by the grant while this API's identifier is an
- * email address, so the value that goes into the form's `username` box is the account's **email**.
- * Only one credential model exists - this one - and any mapping between the two encodings belongs
- * to `@/lib/api/auth`, not here.
+ * **Wire note, worth reading before "fixing" anything here. This shape is the DOMAIN shape, not the
+ * request body.** The route consumes the OAuth 2 password grant and nothing else: its handler takes
+ * `OAuth2PasswordRequestForm`, so the body on the wire is `application/x-www-form-urlencoded` with
+ * the grant's own field names, and sending JSON is answered `422` with a cause that is entirely
+ * unobvious from the call site. That asymmetry is deliberate on the service's side - it is what makes
+ * the **Authorize** control on the generated documentation usable for exploring protected routes -
+ * and every sibling route in the namespace (`register`, `refresh`, `logout`) does take JSON, which is
+ * exactly why this one is easy to get wrong.
+ *
+ * So this interface names what a *caller* holds - an email address and a password - and
+ * `@/lib/api/auth#login` performs the one translation into the grant's encoding, mapping this
+ * `email` onto the field the grant calls `username`. Only one credential model exists, and the
+ * mapping lives in that one function rather than here.
  *
  * The password is deliberately **not** held to the registration policy on this route. Publishing
  * the policy to an unauthenticated caller tells them which candidates they need not try, and any
@@ -616,7 +621,7 @@ export interface UserUpdate {
 
 /* -------------------------------------------------------------------------------------------------
  * Categories - GET /api/v1/categories, GET /api/v1/categories/{slug},
- *              POST|PATCH|DELETE /api/v1/admin/categories
+ *              GET|POST /api/v1/admin/categories, PATCH|DELETE /api/v1/admin/categories/{id}
  *
  * The taxonomy the feed filters by and the administrative screen manages. Two projections, and one
  * pair of request shapes reused by the administrative routes - there is no separate administrative
@@ -644,24 +649,21 @@ export interface CategorySummary {
 }
 
 /**
- * A category in full: the element type of the bare array `GET /api/v1/categories` returns, and the
- * response of `GET /api/v1/categories/{slug}`.
+ * A category in full: the item type of the page `GET /api/v1/categories` returns, and the response
+ * of `GET /api/v1/categories/{slug}`.
  *
- * **`GET /api/v1/categories` answers with a bare JSON array of this type, NOT with a
- * {@link Page}.** It is the single sanctioned exception to the envelope rule across the whole API,
- * and it is specified rather than accidental: the service declares that route's response model as a
- * plain list, and the router carries a comment recording why it must not be normalised. Three
- * reasons, and they compound - the taxonomy is administrator-curated and bounded, so nothing a
- * reader does grows it; the home page needs all of it before it can render the filter control; and a
- * filter offering only some of the terms is not an incomplete filter but a wrong one, silently
- * hiding every post filed exclusively under a term left out.
+ * **The collection answers with `Page<CategoryPublic>`**, exactly as every other collection in this
+ * API does, and the administrator-only `GET /api/v1/admin/categories` answers with the same shape
+ * plus a `q` filter. It was briefly a bare array - the taxonomy is bounded, and a filter control
+ * needs every term or it silently hides the posts filed under the ones it missed - but the envelope
+ * is what a client is entitled to assume of a collection here, and the completeness that argument
+ * was defending is provided by `listAllCategories` in `@/lib/api/categories`, which walks `pages`
+ * and returns `CategoryPublic[]`.
  *
- * So `@/lib/api/categories` returns `CategoryPublic[]`. Do not "normalise" that to an envelope and
- * do not reach for an `items` member on the answer: there is none, the read yields `undefined`, the
- * filter control renders no options, and nothing reports an error - the mismatch is with the wire
- * shape rather than with either signature, so both sides still type-check. The envelope, and with it
- * `@/hooks/use-pagination` and `@/components/ui/pagination`, governs the feed, profile posts, comment
- * threads and the administrative tables; this one route sits outside it by design.
+ * So there are two functions rather than one shape bent to serve both purposes: `listCategories`
+ * for a page, `listAllCategories` for the whole taxonomy. A filter control uses the second; anything
+ * showing a handful of terms uses the first. `@/hooks/use-pagination` and
+ * `@/components/ui/pagination` drive this collection exactly as they drive the feed.
  *
  * Extends {@link CategorySummary}, so anything that renders a badge from the slim shape renders one
  * from this too.
@@ -729,23 +731,42 @@ export interface CategoryUpdate {
 /**
  * The orderings `GET /api/v1/posts` accepts, in its `sort` query parameter.
  *
- * Exactly two members and no third. `recent` is the service's default when the parameter is absent.
+ * Exactly two members and no third. Omitting the parameter is **not** the same as sending
+ * `recent`: with no `sort`, the service orders by `relevance` when a `q` was supplied and by
+ * `recent` when none was, so the ordering follows whether the request was a search or a browse.
  */
 export const POST_SORTS = ['recent', 'relevance'] as const;
 
 /**
  * The feed's ordering parameter.
  *
- * - `recent` - newest published first, which is the default and the only sensible ordering when no
- *   search term was supplied, since relevance against an empty query is meaningless.
+ * - `recent` - newest published first. The service's choice when no `sort` and no `q` were sent,
+ *   and the value to send explicitly to search and still read newest-first.
  * - `relevance` - ranked by full-text match quality against the `q` parameter, weighted so a hit in
- *   a title outranks one in the body.
+ *   a title outranks one in the body. The service's choice when a `q` was sent with no `sort`. With
+ *   no search term it degrades to recency rather than failing, since relevance against an empty
+ *   query is meaningless.
  *
  * The home feed keeps this in the URL alongside the search term, the category filter and the page
  * number, which is what makes any result set linkable, shareable, crawlable and correct under
- * browser back and forward navigation.
+ * browser back and forward navigation. Leaving it out of the URL until a reader picks an ordering
+ * is what lets a search be ranked by relevance without the link having to say so.
  */
 export type PostSort = (typeof POST_SORTS)[number];
+
+/**
+ * Longest free-text search term the service accepts in any `q` parameter.
+ *
+ * Mirrors `MAX_SEARCH_TERM_LENGTH` in `backend/app/schemas/common.py`, which bounds all four
+ * search surfaces - the public feed and the three administrative listings - and publishes the
+ * number as `maxLength` on each parameter in the OpenAPI document.
+ *
+ * The service **refuses** a longer term with the uniform problem document rather than truncating
+ * it, so a client that sent one would show the reader an error instead of results. The wrappers in
+ * `@/lib/api` therefore check the length before spending a request: a search input should cap its
+ * own value at this number, which is roughly three sentences and far longer than any real query.
+ */
+export const MAX_SEARCH_TERM_LENGTH = 256;
 
 /**
  * Body of `POST /api/v1/posts`. Returns the created {@link PostDetail}.
@@ -863,7 +884,17 @@ export interface PostSummary {
    * correctness requirement rather than defensive padding, because the dashboard renders drafts.
    */
   published_at: string | null;
-  /** How many times the post's page has been viewed. */
+  /**
+   * A server-owned readership counter - **not** audience data.
+   *
+   * No endpoint in this product increments it, which `backend/app/schemas/post.py` states outright
+   * and gives as the reason {@link PostSortOption} offers no `popular` value. The only values it can
+   * therefore carry are the zero the column defaults to and whatever the demonstration seeder wrote.
+   * It is published so that counting reads later is a service change behind an unchanged contract.
+   *
+   * Do not present it as a view figure: an unmeasured number is indistinguishable from a measured
+   * one on screen. `src/components/blog/post-card.tsx` records the same rule at the render site.
+   */
   view_count: number;
   /** Instant the post was created, as an ISO-8601 string. Distinct from its publication instant. */
   created_at: string;
@@ -955,6 +986,13 @@ export interface CommentUpdate {
  *
  * A public caller sees only `APPROVED` comments, in the tree and in the nested replies alike,
  * because the thread query filters on that state explicitly.
+ *
+ * The responses differ in what `replies` carries, and the difference is truthful rather than
+ * incidental. A **created** comment answers with an empty array, because a comment that has just been
+ * written has nothing answering it. An **edited** comment answers with its whole reply tree, narrowed
+ * to the states that caller may see, so replacing the edited node in a cached thread preserves the
+ * discussion beneath it. Either way the array is present, so a consumer recurses on it without a
+ * guard.
  */
 export interface CommentPublic {
   /** Server-generated identifier. The value the edit and delete routes address. */
@@ -986,6 +1024,10 @@ export interface CommentPublic {
   /**
    * The comments answering this one, nested. Empty for a leaf, so the array is always present and
    * never needs a null check - recurse on it directly.
+   *
+   * Narrowed to the moderation states the caller may see, at **every** level: a reply beneath an
+   * approved parent is withheld from a public caller if it is not itself approved, and a reply whose
+   * parent is withheld never appears at all rather than being re-parented to the root.
    */
   replies: CommentPublic[];
 }
@@ -1129,7 +1171,10 @@ export interface AdminPost {
    * published - which is the normal case for the drafts this table is largely there to show.
    */
   published_at: string | null;
-  /** Number of times the post's detail page has been viewed. */
+  /**
+   * A server-owned readership counter, exactly as {@link PostSummary.view_count} documents it -
+   * nothing in this product increments it, so it is not audience data and is not rendered as such.
+   */
   view_count: number;
   /**
    * The account that wrote the post, as the public projection - the same shape the public surfaces
@@ -1222,3 +1267,228 @@ export interface AdminStats {
   /** Total number of categories in the taxonomy. */
   category_count: number;
 }
+
+/* -------------------------------------------------------------------------------------------------
+ * Response decoders - the runtime half of every declaration above
+ *
+ * Each schema below validates one response shape at the moment it arrives, and each is declared
+ * beside the interface it checks so the two cannot drift. `@/lib/api/client` takes one per JSON call
+ * and rejects a body that does not satisfy it as `/errors/malformed-response`.
+ *
+ * ## Why a runtime check exists at all
+ *
+ * A type annotation is a claim about a value, not a check of it. `JSON.parse(text) as PostDetail`
+ * compiles for any body whatsoever, so a response missing a member, carrying `null` where a string
+ * was declared, or answering an entirely different shape used to satisfy the generic and reach
+ * consumers as a value that lies about itself. The failure then surfaced somewhere else - a component
+ * reading `post.author.username` off an undefined author - or did not surface at all, which is worse:
+ * an unrecognised token response was adopted as a credential and every subsequent request failed
+ * instead of the one that was actually wrong.
+ *
+ * The service is not the threat being modelled. What sits between the two tiers is: a proxy that
+ * answers with its own JSON error envelope, a gateway that rewrites a body, a stale deployment
+ * serving a contract this build was not written against, a captive portal. Validating at the boundary
+ * turns every one of those into one legible rejection naming the endpoint and carrying the request
+ * identifier.
+ *
+ * ## How each schema is kept honest
+ *
+ * Every schema is annotated `z.ZodType<T>` against the interface it decodes, so a schema that drifts
+ * from its type is a **compile** error rather than a runtime surprise: add a member to the interface
+ * and the schema no longer satisfies the annotation. That is the whole reason the two live in one
+ * file - a schema in another module could only be kept in step by discipline.
+ *
+ * ## Two deliberate strictnesses, and one deliberate looseness
+ *
+ * - **Unknown members are stripped, not rejected.** `z.object` ignores what it was not told about, so
+ *   a service that adds a field in a later version does not break a client built against this one -
+ *   which is the compatible direction for a REST contract to evolve in. What cannot pass is a
+ *   *missing* or *wrongly typed* member, because that is the case a consumer cannot survive.
+ * - **Enumerations are checked against their literal sets.** A `role`, `status` or `token_type` outside
+ *   its documented values is rejected rather than admitted as a string, because every consumer of
+ *   those fields branches on them exhaustively.
+ * - **Timestamps are validated as strings, not as dates.** They are ISO-8601 instants the service
+ *   formats, they are rendered by `@/lib/format` and never arithmetic'd here, and a date parse at the
+ *   boundary would reject a perfectly good value over a formatting difference.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Wrap any row schema in the page envelope every collection in this API returns.
+ *
+ * A factory rather than nine hand-written page schemas: the envelope is identical on every collection,
+ * so declaring it once means a change to it is one edit and no collection can be validated against a
+ * differently-shaped envelope. The returned schema is typed `z.ZodType<Page<T>>`, so it composes with
+ * the same compile-time guarantee the row schemas carry.
+ *
+ * @typeParam T - The row type, for example {@link PostSummary} or {@link AdminUser}.
+ * @param row - The schema for one row.
+ * @returns A schema for one page of them.
+ */
+export function pageOf<T>(row: z.ZodType<T>): z.ZodType<Page<T>> {
+  return z.object({
+    items: z.array(row),
+    total: z.number(),
+    page: z.number(),
+    page_size: z.number(),
+    pages: z.number(),
+  });
+}
+
+/** Decoder for {@link TokenPair} - the response of sign-in and of rotation. */
+export const tokenPairSchema: z.ZodType<TokenPair> = z.object({
+  access_token: z.string(),
+  refresh_token: z.string(),
+  token_type: z.literal('bearer'),
+  expires_in: z.number(),
+});
+
+/** Decoder for {@link UserPublic} - the byline projection, nested inside posts and comments. */
+export const userPublicSchema: z.ZodType<UserPublic> = z.object({
+  id: z.string(),
+  username: z.string(),
+  display_name: z.string(),
+  bio: z.string().nullable(),
+  avatar_url: z.string().nullable(),
+  created_at: z.string(),
+});
+
+/** Decoder for {@link UserMe} - the caller's own account, email and role included. */
+export const userMeSchema: z.ZodType<UserMe> = z.object({
+  id: z.string(),
+  username: z.string(),
+  display_name: z.string(),
+  bio: z.string().nullable(),
+  avatar_url: z.string().nullable(),
+  created_at: z.string(),
+  email: z.string(),
+  role: z.enum(USER_ROLES),
+  is_active: z.boolean(),
+  updated_at: z.string(),
+});
+
+/** Decoder for {@link CategorySummary} - the slim taxonomy projection embedded in a post. */
+export const categorySummarySchema: z.ZodType<CategorySummary> = z.object({
+  id: z.string(),
+  name: z.string(),
+  slug: z.string(),
+});
+
+/** Decoder for {@link CategoryPublic} - a category in full, tally included. */
+export const categoryPublicSchema: z.ZodType<CategoryPublic> = z.object({
+  id: z.string(),
+  name: z.string(),
+  slug: z.string(),
+  description: z.string().nullable(),
+  post_count: z.number(),
+  created_at: z.string(),
+});
+
+/** Decoder for {@link PostSummary} - a feed card, deliberately without `content`. */
+export const postSummarySchema: z.ZodType<PostSummary> = z.object({
+  id: z.string(),
+  title: z.string(),
+  slug: z.string(),
+  excerpt: z.string().nullable(),
+  cover_image_url: z.string().nullable(),
+  status: z.enum(POST_STATUSES),
+  published_at: z.string().nullable(),
+  view_count: z.number(),
+  created_at: z.string(),
+  author: userPublicSchema,
+  categories: z.array(categorySummarySchema),
+});
+
+/** Decoder for {@link PostDetail} - the summary plus the article body. */
+export const postDetailSchema: z.ZodType<PostDetail> = z.object({
+  id: z.string(),
+  title: z.string(),
+  slug: z.string(),
+  excerpt: z.string().nullable(),
+  cover_image_url: z.string().nullable(),
+  status: z.enum(POST_STATUSES),
+  published_at: z.string().nullable(),
+  view_count: z.number(),
+  created_at: z.string(),
+  author: userPublicSchema,
+  categories: z.array(categorySummarySchema),
+  content: z.string(),
+  updated_at: z.string(),
+});
+
+/**
+ * Decoder for {@link CommentPublic} - one comment and, recursively, the thread beneath it.
+ *
+ * `z.lazy` is what makes the self-reference expressible: the schema names itself inside its own
+ * definition, so the reference has to be deferred until the binding exists. The type annotation is
+ * what keeps that indirection honest, and it is why the annotation is not optional here - an inferred
+ * recursive schema would infer `any` for the nested level.
+ *
+ * The whole tree is validated, at every depth. That is deliberate rather than incidental: a thread is
+ * the one response whose shape recurses, so a malformed reply five levels down is exactly the case a
+ * shallow check would miss and a recursive renderer would crash on.
+ */
+export const commentPublicSchema: z.ZodType<CommentPublic> = z.lazy(() =>
+  z.object({
+    id: z.string(),
+    post_id: z.string(),
+    parent_id: z.string().nullable(),
+    author: userPublicSchema,
+    body: z.string(),
+    status: z.enum(COMMENT_STATUSES),
+    created_at: z.string(),
+    updated_at: z.string(),
+    replies: z.array(commentPublicSchema),
+  }),
+);
+
+/** Decoder for {@link LikeSummary} - the answer of all three like routes. */
+export const likeSummarySchema: z.ZodType<LikeSummary> = z.object({
+  post_id: z.string(),
+  like_count: z.number(),
+  liked_by_caller: z.boolean(),
+});
+
+/** Decoder for {@link AdminUser} - the privileged account projection. */
+export const adminUserSchema: z.ZodType<AdminUser> = z.object({
+  id: z.string(),
+  email: z.string(),
+  username: z.string(),
+  display_name: z.string(),
+  role: z.enum(USER_ROLES),
+  is_active: z.boolean(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+/** Decoder for {@link AdminPost} - a post row in the administrative table, without its body. */
+export const adminPostSchema: z.ZodType<AdminPost> = z.object({
+  id: z.string(),
+  title: z.string(),
+  slug: z.string(),
+  status: z.enum(POST_STATUSES),
+  published_at: z.string().nullable(),
+  view_count: z.number(),
+  author: userPublicSchema,
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+/** Decoder for {@link AdminComment} - a moderation-queue row, flat rather than threaded. */
+export const adminCommentSchema: z.ZodType<AdminComment> = z.object({
+  id: z.string(),
+  post_id: z.string(),
+  parent_id: z.string().nullable(),
+  author: userPublicSchema,
+  body: z.string(),
+  status: z.enum(COMMENT_STATUSES),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+/** Decoder for {@link AdminStats} - the four aggregate counts behind the overview screen. */
+export const adminStatsSchema: z.ZodType<AdminStats> = z.object({
+  user_count: z.number(),
+  post_count: z.number(),
+  comment_count: z.number(),
+  category_count: z.number(),
+});

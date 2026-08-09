@@ -78,10 +78,13 @@ keeps sending it.
     either as a patchable member would let a general update path reach half of a paired change.
 ``view_count``
     Server-owned: a counter a client could set is not a counter, so it appears on the projections
-    and on neither input model. Nothing advances it at present - no route in this surface
-    increments it - so it reads ``0`` on every post, which is why ``PostSortOption`` deliberately
-    offers no ``"popular"`` value. The column is published anyway so that counting reads later is a
-    service change behind an unchanged contract.
+    and on neither input model. Nothing advances it at present - no route in this surface increments
+    it - so every post this API creates reads ``0`` for the whole of its life, and the only other
+    value the column can hold is the plausible figure ``app.db.seed`` writes into its demonstration
+    corpus. Either way the number is not a measurement, which is why ``PostSortOption`` deliberately
+    offers no ``"popular"`` value and why no surface in ``frontend/src/`` renders it as a readership
+    figure. The column is published anyway so that counting reads later is a service change behind
+    an unchanged contract.
 ``author_id``
     Taken from the principal that ``app.core.dependencies`` resolved from the bearer token, never
     from a body. Reading ownership out of the request would let any authenticated caller publish
@@ -217,8 +220,10 @@ from app.schemas.user import UserPublic
 # bounds and the annotated aliases below are the genuinely shared machinery - importable by a
 # test or by a client-side validator mirroring a bound, reachable at their single module address,
 # and off this list exactly as the two length constants in `app.schemas.category` are.
-# `DEFAULT_POST_SORT_OPTION` stays off it too: a route spells its own default in its signature,
-# so no consumer outside this module needs the constant. Keep this list in step with what the
+# `DEFAULT_POST_SORT_OPTION` stays off it too: its one consumer is
+# `app.services.post_service._default_sort_for`, which imports it from this module by name, and no
+# router needs it - the `sort` query parameter deliberately defaults to `None` so that function
+# can decide the ordering from the request as a whole. Keep this list in step with what the
 # module defines: mypy's strict `no_implicit_reexport` consults it, and it is what tells a reader
 # that the three names imported above are dependencies rather than re-exports.
 __all__ = ["PostCreate", "PostDetail", "PostSortOption", "PostSummary", "PostUpdate"]
@@ -335,11 +340,16 @@ looks authoritative while meaning nothing is worse than one that is absent.
 """
 
 DEFAULT_POST_SORT_OPTION: Final[PostSortOption] = "recent"
-"""The ordering applied when a caller expresses no preference.
+"""The ordering applied when a caller expresses no preference **and is not searching**.
 
-Named rather than repeated as a literal at each route, so the feed, the profile listing and the
-administrative table cannot drift onto different defaults. Equal to
+Named rather than repeated as a literal, so the feed, the profile listing and the administrative
+table cannot drift onto different defaults. Equal to
 ``app.repositories.post_repository.DEFAULT_POST_SORT``, for the reason recorded above it.
+
+Consumed in exactly one place: ``app.services.post_service._default_sort_for``, which returns it
+for a browse and ``"relevance"`` for a search. It is deliberately **not** a route-level default -
+a ``sort`` parameter that always arrives with a value makes that function unreachable, which is
+precisely how a search came to be answered by recency.
 """
 
 
@@ -463,6 +473,17 @@ Nothing here sanitises. Rich text authored by one account and rendered to every 
 schema's only stored-injection surface, and it is cleaned at two boundaries - on write by
 ``app.services.post_service`` and again where it is rendered - neither of which is a schema
 validator, because a validator cannot know which of the two it is standing at.
+
+What the write-side pass guarantees about the **stored** value, and therefore what every consumer
+of this API inherits without repeating it, is two things rather than one. Markup outside the
+service's element allow-list is removed, and - because this field is Markdown rather than HTML -
+every Markdown link, image, autolink and reference definition whose destination names a scheme
+outside ``http``, ``https`` and ``mailto`` has its link dropped and its visible text kept. The
+second half is not redundant with the first: ``[Click here](javascript:...)`` contains no markup
+at all, so an HTML sanitiser passes it through untouched and only a Markdown-aware pass can
+neutralise it. Destinations inside fenced blocks and code spans are left exactly as authored,
+because Markdown renders those as text and a technical article is entitled to quote a dangerous
+URL as its subject.
 """
 
 OptionalCoverImageUrl = Annotated[HttpUrl | None, BeforeValidator(_blank_to_none)]
@@ -937,10 +958,10 @@ class PostSummary(BaseModel):
             # /docs reads as one worked example - and the difference between this example and
             # PostDetail's is exactly the two members that separate the projections.
             #
-            # `view_count` is 0 rather than a plausible-looking figure because 0 is what this API
-            # actually returns for every post: nothing advances the counter. An example is a
-            # promise about the response, so an invented 128 would be the one line of this
-            # document that no response can match.
+            # `view_count` is 0 rather than a plausible-looking figure because 0 is what a post
+            # created through this API returns for the whole of its life: nothing advances the
+            # counter. An example is a promise about the response, so an invented 128 would be the
+            # one line of this document that no post of this API's own making can match.
             "example": {
                 "id": "7c9e6a2b-4d81-4f3a-9c5e-2b8d1f0a6e34",
                 "title": "Scaling FastAPI",

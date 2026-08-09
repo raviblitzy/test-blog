@@ -89,8 +89,11 @@ import {
   apiPostNoContent,
   clearCredentials,
   getRefreshToken,
+  isApiError,
   type RequestOptions,
+  rotateSession,
 } from '@/lib/api/client';
+import { tokenPairSchema, userMeSchema, userPublicSchema } from '@/lib/types';
 import type {
   LoginRequest,
   RefreshRequest,
@@ -115,9 +118,6 @@ const REGISTER_PATH = '/auth/register';
 /** `POST` - exchange a credential for a pair. **Form-encoded**; see {@link login}. */
 const LOGIN_PATH = '/auth/login';
 
-/** `POST` - spend a refresh token for a new pair. JSON. Single-use: the presented token is spent. */
-const REFRESH_PATH = '/auth/refresh';
-
 /** `POST` - revoke a refresh token. JSON body *and* a bearer credential; answers `204`. */
 const LOGOUT_PATH = '/auth/logout';
 
@@ -134,6 +134,15 @@ const GRANT_USERNAME_FIELD = 'username';
 
 /** The grant's credential field name. Its content is exactly what its name says. */
 const GRANT_PASSWORD_FIELD = 'password';
+
+/**
+ * The one status this module interprets, and it interprets it in exactly one place.
+ *
+ * {@link logout} branches on it because a `401` there is recoverable in a way the transport cannot
+ * recover it - see that function's note on why its body has to be rebuilt rather than replayed.
+ * Nothing else here reads a status: interpreting a failure is not a wrapper's concern.
+ */
+const UNAUTHORIZED_STATUS = 401;
 
 /* -------------------------------------------------------------------------------------------------
  * Option shaping
@@ -220,7 +229,7 @@ function withoutCredential(options: RequestOptions | undefined): RequestOptions 
  * validation rejection carrying field-level detail, a throttled window, or an unreachable service.
  */
 export function register(payload: RegisterRequest, options?: RequestOptions): Promise<UserPublic> {
-  return apiPost<UserPublic>(REGISTER_PATH, payload, withoutCredential(options));
+  return apiPost(REGISTER_PATH, userPublicSchema, payload, withoutCredential(options));
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -304,8 +313,9 @@ export function login(credentials: LoginRequest, options?: RequestOptions): Prom
   // the handler consumes `OAuth2PasswordRequestForm` and nothing else, so JSON here is a silent
   // `422`, and the grant - not this API - is what named the field. See the docblock above before
   // altering either the helper or the field names.
-  return apiPostForm<TokenPair>(
+  return apiPostForm(
     LOGIN_PATH,
+    tokenPairSchema,
     {
       [GRANT_USERNAME_FIELD]: credentials.email,
       [GRANT_PASSWORD_FIELD]: credentials.password,
@@ -318,51 +328,23 @@ export function login(credentials: LoginRequest, options?: RequestOptions): Prom
  * Rotation
  * ---------------------------------------------------------------------------------------------- */
 
-/**
- * Spend a refresh token for a new credential pair.
+/* -------------------------------------------------------------------------------------------------
+ * Rotation lives in the transport module, not here
  *
- * `POST /auth/refresh`, **JSON**, answering `200` with a {@link TokenPair}.
+ * There is deliberately NO `refresh` wrapper in this file, and its absence is the guarantee rather
+ * than an omission. A refresh token is SINGLE-USE: the service revokes the token presented to
+ * `POST /auth/refresh` in the same statement that issues its replacement, and reads a token
+ * presented twice as evidence of theft - which costs the account every outstanding token. So two
+ * ways to rotate is not a convenience, it is a race whose observable symptom is a reader signed out
+ * of every session while using the site normally.
  *
- * ## Rotation is destructive: the presented token is spent, not reused
- *
- * The service revokes the token presented here as part of the same statement that issues its
- * replacement, so a refresh token is **single-use**. The pair in the response is the only one that
- * remains valid, and a caller *must* replace what it stored - keeping the old refresh token
- * guarantees that the next rotation fails. `setCredentials` in `@/lib/api/client` replaces both
- * members for exactly this reason.
- *
- * Presenting a token that has already been spent is treated by the service as evidence of theft: it
- * revokes every outstanding token for that account, ending all of its sessions. That is why this
- * call withholds the reader's credential (see {@link withoutCredential}) - it makes a redundant
- * second rotation structurally impossible rather than merely unlikely.
- *
- * The token travels in the JSON body and never in the `Authorization` header. The two credentials are
- * different kinds of thing and must not be confused: the header carries the *access* token when there
- * is one, and this route needs no access token because the refresh token is itself the credential.
- *
- * ## Why this exists alongside the client's own rotation
- *
- * `@/lib/api/client` rotates automatically, once, when a request that carried a credential is
- * answered `401`, and it does so through a single-flight guard so that concurrent failures produce one
- * rotation rather than a race. That path is for *reacting* to an expiry mid-request and is issued
- * inline there to avoid an import cycle with this module.
- *
- * This function is for *deliberate* rotation, which is a different operation with a different caller:
- * `src/providers/auth-provider.tsx` restoring a session on load holds a refresh token and no access
- * token, and has no failing request to react to. Prefer the automatic path for ordinary requests -
- * two callers rotating concurrently would race to invalidate each other's replacement, and only the
- * client's guard prevents that.
- *
- * @param payload - The refresh token to spend, under its wire member name.
- * @param options - Optional per-call transport controls, forwarded unchanged. The credential is
- * withheld regardless - see {@link withoutCredential}.
- * @returns The new pair. Adopt **both** of its tokens; the presented one is now dead.
- * @throws `ApiError` from `@/lib/api/client`: `401` when the token was never issued, has expired, has
- * been revoked or has already been spent; `429` for a throttled window; or a transport failure.
- */
-export function refresh(payload: RefreshRequest, options?: RequestOptions): Promise<TokenPair> {
-  return apiPost<TokenPair>(REFRESH_PATH, payload, withoutCredential(options));
-}
+ * `rotateSession` in `@/lib/api/client` is therefore the tier's only rotation entry point. It owns
+ * the single-flight promise that the automatic retry-on-401 also joins, it adopts the new pair
+ * itself so no caller can leave a window carrying the token that was just revoked, and it discards
+ * a result that arrives after a sign-out. A wrapper here would necessarily issue its own request and
+ * bypass all three. `src/providers/auth-provider.tsx` awaits `rotateSession` for exactly this
+ * reason; nothing in this module needs the path, so the path is not stated here either.
+ * ---------------------------------------------------------------------------------------------- */
 
 /* -------------------------------------------------------------------------------------------------
  * Sign-out
@@ -411,6 +393,25 @@ export function refresh(payload: RefreshRequest, options?: RequestOptions): Prom
  * exists and would fail the honest cases - a retried request, a second tab, a reader signing out
  * twice.
  *
+ * ## Why rotation is disabled here, and what happens instead
+ *
+ * This is the one route whose **body names a credential**, and that makes the transport's ordinary
+ * rotate-and-retry actively wrong for it. The sequence it would produce: the access token has expired,
+ * so the service answers `401`; the transport rotates, which spends refresh token R1 and issues R2;
+ * the transport then replays the request with the new access token *and the original body*, which
+ * still names R1. The service accepts it - revocation is idempotent - and re-revokes a token that was
+ * already spent. R2 is left **alive**, so the session the reader asked to end is still usable by
+ * anything holding R2, while the local clear reports success.
+ *
+ * So the call is dispatched with `allowRefresh: false` and the `401` is handled here, where the body
+ * can be rebuilt: rotate once through `rotateSession`, then re-issue sign-out naming the *post-
+ * rotation* refresh token. That revokes the credential that is actually live. If the rotation is
+ * itself refused, there is nothing left to revoke - the session is already over and
+ * `@/lib/api/client` has cleared it - so the local clear runs and sign-out succeeds.
+ *
+ * The retry is attempted at most once, and only for a `401`. Any other failure - a throttled window, a
+ * transport fault - propagates, because it says nothing about the credential.
+ *
  * ## On the ordering of the clear
  *
  * The local clear runs after the request succeeds, so a genuine failure - a throttled window, say -
@@ -422,21 +423,61 @@ export function refresh(payload: RefreshRequest, options?: RequestOptions): Prom
  * not wrap the request in error handling, because interpreting a failure is not a wrapper's concern.
  *
  * @param payload - The refresh token to revoke. Omit it to revoke the one currently held.
- * @param options - Optional per-call transport controls, forwarded unchanged.
+ * @param options - Optional per-call transport controls, forwarded unchanged. `allowRefresh` is set
+ * by this function and a caller's value for it is deliberately overridden - see above.
  * @returns Nothing. The route answers `204`, so there is no resource to return.
- * @throws `ApiError` from `@/lib/api/client`: `401` when the access token is absent or expired, `429`
- * for a throttled window, or a transport failure. The local credential is left in place for the
- * caller to act on, except where the client has already abandoned the session itself.
+ * @throws `ApiError` from `@/lib/api/client`: `429` for a throttled window, or a transport failure. A
+ * `401` is handled internally by rotating once and re-issuing with the live token; it propagates only
+ * if the re-issued request is refused as well. The local credential is left in place for the caller to
+ * act on, except where the client has already abandoned the session itself.
  */
 export async function logout(payload?: RefreshRequest, options?: RequestOptions): Promise<void> {
   const presented = payload?.refresh_token ?? getRefreshToken();
 
   if (presented !== null && presented !== '') {
-    const body: RefreshRequest = { refresh_token: presented };
-    await apiPostNoContent(LOGOUT_PATH, body, options);
+    // `allowRefresh: false` last, so it cannot be overridden by a caller's options object. A caller
+    // has no legitimate reason to re-enable rotation here, and enabling it re-introduces the defect
+    // this function exists to avoid.
+    const noRotation: RequestOptions = { ...options, allowRefresh: false };
+    try {
+      await apiPostNoContent(LOGOUT_PATH, { refresh_token: presented }, noRotation);
+    } catch (cause) {
+      if (!isApiError(cause) || cause.status !== UNAUTHORIZED_STATUS) {
+        throw cause;
+      }
+      // The access token had expired. Rotate once - which spends the token just presented and issues
+      // its successor - and then revoke THAT successor, which is the credential now keeping the
+      // session alive. Replaying the original body would revoke a token that is already spent.
+      await revokeAfterRotation(noRotation);
+    }
   }
 
   clearCredentials();
+}
+
+/**
+ * Rotate once, then sign out with the token the rotation issued.
+ *
+ * Split out of {@link logout} so the retry path reads as the two steps it is. Called only after a
+ * `401`, and never more than once per sign-out.
+ *
+ * A refused rotation is swallowed deliberately: it means the session is already over - the refresh
+ * token was unknown, expired or revoked - so there is nothing left to revoke and sign-out has
+ * effectively already happened server-side. `@/lib/api/client` has cleared the credential and notified
+ * its unauthorised handler by then, and {@link logout} clears again unconditionally. Reporting a
+ * failure to the reader for a session that is provably gone would be a worse answer than success.
+ */
+async function revokeAfterRotation(options: RequestOptions): Promise<void> {
+  let rotated: TokenPair;
+  try {
+    rotated = await rotateSession();
+  } catch (cause) {
+    if (!isApiError(cause)) {
+      throw cause;
+    }
+    return;
+  }
+  await apiPostNoContent(LOGOUT_PATH, { refresh_token: rotated.refresh_token }, options);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -482,5 +523,5 @@ export async function logout(payload?: RefreshRequest, options?: RequestOptions)
  * failure.
  */
 export function getMe(options?: RequestOptions): Promise<UserMe> {
-  return apiGet<UserMe>(ME_PATH, options);
+  return apiGet(ME_PATH, userMeSchema, options);
 }

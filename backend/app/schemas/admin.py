@@ -1,7 +1,8 @@
 """The administrative contract: what an administrator may see, and what an administrator may change.
 
-Thirteen operations live beneath ``/api/v1/admin`` - the four management surfaces the user named
-("an admin dashboard for managing users, posts, comments, and categories"), three operations each,
+Fourteen operations live beneath ``/api/v1/admin`` - the four management surfaces the user named
+("an admin dashboard for managing users, posts, comments, and categories"), each with a listing, a
+state mutation and a deletion, plus a creation for the one family that has no self-service path,
 plus the overview screen. This module declares every payload they carry, and nothing else.
 
 Because the framework choice was resolved to FastAPI there is no framework-provided administration
@@ -32,6 +33,13 @@ Requests:
     from ``app.schemas.category`` and re-exported below rather than redeclared here - that module
     names itself the single definition site of both, and one wire format deserves one description.
 
+There is deliberately no ``AdminCategory``, and its absence is not an oversight: a category has no
+private member. No owner, no address, no credential, no moderation state - nothing for a
+privileged projection to reveal that ``CategoryPublic`` withholds. So
+``GET /api/v1/admin/categories`` names the public item type, which is why the three privileged
+projections above number three rather than four. The administrative listing differs from the public
+one in what it *accepts* (a ``q`` search term), not in what it *returns*.
+
 The whole namespace, and the payload each operation carries::
 
     GET    /api/v1/admin/stats                  ->  AdminStats
@@ -44,6 +52,7 @@ The whole namespace, and the payload each operation carries::
     GET    /api/v1/admin/comments               ->  Page[AdminComment]
     PATCH  /api/v1/admin/comments/{id}/status   AdminCommentStatusUpdate ->  AdminComment
     DELETE /api/v1/admin/comments/{id}                                   ->  204, no body
+    GET    /api/v1/admin/categories             ->  Page[CategoryPublic]
     POST   /api/v1/admin/categories             CategoryCreate           ->  CategoryPublic
     PATCH  /api/v1/admin/categories/{id}        CategoryUpdate           ->  CategoryPublic
     DELETE /api/v1/admin/categories/{id}                                 ->  204, no body

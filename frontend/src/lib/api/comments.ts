@@ -101,7 +101,9 @@
  */
 
 import { apiDeleteNoContent, apiGet, apiPatch, apiPost } from '@/lib/api/client';
+import { encodePathSegment } from '@/lib/paths';
 import type { RequestOptions } from '@/lib/api/client';
+import { commentPublicSchema, pageOf } from '@/lib/types';
 import type { CommentCreate, CommentPublic, CommentUpdate, Page } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
@@ -140,15 +142,16 @@ import type { CommentCreate, CommentPublic, CommentUpdate, Page } from '@/lib/ty
  * @throws Error when `value` is empty or contains only whitespace. A programming error in the
  * caller, surfaced as a rejection because every function in this module is `async`.
  */
-function identifierSegment(value: string, parameterName: string): string {
-  const trimmed = value.trim();
-  if (trimmed === '') {
-    throw new Error(
-      `${parameterName} must be a non-empty identifier: @/lib/api/comments cannot compose a ` +
-        `request path from a blank value. Pass the UUID the API emitted for the resource.`,
-    );
-  }
-  return encodeURIComponent(trimmed);
+function identifierSegment(value: string, parameterName: string, operation: string): string {
+  // Through the tier's ONE encoder, which refuses more than a blank value: `.` and `..` are
+  // already URL-safe, so percent-encoding leaves them intact and the URL grammar resolves
+  // `/posts/../auth/me/comments` against the surrounding path - a successful request against a
+  // route this wrapper never named, carrying the reader's bearer and reporting no error.
+  return encodePathSegment(value, {
+    operation,
+    parameterName,
+    hint: 'Pass the UUID the API emitted for the resource.',
+  });
 }
 
 /**
@@ -159,8 +162,8 @@ function identifierSegment(value: string, parameterName: string): string {
  * tidiness one: the service's request model forbids a `post_id` in the body precisely so that a
  * caller cannot name a second post the request was never authorised against.
  */
-function threadPath(postId: string): string {
-  return `/posts/${identifierSegment(postId, 'postId')}/comments`;
+function threadPath(postId: string, operation: string): string {
+  return `/posts/${identifierSegment(postId, 'postId', operation)}/comments`;
 }
 
 /**
@@ -170,8 +173,8 @@ function threadPath(postId: string): string {
  * A comment is addressed by its own identifier here, with no post segment: the service loads the
  * row and derives the post from it, so a caller cannot assert one.
  */
-function commentPath(commentId: string): string {
-  return `/comments/${identifierSegment(commentId, 'commentId')}`;
+function commentPath(commentId: string, operation: string): string {
+  return `/comments/${identifierSegment(commentId, 'commentId', operation)}`;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -234,13 +237,17 @@ export interface ListCommentsParams {
  * Build the create document: the text, and the parent only when there genuinely is one.
  *
  * `parent_id` is the *entire* difference between a comment and a reply, so its treatment is the one
- * subtlety in this file's write path. It is included only when the caller supplied a usable value;
- * `undefined`, `null` and `''` are all read as "this is a top-level comment" and the member is left
- * out of the document altogether. That mirrors two conventions this tier already holds: the service
- * accepts an omitted *or* null parent as top-level, and `@/lib/api/client` treats those same three
- * values as omissions when it serialises a query string. `@/lib/validation/comment` permits a form
- * to submit `parent_id: null` for a root comment, so the normalisation is reached in practice rather
- * than being defensive decoration.
+ * subtlety in this file's write path. `undefined` and `null` mean "this is a top-level comment" and
+ * the member is left out of the document altogether: the service accepts an omitted *or* null parent
+ * as top-level, and `@/lib/validation/comment` permits a form to submit `parent_id: null` for a root
+ * comment, so the normalisation is reached in practice rather than being defensive decoration.
+ *
+ * **A blank or whitespace-only value is REFUSED rather than normalised**, and the distinction is the
+ * point. Silently dropping `''` posted a reply as a NEW ROOT COMMENT: the reader saw their answer
+ * detached from the message they were answering, with nothing failing anywhere and no way to tell
+ * that the thread had been reshaped. An empty string is not a caller saying "top level" - it is a
+ * caller whose identifier went missing, and the only honest answer is to say so before a request is
+ * spent creating the wrong resource.
  *
  * What cannot appear, and why each absence is deliberate: `post_id`, because the post comes from the
  * path and a body-supplied one would be a second, unchecked way to name it; `author_id`, because
@@ -253,8 +260,16 @@ export interface ListCommentsParams {
  */
 function toCreateDocument(input: CommentCreate): CommentCreate {
   const parentId = input.parent_id;
-  if (parentId === undefined || parentId === null || parentId === '') {
+  if (parentId === undefined || parentId === null) {
     return { body: input.body };
+  }
+  if (parentId.trim() === '') {
+    throw new TypeError(
+      'createComment: parent_id was supplied but is blank, so it cannot address a comment. ' +
+        'Omit the member (or pass null) for a top-level comment; otherwise pass the UUID the API ' +
+        'emitted for the comment being replied to - dropping a blank value would post the reply ' +
+        'as a new root comment with nothing reporting an error.',
+    );
   }
   return { body: input.body, parent_id: parentId };
 }
@@ -336,8 +351,9 @@ export async function listComments(
   // undefined one: a call that names no window therefore produces a bare path with no query string
   // at all, and the service applies its own defaults. Nothing is defaulted here, which leaves
   // exactly one definition of "page 1, twenty rows" - the service's.
-  return apiGet<Page<CommentPublic>>(threadPath(postId), {
+  return apiGet(threadPath(postId, 'listComments'), pageOf(commentPublicSchema), {
     ...options,
+    anonymousFallback: true,
     query: { page: params.page, page_size: params.page_size },
   });
 }
@@ -357,10 +373,18 @@ export async function listComments(
  * rather than as something already public. And its `replies` array is empty, which is simply true: a
  * comment that has just been written has nothing answering it yet.
  *
- * Safe to retry after a failure, which is what makes an optimistic insertion sound: a rejected
- * submission has written nothing and leaves the draft in the form. The optimistic entry and its
- * rollback belong to the hook that owns the cache; this function neither performs nor assumes
- * either.
+ * **A rejected submission has written nothing**, which is what makes an optimistic insertion sound:
+ * the rollback restores the truth, and the draft is still in the form to re-submit. The optimistic
+ * entry and its rollback belong to the hook that owns the cache; this function neither performs nor
+ * assumes either.
+ *
+ * **This is not an idempotent operation and there is no idempotency key.** A retry is safe only when
+ * the request demonstrably did not reach the service - a rejection, a refusal, or an abort before
+ * dispatch. A request that committed and whose response was lost has already created the comment,
+ * and re-sending it creates a second one, so a resubmission after an ambiguous failure (a timeout,
+ * an aborted read, a network error mid-response) must be a decision the reader makes rather than one
+ * the client makes for them. Re-reading the thread reconciles it: a duplicate is visible there, and
+ * its author can delete it.
  *
  * @param postId - Identifier of the post being commented on. The only source for it, by design.
  * @param input - The text, and optionally the comment being replied to. Nothing else is sent.
@@ -369,7 +393,8 @@ export async function listComments(
  * @throws `ApiError` with status `401` when no usable credential is held, `404` when the post does
  * not exist or is not visible to this caller, `422` when the text or the named parent is rejected,
  * and `409` when the post, the parent or the account is removed between validation and the insert -
- * in which case the request is safe to retry.
+ * which reports a row that is gone rather than a transient fault, so re-sending the same body will
+ * report it again.
  *
  * @example
  * ```ts
@@ -382,7 +407,12 @@ export async function createComment(
   input: CommentCreate,
   options?: CommentRequestOptions,
 ): Promise<CommentPublic> {
-  return apiPost<CommentPublic>(threadPath(postId), toCreateDocument(input), options);
+  return apiPost(
+    threadPath(postId, 'createComment'),
+    commentPublicSchema,
+    toCreateDocument(input),
+    options,
+  );
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -402,9 +432,15 @@ export async function createComment(
  * The returned comment's `status` may differ from the value the caller last saw without the caller
  * having asked for a change: an accepted edit to an approved comment returns it to awaiting
  * moderation, so replaced text is reviewed before it is public again. Treat the response as
- * authoritative rather than merging the submitted text into the comment already on screen. Its
- * `replies` array is empty for the same reason it is on creation - an edit changes text, never a
- * thread's shape, so this response describes one comment and not the thread around it.
+ * authoritative rather than merging the submitted text into the comment already on screen.
+ *
+ * **The response carries the comment's reply tree**, nested to full depth in `replies` and narrowed
+ * to the moderation states this caller may see - the same states {@link listComments} would show
+ * them. So replacing the edited node in a cached thread with this response is the correct update and
+ * loses nothing: the discussion beneath it comes back with it. (It did not always: an earlier
+ * revision answered with `replies: []`, and replacing a cached node with that answer silently
+ * removed every descendant from the rendered thread.) A comment with no visible replies still comes
+ * back with an empty array rather than an absent one, so the field never has to be guarded.
  *
  * @param commentId - Identifier of the comment to edit.
  * @param input - The replacement text, or an empty patch. Carries no `status` and no `parent_id`.
@@ -426,7 +462,12 @@ export async function updateComment(
   input: CommentUpdate,
   options?: CommentRequestOptions,
 ): Promise<CommentPublic> {
-  return apiPatch<CommentPublic>(commentPath(commentId), toUpdateDocument(input), options);
+  return apiPatch(
+    commentPath(commentId, 'updateComment'),
+    commentPublicSchema,
+    toUpdateDocument(input),
+    options,
+  );
 }
 
 /**
@@ -468,5 +509,5 @@ export async function deleteComment(
   commentId: string,
   options?: CommentRequestOptions,
 ): Promise<void> {
-  return apiDeleteNoContent(commentPath(commentId), options);
+  return apiDeleteNoContent(commentPath(commentId, 'deleteComment'), options);
 }

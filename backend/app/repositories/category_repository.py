@@ -1,9 +1,9 @@
 """Every SQL statement the ``categories`` taxonomy needs, and nothing else.
 
 This module is the sole home of the queries behind the category taxonomy: the slug lookup a
-canonical URL resolves through, the whole-taxonomy listing that fills the home page's filter
-control, the counted listing rendered beside each filter chip, the windowed listing the
-administrative table pages through, the prefix scan that feeds slug de-duplication, and the
+canonical URL resolves through, the windowed listing **both** category collections page through,
+the counted listing that supplies the tally rendered beside every term, the un-paginated listing a
+bulk membership check indexes in memory, the prefix scan that feeds slug de-duplication, and the
 in-use probe that a delete is refused on. ``app.services.category_service`` and
 ``app.services.admin_service`` are the only callers; nothing above them ever composes a
 statement of its own.
@@ -236,7 +236,9 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
 
         repository = CategoryRepository(session)
 
-        # GET /api/v1/categories - one statement, counts included.
+        # GET /api/v1/categories and GET /api/v1/admin/categories - one windowed statement,
+        # and one aggregate for the tallies. Never one count per row.
+        rows, total = await repository.list_paginated(q=None, limit=20, offset=0)
         counted = await repository.list_with_post_counts()
 
         # Creating a category: the service derives the slug, this class stores it.
@@ -330,11 +332,12 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
     async def list_all(self) -> Sequence[Category]:
         """Return the entire taxonomy, ordered by display name.
 
-        Unpaginated on purpose. ``GET /api/v1/categories`` fills a filter control that has to
-        offer every term at once - a half-populated filter is a filter that silently hides
-        posts - and a reference taxonomy is bounded by editorial effort rather than by user
-        input, so there is no growth curve to defend against. The administrative table, which
-        *is* unbounded in principle and needs searching, uses :meth:`list_paginated` instead.
+        Unpaginated on purpose, and **not** the listing either category collection serves - both
+        of those window through :meth:`list_paginated`. This one exists for the caller that needs
+        the taxonomy as a lookup rather than as a page: ``post_service`` indexes it by identifier
+        to validate every category a post is being filed under in one statement instead of probing
+        once per identifier. A reference taxonomy is bounded by editorial effort rather than by
+        user input, so reading all of it for that purpose has no growth curve to defend against.
 
         Returns:
             Every category, ascending by ``name``; an empty sequence when the taxonomy is
@@ -349,14 +352,66 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
         result = await self.session.execute(select(Category).order_by(Category.name.asc()))
         return result.scalars().all()
 
-    async def list_with_post_counts(
-        self, *, status: PostStatus | None = PostStatus.PUBLISHED
-    ) -> Sequence[tuple[Category, int]]:
-        """Return every category paired with how many posts are filed under it.
+    async def published_post_count(
+        self, category_id: uuid.UUID, *, status: PostStatus | None = PostStatus.PUBLISHED
+    ) -> int:
+        """Count the posts filed under **one** category.
 
-        One statement, always - see "Aggregate, not N+1" in the module docstring. This is what
-        ``GET /api/v1/categories`` serialises into the filter control's chips, and what the
-        administrative category screen shows in its count column.
+        The targeted counterpart of :meth:`list_with_post_counts`, and the right call whenever a
+        caller needs the tally for a category it already holds. Reading a single-category count out
+        of the whole-taxonomy aggregate works, but it groups every category and joins every filing
+        to answer a question about one row - which is the shape ``GET /api/v1/categories/{slug}``
+        and every administrative create-or-update readback were paying for.
+
+        Args:
+            category_id: The category whose filings to count.
+            status: Which lifecycle state to count, with the same meaning and the same public
+                default as :meth:`list_with_post_counts`, so the two can never report a different
+                number for the same category.
+
+        Returns:
+            The number of matching posts; ``0`` for a category with none, and ``0`` for an
+            identifier that names no category at all - a count is not the place to discover that a
+            row is missing, and every caller has already resolved the category before asking.
+
+        Note:
+            One statement, no entity. It counts over ``post_categories`` joined to ``posts`` and
+            selects no column of either relation, so nothing is hydrated and nothing enters the
+            session's identity map.
+
+            The access path is ``ix_post_categories_category_id`` for the equality on
+            ``category_id`` - the index that exists for exactly this direction of the association -
+            and ``pk_posts`` for the join to the post. The status predicate sits in the ``WHERE``
+            clause here rather than in an ``ON`` clause, and that difference from
+            :meth:`list_with_post_counts` is deliberate: there is no outer join to preserve, so
+            there are no null-extended rows a ``WHERE`` could discard.
+        """
+        criteria: list[ColumnElement[bool]] = [post_categories.c.category_id == category_id]
+        if status is not None:
+            criteria.append(Post.status == status)
+
+        result = await self.session.execute(
+            select(func.count())
+            .select_from(post_categories)
+            .join(Post, Post.id == post_categories.c.post_id)
+            .where(*criteria)
+        )
+        counted = result.scalar()
+        return 0 if counted is None else counted
+
+    async def list_with_post_counts(
+        self,
+        *,
+        status: PostStatus | None = PostStatus.PUBLISHED,
+        category_ids: Sequence[uuid.UUID] | None = None,
+    ) -> Sequence[tuple[Category, int]]:
+        """Return categories paired with how many posts are filed under each.
+
+        One statement, always - see "Aggregate, not N+1" in the module docstring. This is where
+        every ``post_count`` in the API comes from: ``category_service`` turns these pairs into a
+        tally map and attaches it to whichever categories it is projecting, which is how the single
+        read, the public page and the administrative page all report the same figure at the cost of
+        one aggregate rather than one count per row.
 
         Args:
             status: Which lifecycle state to count. Defaults to
@@ -365,9 +420,17 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
                 turn out to be drafts is worse than no chip. Pass ``None`` to count posts in
                 every state, which is the administrative view. Purely a filter: this module
                 never decides who is entitled to which value.
+            category_ids: Restrict the aggregate to these categories, or ``None`` for the whole
+                taxonomy. The public filter control passes ``None`` deliberately - it renders a chip
+                per category, so its enrichment set *is* the taxonomy, which is finite by editorial
+                effort rather than by user input. A **paginated** caller must pass the identifiers
+                on its page: aggregating the whole relation to enrich twenty rows defeats the page
+                boundary the window just established, and the cost then grows with the taxonomy
+                instead of with the page. An empty sequence is honoured as "no categories" and
+                returns nothing, rather than being treated as "all".
 
         Returns:
-            ``(category, count)`` pairs ascending by ``name``. **Every** category appears,
+            ``(category, count)`` pairs ascending by ``name``. Every category **in scope** appears,
             including those with no matching post, whose count is ``0``.
 
         Note:
@@ -405,16 +468,30 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
             .group_by(Category.id)
             .order_by(Category.name.asc())
         )
+        # Narrowing goes in the WHERE clause on the CATEGORIES side, which is the one place it can
+        # go without changing what the aggregate means: it removes whole groups rather than rows
+        # within a group, so every category still in scope keeps its outer join and its zero.
+        # Tested against `None` rather than for truth, because an empty sequence is a legitimate
+        # request for nothing - a page with no rows to enrich - and `if category_ids:` would
+        # silently promote it to the whole taxonomy.
+        if category_ids is not None:
+            stmt = stmt.where(Category.id.in_(category_ids))
+
         result = await self.session.execute(stmt)
         return result.tuples().all()
 
     async def list_paginated(
         self, *, q: str | None = None, limit: int, offset: int
     ) -> tuple[Sequence[Category], int]:
-        """Window the taxonomy for the administrative table, optionally filtered by text.
+        """Window the taxonomy, optionally filtered by text.
 
-        Backs ``GET /api/v1/admin/categories``. Unlike :meth:`list_all`, this surface is a
-        management table rather than a filter control: it is searched and paged, so it windows.
+        Backs **both** category collections - the public ``GET /api/v1/categories`` and the
+        administrator-only ``GET /api/v1/admin/categories`` - which reach it through the one
+        service method ``CategoryService.list_paginated``. The two differ only in whether a ``q``
+        arrives: every collection in this API answers with the page envelope, so the reader-facing
+        control windows exactly as the management table does. Unlike :meth:`list_all`, which
+        returns the taxonomy as a lookup for a bulk membership check, this is the surface a client
+        pages through.
 
         Args:
             q: Optional search text, matched as a case-insensitive containment against both

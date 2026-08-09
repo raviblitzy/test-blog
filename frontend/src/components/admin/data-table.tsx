@@ -27,6 +27,12 @@
 // knowledge that would stop it being shared. Because it takes an envelope instead, the users
 // screen and the comment moderation queue are the same component with different columns.
 //
+// One import from that module is nevertheless required and is not a fetch: `isApiError`, the
+// narrowing predicate. React Query hands a caller's `error` back as `Error`, so the only way to
+// reach the problem document inside a failure - the title and detail this grid's error panel is
+// made of - is to narrow it with the client's own guard. Doing it here rather than obliging four
+// screens to map the error first is what keeps `error={error}` correct at every call site.
+//
 // It also keeps the component suite honest: the request interceptor is configured to error on any
 // request no handler claims, so a stray fetch here would fail the whole suite rather than
 // silently pass with mock data.
@@ -93,8 +99,11 @@
 //   1. Every column carries a `cell` RENDER FUNCTION, and a function is not serializable across
 //      the server-to-client boundary. A Server Component could not pass one, so a shared module
 //      would be unusable by its actual callers.
-//   2. It calls `usePagination`, which reads the URL. All four administrative screens are client
-//      screens in the plan's own screen inventory, so nothing is lost.
+//   2. It renders `@/components/ui/pagination`, which reads the URL and is therefore a client
+//      component itself. All four administrative screens are client screens in the plan's own screen
+//      inventory, so nothing is lost. Note that this file no longer calls `usePagination` directly:
+//      its page arithmetic comes from `@/lib/pagination`, which is a pure function, so the grid holds
+//      no URL subscription of its own.
 //
 // The island still stays narrow: nothing entity-specific is pushed in here. There is not one
 // reference below to a user, a post, a comment or a category - no `role`, no `status`, no
@@ -124,7 +133,7 @@
 //      trigger or a link, so focus already enters the container and the browser scrolls it to
 //      reveal whichever cell takes focus; the primitive says outright not to pass it for these
 //      grids, and surfacing it as a prop would invite exactly that mistake.
-//   4. A `<Suspense>` boundary. `usePagination` reads search parameters, and on a statically
+//   4. A `<Suspense>` boundary. The page control reads search parameters, and on a statically
 //      rendered route Next.js requires a boundary above any component that does. That boundary
 //      belongs to the route - a fallback placed here would put a placeholder rather than the real
 //      page links into the prerendered HTML, which is the one outcome the anchor-based pagination
@@ -160,8 +169,9 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { usePagination } from '@/hooks/use-pagination';
-import type { Page, ProblemDetail } from '@/lib/types';
+import { isApiError } from '@/lib/api/client';
+import { derivePagination, formatResultRange } from '@/lib/pagination';
+import type { Page } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------- */
@@ -571,24 +581,6 @@ function resolveColumns<T>(
 }
 
 /**
- * Compose the "showing X to Y of N" line beneath a grid.
- *
- * The three numbers come from `usePagination` and are never recomputed here: that hook is this
- * tier's single implementation of page arithmetic, and a second one could disagree with it - the
- * symptom being a grid that reports a range the service would not serve. It already handles the
- * cases that make this line wrong when it is written by hand, notably a partial final page, where
- * the last index is the total rather than page times window size.
- *
- * @param firstItem - 1-based index of the first row on screen.
- * @param lastItem - 1-based index of the last row on screen.
- * @param total - Total matching rows, ignoring the window.
- * @returns The rendered sentence.
- */
-function formatResultRange(firstItem: number, lastItem: number, total: number): string {
-  return `Showing ${firstItem}\u2013${lastItem} of ${total} ${total === 1 ? 'result' : 'results'}`;
-}
-
-/**
  * Pick the headline and the supporting line for the error panel out of one problem document.
  *
  * The error contract gives `title` a constant meaning per problem kind - "Forbidden" - and `detail`
@@ -599,12 +591,21 @@ function formatResultRange(firstItem: number, lastItem: number, total: number): 
  * @param error - The normalised problem document from the API client.
  * @returns The headline, and the supporting line or `null` when there is nothing more to add.
  */
-function resolveErrorCopy(error: ProblemDetail): {
+function resolveErrorCopy(error: Error): {
   readonly headline: string;
   readonly explanation: string | null;
 } {
-  const title = error.title.trim();
-  const detail = error.detail.trim();
+  if (!isApiError(error)) {
+    const message = error.message.trim();
+
+    return {
+      headline: FALLBACK_ERROR_HEADLINE,
+      explanation: message.length > 0 ? message : null,
+    };
+  }
+
+  const title = error.problem.title.trim();
+  const detail = error.problem.detail.trim();
 
   if (title.length > 0) {
     return { headline: title, explanation: detail.length > 0 && detail !== title ? detail : null };
@@ -687,12 +688,18 @@ export interface DataTableProps<T> {
   /**
    * The failure to report, or `null` when there is none. Defaults to `null`.
    *
-   * The single error shape of the whole API, already normalised by `@/lib/api/client.ts`. A `403`
-   * belongs here like any other status: authority is re-checked server-side on every protected
-   * operation, so a screen that hid an action can still be refused, and the refusal has to be
-   * readable rather than swallowed.
+   * `Error`, because that is what a caller HAS: the API client throws, so React Query's `error` is
+   * typed `Error | null` and a screen passes it straight through - `error={error}`. This component
+   * narrows it with the client's `isApiError` and renders the problem document inside, so no screen
+   * writes a mapping step and none can write a different one. Declaring the problem shape here
+   * instead would have obliged every caller to unwrap the failure first, and a caller that forgot
+   * would have compiled while rendering nothing.
+   *
+   * A `403` belongs here like any other status: authority is re-checked server-side on every
+   * protected operation, so a screen that hid an action can still be refused, and the refusal has to
+   * be readable rather than swallowed.
    */
-  error?: ProblemDetail | null;
+  error?: Error | null;
 
   /** Headline for the empty state. Defaults to a generic line; name the entity if you can. */
   emptyTitle?: string;
@@ -717,6 +724,10 @@ export interface DataTableProps<T> {
    * builds, so turning the page works with this prop absent and with JavaScript disabled; this is
    * the place for something that belongs to the click rather than to the destination, such as
    * scrolling a long grid back to its top.
+   *
+   * It must not navigate, and `usePagination`'s `goToPage` in particular must not be passed here:
+   * the anchor has already performed the transition, so a second one would leave two history
+   * entries and refetch the grid. Both the primitive and the hook state the same rule.
    */
   onPageChange?: (page: number) => void;
 
@@ -779,12 +790,19 @@ export function DataTable<T>({
   className,
 }: DataTableProps<T>): JSX.Element {
   /*
-   * The tier's single implementation of page arithmetic. It is called for the range line's three
-   * numbers and for the two counts this component gates on, and it holds no state and runs no
-   * effect, so calling it here as well as inside the page control costs nothing and cannot
-   * disagree with it - both derive from the same envelope.
+   * The tier's single page arithmetic, called as a PURE FUNCTION rather than as a hook.
+   *
+   * This used to call `usePagination(page)`, which subscribes to the URL - and `@/components/ui/pagination`
+   * below calls it too, so one grid held two subscriptions to the same search parameters and rebuilt two
+   * sets of memoised callbacks on every navigation. The numbers were never wrong (both derive from the
+   * same envelope), but the duplication was: it is the kind that grows a third copy the next time a
+   * surface needs a range label.
+   *
+   * `derivePagination` is the same arithmetic with the URL removed, so this grid takes what it needs -
+   * the range line's three numbers and the two counts it gates on - while the page control keeps the ONE
+   * subscription that genuinely needs the URL, because it is the thing building hrefs.
    */
-  const view = usePagination(page);
+  const view = derivePagination(page);
 
   const resolvedColumns = resolveColumns(columns);
 
@@ -914,11 +932,7 @@ export function DataTable<T>({
 
       {showsRange || showsPagination ? (
         <div className={FOOTER_CLASSES}>
-          {showsRange ? (
-            <p className={RANGE_CLASSES}>
-              {formatResultRange(view.firstItem, view.lastItem, view.total)}
-            </p>
-          ) : null}
+          {showsRange ? <p className={RANGE_CLASSES}>{formatResultRange(view)}</p> : null}
 
           {showsPagination ? (
             <Pagination
@@ -952,10 +966,10 @@ export function DataTable<T>({
  * `role="alert"` from it, so choosing the tone and choosing the announcement are one decision and
  * cannot be set inconsistently.
  *
- * @param error - The normalised problem document to report.
+ * @param error - The thrown failure to report, narrowed and read by {@link resolveErrorCopy}.
  * @returns The rendered panel.
  */
-function DataTableError({ error }: { readonly error: ProblemDetail }): JSX.Element {
+function DataTableError({ error }: { readonly error: Error }): JSX.Element {
   const { headline, explanation } = resolveErrorCopy(error);
 
   return (

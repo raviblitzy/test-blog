@@ -5,14 +5,33 @@
  * segments, layouts, client islands, hooks, providers, `src/app/sitemap.ts`, `src/app/robots.ts`
  * and the seven typed wrappers beside this module (`auth`, `posts`, `categories`, `comments`,
  * `likes`, `users`, `admin`) all reach the API *through* here and never around it. `fetch`,
- * `Headers`, `AbortSignal` handling, bearer attachment, refresh-on-unauthorised, retry and error
- * normalisation live in this module exclusively; a wrapper that reaches for any of them, or that
- * branches on a status code, has taken on transport logic that belongs here.
+ * `Headers`, `AbortSignal` handling, per-attempt deadlines, bearer attachment,
+ * refresh-on-unauthorised, retry, response validation and error normalisation live in this module
+ * exclusively; a wrapper that reaches for any of them, or that branches on a status code, has taken
+ * on transport logic that belongs here.
  *
  * That concentration is the whole point. There is exactly one place where a credential is attached,
- * one place where a rotation can race, one place where a failure becomes a typed error and one
+ * one place where a rotation can race, one place where a request can hang, one place where a body is
+ * checked against its declared contract, one place where a failure becomes a typed error and one
  * place where the API's origin is read. Each of those is a defect class that cannot be distributed
  * across forty call sites if it only exists once.
+ *
+ * ## Four properties worth knowing before calling anything here
+ *
+ * 1. **Every attempt is bounded.** `fetch` has no timeout, so a stalled connection would otherwise
+ *    hang a render or a mutation indefinitely. Each attempt gets {@link DEFAULT_TIMEOUT_MS},
+ *    composed with the caller's own `signal` so both remain effective and remain distinguishable -
+ *    see {@link startDeadline}.
+ * 2. **Every JSON body is validated.** A JSON call takes a {@link ResponseDecoder} and a body that
+ *    does not satisfy it is rejected as `/errors/malformed-response` rather than cast to the declared
+ *    type. `@/lib/types` declares one decoder per response shape beside the interface it checks.
+ * 3. **The credential store is browser-only.** A module global on a server is shared by every
+ *    concurrent render, so nothing is stored there; a server render passes its credential per request
+ *    through {@link RequestOptions.bearer}. The API's address is resolved per context too - see
+ *    {@link resolveApiBaseUrl}.
+ * 4. **Rotation happens once, in one place, and can be superseded.** {@link rotateSession} is the
+ *    only public way to rotate; concurrent callers share one request, and a rotation whose result
+ *    arrives after a sign-out is discarded rather than adopted.
  *
  * ## What this module does NOT do, and must never start doing
  *
@@ -22,8 +41,10 @@
  *   inside functions, behind guards, never while the module is being evaluated.
  * - **No React, no `@tanstack/react-query`, no provider, hook, component or route import.** The
  *   dependency arrow points strictly outward: this module imports one thing, `@/lib/types`, and it
- *   imports it as types only. Cache invalidation, mutation state and navigation belong to the
- *   layers above; see {@link setUnauthorizedHandler} for the one callback seam that exists instead.
+ *   imports it as **types only** - which is why the one decoder it needs for itself,
+ *   {@link tokenPairDecoder}, is written out here rather than imported. Cache invalidation, mutation
+ *   state and navigation belong to the layers above; see {@link setUnauthorizedHandler} for the one
+ *   callback seam that exists instead.
  * - **No redirect and no navigation.** `src/middleware.ts` owns the `/login?next=<encoded path>`
  *   contract. When authentication is definitively gone this module clears the credential, notifies
  *   the registered handler and throws {@link ApiError}. It does not decide where the reader goes.
@@ -46,7 +67,9 @@
  * an unversioned path.
  *
  * The prefix is composed **idempotently**, and that detail is contractual rather than defensive
- * habit. `.env.example` documents `NEXT_PUBLIC_API_BASE_URL` as *including* the `/api/v1` prefix
+ * habit. It applies to whichever base URL the context resolved - the public one in a browser, or
+ * `API_INTERNAL_BASE_URL` on a server where that is set. `.env.example` documents
+ * `NEXT_PUBLIC_API_BASE_URL` as *including* the `/api/v1` prefix
  * (`http://localhost:8000/api/v1`), because "the prefix lives here and only here". So
  * {@link resolveApiBaseUrl} appends the prefix only when the configured base does not already carry
  * it: a base URL of `http://localhost:8000/api/v1` is used as it stands, and a bare origin such as
@@ -65,10 +88,10 @@
  * | Standard                        | How this module satisfies it                                                                                    |
  * | ------------------------------- | --------------------------------------------------------------------------------------------------------------- |
  * | Layered separation of concerns  | Sole HTTP module; imports only `@/lib/types`; no inward import; no `'use client'`; no navigation                 |
- * | Explicit API contracts          | {@link ProblemDetail} is the one error shape; every transport function is generic over a caller-supplied type    |
+ * | Explicit API contracts          | {@link ProblemDetail} is the one error shape; every JSON call carries a {@link ResponseDecoder} checked at runtime |
  * | API versioning                  | `/api/v1` composed here once, idempotently; no caller can emit an unversioned path                              |
- * | Secure-by-default authentication | Bearer attachment, single-flight rotation, cookie cleared on sign-out, no credential logged or echoed          |
- * | Configuration from environment  | One key, `NEXT_PUBLIC_API_BASE_URL`, read lazily; no hard-coded origin and no environment-gated fallback         |
+ * | Secure-by-default authentication | Bearer attachment, one single-flight rotation guarded by a generation counter, browser-only credential store    |
+ * | Configuration from environment  | Two keys, read lazily and per context - `NEXT_PUBLIC_API_BASE_URL`, and `API_INTERNAL_BASE_URL` on a server      |
  * | Blocking quality gates          | Compiles under `tsc --noEmit`, lints at `--max-warnings=0`, explicit return type on every exported function      |
  * | No secrets in the repository    | No credential is written to `console`, to a thrown message, to a query string or onto a serialised error         |
  *
@@ -85,22 +108,26 @@ import type { ProblemDetail, TokenPair, ValidationErrorItem } from '@/lib/types'
  * Name of the cookie that signals "a session exists" to `src/middleware.ts`.
  *
  * **A three-file shared constant, and the agreement has to be character for character.**
- * `src/providers/auth-provider.tsx` writes it, `src/middleware.ts` reads it to gate
- * `/dashboard/:path*`, `/posts/:path*` and `/admin/:path*`, and this module clears it in
- * {@link clearCredentials} and keeps it in step with rotation in {@link setCredentials}. A
- * mismatched literal does not fail anywhere: route protection simply never fires, silently.
+ * `src/providers/auth-provider.tsx` writes and clears it, `src/middleware.ts` reads it to gate
+ * `/dashboard/:path*`, `/posts/:path*` and `/admin/:path*`, and this module only declares the
+ * literal. A mismatched literal does not fail anywhere: route protection simply never fires,
+ * silently.
  *
  * `src/middleware.ts` runs in the Edge runtime and cannot import from `@/lib/api`, so it
- * necessarily restates the literal. `auth-provider.tsx` should import this constant rather than
- * restate it, because `providers -> lib` is a permitted dependency direction.
+ * necessarily restates the literal. `auth-provider.tsx` imports this constant rather than
+ * restating it, because `providers -> lib` is a permitted dependency direction.
  *
- * The cookie carries the access token as its value because the middleware needs the role claim to
- * gate the administrative route group. It is a *presence and role* signal for the client tier and
- * nothing more: the API authenticates from the `Authorization` header alone and never reads a
- * cookie, and every authority decision is re-made server-side. Hiding a route is user experience,
- * not a security boundary.
+ * **THE COOKIE CARRIES THE ROLE LITERAL AND NEVER A CREDENTIAL**, which is why this module writes
+ * no cookie at all. A cookie written by client-side script cannot be `HttpOnly`, so putting the
+ * access token in it publishes a reusable bearer to every script on the origin (CWE-1004,
+ * CWE-922) - and the middleware never needed the token, only the role. This module sees token
+ * pairs and never a principal, so it could not write the marker even if it should: the role is
+ * knowable only from `GET /auth/me`, which is the provider's request. Presence and role are a
+ * client-tier signal and nothing more: the API authenticates from the `Authorization` header
+ * alone, never reads a cookie, and re-makes every authority decision server-side. Hiding a route
+ * is user experience, not a security boundary.
  */
-export const AUTH_COOKIE_NAME = 'access_token';
+export const AUTH_COOKIE_NAME = 'blog_session';
 
 /**
  * The version namespace every API path sits beneath. Composed by {@link resolveApiBaseUrl} exactly
@@ -110,6 +137,17 @@ const API_VERSION_PREFIX = '/api/v1';
 
 /** Spelled out for diagnostics; the read itself is a static member access, see {@link resolveApiBaseUrl}. */
 const API_BASE_URL_ENV_KEY = 'NEXT_PUBLIC_API_BASE_URL';
+
+/**
+ * The server-only endpoint, preferred while rendering on the server. See
+ * {@link resolveApiBaseUrl} for why one URL cannot serve both execution contexts.
+ *
+ * Deliberately **not** `NEXT_PUBLIC_`-prefixed: the framework inlines only that prefix into the
+ * browser bundle, so this value is readable on the server and structurally absent in the browser -
+ * which is the guarantee, not an accident. An internal container hostname must never be shipped to
+ * a reader's browser, where it does not resolve.
+ */
+const API_INTERNAL_BASE_URL_ENV_KEY = 'API_INTERNAL_BASE_URL';
 
 /**
  * Rotation endpoint, stated here rather than imported from `@/lib/api/auth` to keep this module free
@@ -133,6 +171,17 @@ const REQUEST_ID_HEADER = 'X-Request-ID';
 
 /** Present on the service's 429, whose interval is the only actionable part of a throttled answer. */
 const RETRY_AFTER_HEADER = 'Retry-After';
+
+/**
+ * Present on the service's 401, naming the scheme the route expects - `Bearer`.
+ *
+ * Readable from a browser only because the service lists it in the CORS `Access-Control-Expose-
+ * Headers` response header; a cross-origin response otherwise exposes just six safelisted headers
+ * and this is not one of them. It is carried onto {@link ApiError.wwwAuthenticate} so a consumer can
+ * distinguish "no credential presented" from "the credential presented was rejected" without
+ * re-reading a response it no longer has.
+ */
+const WWW_AUTHENTICATE_HEADER = 'WWW-Authenticate';
 
 /** The scheme literal, with its trailing space, used to build the credential header. */
 const BEARER_SCHEME = 'Bearer ';
@@ -158,6 +207,15 @@ const HTTP_UNAUTHORIZED = 401;
 const HTTP_NO_CONTENT = 204;
 
 /**
+ * How much of a decoder's rejection message reaches a problem document's `detail`.
+ *
+ * Enough to name the offending member and say what was wrong with it, and short enough that a
+ * validator which quotes the payload cannot turn an error surface into a data dump. See
+ * {@link describeDecodeFailure}.
+ */
+const DECODE_FAILURE_DETAIL_LIMIT = 200;
+
+/**
  * `status` on a synthesised document for which no response was ever received.
  *
  * Zero is not an HTTP status and is chosen precisely because it cannot collide with one: a consumer
@@ -177,7 +235,32 @@ const NO_RESPONSE_STATUS = 0;
 const ERROR_TYPE_HTTP = '/errors/http-error';
 const ERROR_TYPE_NETWORK = '/errors/network-error';
 const ERROR_TYPE_ABORTED = '/errors/request-aborted';
+const ERROR_TYPE_TIMEOUT = '/errors/request-timeout';
 const ERROR_TYPE_MALFORMED_RESPONSE = '/errors/malformed-response';
+
+/**
+ * How long one attempt may take before it is abandoned, in milliseconds.
+ *
+ * A default rather than an option a caller has to remember, because the failure it prevents is
+ * silent: `fetch` has no timeout of its own, so a connection that opens and then stalls - a hung
+ * upstream, a black-holed route, a container that is up but not answering - leaves a promise pending
+ * for as long as the platform allows. In a Server Component that is a request that never renders; in
+ * a client island it is a spinner that never resolves and a mutation whose outcome is unknown.
+ *
+ * Fifteen seconds is chosen against what this API actually does rather than as a round number. The
+ * slowest documented operations are the ranked full-text feed query and the recursive comment
+ * descent, both of which are index-backed and measured in single-digit milliseconds against seeded
+ * data; argon2id verification on sign-in is the deliberate outlier and is still far below this.
+ * Anything approaching this bound is a fault rather than a slow success, and reporting it as one is
+ * more useful than waiting.
+ *
+ * **Per attempt, not per call.** A `401` that rotates and retries gives each of its three requests
+ * its own deadline, because each is a distinct network operation that can stall independently.
+ *
+ * Override per call with {@link RequestOptions.timeoutMs}; a non-positive value removes the deadline
+ * entirely, which is the honest way to express "this one may take as long as it takes".
+ */
+export const DEFAULT_TIMEOUT_MS = 15_000;
 
 /* -------------------------------------------------------------------------------------------------
  * Public option and payload types
@@ -243,6 +326,52 @@ export interface RequestOptions {
   cache?: RequestCache;
   /** Framework revalidation controls, passed straight through. */
   next?: RevalidationOptions;
+  /**
+   * Per-attempt deadline in milliseconds, overriding {@link DEFAULT_TIMEOUT_MS}.
+   *
+   * A non-positive value removes the deadline. Composed with `signal` rather than replacing it: both
+   * can fire, whichever comes first wins, and the two are distinguishable afterwards - a deadline
+   * produces `/errors/request-timeout` and a caller's abort produces `/errors/request-aborted`.
+   */
+  timeoutMs?: number;
+  /**
+   * An explicit credential for **this request only**, used instead of the stored one.
+   *
+   * This is how a Server Component makes an authenticated read. The credential store is a module
+   * global and is therefore browser-only by construction: on a server it would be shared by every
+   * concurrent render, which is one reader's token answering another reader's request. So a server
+   * caller passes the token it resolved from that request's own context - a cookie, a header - and
+   * nothing is retained between renders.
+   *
+   * Rotation is **disabled** for a request that carries this: renewing a credential the caller owns
+   * would write a pair into a store the caller is not reading, and on a server there is nowhere to
+   * write it at all. A `401` therefore surfaces unchanged, which is the correct answer for a server
+   * render - the page can redirect, or fall back to the anonymous view.
+   *
+   * Ignored when `anonymous` is set, because a deliberately unauthenticated request has no bearer.
+   */
+  bearer?: string;
+  /**
+   * Whether a `401` may trigger a credential rotation. Defaults to `true`.
+   *
+   * Set `false` where a rotation would invalidate the request itself. Sign-out is the case that
+   * matters: its body carries the refresh token being revoked, so rotating mid-flight would spend
+   * that token and then replay a body naming the spent one - revoking nothing and leaving the
+   * successor alive. `@/lib/api/auth` sets this and re-issues the request with the post-rotation
+   * token instead.
+   */
+  allowRefresh?: boolean;
+  /**
+   * Whether this request may be replayed once **without a credential** after the session has been
+   * definitively abandoned.
+   *
+   * For public reads only, and it exists because a held-but-dead credential must not break a page
+   * that needs none. The feed, a post, a profile, the taxonomy, a like summary and a comment thread
+   * all answer anonymously; without this, a reader whose session expired in a background tab gets a
+   * `401` on a page a signed-out visitor renders perfectly. Never set it on a request whose answer
+   * depends on who is asking - an anonymous replay would silently return the public projection.
+   */
+  anonymousFallback?: boolean;
 }
 
 /**
@@ -294,11 +423,61 @@ interface DispatchOptions {
   readonly anonymous: boolean;
   readonly cache: RequestCache | undefined;
   readonly next: RevalidationOptions | undefined;
+  /** Per-attempt deadline in milliseconds. Non-positive means no deadline. */
+  readonly timeoutMs: number;
+  /** A request-scoped credential supplied by the caller, or `undefined` to use the stored one. */
+  readonly bearer: string | undefined;
   /**
    * Whether a `401` may trigger a rotation. `false` for the rotation request itself, which is what
-   * makes recursion impossible rather than merely unlikely.
+   * makes recursion impossible rather than merely unlikely, and `false` whenever the caller supplied
+   * its own `bearer` or asked for rotation to be skipped.
    */
   readonly allowRefresh: boolean;
+  /** Whether one anonymous replay is permitted after the session is abandoned. */
+  readonly anonymousFallback: boolean;
+}
+
+/**
+ * One network attempt: the response, and the deadline that is still armed around it.
+ *
+ * The two travel together because the deadline outlives the response - it has to stay armed until the
+ * body has been read, and it has to be disposed exactly once afterwards. Returning the response alone
+ * would leave the timer with no owner.
+ */
+interface Attempt {
+  readonly response: Response;
+  readonly deadline: Deadline;
+}
+
+/**
+ * A bounded per-attempt deadline: the signal to hand `fetch`, and the means to tell afterwards
+ * whether it was the deadline that fired.
+ */
+interface Deadline {
+  /** The signal for this attempt - the caller's abort and the timer, composed. */
+  readonly signal: AbortSignal | undefined;
+  /** Whether the timer fired, as opposed to the caller aborting or nothing happening at all. */
+  expired: () => boolean;
+  /** Clear the timer and detach the listener. Idempotent, and mandatory - see {@link startDeadline}. */
+  dispose: () => void;
+}
+
+/**
+ * A runtime check that a decoded JSON body really is the shape the wrapper declared.
+ *
+ * Structural on purpose, so that a `zod` schema satisfies it with no adapter - `schema.parse` has
+ * exactly this signature - while nothing here imports `zod` or depends on it. A hand-written guard
+ * that throws on a mismatch satisfies it equally.
+ *
+ * The contract is narrow: given an already-parsed JSON value, return the value typed as `T`, or
+ * **throw**. Returning something malformed rather than throwing defeats the purpose, and returning a
+ * default silently substitutes data the service did not send.
+ *
+ * @typeParam T - The response type the caller declared, from `@/lib/types`.
+ */
+export interface ResponseDecoder<T> {
+  /** Validate and return, or throw. The thrown value is normalised; it never reaches a caller raw. */
+  parse: (value: unknown) => T;
 }
 
 /** Constructor input for a document this module synthesises rather than receives. */
@@ -370,7 +549,26 @@ export class ApiError extends Error {
    */
   readonly errors: readonly ValidationErrorItem[] | undefined;
 
-  constructor(problem: ProblemDetail, retryAfterSeconds: number | null = null) {
+  /**
+   * The `WWW-Authenticate` challenge the response carried, or `null` when it carried none.
+   *
+   * Present on this API's `401` and nowhere else, where its value is `Bearer`. Worth keeping because
+   * it is the only part of the answer that distinguishes *why* a route refused: the service sends the
+   * header on an absent, malformed or expired credential alike, so its presence confirms the refusal
+   * is an authentication one rather than an authorisation one - which a `403` would be, and which no
+   * fresh credential can fix.
+   *
+   * `null` in a browser also means the service did not expose the header through CORS. It does; if
+   * this is unexpectedly `null` on a cross-origin `401`, the `Access-Control-Expose-Headers` list is
+   * where to look.
+   */
+  readonly wwwAuthenticate: string | null;
+
+  constructor(
+    problem: ProblemDetail,
+    retryAfterSeconds: number | null = null,
+    wwwAuthenticate: string | null = null,
+  ) {
     super(problem.detail === '' ? problem.title : problem.detail);
     this.name = 'ApiError';
     this.problem = problem;
@@ -378,6 +576,7 @@ export class ApiError extends Error {
     this.requestId = problem.request_id;
     this.retryAfterSeconds = retryAfterSeconds;
     this.errors = problem.errors;
+    this.wwwAuthenticate = wwwAuthenticate;
     // Some bundler/transpiler targets rewrite `class ... extends Error` in a way that loses the
     // prototype link, which would make `instanceof ApiError` - and therefore isApiError - answer
     // false for a genuine instance. Restoring it explicitly costs one call and removes the risk.
@@ -457,7 +656,11 @@ function readValidationErrors(
  * ride along into a consumer, and a missing one cannot surface as `undefined` behind a type that
  * claims otherwise.
  */
-function readProblemDetail(payload: unknown, fallback: ProblemDetail): ProblemDetail {
+function readProblemDetail(
+  payload: unknown,
+  fallback: ProblemDetail,
+  httpStatus: number,
+): ProblemDetail {
   if (typeof payload !== 'object' || payload === null) {
     return fallback;
   }
@@ -477,7 +680,15 @@ function readProblemDetail(payload: unknown, fallback: ProblemDetail): ProblemDe
   const problem: ProblemDetail = {
     type,
     title,
-    status,
+    // THE HTTP STATUS WINS, ALWAYS - the body's own `status` member is read only to check that it is
+    // a number, and then discarded. The two agree on every response this service sends, so this
+    // costs nothing in the ordinary case; it earns its place where they do not. A body is
+    // attacker-influenceable in a way a status line is not, and an intermediary can rewrite one
+    // without the other: a gateway that turns a 502 into a wrapper carrying `"status": 200`, or a
+    // cached error document replayed under a different code. `ApiError.status` is what consumers
+    // branch on - the rotation path in this module keys on 401 - so trusting the body would let a
+    // response body decide whether a credential gets rotated, which is authority in the wrong place.
+    status: httpStatus,
     detail,
     instance,
     request_id: requestId,
@@ -530,20 +741,48 @@ function parseRetryAfterSeconds(response: Response): number | null {
  * 2. `docker-compose.yml` resolves the value against the internal service hostname, which is only
  *    meaningful at run time inside the container network.
  *
- * The single environment key this module reads. It is written as a static member access rather than
- * a computed one because the framework inlines `process.env.NEXT_PUBLIC_*` textually at build time;
- * an indexed read would not be substituted and would resolve to `undefined` in the browser bundle.
+ * Both keys are written as static member accesses rather than computed ones because the framework
+ * inlines `process.env.NEXT_PUBLIC_*` textually at build time; an indexed read would not be
+ * substituted and would resolve to `undefined` in the browser bundle.
  *
- * @throws Error when the variable is unset or blank. Deliberately loud: a silent default origin
+ * ## Two contexts, two URLs, and why one value cannot serve both
+ *
+ * This module runs in two places, and the address of the API is not the same in each. A browser
+ * reaches the service across the public network at whatever origin a reader can resolve. A Server
+ * Component or route handler reaches it from inside the deployment, where that public origin may be
+ * unroutable, may traverse a load balancer for no reason, or may not exist at all: under
+ * `docker-compose` the service is `http://backend:8000`, a name that resolves on the container
+ * network and nowhere else, while the browser must be told `http://localhost:8000`.
+ *
+ * A single build-inlined `NEXT_PUBLIC_API_BASE_URL` therefore cannot be correct for both, and
+ * whichever way it is set the other context fails in a way that looks like something else - a Server
+ * Component whose fetch is refused, or a browser aimed at a hostname it cannot resolve.
+ *
+ * So: **on the server, `API_INTERNAL_BASE_URL` is preferred when it is set**; everywhere else, and
+ * whenever it is not set, `NEXT_PUBLIC_API_BASE_URL` is used. The internal key deliberately carries
+ * no `NEXT_PUBLIC_` prefix, so it is structurally absent from the browser bundle rather than merely
+ * unused there - an internal hostname is not something to ship to a reader. Setting it is optional:
+ * a single-origin deployment where both contexts share one URL configures only the public key and
+ * this resolves to it in both.
+ *
+ * @throws Error when neither variable yields a value. Deliberately loud: a silent default origin
  * would turn a missing deployment variable into requests quietly aimed at the wrong service.
  */
 function resolveApiBaseUrl(): string {
-  const configured = process.env.NEXT_PUBLIC_API_BASE_URL;
+  // The server-only value first, and only on the server. `isBrowser()` rather than a check on the
+  // variable alone, because a bundler that ever did inline it must still not let a browser use it.
+  const internal = isBrowser() ? undefined : process.env.API_INTERNAL_BASE_URL;
+  const configured =
+    internal !== undefined && internal.trim() !== ''
+      ? internal
+      : process.env.NEXT_PUBLIC_API_BASE_URL;
   if (configured === undefined || configured.trim() === '') {
     throw new Error(
       `${API_BASE_URL_ENV_KEY} is not set, so the presentation tier has no API to call. ` +
         `Copy the NEXT_PUBLIC_ block of .env.example into frontend/.env.local; the documented ` +
-        `value is http://localhost:8000${API_VERSION_PREFIX}.`,
+        `value is http://localhost:8000${API_VERSION_PREFIX}. On a server, ` +
+        `${API_INTERNAL_BASE_URL_ENV_KEY} may be set instead to reach the service on an internal ` +
+        `network.`,
     );
   }
   const base = configured.trim().replace(TRAILING_SLASHES_PATTERN, '');
@@ -620,9 +859,22 @@ function problemInstance(relativePath: string): string {
 /* -------------------------------------------------------------------------------------------------
  * Credential store
  *
- * Module-scoped rather than React state, because a Server Component, a route handler and a client
- * island all need the same credential and none of them shares a React tree with the others. The auth
- * provider drives these functions; this module owns no component state and re-renders nothing.
+ * Module-scoped rather than React state, because every client island in the tab needs the same
+ * credential and none of them shares a React tree with the others. The auth provider drives these
+ * functions; this module owns no component state and re-renders nothing.
+ *
+ * BROWSER-ONLY, AND THAT IS A SECURITY PROPERTY RATHER THAN A LIMITATION
+ *
+ * A module global on a server is shared by every concurrent render in the process. Storing a
+ * per-reader credential there means one reader's token is attached to another reader's request - not
+ * as a race that is hard to hit, but as the ordinary behaviour once two people load a page at the
+ * same time. So the store is inert outside a browser: nothing is written, nothing is read, and
+ * `dispatch` attaches no stored bearer.
+ *
+ * A server render that needs an authenticated read therefore passes the credential explicitly, per
+ * request, through {@link RequestOptions.bearer}, resolved from that request's own context. Rotation
+ * is disabled for such a request, because there is nowhere to put a new pair and the caller owns the
+ * one it supplied.
  * ---------------------------------------------------------------------------------------------- */
 
 let accessToken: string | null = null;
@@ -630,80 +882,73 @@ let refreshToken: string | null = null;
 let unauthorizedHandler: UnauthorizedHandler | null = null;
 
 /**
+ * How many times the held credential has been replaced or cleared.
+ *
+ * The session identity a rotation is checked against. A rotation is an in-flight network request, and
+ * anything can happen while it is running: the reader signs out, another tab's restore adopts a
+ * different pair, a `401` elsewhere abandons the session. Adopting a rotation's result unconditionally
+ * would then *resurrect* a session that had been ended, or overwrite a newer pair with an older one.
+ *
+ * So {@link rotateCredentials} reads this before it dispatches and compares it before it adopts: if
+ * the number moved, the rotation has been superseded and its result is discarded rather than stored.
+ * A monotonic counter rather than a token comparison because it also detects a return to the *same*
+ * value - cleared and then re-adopted - which comparing tokens would miss.
+ */
+let credentialGeneration = 0;
+
+/**
  * The single in-flight rotation, or `null` when none is running. See {@link refreshCredentials} for
  * why one shared promise is the whole of the single-flight guarantee.
  */
 let rotationInFlight: Promise<TokenPair | null> | null = null;
 
-/** Whether a document object exists - false during server rendering and in a route handler. */
-function isDocumentAvailable(): boolean {
-  return typeof document !== 'undefined';
-}
-
 /**
- * Write the presence cookie `src/middleware.ts` gates on.
+ * Whether this code is executing in a browser.
  *
- * Deliberately a **session** cookie with no `Max-Age` and no `Expires`. Deriving a lifetime from
- * `TokenPair.expires_in` - which is a count of **seconds**, not milliseconds - would expire the
- * cookie when the *access* token expires, and the middleware would then bounce a reader whose
- * session is perfectly alive because rotation had renewed it. Presence is refreshed on every
- * rotation instead, so the cookie tracks the session rather than one token in it.
- *
- * A no-op when no document exists, so the function is safe to call from server-rendered code
- * without a caller-side guard.
+ * `window` rather than `document`, because the two answer different questions: `document` is about
+ * whether a cookie can be written, and this is about whether there is a single reader whose
+ * credential a module global may hold. Both are false on a server, but they are checked separately so
+ * neither reads as a proxy for the other.
  */
-function writeAuthCookie(token: string): void {
-  if (!isDocumentAvailable()) {
-    return;
-  }
-  const attributes = ['Path=/', 'SameSite=Lax'];
-  if (document.location.protocol === 'https:') {
-    attributes.push('Secure');
-  }
-  document.cookie = `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; ${attributes.join('; ')}`;
-}
-
-/**
- * Expire the presence cookie.
- *
- * `Path=/` must match the path the cookie was written with or the browser treats it as a different
- * cookie and the original survives - which would leave the middleware admitting a reader who has
- * signed out. Both a zero `Max-Age` and a past `Expires` are sent because the two are honoured by
- * different vintages of behaviour and neither is expensive.
- */
-function expireAuthCookie(): void {
-  if (!isDocumentAvailable()) {
-    return;
-  }
-  document.cookie = `${AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`;
+function isBrowser(): boolean {
+  return typeof window !== 'undefined';
 }
 
 /**
  * Adopt a credential pair: sign-in, rotation and session restore all land here.
  *
- * Also refreshes the presence cookie, so the signal `src/middleware.ts` reads stays in step with
- * rotation. The auth provider remains the owner of the *initial* write at sign-in; because both
- * writes use {@link AUTH_COOKIE_NAME} and `Path=/`, they address one cookie and the later write
- * simply replaces the earlier value.
+ * Writes **no cookie**. The session marker `src/middleware.ts` reads is the provider's to write,
+ * because it carries the principal's role and this module never sees a principal - only a token
+ * pair. See {@link AUTH_COOKIE_NAME} for why the marker is not the token.
  */
 export function setCredentials(tokens: TokenPair): void {
+  // Inert outside a browser. A server has no single reader to hold a credential for, and the store
+  // is a module global shared by every concurrent render - see the section header. A server-side
+  // caller that has a token uses `RequestOptions.bearer`, which is scoped to one request.
+  if (!isBrowser()) {
+    return;
+  }
   accessToken = tokens.access_token;
   refreshToken = tokens.refresh_token;
-  writeAuthCookie(tokens.access_token);
+  credentialGeneration += 1;
 }
 
 /**
  * Forget the credential entirely: sign-out, a refused rotation, or a session that cannot be
  * restored.
  *
- * Clears the in-memory pair *and* expires the presence cookie, because leaving the cookie behind
- * would keep `src/middleware.ts` admitting a reader who has no credential left - a route that
- * renders and then fails every request it makes.
+ * Clears the in-memory pair only. Expiring the session marker is the provider's half of the same
+ * transition - it owns every cookie write in this tier - and it calls this function alongside its
+ * own clear, so the two always move together.
  */
 export function clearCredentials(): void {
   accessToken = null;
   refreshToken = null;
-  expireAuthCookie();
+  // Bumped even when there was nothing to clear, and deliberately: an in-flight rotation must be
+  // superseded by the *intent* to end the session, not merely by a token having changed. A sign-out
+  // that lands while a rotation is in flight is exactly the case, and it is the one where adopting
+  // the rotation's result would sign the reader back in.
+  credentialGeneration += 1;
 }
 
 /**
@@ -713,18 +958,35 @@ export function clearCredentials(): void {
  * public read endpoints on a post all answer without a credential.
  */
 export function getAccessToken(): string | null {
-  return accessToken;
+  return heldAccessToken();
 }
 
 /**
- * The rotation credential currently held, or `null`.
+ * The stored access token, or `null` outside a browser.
  *
- * Exposed so the auth provider can persist and restore a session across reloads. It is an **opaque**
- * high-entropy string, not a JWT: never decode it, never parse it, never put it in a URL, a log or a
- * rendered surface. The service keeps only its hash, so it cannot be recovered there either.
+ * The internal read every code path in this module uses, so the browser-only rule is enforced in one
+ * place rather than at each of the four sites that want the token. On a server the store is never
+ * written, so this is `null` there in any case - but reading through this function states the rule
+ * rather than relying on it.
+ */
+function heldAccessToken(): string | null {
+  return isBrowser() ? accessToken : null;
+}
+
+/**
+ * The rotation credential currently held, or `null` - which it always is outside a browser.
+ *
+ * Exposed for exactly one caller: `@/lib/api/auth`'s sign-out, which has to name the token it is
+ * revoking in a request body. Rotation itself does **not** go through here - {@link rotateSession}
+ * reads the store internally - because a caller that reads the token and then presents it separately
+ * is a caller racing the single-flight path.
+ *
+ * It is an **opaque** high-entropy string, not a JWT: never decode it, never parse it, never put it in
+ * a URL, a log or a rendered surface. The service keeps only its hash, so it cannot be recovered
+ * there either.
  */
 export function getRefreshToken(): string | null {
-  return refreshToken;
+  return isBrowser() ? refreshToken : null;
 }
 
 /**
@@ -797,8 +1059,21 @@ function buildPayload(options: PayloadRequestOptions): Payload | undefined {
   return undefined;
 }
 
-/** Collapse the public options plus a resolved payload into the fully explicit dispatch shape. */
+/**
+ * Collapse the public options plus a resolved payload into the fully explicit dispatch shape.
+ *
+ * Three defaults are resolved here rather than downstream, so no branch below has to re-derive one:
+ *
+ * * `timeoutMs` falls back to {@link DEFAULT_TIMEOUT_MS} when the caller said nothing. A caller that
+ *   passed `0` or a negative number said something - "no deadline" - and it is preserved.
+ * * `allowRefresh` is the AND of what this call site permits and what the caller permits, and a
+ *   caller-supplied `bearer` removes it outright: rotation writes into a store that request is not
+ *   reading, and on a server there is no store at all.
+ * * `anonymousFallback` is opt-in, so a request whose answer depends on who is asking can never be
+ *   silently downgraded to the public projection.
+ */
 function toDispatchOptions(options: PayloadRequestOptions, allowRefresh: boolean): DispatchOptions {
+  const callerBearer = options.anonymous === true ? undefined : options.bearer;
   return {
     payload: buildPayload(options),
     query: options.query,
@@ -806,7 +1081,78 @@ function toDispatchOptions(options: PayloadRequestOptions, allowRefresh: boolean
     anonymous: options.anonymous === true,
     cache: options.cache,
     next: options.next,
-    allowRefresh,
+    timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    bearer: callerBearer,
+    allowRefresh: allowRefresh && options.allowRefresh !== false && callerBearer === undefined,
+    anonymousFallback: options.anonymousFallback === true,
+  };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The per-attempt deadline
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Arm a deadline for one attempt, composed with whatever cancellation the caller supplied.
+ *
+ * Composed by hand rather than with `AbortSignal.any`, for two reasons that both matter. The first is
+ * reach: this module runs in a browser, in the Node server runtime, and under `jsdom` in the component
+ * suite, and hand composition needs nothing beyond `AbortController` and `addEventListener`. The
+ * second is diagnosis: composing signals loses *which* one fired, and a request that timed out is a
+ * different fact from a request the reader cancelled - one is a fault worth reporting, the other is
+ * the reader getting what they asked for.
+ *
+ * Returns `signal: undefined` only when there is nothing to arm at all: no caller signal and a
+ * non-positive timeout. That case passes no `signal` to `fetch` rather than an inert one.
+ *
+ * **{@link Deadline.dispose} must be called**, and after the body has been consumed rather than after
+ * the response arrives: aborting a signal mid-body cancels the read. A pending timer keeps the runtime
+ * alive and, more visibly, would abort a completed request's stream some seconds later. Every caller
+ * below disposes in a `finally`.
+ */
+function startDeadline(timeoutMs: number, callerSignal: AbortSignal | undefined): Deadline {
+  if (timeoutMs <= 0) {
+    // Nothing to arm. The caller's own signal, if any, is used directly - wrapping it would add a
+    // listener and a controller for no behaviour.
+    return { signal: callerSignal, expired: () => false, dispose: () => undefined };
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  let disposed = false;
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  // The caller's abort has to be forwarded, because `fetch` is given this controller's signal and
+  // not the caller's. Forwarded WITHOUT setting `timedOut`, which is what keeps the two causes
+  // distinguishable afterwards.
+  const forwardAbort = (): void => {
+    controller.abort();
+  };
+  if (callerSignal !== undefined) {
+    if (callerSignal.aborted) {
+      // Already cancelled before the request was built. Abort immediately rather than waiting for an
+      // event that has already fired and will not fire again.
+      forwardAbort();
+    } else {
+      callerSignal.addEventListener('abort', forwardAbort, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    expired: () => timedOut,
+    dispose: () => {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      clearTimeout(timer);
+      callerSignal?.removeEventListener('abort', forwardAbort);
+    },
   };
 }
 
@@ -829,7 +1175,22 @@ function isAbortError(cause: unknown): boolean {
  * platform error's message and stack can carry the full request URL, and this module does not
  * republish a URL onto an object that application code may log or serialise.
  */
-function toTransportError(cause: unknown, instance: string): ApiError {
+function toTransportError(cause: unknown, instance: string, timedOut = false): ApiError {
+  if (timedOut) {
+    // Checked before the abort branch, because a deadline aborts the request and therefore arrives as
+    // an AbortError too. Reporting that as a cancellation would blame the reader for a stalled
+    // service, and the two need different handling: a cancellation is expected and usually silent,
+    // whereas a timeout is worth surfacing and worth retrying.
+    return new ApiError(
+      synthesiseProblemDetail({
+        type: ERROR_TYPE_TIMEOUT,
+        title: 'Request timed out',
+        status: NO_RESPONSE_STATUS,
+        detail: 'The API did not answer in time. It may be unreachable or overloaded.',
+        instance,
+      }),
+    );
+  }
   if (isAbortError(cause)) {
     return new ApiError(
       synthesiseProblemDetail({
@@ -907,7 +1268,11 @@ async function toApiError(response: Response, instance: string): Promise<ApiErro
     requestId,
   });
   const payload = parseJsonOrUndefined(await readBodyTextOrEmpty(response));
-  return new ApiError(readProblemDetail(payload, fallback), parseRetryAfterSeconds(response));
+  return new ApiError(
+    readProblemDetail(payload, fallback, response.status),
+    parseRetryAfterSeconds(response),
+    response.headers.get(WWW_AUTHENTICATE_HEADER),
+  );
 }
 
 /**
@@ -919,13 +1284,25 @@ async function toApiError(response: Response, instance: string): Promise<ApiErro
  * resource and received no content has hit a contract mismatch, and saying so is far more useful
  * than handing back a value that lies about its type.
  */
-async function readJsonBody<T>(response: Response, instance: string): Promise<T> {
+async function readJsonBody<T>(
+  attempt: Attempt,
+  decoder: ResponseDecoder<T>,
+  instance: string,
+): Promise<T> {
+  const { response, deadline } = attempt;
   let text: string;
   try {
     text = await response.text();
   } catch (cause) {
-    throw toTransportError(cause, instance);
+    const timedOut = deadline.expired();
+    throw toTransportError(cause, instance, timedOut);
+  } finally {
+    // The body is read, so the deadline has done its job. Disposed here rather than by the caller
+    // because every exit from this function - value, decode failure, transport failure - passes
+    // through it, and a timer that outlives its request would abort a stream nobody is waiting on.
+    deadline.dispose();
   }
+
   const requestId = response.headers.get(REQUEST_ID_HEADER) ?? '';
   if (response.status === HTTP_NO_CONTENT || text.trim() === '') {
     throw new ApiError(
@@ -939,8 +1316,10 @@ async function readJsonBody<T>(response: Response, instance: string): Promise<T>
       }),
     );
   }
+
+  let parsed: unknown;
   try {
-    return JSON.parse(text) as T;
+    parsed = JSON.parse(text);
   } catch {
     throw new ApiError(
       synthesiseProblemDetail({
@@ -953,6 +1332,51 @@ async function readJsonBody<T>(response: Response, instance: string): Promise<T>
       }),
     );
   }
+
+  // THE DECODE IS THE CONTRACT CHECK, and it is what a bare `as T` never was. `JSON.parse` returns
+  // whatever arrived; asserting a type over it is a compile-time claim about a runtime value that
+  // nothing verified, so a body missing a member, carrying a null where a string was declared, or
+  // answering an entirely different shape satisfied the generic and reached consumers as a value that
+  // lies about itself. The failure then surfaced far from here - a component reading `post.author.
+  // username` off an undefined author - or, worse, did not surface at all: an unrecognised token
+  // response was adopted as a credential and every later request failed instead.
+  //
+  // Two properties make this worth doing at the boundary rather than at the point of use. The
+  // rejection names the endpoint and carries the request identifier, so a contract drift is
+  // diagnosable from the error alone; and it is the same `ApiError` every other failure is, so no
+  // caller needs a second kind of catch.
+  try {
+    return decoder.parse(parsed);
+  } catch (cause) {
+    throw new ApiError(
+      synthesiseProblemDetail({
+        type: ERROR_TYPE_MALFORMED_RESPONSE,
+        title: 'Unexpected response shape',
+        status: response.status,
+        detail: `The API answered ${String(response.status)} with a body that does not match the declared response contract for this endpoint: ${describeDecodeFailure(cause)}`,
+        instance,
+        requestId,
+      }),
+    );
+  }
+}
+
+/**
+ * Reduce a decoder's rejection to one short, safe line for a problem document's `detail`.
+ *
+ * Deliberately lossy. A validator's own message can be long, structured and shaped by the payload it
+ * rejected, and a document's `detail` is a member the service writes to be safe to show to a person -
+ * so the *content* of a rejected body must not be pasted into it. The message is taken when there is
+ * one, trimmed, and truncated; anything else becomes a fixed phrase.
+ */
+function describeDecodeFailure(cause: unknown): string {
+  const message =
+    cause instanceof Error && cause.message.trim() !== ''
+      ? cause.message.trim()
+      : 'the response did not satisfy its schema';
+  return message.length > DECODE_FAILURE_DETAIL_LIMIT
+    ? `${message.slice(0, DECODE_FAILURE_DETAIL_LIMIT)}...`
+    : message;
 }
 
 /**
@@ -962,8 +1386,12 @@ async function readJsonBody<T>(response: Response, instance: string): Promise<T>
  * stream, because an unread body keeps its connection from being released. A `204` and a zero-length
  * `200` are handled identically: there is nothing to parse in either case.
  */
-async function discardBody(response: Response): Promise<void> {
-  await readBodyTextOrEmpty(response);
+async function discardBody(attempt: Attempt): Promise<void> {
+  try {
+    await readBodyTextOrEmpty(attempt.response);
+  } finally {
+    attempt.deadline.dispose();
+  }
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -986,7 +1414,7 @@ async function sendRequest(
   options: DispatchOptions,
   bearer: string | null,
   instance: string,
-): Promise<Response> {
+): Promise<Attempt> {
   const headers = new Headers();
   headers.set(ACCEPT_HEADER, `${JSON_MEDIA_TYPE}, ${PROBLEM_JSON_MEDIA_TYPE}`);
   if (options.payload !== undefined) {
@@ -1000,9 +1428,6 @@ async function sendRequest(
   if (options.payload !== undefined) {
     init.body = options.payload.body;
   }
-  if (options.signal !== undefined) {
-    init.signal = options.signal;
-  }
   if (options.cache !== undefined) {
     init.cache = options.cache;
   }
@@ -1010,15 +1435,28 @@ async function sendRequest(
     init.next = options.next;
   }
 
+  // Armed here rather than in `dispatch`, so each attempt of a rotate-and-retry gets its own bound:
+  // three network operations that can stall independently deserve three deadlines, and a single
+  // shared one would let a slow first attempt eat the budget of the retry that was going to succeed.
+  const deadline = startDeadline(options.timeoutMs, options.signal);
+  if (deadline.signal !== undefined) {
+    init.signal = deadline.signal;
+  }
+
   try {
-    return await fetch(url, init);
+    return { response: await fetch(url, init), deadline };
   } catch (cause) {
-    throw toTransportError(cause, instance);
+    // Disposed on this path only. On the success path the deadline stays armed until the caller has
+    // consumed the body, because aborting mid-stream would cancel that read - see `Deadline.dispose`.
+    const timedOut = deadline.expired();
+    deadline.dispose();
+    throw toTransportError(cause, instance, timedOut);
   }
 }
 
 /**
- * Obtain a fresh credential pair, at most once concurrently.
+ * Obtain a fresh credential pair, at most once concurrently. Internal; {@link rotateSession} is the
+ * public entry point and the only one a consumer should reach for.
  *
  * **The single-flight guarantee is the shared promise, and nothing else.** A page mounts a feed, a
  * like button and a comment thread that all request at once; when the access token has expired they
@@ -1032,14 +1470,27 @@ async function sendRequest(
  * rather than reusing a stale result. N concurrent unauthorised responses produce exactly ONE
  * request to `POST /api/v1/auth/refresh`.
  *
+ * A second guard sits inside {@link rotateCredentials} and answers a different question: not "how
+ * many rotations are running" but "is the session this rotation belongs to still the current one".
+ * Sharing a promise cannot help there, because the interference arrives from outside rotation
+ * entirely - a sign-out, or a restore adopting a different pair - so the result is compared against
+ * {@link credentialGeneration} before it is adopted.
+ *
  * @returns The new pair, or `null` when rotation was refused or there was nothing to present. `null`
  * means the session is over and {@link abandonSession} has already run.
  */
 function refreshCredentials(): Promise<TokenPair | null> {
   if (rotationInFlight === null) {
-    rotationInFlight = rotateCredentials().finally(() => {
-      rotationInFlight = null;
+    // `const` is safe despite the self-reference: the callback runs only when the rotation settles,
+    // which is necessarily after this binding is initialised.
+    const started: Promise<TokenPair | null> = rotateCredentials().finally(() => {
+      // Release the slot only if it still holds THIS rotation. Nulling another one would silently
+      // break the single-flight guarantee for every request still waiting behind it.
+      if (rotationInFlight === started) {
+        rotationInFlight = null;
+      }
     });
+    rotationInFlight = started;
   }
   return rotationInFlight;
 }
@@ -1063,18 +1514,40 @@ async function rotateCredentials(): Promise<TokenPair | null> {
     abandonSession();
     return null;
   }
+  // Captured BEFORE the request, so the comparison after it spans the whole time the request was in
+  // flight - which is the interval anything else could have changed the session in.
+  const generation = credentialGeneration;
   try {
     const rotated = await dispatchJson<TokenPair>(
       'POST',
       REFRESH_PATH,
       { json: { [REFRESH_TOKEN_FIELD]: presented }, anonymous: true },
+      tokenPairDecoder,
       false,
     );
+    if (credentialGeneration !== generation) {
+      // Superseded while in flight: the reader signed out, another rotation completed first, or a
+      // session restore adopted a different pair. Adopting now would resurrect an ended session or
+      // overwrite a newer credential with an older one, so the result is DISCARDED - and the session
+      // is deliberately NOT abandoned, because whatever moved the generation is the authority on what
+      // the session should be. The caller sees `null` and throws its original 401, which is honest:
+      // this request did not get a usable credential.
+      return null;
+    }
     // Rotation replaces BOTH tokens: the presented refresh token is revoked as the new pair is
     // issued, so keeping the old one would guarantee the next rotation fails.
     setCredentials(rotated);
     return rotated;
   } catch (cause) {
+    if (credentialGeneration !== generation) {
+      // Refused, but the session has already moved on without this rotation - most likely because a
+      // sign-out revoked the very token being presented. Abandoning here would clear a credential
+      // that a concurrent sign-in may already have installed, so the failure is simply reported.
+      if (!isApiError(cause)) {
+        throw cause;
+      }
+      return null;
+    }
     abandonSession();
     if (!isApiError(cause)) {
       throw cause;
@@ -1084,69 +1557,197 @@ async function rotateCredentials(): Promise<TokenPair | null> {
 }
 
 /**
+ * The decoder for the one response this module reads on its own behalf: a rotated credential pair.
+ *
+ * Hand-written rather than imported from `@/lib/types`, and that is a deliberate cost of ten lines.
+ * {@link ResponseDecoder} is structural precisely so that this is possible: keeping the check here
+ * leaves this module with a single **type-only** import and no runtime dependency of its own, which
+ * is what lets it be imported from a Server Component, a route handler, a middleware and a client
+ * island alike without dragging a validator into each of those bundles. Every wrapper's decoder comes
+ * from `@/lib/types`; this one cannot, because the module those live in must be free to import nothing
+ * but its validator.
+ *
+ * It is also the decoder that matters most. A rotation's answer is **adopted as a credential**, so a
+ * body that is not a token pair used to be stored as one, and every request afterwards failed instead
+ * of the one that was actually wrong. Rejecting it here turns that into a refused rotation, which the
+ * session-abandonment path already handles correctly.
+ */
+const tokenPairDecoder: ResponseDecoder<TokenPair> = {
+  parse: (value: unknown): TokenPair => {
+    if (typeof value !== 'object' || value === null) {
+      throw new Error('a token pair was expected');
+    }
+    const record = value as Record<string, unknown>;
+    const {
+      access_token: access,
+      refresh_token: refresh,
+      token_type: type,
+      expires_in: expires,
+    } = record;
+    if (
+      typeof access !== 'string' ||
+      access === '' ||
+      typeof refresh !== 'string' ||
+      refresh === '' ||
+      type !== 'bearer' ||
+      typeof expires !== 'number'
+    ) {
+      throw new Error('a token pair was expected');
+    }
+    return { access_token: access, refresh_token: refresh, token_type: type, expires_in: expires };
+  },
+};
+
+/**
+ * Rotate the session's credential, through the one single-flight path, and report the outcome.
+ *
+ * **This is the only public way to rotate**, and it exists so that no consumer has to reach for the
+ * `POST /auth/refresh` wrapper directly. Calling that wrapper bypasses everything this function is:
+ * the shared promise that collapses N concurrent rotations into one request, the generation guard
+ * that stops a late rotation resurrecting an ended session, and the adoption of the new pair into the
+ * store the rest of the tier reads. A rotation issued around this module is a rotation that can
+ * revoke the token a rotation issued *through* it just obtained.
+ *
+ * Concurrency is therefore free: two callers arriving together receive the same promise and the same
+ * pair, and exactly one request is made.
+ *
+ * @returns The newly adopted pair.
+ * @throws {@link ApiError} when rotation was refused, when nothing was held to present, or when the
+ * result was superseded mid-flight by a sign-out or another adoption. The session has already been
+ * abandoned in the first two cases - {@link setUnauthorizedHandler}'s handler has run - so a caller
+ * needs no cleanup of its own beyond dropping its view state.
+ */
+export async function rotateSession(): Promise<TokenPair> {
+  const rotated = await refreshCredentials();
+  if (rotated !== null) {
+    return rotated;
+  }
+  throw new ApiError(
+    synthesiseProblemDetail({
+      type: ERROR_TYPE_HTTP,
+      title: 'Session expired',
+      status: HTTP_UNAUTHORIZED,
+      detail: 'The session could not be renewed. Sign in again to continue.',
+      instance: problemInstance(REFRESH_PATH),
+    }),
+  );
+}
+
+/**
  * Issue a request, and on a single unauthorised answer rotate the credential and retry it once.
  *
  * The sequence, and every branch that deliberately does *not* rotate:
  *
  * 1. Send. A `fetch`-level rejection is already an {@link ApiError} by the time it arrives here.
- * 2. On success, hand the response back for the caller's chosen body treatment.
- * 3. On failure, normalise it *first* - which consumes the body exactly once - and then decide.
+ * 2. On success, hand the attempt back for the caller's chosen body treatment - deadline included,
+ *    still armed, for the caller to dispose once the body is read.
+ * 3. On failure, normalise it *first* - which consumes the body exactly once, and lets the deadline be
+ *    disposed immediately - and then decide.
  * 4. Rotate only when all three hold: the status is `401`, a credential was actually attached, and
  *    this dispatch permits rotation. A `403` is an authority decision that a fresh token cannot
  *    change and must surface unchanged; a `401` on a request that carried no credential is the
- *    ordinary "this route needs signing in" answer with nothing to refresh; and the rotation request
- *    itself is excluded outright.
- * 5. If rotation is refused, throw the original `401`. The session is already abandoned.
- * 6. Otherwise retry **once**, with the new credential. A second `401` means the freshly issued token
+ *    ordinary "this route needs signing in" answer with nothing to refresh; and the rotation request,
+ *    a caller-supplied `bearer` and an explicit `allowRefresh: false` are each excluded outright.
+ * 5. **Before rotating, check whether the credential has already moved on.** A `401` answering a token
+ *    that is no longer the held one is a stale answer, not a reason to rotate: something else rotated
+ *    while this request was in flight, and a second rotation would revoke the pair that first one just
+ *    obtained. Replay once with the current token instead.
+ * 6. If rotation is refused, the session is over. A request marked {@link
+ *    RequestOptions.anonymousFallback} is replayed once with no credential, because a public read must
+ *    not fail merely because the reader was holding a dead token; anything else throws the original
+ *    `401`.
+ * 7. Otherwise retry **once**, with the new credential. A second `401` means the freshly issued token
  *    was rejected too, so the session is abandoned and that failure is thrown. There is no third
- *    attempt and no loop anywhere on this path.
+ *    rotation and no loop anywhere on this path: every branch below either returns or throws, and each
+ *    of the three replay branches is guarded by a condition that cannot be true twice.
  */
 async function dispatch(
   method: HttpMethod,
   path: string,
   options: DispatchOptions,
-): Promise<Response> {
+): Promise<Attempt> {
   const relativePath = normaliseApiPath(path);
   const instance = problemInstance(relativePath);
   const url = `${resolveApiBaseUrl()}${relativePath}${buildQueryString(options.query)}`;
-  const bearer = options.anonymous ? null : accessToken;
+  // A caller-supplied bearer wins over the store, and outside a browser the store is empty by
+  // construction - so a server render is anonymous unless it passed a credential explicitly.
+  const bearer = options.anonymous ? null : (options.bearer ?? heldAccessToken());
 
-  const response = await sendRequest(method, url, options, bearer, instance);
-  if (response.ok) {
-    return response;
+  const attempt = await sendRequest(method, url, options, bearer, instance);
+  if (attempt.response.ok) {
+    return attempt;
   }
 
-  const failure = await toApiError(response, instance);
+  const failure = await toApiError(attempt.response, instance);
+  attempt.deadline.dispose();
   if (failure.status !== HTTP_UNAUTHORIZED || bearer === null || !options.allowRefresh) {
     throw failure;
   }
 
+  // A LATE 401 FOR A TOKEN THAT IS NO LONGER CURRENT. Two requests go out with token A1, both are
+  // refused, the first rotates to A2 and succeeds - and then this one arrives holding a refusal that
+  // describes A1. Rotating again would spend A2's refresh token and, if that rotation failed for any
+  // reason, would clear a session that was working a moment ago. So the request is simply replayed
+  // with what is current. Reached at most once: after the replay this function returns or throws.
+  const current = heldAccessToken();
+  if (current !== null && current !== bearer) {
+    return await replay(method, url, options, current, instance);
+  }
+
   const rotated = await refreshCredentials();
   if (rotated === null) {
+    // The session is gone. For a public read that is not fatal - the endpoint answers without a
+    // credential - so one anonymous replay is permitted, and only where the caller opted in.
+    if (options.anonymousFallback) {
+      return await replay(method, url, options, null, instance);
+    }
     throw failure;
   }
 
-  const retried = await sendRequest(method, url, options, rotated.access_token, instance);
-  if (retried.ok) {
+  return await replay(method, url, options, rotated.access_token, instance);
+}
+
+/**
+ * Send one request again with a different credential, and abandon the session if *that* is refused.
+ *
+ * The single retry shared by all three replay branches in {@link dispatch}, so the "one more attempt,
+ * then give up" rule is written once. It performs no rotation itself, which is what makes a loop
+ * structurally impossible rather than merely unlikely.
+ *
+ * A `401` here abandons the session because every path that reaches it has already presented the best
+ * credential available: a freshly issued one, the one that superseded the request's own, or none at
+ * all on a public read. If that is refused too, there is nothing left to try.
+ */
+async function replay(
+  method: HttpMethod,
+  url: string,
+  options: DispatchOptions,
+  bearer: string | null,
+  instance: string,
+): Promise<Attempt> {
+  const retried = await sendRequest(method, url, options, bearer, instance);
+  if (retried.response.ok) {
     return retried;
   }
-  const retryFailure = await toApiError(retried, instance);
-  if (retryFailure.status === HTTP_UNAUTHORIZED) {
+  const retryFailure = await toApiError(retried.response, instance);
+  retried.deadline.dispose();
+  if (retryFailure.status === HTTP_UNAUTHORIZED && bearer !== null) {
     abandonSession();
   }
   throw retryFailure;
 }
 
-/** Internal JSON dispatch, parameterised by whether rotation is permitted. */
+/** Internal JSON dispatch, parameterised by the decoder and by whether rotation is permitted. */
 async function dispatchJson<T>(
   method: HttpMethod,
   path: string,
   options: PayloadRequestOptions,
+  decoder: ResponseDecoder<T>,
   allowRefresh: boolean,
 ): Promise<T> {
   const dispatchOptions = toDispatchOptions(options, allowRefresh);
-  const response = await dispatch(method, path, dispatchOptions);
-  return readJsonBody<T>(response, problemInstance(normaliseApiPath(path)));
+  const attempt = await dispatch(method, path, dispatchOptions);
+  return readJsonBody(attempt, decoder, problemInstance(normaliseApiPath(path)));
 }
 
 /** Attach a JSON body to a caller's options, or leave the request bodyless when there is none. */
@@ -1165,8 +1766,11 @@ function withJsonBody(body: unknown, options: RequestOptions | undefined): Paylo
  *   2. Sign-out and most deletions answer 204 (the *NoContent forms).
  *   3. Un-liking answers 200 with a body, unlike every other deletion (apiDelete, not
  *      apiDeleteNoContent).
- *   4. The category list is a bare array rather than a page envelope - which is a matter for the
- *      caller's type argument, and works because nothing here presumes an envelope.
+ *   4. Nothing here presumes a response SHAPE at all - a page envelope and a bare representation are
+ *      alike to this module, because the shape is whatever the caller's decoder accepts. Every
+ *      collection in the API answers with the envelope, including the category taxonomy; this module
+ *      simply does not depend on that being true, and the decoder is what makes the caller's claim
+ *      about it checkable rather than assumed.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -1181,9 +1785,10 @@ function withJsonBody(body: unknown, options: RequestOptions | undefined): Paylo
 export function apiRequest<T>(
   method: HttpMethod,
   path: string,
+  decoder: ResponseDecoder<T>,
   options: PayloadRequestOptions = {},
 ): Promise<T> {
-  return dispatchJson<T>(method, path, options, true);
+  return dispatchJson(method, path, options, decoder, true);
 }
 
 /**
@@ -1201,8 +1806,8 @@ export async function apiRequestNoContent(
   path: string,
   options: PayloadRequestOptions = {},
 ): Promise<void> {
-  const response = await dispatch(method, path, toDispatchOptions(options, true));
-  await discardBody(response);
+  const attempt = await dispatch(method, path, toDispatchOptions(options, true));
+  await discardBody(attempt);
 }
 
 /**
@@ -1211,8 +1816,12 @@ export async function apiRequestNoContent(
  * The read verb for the feed, a post, a profile, the category list, a comment thread, a like summary
  * and every administrative table. Pass filters through `options.query`; blank ones are dropped.
  */
-export function apiGet<T>(path: string, options?: RequestOptions): Promise<T> {
-  return apiRequest<T>('GET', path, { ...options });
+export function apiGet<T>(
+  path: string,
+  decoder: ResponseDecoder<T>,
+  options?: RequestOptions,
+): Promise<T> {
+  return apiRequest('GET', path, decoder, { ...options });
 }
 
 /**
@@ -1222,8 +1831,13 @@ export function apiGet<T>(path: string, options?: RequestOptions): Promise<T> {
  * `POST /posts/{id}/publish` and `POST /posts/{id}/unpublish` require: they carry no request
  * document and answer with the updated post.
  */
-export function apiPost<T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-  return apiRequest<T>('POST', path, withJsonBody(body, options));
+export function apiPost<T>(
+  path: string,
+  decoder: ResponseDecoder<T>,
+  body?: unknown,
+  options?: RequestOptions,
+): Promise<T> {
+  return apiRequest('POST', path, decoder, withJsonBody(body, options));
 }
 
 /**
@@ -1252,10 +1866,11 @@ export function apiPostNoContent(
  */
 export function apiPostForm<T>(
   path: string,
+  decoder: ResponseDecoder<T>,
   fields: FormFields,
   options?: RequestOptions,
 ): Promise<T> {
-  return apiRequest<T>('POST', path, { ...options, form: fields });
+  return apiRequest('POST', path, decoder, { ...options, form: fields });
 }
 
 /**
@@ -1264,8 +1879,13 @@ export function apiPostForm<T>(
  * Genuinely partial: send only the members that change. Used by profile self-update, post update,
  * comment edit and every administrative mutation.
  */
-export function apiPatch<T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-  return apiRequest<T>('PATCH', path, withJsonBody(body, options));
+export function apiPatch<T>(
+  path: string,
+  decoder: ResponseDecoder<T>,
+  body?: unknown,
+  options?: RequestOptions,
+): Promise<T> {
+  return apiRequest('PATCH', path, decoder, withJsonBody(body, options));
 }
 
 /**
@@ -1275,8 +1895,13 @@ export function apiPatch<T>(path: string, body?: unknown, options?: RequestOptio
  * convention - the service's composite primary key means a repeated like cannot inflate a count - so
  * this call is safe to retry.
  */
-export function apiPut<T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-  return apiRequest<T>('PUT', path, withJsonBody(body, options));
+export function apiPut<T>(
+  path: string,
+  decoder: ResponseDecoder<T>,
+  body?: unknown,
+  options?: RequestOptions,
+): Promise<T> {
+  return apiRequest('PUT', path, decoder, withJsonBody(body, options));
 }
 
 /**
@@ -1289,8 +1914,12 @@ export function apiPut<T>(path: string, body?: unknown, options?: RequestOptions
  * Every other deletion answers `204` and belongs to {@link apiDeleteNoContent}. Nothing in this
  * module infers a body treatment from the verb, so both are available and neither is a special case.
  */
-export function apiDelete<T>(path: string, options?: RequestOptions): Promise<T> {
-  return apiRequest<T>('DELETE', path, { ...options });
+export function apiDelete<T>(
+  path: string,
+  decoder: ResponseDecoder<T>,
+  options?: RequestOptions,
+): Promise<T> {
+  return apiRequest('DELETE', path, decoder, { ...options });
 }
 
 /**

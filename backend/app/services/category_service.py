@@ -3,8 +3,9 @@
 This module owns everything that happens to a category between being named by an administrator
 and being removed by one: the slug derived from its name at creation, the deliberate refusal to
 re-derive that slug when the name later changes, the two conflict rules that keep names and
-slugs unique, the in-use guard that stops a delete from silently unfiling posts, and the two
-read projections the home page's filter control and the administrative table render.
+slugs unique, the in-use guard that stops a delete from silently unfiling posts, and the read
+projections the home page's filter control and the administrative table render - which are one
+windowed method serving both, so the two screens cannot disagree about a page or a tally.
 
 Why the entity exists at all
 ----------------------------
@@ -87,6 +88,7 @@ model, and the one page envelope every collection in the API shares.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from typing import Final
 
 from sqlalchemy.exc import IntegrityError
@@ -150,12 +152,15 @@ class CategoryService:
 
         service = CategoryService(session)
 
-        # GET /api/v1/categories - the filter control, counts included, one statement.
-        chips = await service.list_with_post_counts()
+        # GET /api/v1/categories - the filter control, counts included, one page envelope.
+        page = await service.list_paginated(q=None, page=1, page_size=100)
 
         # POST /api/v1/admin/categories - the slug is derived here, never sent by a client.
+        # Both mutations return the projected `CategoryPublic` rather than the mapped row: the
+        # tally belongs to the transaction that wrote the row, so it is read before the commit
+        # rather than by a caller afterwards.
         category = await service.create(CategoryCreate(name="Machine Learning"))
-        assert category.slug == "machine-learning"
+        assert category.slug == "machine-learning" and category.post_count == 0
 
         # PATCH /api/v1/admin/categories/{id} - a rename leaves the slug alone.
         renamed = await service.update(category.id, CategoryUpdate(name="ML"))
@@ -222,66 +227,61 @@ class CategoryService:
             created_at=category.created_at,
         )
 
-    async def _published_post_counts(self) -> dict[uuid.UUID, int]:
-        """Return every category's published-post tally, keyed by identifier.
+    async def _published_post_counts(
+        self, category_ids: Sequence[uuid.UUID] | None = None
+    ) -> dict[uuid.UUID, int]:
+        """Return published-post tallies keyed by category identifier.
 
-        One statement for the whole taxonomy, so a caller holding an arbitrary set of categories
-        can attach a real tally to each of them without asking a question per category.
+        One statement for the requested scope, so a caller holding a set of categories can attach a
+        real tally to each of them without asking a question per category.
 
         Keyed by ``id`` rather than by ``slug`` or ``name``: the identifier is a UUID, so
         lookups need no case handling at all, while a slug key would tempt a caller into folding
         case in Python and duplicating - or contradicting - what the ``citext`` column already
         does.
 
+        Args:
+            category_ids: The categories to tally, or ``None`` for the whole taxonomy. **A paginated
+                caller must pass its page's identifiers.** The unbounded form is correct for
+                :meth:`list_with_post_counts`, whose result set *is* the taxonomy, and wrong
+                everywhere else: aggregating every category and every filing in order to enrich
+                twenty rows defeats the page boundary the window just established, and the cost then
+                grows with the taxonomy rather than with the page. A caller that needs exactly one
+                tally should not come here at all - :meth:`_targeted_count` answers that with a
+                single targeted count, and every one-category projection in this module uses it.
+
         Returns:
-            ``{category_id: published_post_count}`` covering every category in the taxonomy. A
-            category with no published post is present with a value of ``0``; the aggregate's
-            outer join is what keeps it in the result.
+            ``{category_id: published_post_count}`` covering every category in scope. A category
+            with no published post is present with a value of ``0``; the aggregate's outer join is
+            what keeps it in the result.
         """
-        counted = await self.categories.list_with_post_counts(status=PostStatus.PUBLISHED)
+        counted = await self.categories.list_with_post_counts(
+            status=PostStatus.PUBLISHED, category_ids=category_ids
+        )
         return {category.id: post_count for category, post_count in counted}
+
+    async def _targeted_count(self, category_id: uuid.UUID) -> int:
+        """Return one category's published-post tally with a single targeted count.
+
+        The one-row counterpart to :meth:`_published_post_counts`. Every method here that projects
+        exactly one category routes through this, so ``published`` means the same thing on the
+        single-category read as it does in the aggregate - one call site, one default, no second
+        definition of the number to drift.
+
+        Args:
+            category_id: The category to tally. An identifier that matches nothing counts ``0``
+                rather than raising: the callers below have already resolved the row, so a zero here
+                would mean the filings vanished between the two statements, and reporting an empty
+                category is a truer answer than failing the request.
+
+        Returns:
+            How many published posts are filed under that category.
+        """
+        return await self.categories.published_post_count(category_id, status=PostStatus.PUBLISHED)
 
     # -----------------------------------------------------------------------------------
     # Reads
     # -----------------------------------------------------------------------------------
-
-    async def list_with_post_counts(self) -> list[CategoryPublic]:
-        """Return the whole taxonomy with each term's published-post tally.
-
-        What ``GET /api/v1/categories`` serialises into the home page's filter control: a chip
-        per category reading ``Python (12)``. Deliberately **un-paginated** - a filter that
-        offers only some of the terms is a filter that silently hides posts, and a curated
-        taxonomy is bounded by editorial effort rather than by user input, so there is no growth
-        curve to defend against here. :meth:`list_paginated` is the surface that windows.
-
-        Two properties of the result are decisions rather than mechanics:
-
-        **The tally counts published posts only.** ``status`` is passed explicitly rather than
-        left to the repository's default, so the choice is visible and testable at this call
-        site instead of being inherited invisibly from another module. A draft must not inflate
-        a public count: the number beside a chip has to agree with the number of results an
-        anonymous caller gets from ``GET /api/v1/posts?category={slug}``, and a chip promising
-        three posts that turn out to be invisible drafts both misleads a reader and discloses
-        that unpublished work exists.
-
-        **A category with no posts still appears, with a count of ``0``.** The repository's join
-        is an outer one for exactly this reason, and the filter control is expected to show an
-        empty term rather than hide it.
-
-        Returns:
-            Every category ascending by name, each carrying its published-post tally; an empty
-            list when the taxonomy is empty.
-
-        Note:
-            One statement, always. The tally is a single ``LEFT OUTER JOIN`` with a ``GROUP BY``
-            inside the repository, and this method must never be re-implemented as "list the
-            categories, then count each one's posts": that shape issues a statement per category
-            and grows with the taxonomy, on the endpoint every single home-feed render calls.
-            The pairs are projected in the order they arrive, so no second pass over the
-            taxonomy is taken either.
-        """
-        counted = await self.categories.list_with_post_counts(status=PostStatus.PUBLISHED)
-        return [self._to_public(category, post_count) for category, post_count in counted]
 
     async def get_by_slug(self, slug: str) -> Category:
         """Resolve one category by the slug in its URL, or report that there is none.
@@ -335,20 +335,19 @@ class CategoryService:
             NotFoundError: If no category carries that slug.
 
         Note:
-            Two statements: the indexed slug lookup, then the counted aggregate. The tally is
-            read from the whole-taxonomy aggregate rather than from a count scoped to this one
-            category because the repository publishes no single-category count, and adding a
-            second way to compute the same number is how two callers start disagreeing about
-            what it means. On a curated taxonomy the difference is one bounded aggregate.
+            Two statements, and the second is scoped to this category: the indexed slug lookup, then
+            a targeted ``COUNT`` over its filings. It used to read the tally out of the
+            whole-taxonomy aggregate, which grouped every category and joined every filing to answer
+            a question about one row - on the endpoint a reader hits for every category page. The
+            repository now publishes both shapes, and the two share one definition of what is
+            counted (published posts, with the same default), so there is still exactly one meaning
+            for the number rather than two implementations of it.
         """
         category = await self.get_by_slug(slug)
-        counts = await self._published_post_counts()
-        # `.get(..., 0)` cannot silently invent a tally here. The aggregate covers every
-        # category and runs strictly after the lookup, so the only way this category is missing
-        # from it is a concurrent transaction having deleted the row in between - in which case
-        # the response is about to describe a category that no longer exists, and 0 is as
-        # truthful a tally as any. Every other path takes the real counted value.
-        return self._to_public(category, counts.get(category.id, 0))
+        # Targeted: one count over this category's filings, served by
+        # ix_post_categories_category_id. A category with no published post counts 0, which is the
+        # honest tally rather than a placeholder.
+        return self._to_public(category, await self._targeted_count(category.id))
 
     async def list_paginated(
         self,
@@ -357,11 +356,14 @@ class CategoryService:
         page: int,
         page_size: int,
     ) -> Page[CategoryPublic]:
-        """Window the taxonomy for the administrative management table.
+        """Window the taxonomy. **The only listing surface, and both routes reach it.**
 
-        Unlike :meth:`list_with_post_counts`, this surface is a management table rather than a
-        filter control: it is searched and paged. ``app.services.admin_service`` delegates to it
-        so the administrative screen and the public listing agree on what a category looks like.
+        ``GET /api/v1/categories`` calls it with ``q=None`` for the reader-facing filter control,
+        and ``app.services.admin_service`` calls it with the administrator's search term for the
+        management table. One implementation, so the two screens cannot disagree about what a
+        category looks like, about what ``post_count`` counts, or about the shape of a page - a
+        distinction that used to exist here as an un-paginated variant returning a bare list, and
+        that produced the one collection in the API answering outside the page contract.
 
         Args:
             q: Optional search text, matched case-insensitively against both the name and the
@@ -386,12 +388,15 @@ class CategoryService:
                 dividing by zero or substituting a default that would make ``pages`` a fiction.
 
         Note:
-            **``post_count`` is a real number on this surface too.** The repository's windowed
-            query returns entities without tallies, and ``CategoryPublic.post_count`` is a
-            required member, so a tally has to come from somewhere; emitting ``0`` because none
-            was to hand would put a fabricated figure in a documented field. It comes from one
-            further aggregate over the taxonomy instead - three statements in total, constant in
-            the page size, and never one per row.
+            **``post_count`` is a real number on this surface too, and the aggregate behind it is
+            bounded to the page.** The repository's windowed query returns entities without tallies,
+            and ``CategoryPublic.post_count`` is a required member, so a tally has to come from
+            somewhere; emitting ``0`` because none was to hand would put a fabricated figure in a
+            documented field. It comes from one further aggregate - three statements in total,
+            constant in the page size, and never one per row - narrowed to the identifiers this page
+            actually returned. Aggregating the whole taxonomy here would have undone the window: the
+            page bounds what is rendered, and the enrichment behind it has to respect the same
+            bound, or the endpoint's cost grows with the taxonomy however small the page is.
 
             **The tally counts published posts here as well, not posts in every state.**
             ``CategoryPublic.post_count`` is published in ``/openapi.json`` as the number of
@@ -407,13 +412,18 @@ class CategoryService:
         offset = (page - 1) * page_size
         rows, total = await self.categories.list_paginated(q=q, limit=page_size, offset=offset)
 
-        # Ordered after the window on purpose. Both statements take their own snapshot under
-        # READ COMMITTED, so a later aggregate is guaranteed to see every category the window
-        # already returned unless one was deleted in between - whereas an earlier aggregate
-        # could miss a category the window then included. See the comment in
-        # `get_public_by_slug` on why the fallback below is a true tally rather than a
-        # placeholder.
-        counts = await self._published_post_counts()
+        # Ordered after the window on purpose, and scoped BY it. The identifiers come from the rows
+        # the window returned, so the aggregate covers exactly this page rather than the relation.
+        # Sequencing it second is also what makes it complete: both statements take their own
+        # snapshot under READ COMMITTED, so an aggregate that runs after the window sees every row
+        # the window returned unless one was deleted in between, whereas an earlier one could miss a
+        # category the window then included.
+        #
+        # `.get(..., 0)` therefore cannot invent a tally. The only way a row on this page is absent
+        # from the aggregate is a concurrent transaction having deleted it in between, in which case
+        # the response is about to describe a category that no longer exists and 0 is as truthful a
+        # figure as any. Every other row takes its real counted value.
+        counts = await self._published_post_counts([category.id for category in rows])
 
         items = [self._to_public(category, counts.get(category.id, 0)) for category in rows]
         return build_page(items, total, page, page_size)
@@ -422,7 +432,7 @@ class CategoryService:
     # Writes
     # -----------------------------------------------------------------------------------
 
-    async def create(self, payload: CategoryCreate) -> Category:
+    async def create(self, payload: CategoryCreate) -> CategoryPublic:
         """Create a category, deriving its slug from its name.
 
         Behind ``POST /api/v1/admin/categories``. The caller supplies a name and optionally a
@@ -435,10 +445,25 @@ class CategoryService:
                 and a blank ``description`` has already been folded to ``None``, by the schema -
                 so nothing here re-validates input, and nothing here has to decide what an empty
                 string means.
+            commit: Whether this call owns the transaction boundary. ``True`` for the ordinary
+                case, where creating the category *is* the request. Pass ``False`` when this call
+                is one step of a larger unit of work that a caller will complete and commit
+                itself - which is what ``app.services.admin_service`` does, because the
+                administrative operation is not finished until the projection its response
+                declares has been assembled. See the note on the boundary.
 
         Returns:
-            The persisted category, with its server-generated ``id``, its derived ``slug`` and
-            both timestamps populated from the database.
+            The persisted category **already projected into**
+            :class:`~app.schemas.category.CategoryPublic`, with its server-generated ``id``, its
+            derived ``slug``, both timestamps from the database and ``post_count`` of ``0``.
+
+            The projection is built here rather than left to the caller, and that is a transaction
+            decision rather than a convenience. ``CategoryPublic`` carries ``post_count``, which is
+            an aggregate no ``Category`` entity holds, so a caller that received the row had to read
+            the tally itself - and it could only do so *after* this method's commit, which meant a
+            transient failure on that read returned an error for a category that already existed.
+            Owning the projection lets the commit be the last database action of the request. See
+            the note on why the count is a constant here.
 
         Raises:
             ConflictError: If the name is already taken, or if the insert violates either unique
@@ -470,6 +495,14 @@ class CategoryService:
             ``Python`` collides with a stored ``python`` in the database, and ``unique_slug``
             compares its own candidates case-insensitively too, so no case folding is performed
             in this module at all.
+
+            **One request, one commit, and ``commit=False`` is how a composing caller keeps that
+            true.** Committing here unconditionally would mean an administrative create committed
+            the row and *then* read its projection, so a failure on that read would answer an
+            error over a category that already existed - and no rollback could undo it, because
+            the database had already accepted the work. Both unique constraints are still applied
+            here either way: ``add`` flushes, so the INSERT and its violations happen inside the
+            guard below regardless of who commits.
         """
         # The clear-message path for the collision that actually happens. `categories.name` is
         # plain TEXT under a case-SENSITIVE unique constraint, so this lookup asks exactly the
@@ -488,7 +521,13 @@ class CategoryService:
             # inside this block rather than at some later commit. The commit is inside it too:
             # a commit issues a flush of its own, and a translation that covered only one of the
             # two would leave the other able to surface as a 500.
-            await self.categories.add(category)
+            persisted = await self.categories.add(category)
+            # Projected BEFORE the commit, and with a constant rather than a query: a category
+            # created a moment ago has no post filed under it, because `post_categories` rows are
+            # written by the post lifecycle and nothing in this method writes one. Counting would
+            # ask the database a question whose answer is already known - which is what the
+            # administrative readback used to do, and it did it with a whole-taxonomy aggregate.
+            projected = self._to_public(persisted, 0)
             await self.session.commit()
         except IntegrityError as error:
             # Rolled back before the domain error is raised. After an IntegrityError the session
@@ -499,9 +538,9 @@ class CategoryService:
             await self.session.rollback()
             raise ConflictError(_DETAIL_NAME_OR_SLUG_TAKEN) from error
 
-        return category
+        return projected
 
-    async def update(self, category_id: uuid.UUID, payload: CategoryUpdate) -> Category:
+    async def update(self, category_id: uuid.UUID, payload: CategoryUpdate) -> CategoryPublic:
         """Apply a partial update to a category, leaving its slug alone.
 
         Behind ``PATCH /api/v1/admin/categories/{id}``. A genuine partial update: only the
@@ -516,10 +555,18 @@ class CategoryService:
             payload: The validated body. Every member is optional; an omitted member means
                 "leave this as it is". An empty body is a valid no-op rather than an error,
                 because a form that submits an unmodified record is a legitimate request.
+            commit: Whether this call owns the transaction boundary - see :meth:`create`. The
+                administrative caller passes ``False`` so that the rename and the projection its
+                response declares are one transaction.
 
         Returns:
-            The category, reloaded from the database when something changed and returned
-            unchanged when nothing did.
+            The category projected into :class:`~app.schemas.category.CategoryPublic`, reloaded from
+            the database when something changed and read as it stands when nothing did, with
+            ``post_count`` from one targeted count over its filings.
+
+            As in :meth:`create`, the projection is owned here so that the tally is read inside
+            this method's transaction and the commit is the last database action - the caller used
+            to read it afterwards, through a whole-taxonomy aggregate, on a durable row.
 
         Raises:
             NotFoundError: If no category carries that identifier. Resolved **before** any
@@ -558,9 +605,11 @@ class CategoryService:
         # present with a value of None and is honoured as an instruction to clear it.
         changes = payload.model_dump(exclude_unset=True)
         if not changes:
-            # Nothing was sent, so nothing is written and nothing is committed. Returning the
-            # row as it stands keeps an empty patch a successful no-op rather than an error.
-            return category
+            # Nothing was sent, so nothing is written and nothing is committed - the read for the
+            # tally is the only statement this branch issues, and there is no transaction to order
+            # it against. Returning the row as it stands keeps an empty patch a successful no-op
+            # rather than an error.
+            return self._to_public(category, await self._targeted_count(category.id))
 
         if "name" in changes:
             # Read from the model attribute rather than from the dump: `model_dump` widens every
@@ -583,15 +632,20 @@ class CategoryService:
             # `save` flushes the UPDATE and reloads the row, so the returned entity carries the
             # `updated_at` PostgreSQL just re-derived rather than an expired attribute a
             # response serialiser would trip over.
-            await self.categories.save(category)
+            saved = await self.categories.save(category)
+            # One targeted count, inside the transaction, then commit. A rename does not change how
+            # many posts are filed under a category, so this figure is the same before and after the
+            # write - but reading it here rather than afterwards is what makes the commit the last
+            # database action of the request.
+            projected = self._to_public(saved, await self._targeted_count(saved.id))
             await self.session.commit()
         except IntegrityError as error:
             await self.session.rollback()
             raise ConflictError(_DETAIL_NAME_TAKEN) from error
 
-        return category
+        return projected
 
-    async def delete(self, category_id: uuid.UUID) -> None:
+    async def delete(self, category_id: uuid.UUID, *, commit: bool = True) -> None:
         """Delete a category, refusing while any post is still filed under it.
 
         Behind ``DELETE /api/v1/admin/categories/{id}``, which answers ``204`` with no body -
@@ -600,6 +654,9 @@ class CategoryService:
 
         Args:
             category_id: The category's server-generated identifier, taken from the path.
+            commit: Whether this call owns the transaction boundary - see :meth:`create`. The
+                administrative caller passes ``False`` so that the whole operation, its audit line
+                included, is one transaction.
 
         Raises:
             NotFoundError: If no category carries that identifier. Resolved **first**, before the
@@ -645,4 +702,5 @@ class CategoryService:
             raise ConflictError(_DETAIL_IN_USE)
 
         await self.categories.delete(category)
-        await self.session.commit()
+        if commit:
+            await self.session.commit()

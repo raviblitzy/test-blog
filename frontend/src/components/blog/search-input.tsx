@@ -136,6 +136,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { MAX_SEARCH_TERM_LENGTH } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 /**
@@ -628,6 +629,16 @@ export function SearchInput({
             setDraft(event.target.value);
           }}
           placeholder={placeholder}
+          // The service's own bound, mirrored at the one control that can honour
+          // it before a request exists. `MAX_SEARCH_TERM_LENGTH` is the number
+          // `backend/app/schemas/common.py` enforces and publishes as `maxLength`
+          // on the `q` parameter, and the service refuses a longer term with a
+          // 422 rather than truncating it. Capping the field is what keeps that
+          // refusal unreachable from this control: the reader simply cannot type
+          // past it, so there is no error state to render and no request to spend.
+          // It bounds the pasted case too, which is the only realistic way a
+          // reader reaches 256 characters.
+          maxLength={MAX_SEARCH_TERM_LENGTH}
           // A search box has nothing to autofill from, and a browser dropdown
           // over the results would obscure them.
           autoComplete="off"

@@ -97,6 +97,8 @@
 
 import { z } from 'zod';
 
+import { codePointLength } from '@/lib/text';
+
 import type { LoginRequest, RegisterRequest } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
@@ -289,35 +291,6 @@ function hasSufficientCharacterVariety(password: string): boolean {
 }
 
 /* -------------------------------------------------------------------------------------------------
- * Length measurement
- * ---------------------------------------------------------------------------------------------- */
-
-/**
- * How long a string is *in characters*, counted the way the service counts.
- *
- * This is not the same number as `String.prototype.length`, and the difference is a real defect
- * rather than a technicality. JavaScript's `length` counts UTF-16 code units, so a character above
- * `U+FFFF` — an emoji, a historic script, a rarely-used ideograph — counts as **two**. Python's
- * `len`, which is the unit the service's length constraints are expressed in, counts code points,
- * so the same character counts as **one**.
- *
- * Left unhandled that divergence breaks the mirror in both directions at once, and both directions
- * were observed against the running service before this function existed. A 127-character
- * passphrase written in an astral script measures 254 to `length`, so the ceiling refused a password
- * the service accepted. An 11-character one measures 22, so the floor waved through a password the
- * service refused. That is why every bound in this file is applied through this function rather than
- * through zod's `.min()` and `.max()`, whose string checks read `length`.
- *
- * Spreading the string iterates it by code point, which is the unit the service uses.
- *
- * @param value - Any string.
- * @returns The number of code points in it.
- */
-function codePointLength(value: string): number {
-  return [...value].length;
-}
-
-/* -------------------------------------------------------------------------------------------------
  * Field schemas
  *
  * Declared once and shared, so the two forms cannot drift from one another on a field they have in
@@ -333,11 +306,13 @@ function codePointLength(value: string): number {
  * - **Neither password field is trimmed.** Whitespace is significant in a credential, and the
  *   service says so explicitly: trimming would silently change the password a user typed, and they
  *   would then be unable to log in with what they thought they had chosen.
- * - **Every length bound is measured in code points** through {@link codePointLength}, not in
- *   UTF-16 code units. See that function for the two observed failures this prevents. It is why the
- *   bounds below are expressed as explicit checks rather than as zod's `.min()` and `.max()`, which
- *   read `String.prototype.length`. The one exception is the `.min(1)` "is anything here at all"
- *   check on the submitted password, where the two units cannot disagree.
+ * - **Every length bound is measured in code points** through `codePointLength` from `@/lib/text`,
+ *   not in UTF-16 code units. That function is the tier's single measurement and its documentation
+ *   carries the two observed failures this prevents; `validation/category.ts`, `validation/post.ts`
+ *   and `validation/comment.ts` measure through the same one. It is why the bounds below are
+ *   expressed as explicit checks rather than as zod's `.min()` and `.max()`, which read
+ *   `String.prototype.length`. The one exception is the `.min(1)` "is anything here at all" check on
+ *   the submitted password, where the two units cannot disagree.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -359,7 +334,27 @@ const emailField = z
   .string({ error: 'Email address is required.' })
   .trim()
   .min(1, { error: 'Email address is required.', abort: true })
-  .pipe(z.email({ error: 'Enter a valid email address, such as you@example.com.' }));
+  // The pattern is explicit, and choosing it is the whole substance of this field.
+  //
+  // zod's DEFAULT email pattern is ASCII-only, so it rejects every internationalized address:
+  // `ünïcödé@exämple.com`, and any address with a non-ASCII local part or an IDN domain in its
+  // Unicode form. The service accepts them - Pydantic's `EmailStr` follows the SMTPUTF8/IDNA rules -
+  // so the default would make this form STRICTER than the API it mirrors, which is the one direction
+  // a client-side check must never be wrong in. The failure is also invisible to everyone who tests
+  // with an ASCII address: a reader whose own name is not spellable in ASCII simply cannot register,
+  // and the message tells them their address is invalid when it is not.
+  //
+  // `z.regexes.unicodeEmail` is zod's own Unicode-aware pattern, verified in the installed 4.4.3 to
+  // accept `ünïcödé@exämple.com` while still requiring an `@`, a non-empty local part of at most 64
+  // characters and a host of at most 255 - the RFC bounds. Anything it lets through that the service
+  // would refuse comes back as a `422` against this field, which is the correct division: the client
+  // saves the obvious round trip, the service remains the authority on deliverability.
+  .pipe(
+    z.email({
+      pattern: z.regexes.unicodeEmail,
+      error: 'Enter a valid email address, such as you@example.com.',
+    }),
+  );
 
 /**
  * A public handle, trimmed and held to the service's length bounds and character pattern.
@@ -507,11 +502,13 @@ export const signupSchema = z.object({
 export type SignupFormValues = AssertAssignableTo<RegisterRequest, z.infer<typeof signupSchema>>;
 
 /**
- * Validates the log-in form, mirroring the JSON body of `POST /api/v1/auth/login`.
+ * Validates the log-in form, mirroring the `LoginRequest` domain shape of `POST /api/v1/auth/login`.
  *
- * The identifier field is `email`, and it stays `email`. The same route also accepts the OAuth 2
- * password-grant form, in which the grant names that field `username` while the value carried is
- * still an email address; translating between the two encodings belongs to `@/lib/api/auth`.
+ * Note what it does **not** mirror: the wire body. That route consumes the OAuth 2 password grant, so
+ * what is actually sent is `application/x-www-form-urlencoded` with the grant's own field names -
+ * unlike `register`, `refresh` and `logout`, which take JSON. This schema deliberately validates the
+ * form the *reader* fills in, whose identifier field is `email` and stays `email`; mapping it onto the
+ * field the grant calls `username` belongs to `@/lib/api/auth` and happens in exactly one place.
  *
  * @example
  * ```ts

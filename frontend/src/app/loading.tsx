@@ -70,8 +70,11 @@
 //
 //   1. A `'use client'` directive. See note 1.
 //   2. Any data access - no `fetch`, no `@/lib/api/*`, no `await`. See note 1.
-//   3. Any read of the environment. `src/lib/api/client.ts` is the only module in this tier that
-//      reads one, and a placeholder needs nothing from it.
+//   3. Any read of the environment. This tier has exactly two sanctioned readers - and a
+//      placeholder needs nothing from either: `src/lib/api/client.ts` reads
+//      NEXT_PUBLIC_API_BASE_URL, and `src/lib/seo.ts` reads NEXT_PUBLIC_SITE_URL and
+//      NEXT_PUBLIC_SITE_NAME. Those three keys are the whole of the FRONTEND block of
+//      `.env.example`.
 //   4. A grid or column utility of any kind. See note 2.
 //   5. A second live region, an `aria-live` or an `aria-busy`. See note 3.
 //   6. An `<h1>`, an `sr-only` heading, or any real text. See note 4.

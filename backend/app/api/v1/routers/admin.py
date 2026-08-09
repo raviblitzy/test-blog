@@ -1,12 +1,13 @@
-"""The administrative namespace: thirteen gated operations over four entity families.
+"""The administrative namespace: fourteen gated operations over four entity families.
 
 What the user asked for was "an admin dashboard for managing users, posts, comments, and
 categories". Because the framework question was resolved to FastAPI there is no
 framework-provided administration console to inherit, so the dashboard is an explicit route
 group over an explicit API namespace - which is what the prompt asked for in any case: an
 admin dashboard as a deliverable rather than as a by-product. This module is the API half
-of it: three operations for each of the four families the prompt names, plus the aggregate
-counts the overview screen renders.
+of it: a listing, a state mutation and a deletion for each of the four families the prompt
+names - plus a creation for the one family that has no self-service path to a new row - and the
+aggregate counts the overview screen renders.
 
 The whole namespace, in declaration order::
 
@@ -20,11 +21,12 @@ The whole namespace, in declaration order::
     GET    /api/v1/admin/comments                  ->  Page[AdminComment]
     PATCH  /api/v1/admin/comments/{id}/status      ->  AdminComment
     DELETE /api/v1/admin/comments/{comment_id}     ->  204, no body
+    GET    /api/v1/admin/categories                ->  Page[CategoryPublic]
     POST   /api/v1/admin/categories                ->  201, CategoryPublic
     PATCH  /api/v1/admin/categories/{category_id}  ->  CategoryPublic
     DELETE /api/v1/admin/categories/{category_id}  ->  204, no body
 
-Thirteen, and exactly thirteen. There is no bulk endpoint, no password reset for another
+Fourteen, and exactly fourteen. There is no bulk endpoint, no password reset for another
 account, no impersonation and no query console. Each of those is a privileged operation
 whose blast radius is far wider than anything the dashboard needs, and an administrative
 namespace is the one place where "it might be handy" is the most expensive argument in the
@@ -47,7 +49,7 @@ path segment, the ``admin`` documentation tag, and the administrator gate.
 
 That single placement is what makes the gate impossible to omit. It covers every operation
 beneath it, including one added long after this file was written by someone who never read
-this paragraph, so the guarantee is a property of the mount rather than of thirteen separate
+this paragraph, so the guarantee is a property of the mount rather than of fourteen separate
 acts of remembering. Restating it here would document the same security requirement twice in
 ``/openapi.json`` for no additional protection, and would put the version prefix and the tag
 in two files that then have to agree forever.
@@ -86,7 +88,7 @@ is aliased to ``AdminPrincipal`` and the **schema** keeps its documented name. N
 negotiable in isolation - the alias is the vocabulary the handler signatures read in, and the
 class is the name the response model is documented and tested under.
 
-Thirteen handlers, thirteen one-line service calls
+Fourteen handlers, fourteen one-line service calls
 --------------------------------------------------
 Every handler here constructs ``AdminService(db)`` and calls exactly one method on it. That
 is the whole body. The file's job is shape and routing - path, method, status code, response
@@ -127,13 +129,14 @@ this module would be a third record describing the same event.
 """
 
 import uuid
-from typing import Annotated, Any, Final
+from typing import Annotated, Final
 
 from fastapi import APIRouter, Path, Query, status
 
 # The dependency is aliased and the schema keeps its name - see "Two names spelled AdminUser"
 # in the module docstring. `AdminPrincipal` is the injected administrator; `AdminUser`, from
 # the schema barrel below, is the serialised administrative user row.
+from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import AdminUser as AdminPrincipal, DbSession, PageParamsDep
 from app.models import CommentStatus, PostStatus, UserRole
 from app.schemas import (
@@ -148,8 +151,8 @@ from app.schemas import (
     CategoryPublic,
     CategoryUpdate,
     Page,
-    ProblemDetail,
 )
+from app.schemas.common import MAX_SEARCH_TERM_LENGTH, SearchTerm
 from app.services import AdminService
 
 __all__ = ["router"]
@@ -162,33 +165,28 @@ __all__ = ["router"]
 # `/openapi.json` rather than an undocumented body a client generator has to guess at. The
 # entries are composed per route with `|` from the four constants below, which keeps each
 # decorator's declaration an explicit statement of what that operation can actually return
-# and keeps the descriptions from drifting apart between thirteen copies.
+# and keeps the descriptions from drifting apart between fourteen copies.
 #
-# `ProblemDetail` is the model on every one of them, because this API has exactly one error
-# shape - `type`, `title`, `status`, `detail`, `instance`, `request_id` - in place of the
-# three ad-hoc 404 raises and the two different success envelopes the retired surface used.
+# Every entry is built by `app.api.v1.responses.problem_response`, which names the one error
+# shape this API has - `type`, `title`, `status`, `detail`, `instance`, `request_id`, in place
+# of the three ad-hoc 404 raises and the two different success envelopes the retired surface
+# used - and which is the single place its published media type is decided.
 # ---------------------------------------------------------------------------------------
 
-_GATE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_401_UNAUTHORIZED: {
-        "model": ProblemDetail,
-        "description": (
-            "No usable credential was presented: the `Authorization` header was absent or "
-            "malformed, or the bearer token was expired, of the wrong type, or names an "
-            "account that no longer exists. Obtain a fresh access token from "
-            "`POST /api/v1/auth/login` or `POST /api/v1/auth/refresh` and retry."
-        ),
-    },
-    status.HTTP_403_FORBIDDEN: {
-        "model": ProblemDetail,
-        "description": (
-            "The credential is valid but the account may not use this namespace - it holds "
-            "`READER` or `AUTHOR` rather than `ADMIN`, or it has been deactivated. The body "
-            "does not disclose which role would have sufficed."
-        ),
-    },
+_GATE_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_401_UNAUTHORIZED: problem_response(
+        "No usable credential was presented: the `Authorization` header was absent or "
+        "malformed, or the bearer token was expired, of the wrong type, or names an "
+        "account that no longer exists. Obtain a fresh access token from "
+        "`POST /api/v1/auth/login` or `POST /api/v1/auth/refresh` and retry."
+    ),
+    status.HTTP_403_FORBIDDEN: problem_response(
+        "The credential is valid but the account may not use this namespace - it holds "
+        "`READER` or `AUTHOR` rather than `ADMIN`, or it has been deactivated. The body "
+        "does not disclose which role would have sufficed."
+    ),
 }
-"""401 and 403, declared on all thirteen routes because the gate covers all thirteen.
+"""401 and 403, declared on all fourteen routes because the gate covers all fourteen.
 
 Every operation in this namespace is reachable only by an authenticated, active principal
 holding ``ADMIN``, so both failure modes apply uniformly. ``app.api.v1.router`` documents the
@@ -196,30 +194,24 @@ same two statuses on the ``include_router`` call that attaches the gate; the wor
 deliberately consistent with it rather than a second, competing description.
 """
 
-_NOT_FOUND_RESPONSE: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_404_NOT_FOUND: {
-        "model": ProblemDetail,
-        "description": (
-            "No record carries the identifier in the path. Raised by the service before "
-            "anything is written, so a failed mutation leaves no partial change behind."
-        ),
-    }
+_NOT_FOUND_RESPONSE: Final[ProblemResponses] = {
+    status.HTTP_404_NOT_FOUND: problem_response(
+        "No record carries the identifier in the path. Raised by the service before "
+        "anything is written, so a failed mutation leaves no partial change behind."
+    )
 }
 """404, declared on every route that addresses a single record by identifier."""
 
-_CONFLICT_RESPONSE: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_409_CONFLICT: {
-        "model": ProblemDetail,
-        "description": (
-            "The request cannot be applied to the current state of the data. Either a "
-            "category name or its derived slug is already taken; or a category is still "
-            "referenced by at least one post and so may not be deleted yet; or the "
-            "administrator is acting on their **own** account in a way that would remove "
-            "their access - demoting it out of `ADMIN`, deactivating it, or deleting it. "
-            "That last case is a lockout guard rather than an authority rule, which is why "
-            "it is a conflict with the current state and not a 403."
-        ),
-    }
+_CONFLICT_RESPONSE: Final[ProblemResponses] = {
+    status.HTTP_409_CONFLICT: problem_response(
+        "The request cannot be applied to the current state of the data. Either a "
+        "category name or its derived slug is already taken; or a category is still "
+        "referenced by at least one post and so may not be deleted yet; or the "
+        "administrator is acting on their **own** account in a way that would remove "
+        "their access - demoting it out of `ADMIN`, deactivating it, or deleting it. "
+        "That last case is a lockout guard rather than an authority rule, which is why "
+        "it is a conflict with the current state and not a 403."
+    )
 }
 """409, declared wherever the outcome depends on existing rows.
 
@@ -228,22 +220,43 @@ account-mutation routes, where the self-lockout guard refuses a change that woul
 acting administrator of their own access.
 """
 
-_UNPROCESSABLE_RESPONSE: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_422_UNPROCESSABLE_CONTENT: {
-        "model": ProblemDetail,
-        "description": (
-            "A parameter or body member failed validation - a path identifier that is not a "
-            "UUID, a page window outside `1..100`, a status or role outside its enumeration, "
-            "an explicit `null` where omission is how 'unchanged' is expressed, or an "
-            "unrecognised member on a body that forbids extras. The problem document carries "
-            "an `errors` list naming each offending location."
-        ),
-    }
+_UNPROCESSABLE_RESPONSE: Final[ProblemResponses] = {
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "A parameter or body member failed validation - a path identifier that is not a "
+        "UUID, a page window outside `1..100`, a status or role outside its enumeration, "
+        "an explicit `null` where omission is how 'unchanged' is expressed, or an "
+        "unrecognised member on a body that forbids extras. The problem document carries "
+        "an `errors` list naming each offending location."
+    )
 }
 """422, declared on every route carrying a body, a typed query parameter or a UUID path.
 
 Every route in this namespace qualifies except ``GET /stats``, which takes no input at all.
 """
+
+
+# ---------------------------------------------------------------------------------------
+# The search-term contract, stated once for the three listings that accept one
+#
+# The bound itself is `app.schemas.common.MAX_SEARCH_TERM_LENGTH` and is enforced by
+# `SearchTerm`, the annotation the three `q` parameters carry. This sentence is only the
+# published half of it: the number is interpolated rather than written out, so the documentation
+# cannot claim a limit the annotation does not enforce, and the same wording reaches all three
+# listings rather than drifting into three descriptions of one rule.
+#
+# Bounding these three matters as much as bounding the public feed. An administrative caller is
+# authenticated but is not thereby trusted with unbounded work: `q` here is parsed by the
+# full-text parser, matched against a trigram index and written into a structured log line, and
+# the length of all three is the caller's to choose unless something says otherwise.
+# ---------------------------------------------------------------------------------------
+
+_SEARCH_TERM_BOUND: Final[str] = (
+    f"At most {MAX_SEARCH_TERM_LENGTH} characters - a longer term is refused with `422` rather "
+    "than truncated, because a silently shortened search answers a question the caller did not "
+    "ask. Whitespace runs are collapsed, so an empty or whitespace-only value is treated as no "
+    "filter and clearing the search box does not add a predicate that matches everything."
+)
+"""The bound and normalisation sentence appended to each ``q`` description below."""
 
 
 # ---------------------------------------------------------------------------------------
@@ -364,12 +377,11 @@ async def list_users(
     actor: AdminPrincipal,
     page: PageParamsDep,
     q: Annotated[
-        str | None,
+        SearchTerm,
         Query(
             description=(
-                "Free-text term matched against the username and the email address. An empty "
-                "or whitespace-only value is treated as no filter, so clearing the search box "
-                "does not add a predicate that matches everything."
+                "Free-text term matched against the username and the email address.\n\n"
+                + _SEARCH_TERM_BOUND
             ),
         ),
     ] = None,
@@ -539,13 +551,10 @@ async def list_posts(
     actor: AdminPrincipal,
     page: PageParamsDep,
     q: Annotated[
-        str | None,
+        SearchTerm,
         Query(
-            description=(
-                "Search term - ranked full-text matching over title, excerpt and body, "
-                "combined with typo-tolerant matching on the title. An empty or "
-                "whitespace-only value is treated as no filter."
-            ),
+            description="Search term - ranked full-text matching over title, excerpt and body, "
+            "combined with typo-tolerant matching on the title.\n\n" + _SEARCH_TERM_BOUND
         ),
     ] = None,
     post_status: Annotated[
@@ -720,12 +729,9 @@ async def list_comments(
         ),
     ] = None,
     q: Annotated[
-        str | None,
+        SearchTerm,
         Query(
-            description=(
-                "Free-text term matched against the comment body. An empty or whitespace-only "
-                "value is treated as no filter."
-            ),
+            description="Free-text term matched against the comment body.\n\n" + _SEARCH_TERM_BOUND
         ),
     ] = None,
     post_id: Annotated[
@@ -843,12 +849,18 @@ async def delete_comment(comment_id: _CommentIdPath, db: DbSession, actor: Admin
 # ---------------------------------------------------------------------------------------
 # Categories
 #
-# Three routes, and no listing among them. `GET /api/v1/categories` already returns the whole
-# taxonomy with each term's published-post tally - it is what the home page's filter control
-# renders - and a category has no private member for an administrative projection to reveal:
-# no owner, no address, no credential and no moderation state. A fourth route here would be a
-# second description of a resource clients already have, so the administrative categories
-# screen reads the public listing and mutates through the three routes below.
+# Four routes: a searchable listing and the three lifecycle operations. The listing is what the
+# administrative categories screen renders its management table from, and it is a separate
+# operation from the public `GET /api/v1/categories` for one reason - it accepts a `q` term.
+# Searching a taxonomy is a management affordance; putting a text predicate on the public read
+# every home-feed render calls would serve no reader. Both answer the identical page envelope
+# and both reach `CategoryService.list_paginated`, so the two screens cannot disagree about what
+# a category looks like or about what `post_count` counts.
+#
+# There is deliberately no administrative PROJECTION of a category, and none is needed: a
+# category has no private member - no owner, no address, no credential, no moderation state - so
+# `CategoryPublic` already carries everything this screen shows. That is why `app.schemas.admin`
+# declares no category output type and this route names the public model.
 #
 # The two inputs are `CategoryCreate` and `CategoryUpdate` from `app.schemas.category`, reached
 # through the barrel and deliberately not re-declared as administrative variants: one wire
@@ -856,6 +868,64 @@ async def delete_comment(comment_id: _CommentIdPath, db: DbSession, actor: Admin
 # restating them for exactly that reason. Neither accepts an identifier or a slug, because both
 # are the server's to generate.
 # ---------------------------------------------------------------------------------------
+
+
+@router.get(
+    "/categories",
+    response_model=Page[CategoryPublic],
+    status_code=status.HTTP_200_OK,
+    responses=_GATE_RESPONSES | _UNPROCESSABLE_RESPONSE,
+    summary="List categories with post counts",
+    description=(
+        "The management table behind the administrative categories screen: one page of the "
+        "taxonomy, ascending by name, each term carrying how many PUBLISHED posts are filed "
+        "under it.\n\n"
+        "`q` is what this route adds over the public `GET /api/v1/categories`, and it is matched "
+        "case-insensitively against **both** the name and the slug, so a term is findable by "
+        "either spelling. A blank or whitespace-only value is treated as no filter rather than "
+        "as a search for nothing.\n\n"
+        "`post_count` counts published posts here exactly as it does on the public control, "
+        "because it is the same documented model - a moderator reads the figure a reader would "
+        "see. A term with nothing filed under it is included with a `post_count` of `0`, which "
+        "is how the screen shows an unused category rather than hiding it."
+    ),
+)
+async def list_categories(
+    db: DbSession,
+    actor: AdminPrincipal,
+    page: PageParamsDep,
+    q: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Free-text term matched case-insensitively against the category name and its "
+                "slug. An empty or whitespace-only value is treated as no filter."
+            ),
+        ),
+    ] = None,
+) -> Page[CategoryPublic]:
+    """Return one page of the taxonomy, optionally narrowed by a search term.
+
+    Args:
+        db: The request-scoped session.
+        actor: The administrator principal.
+        page: The validated window.
+        q: Optional free-text term over the name and the slug, or ``None`` for no filter.
+
+    Returns:
+        The one page envelope, with :class:`~app.schemas.category.CategoryPublic` items - the
+        same model the public taxonomy endpoints return, so the administrative screen and the
+        home page filter agree on what a category looks like down to the meaning of
+        ``post_count``.
+
+    Note:
+        ``AdminService`` delegates to ``CategoryService.list_paginated``, which is the single
+        windowing implementation over this relation and is what the public collection calls too.
+        Composing a second query here would be a second definition of a page of categories.
+    """
+    return await AdminService(db).list_categories(
+        actor=actor, q=q, page=page.page, page_size=page.page_size
+    )
 
 
 @router.post(

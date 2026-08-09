@@ -159,8 +159,9 @@ from uuid import UUID
 
 from fastapi import APIRouter, status
 
+from app.api.v1.responses import OPTIONAL_AUTHENTICATION, ProblemResponses, problem_response
 from app.core.dependencies import CurrentUser, DbSession, OptionalUser, PageParamsDep
-from app.schemas import CommentCreate, CommentPublic, CommentUpdate, Page, ProblemDetail, UserPublic
+from app.schemas import CommentCreate, CommentPublic, CommentUpdate, Page, UserPublic
 from app.services import CommentService
 
 __all__ = ["post_comments_router", "router"]
@@ -203,121 +204,137 @@ this package uses for its principal object, and the aggregate relies on it."""
 # rather than inferred from a literal nested in an argument, and so the two descriptions that are
 # genuinely identical between routes have one definition instead of four.
 #
-# `model` is the part that matters: without it the failure mode is undocumented and a generated
-# client emits no type for it, which is precisely the gap the "every route declares its shapes"
-# standard closes. Every entry names the one problem document this API returns for every failure at
-# every status, so a client is written against exactly one parser.
+# Every entry is built by `app.api.v1.responses.problem_response`, which is the single place in
+# this package that names the one problem document this API returns for every failure at every
+# status - and the single place its published media type is decided. Without a model the failure
+# mode is undocumented and a generated client emits no type for it, which is precisely the gap
+# the "every route declares its shapes" standard closes.
+#
+# The set declared per route is exactly what that route can PRODUCE. That cuts both ways: a
+# status the route cannot emit advertises a branch no client can take, and a status it CAN emit
+# but does not declare leaves a client with an undocumented body. Neither is acceptable, so a
+# reachable status is never left to the route's prose - `POST /{post_id}/comments` declares 403
+# and 409 for that reason, and `GET /{post_id}/comments` declares 401.
 # ---------------------------------------------------------------------------------------
 
-_UNAUTHORIZED: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "No usable credential was presented. The `Authorization` header was absent or malformed, "
-        "or the bearer token was expired, of the wrong type, or names an account that no longer "
-        "exists. Writing to a discussion always requires a principal; reading one never does."
-    ),
-}
+_UNAUTHORIZED: Final[dict[str, Any]] = problem_response(
+    "No usable credential was presented. The `Authorization` header was absent or malformed, "
+    "or the bearer token was expired, of the wrong type, or names an account that no longer "
+    "exists. Writing to a discussion always requires a principal; reading one never does - "
+    "though a credential *presented* on a read must still be usable."
+)
 """The 401 entry, shared by the three routes that require authentication.
 
 One description for one meaning. The condition is resolved by ``app.core.dependencies`` before a
 handler below is entered, so it is identical on all three and is stated once."""
 
-_FORBIDDEN: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "The credential is valid but does not permit this action: the caller neither wrote the "
-        "comment nor holds the administrator role, or the account has been deactivated. The "
-        "response never states which of those it was, and never states which role would have "
-        "sufficed."
-    ),
-}
-"""The 403 entry, shared by the two routes whose authority is scoped to a row's owner.
+_UNAUTHORIZED_ON_READ: Final[dict[str, Any]] = problem_response(
+    "A credential was presented and could not be used - absent is fine here, unusable is not. "
+    "Reading a thread needs no credential at all, and an anonymous caller is served the "
+    "approved comments; but a malformed, expired or wrong-type token is refused rather than "
+    "silently degraded to anonymous, because degrading it would hide an expired session from "
+    "the client that needs to renew it. Retry after refreshing, or omit the header entirely."
+)
+"""The 401 entry for the public listing route, whose principal is optional but not ignorable."""
 
-Deliberately absent from the create route: commenting is gated on authentication alone, never on a
-role, so a reader who registered a moment ago may join a discussion. Deliberately vague about the
-cause, because naming it would tell an unauthorised caller which half of the check it failed."""
+_FORBIDDEN: Final[dict[str, Any]] = problem_response(
+    "The credential is valid but does not permit this action: the caller neither wrote the "
+    "comment nor holds the administrator role, or the account has been deactivated. The "
+    "response never states which of those it was, and never states which role would have "
+    "sufficed."
+)
+"""The 403 entry for the two routes whose authority is scoped to a row's owner."""
 
-_POST_NOT_FOUND: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "No post carries that identifier, or the post is not visible to this caller. A draft "
-        "someone else owns is reported exactly as a missing post: answering 403 would confirm "
-        "that the identifier addresses something real, which is how an unauthorised caller "
-        "enumerates identifiers by reading status codes."
-    ),
-}
+_FORBIDDEN_ON_CREATE: Final[dict[str, Any]] = problem_response(
+    "The account has been deactivated. Commenting requires no *role* - a reader who "
+    "registered a moment ago may join a discussion, which is why this is the only state that "
+    "produces a 403 here - but a deactivated account holds no authority at all, and the "
+    "shared principal dependency refuses it before the handler is entered."
+)
+"""The 403 entry on the create route, whose only forbidden state is deactivation.
+
+Declared rather than left to prose. A client that sees this status needs to know the body it
+carries and that re-authenticating will not clear it, and neither fact is available to it from a
+sentence in the route description."""
+
+_POST_NOT_FOUND: Final[dict[str, Any]] = problem_response(
+    "No post carries that identifier, or the post is not visible to this caller. A draft "
+    "someone else owns is reported exactly as a missing post: answering 403 would confirm "
+    "that the identifier addresses something real, which is how an unauthorised caller "
+    "enumerates identifiers by reading status codes."
+)
 """The 404 entry for the two routes addressed through a post.
 
 The thread of an invisible post is unreachable rather than merely empty - the post is resolved
 before any comment statement is issued, so an empty page never stands in for a refusal."""
 
-_COMMENT_NOT_FOUND: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "No comment carries that identifier. Reported before authority is considered, so a comment "
-        "the caller may not act on is indistinguishable from one that does not exist."
-    ),
-}
+_COMMENT_NOT_FOUND: Final[dict[str, Any]] = problem_response(
+    "No comment carries that identifier. Reported before authority is considered, so a comment "
+    "the caller may not act on is indistinguishable from one that does not exist."
+)
 """The 404 entry for the two routes addressed by a comment identifier."""
 
 
-_LIST_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+_LIST_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED_ON_READ,
     status.HTTP_404_NOT_FOUND: _POST_NOT_FOUND,
-    status.HTTP_422_UNPROCESSABLE_CONTENT: {
-        "model": ProblemDetail,
-        "description": (
-            "`post_id` is not a UUID, or `page` or `page_size` is outside its bounds - `page` at "
-            "least 1, `page_size` between 1 and 100. A `page` beyond the last one is *not* one of "
-            "these: it is a legitimate request answered with 200 and an empty `items` list."
-        ),
-    },
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "`post_id` is not a UUID, or `page` or `page_size` is outside its bounds - `page` at "
+        "least 1, `page_size` between 1 and 100. A `page` beyond the last one is *not* one of "
+        "these: it is a legitimate request answered with 200 and an empty `items` list."
+    ),
 }
-"""Failures the listing route can answer with. No 401 and no 403: reading a thread is public."""
+"""Failures the listing route can answer with.
 
-_CREATE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+No 403: reading a thread requires no authority, and a deactivated account resolves as anonymous
+on this route rather than being refused. The 401 is *not* a contradiction of that - see
+:data:`_UNAUTHORIZED_ON_READ` for the difference between an absent credential and an unusable
+one."""
+
+_CREATE_RESPONSES: Final[ProblemResponses] = {
     status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED,
+    status.HTTP_403_FORBIDDEN: _FORBIDDEN_ON_CREATE,
     status.HTTP_404_NOT_FOUND: _POST_NOT_FOUND,
-    status.HTTP_422_UNPROCESSABLE_CONTENT: {
-        "model": ProblemDetail,
-        "description": (
-            "The body did not satisfy its contract. Either `body` is missing, empty once trimmed, "
-            "longer than 5000 characters, or sanitises to nothing; or the request carried a "
-            "member the model forbids - `post_id`, `author_id`, `status` and `id` are all "
-            "server-owned and none may be sent; or `parent_id` names a comment that does not "
-            "exist, hangs off a different post, is not visible to this author, or already sits at "
-            "the maximum reply depth. The `errors` array names the offending field."
-        ),
-    },
+    status.HTTP_409_CONFLICT: problem_response(
+        "The thread changed underneath the insert: the post, the parent comment or the "
+        "author's account was removed between the moment each was verified and the moment the "
+        "row was written. Nothing is locked to prevent it, because taking a write lock on a "
+        "whole post to add one comment would serialise a public, high-frequency operation "
+        "against every other comment on the same article. A retry resolves it - and reports "
+        "the now-settled state as a clean 404 if the post really is gone."
+    ),
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "The body did not satisfy its contract. Either `body` is missing, empty once trimmed, "
+        "longer than 5000 characters, or sanitises to nothing; or the request carried a "
+        "member the model forbids - `post_id`, `author_id`, `status` and `id` are all "
+        "server-owned and none may be sent; or `parent_id` names a comment that does not "
+        "exist, hangs off a different post, is not visible to this author, or already sits at "
+        "the maximum reply depth. The `errors` array names the offending field."
+    ),
 }
-"""Failures the create route can answer with.
+"""Failures the create route can answer with, all five declared.
 
-Two further statuses are reachable and are described in the route's own prose rather than listed
-here, because neither is a contract a client should branch on. A deactivated account is refused
-with 403 by the shared authentication dependency - commenting itself requires no role, so 403 is
-not part of *this* route's authority contract. And a post, parent or account removed between the
-checks and the insert yields 409; nothing is locked to prevent that, because taking a write lock on
-a whole post to add one comment would serialise a public, high-frequency operation against every
-other comment on the same article, and retrying resolves the race with a clean 404."""
+403 and 409 are both here because both are reachable, and a reachable status belongs in the
+document rather than in prose: the first when the account has been deactivated, the second when
+the thread changes underneath the insert. Neither is a *frequent* outcome, which is precisely why
+a client is unlikely to have been written for it unless the contract says so."""
 
-_UPDATE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+_UPDATE_RESPONSES: Final[ProblemResponses] = {
     status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED,
     status.HTTP_403_FORBIDDEN: _FORBIDDEN,
     status.HTTP_404_NOT_FOUND: _COMMENT_NOT_FOUND,
-    status.HTTP_422_UNPROCESSABLE_CONTENT: {
-        "model": ProblemDetail,
-        "description": (
-            "`comment_id` is not a UUID, or the body did not satisfy its contract: `body` was sent "
-            "as null, was empty once trimmed, exceeded 5000 characters or sanitised to nothing; or "
-            "the request carried a member the model forbids. `status` and `parent_id` are among "
-            "those - the first would be a moderation bypass on a route the comment's own author "
-            "can reach, the second would silently re-parent a comment others have already replied "
-            "within. Omitting `body` entirely is accepted and changes nothing."
-        ),
-    },
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "`comment_id` is not a UUID, or the body did not satisfy its contract: `body` was sent "
+        "as null, was empty once trimmed, exceeded 5000 characters or sanitised to nothing; or "
+        "the request carried a member the model forbids. `status` and `parent_id` are among "
+        "those - the first would be a moderation bypass on a route the comment's own author "
+        "can reach, the second would silently re-parent a comment others have already replied "
+        "within. Omitting `body` entirely is accepted and changes nothing."
+    ),
 }
 """Failures the edit route can answer with."""
 
-_DELETE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+_DELETE_RESPONSES: Final[ProblemResponses] = {
     status.HTTP_204_NO_CONTENT: {
         "description": (
             "The comment and every reply beneath it were removed. The response carries no body at "
@@ -337,10 +354,7 @@ _DELETE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     # the status here replaces that generated entry, which is what keeps "every error response is
     # the same problem document" true of this route as well as of the other three, and keeps
     # `HTTPValidationError` out of the published components altogether.
-    status.HTTP_422_UNPROCESSABLE_CONTENT: {
-        "model": ProblemDetail,
-        "description": "`comment_id` is not a UUID.",
-    },
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response("`comment_id` is not a UUID."),
 }
 """Responses the delete route can answer with, success included.
 
@@ -360,6 +374,10 @@ an empty body" a statement in this file instead of an accident of the generator.
     response_model=Page[CommentPublic],
     status_code=status.HTTP_200_OK,
     responses=_LIST_RESPONSES,
+    # Anonymous OR bearer, in that order. This handler resolves `OptionalUser`, so the framework
+    # would otherwise publish the bearer scheme as REQUIRED and a generated client would refuse
+    # to read a public discussion without one. See `app.api.v1.responses`.
+    openapi_extra=OPTIONAL_AUTHENTICATION,
     summary="List a post's comments",
     description=(
         "Returns one page of a post's discussion. The page members are the post's **top-level** "
@@ -437,8 +455,15 @@ async def list_post_comments(
         "text is sanitised before it is stored. The new comment is created awaiting moderation, "
         "which is why the response reports a `status` the author did not ask for: render "
         "'awaiting review' from it rather than showing the comment as though it were already "
-        "public. A post, parent or account removed between validation and the insert answers 409, "
-        "and the request is safe to retry."
+        "public. A post, parent or account removed between validation and the insert answers 409; "
+        "that conflict reports a row that is gone rather than a transient fault, so re-sending the "
+        "same request will report it again until the client stops naming a post or a parent that "
+        "no longer exists.\n\n"
+        "**This operation is not idempotent and carries no idempotency key.** A retry after a "
+        "request that committed but whose response was lost writes a second comment. A client that "
+        "cannot tell the two apart should surface the failure rather than re-send silently, and "
+        "may reconcile by re-reading the thread - a duplicate is visible there, and its author can "
+        "delete it."
     ),
 )
 async def create_post_comment(
@@ -494,7 +519,7 @@ async def create_post_comment(
     comment = await CommentService(db).create(post_id, payload, author=principal)
 
     # Built member by member, with `replies` omitted so its empty default applies. See the note
-    # above, and `_load_author` in the service for the security property this preserves. The
+    # above, and `CommentService._projected` for the security property this preserves. The
     # byline is the public account projection - identity, display name, bio, avatar, join date -
     # and never the private one: an email address, a role and an active flag are not published
     # beside a comment, which is the most public surface in this product.
@@ -531,7 +556,12 @@ async def create_post_comment(
         "creation uses, so an edit is not a way past a rule creation enforces, and an accepted "
         "edit returns an approved comment to awaiting-moderation - with no exemption for an "
         "administrator - because approval attaches to the text a moderator read and not to the row "
-        "that held it."
+        "that held it.\n\n"
+        "The response carries the edited comment **with its reply tree**, nested to full depth "
+        "and narrowed to the moderation states this caller may see - the same states the thread "
+        "listing would show them. So replacing a cached thread node with this response preserves "
+        "the discussion beneath it: `replies` is a statement about the thread, never an empty "
+        "placeholder."
     ),
 )
 async def update_comment(
@@ -557,10 +587,10 @@ async def update_comment(
             administrator role, which the service confirms.
 
     Returns:
-        The updated comment as a bare public representation, with ``replies`` empty. An edit
-        changes text, never a thread's shape, so an empty collection here is not a projection
-        artefact: it is the correct statement that this response describes one comment and not the
-        thread around it.
+        The updated comment as a bare public representation, carrying the reply tree beneath it
+        nested to full depth. An edit changes text and never a thread's shape, so the tree returned
+        is the one that was already there - reported rather than omitted, because a client renders
+        the discussion from it.
 
     Raises:
         NotFoundError: No comment carries that identifier. Reported before authority is considered,
@@ -575,22 +605,23 @@ async def update_comment(
         model, and without it the first half would be worthless - submit something innocuous, wait
         for approval, then swap the body, and the replacement would be public unreviewed and absent
         from the queue an administrator works.
+
+        **Unlike creation, this response is validated whole**, and the difference is not stylistic.
+        The service attaches the caller-visible subtree through
+        ``CommentRepository.load_visible_replies`` before returning, so every node - the edited
+        comment and every descendant - carries a populated ``author`` and a populated ``replies``,
+        which is exactly the shape ``CommentPublic.model_validate`` may walk. Projecting member by
+        member here would discard that tree and report an empty one, which is the defect this route
+        used to have: a client replacing a cached thread node with the answer lost every reply
+        beneath it, with nothing raised and nothing logged.
     """
     comment = await CommentService(db).update(comment_id, payload, actor=principal)
 
-    # As on create: member by member, `replies` omitted. The service returns this row with its
-    # `replies` collection unloaded on purpose, so validating the whole model against it would read
-    # the unfiltered ownership edge and raise under an async session.
-    return CommentPublic(
-        id=comment.id,
-        post_id=comment.post_id,
-        parent_id=comment.parent_id,
-        author=UserPublic.model_validate(comment.author),
-        body=comment.body,
-        status=comment.status,
-        created_at=comment.created_at,
-        updated_at=comment.updated_at,
-    )
+    # Validated whole, deliberately - see the note above. The tree the service attached is complete
+    # and status-filtered, so nothing here reads an unloaded attribute, and the nested bylines are
+    # the public account projection because `CommentPublic.author` is typed as `UserPublic`: an
+    # email address, a role and an active flag are not published beside a comment.
+    return CommentPublic.model_validate(comment)
 
 
 @router.delete(

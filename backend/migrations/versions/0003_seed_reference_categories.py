@@ -24,24 +24,43 @@ schema drift, so ``alembic check`` at ``head`` stays clean, and anything it does
 genuine disagreement between the models and ``0001``/``0002`` rather than noise from here. If
 this file ever makes ``alembic check`` speak, the cause is DDL that does not belong in it.
 
-Three columns, and only three
------------------------------
-Each row supplies ``name``, ``slug`` and ``description`` - nothing else. ``id``, ``created_at``
-and ``updated_at`` are deliberately absent so that the server defaults ``0001`` attached to
-them fire: ``gen_random_uuid()`` for the primary key and ``now()`` for both audit columns.
+Four columns, and the fourth is provenance
+-----------------------------------------
+Each row supplies ``id``, ``name``, ``slug`` and ``description``. ``created_at`` and
+``updated_at`` are deliberately absent so that the server defaults ``0001`` attached to them
+fire - ``now()`` for both - because an audit column stating when a row was written is worth
+nothing if the writer gets to choose it.
 
-Writing literal UUIDs here instead would make this file the source of identity for eight rows,
-which is precisely the defect this schema was designed to remove. The service this repository
-grew out of let the client supply ``Item.id`` with no uniqueness check of any kind, and a
-duplicate identifier there permanently shadowed every later record carrying the same value.
-Identity is the database's to assign in a migration exactly as much as in a request, and the
-same reasoning covers the two timestamps: an audit column stating when a row was written is
-worth nothing if the writer gets to choose it.
+``id`` is present, and it is the one column here that is not about the taxonomy at all. It is
+**this revision's record of what it inserted**, and :func:`downgrade` deletes by it and by
+nothing else. The identifier is not chosen, invented or typed: it is
+``uuid.uuid5(PROVENANCE_NAMESPACE, slug)``, a deterministic function of a value this revision
+already owns, so the same eight identifiers arise on every database this history is applied to
+and no two rows can collide.
 
-``app.models.category`` records the same three-column expectation from the other side, so a
-fourth *required* column added to ``categories`` without a matching change here would break
-this revision. ``description`` is nullable, which is why prose is optional in the schema even
-though all eight rows below carry some.
+The alternative - omitting ``id`` and letting ``gen_random_uuid()`` supply it - is what this
+revision used to do, and it made the way down unsound. Without a stored mark there is nothing to
+distinguish a row *this* revision inserted from a row that merely shares a reference slug,
+because the upgrade below deliberately **adopts** the latter rather than colliding with it. A
+downgrade scoped by slug therefore deleted rows it never wrote: a category an administrator
+created through ``POST /api/v1/admin/categories`` while the database sat at ``0002``, or one an
+early ``make seed`` wrote, was adopted on the way up and destroyed on the way down, taking its
+``post_categories`` filings with it through the cascade. Measured before the fix: seed a
+category with slug ``engineering`` at ``0002``, ``upgrade head`` (eight rows, the adopted one
+among them), ``downgrade`` - and the adopted row was gone.
+
+So server-generated identity remains the rule everywhere a *request* writes a row, which is the
+defect this schema was designed to remove: the service this repository grew out of let a client
+supply ``Item.id`` with no uniqueness check of any kind, and a duplicate identifier there
+permanently shadowed every later record carrying the same value. A migration is not a client. It
+is the schema's own author, writing fixed reference data whose identity has to be recognisable
+again later, and a derived-and-frozen identifier is how that recognition is stored without a
+provenance column that ``0001`` never declared.
+
+``app.models.category`` records the same column set from the other side, so a fifth *required*
+column added to ``categories`` without a matching change here would break this revision.
+``description`` is nullable, which is why prose is optional in the schema even though all eight
+rows below carry some.
 
 The taxonomy is stated in one place, and this is not it
 ------------------------------------------------------
@@ -73,9 +92,15 @@ absent.**
 
 The seed side does it in Python - it selects the sixteen candidate values, skips whatever it
 finds, and inserts the rest. This side does it in SQL. Each of the eight statements in
-:func:`upgrade` is an ``INSERT ... SELECT ... WHERE NOT EXISTS`` naming that row's own slug and
-folded name, with ``ON CONFLICT DO NOTHING`` behind it, so a category the seed script already
-created is skipped by the guard rather than colliding with ``uq_categories_name``.
+:func:`upgrade` is an ``INSERT ... SELECT ... WHERE NOT EXISTS`` naming that row's own
+identifier, slug and folded name, with ``ON CONFLICT DO NOTHING`` behind it, so a category the
+seed script already created is skipped by the guard rather than colliding with
+``uq_categories_name``.
+
+An adopted row keeps the identity its own writer gave it - a random ``gen_random_uuid()`` value
+from the seed script or from an administrative create - and therefore carries none of this
+revision's marks. That is exactly the property :func:`downgrade` depends on: a row without the
+mark is not this revision's to remove.
 
 That guard is **not** about this revision running twice. Alembic already guarantees a revision
 runs at most once per database through the ``alembic_version`` table, so the insert can never
@@ -128,26 +153,41 @@ already run.
 
 Reversibility
 -------------
-``downgrade()`` deletes exactly the eight slugs :data:`REFERENCE_SLUGS` names, and that tuple
-is derived from :data:`REFERENCE_CATEGORIES` rather than typed a second time, so the way down
-cannot fall out of step with the way up. A bare ``DELETE FROM categories`` would be wrong: by
-the time a downgrade runs an administrator may have created categories through
-``POST /api/v1/admin/categories``, and those rows are not this revision's to remove.
+``downgrade()`` deletes exactly the eight rows :data:`REFERENCE_IDS` names, and that tuple is
+projected from :data:`REFERENCE_CATEGORIES` rather than typed a second time, so the way down
+cannot fall out of step with the way up. Two things follow from scoping it by identifier:
 
-One consequence is expected rather than worked around. ``post_categories.category_id`` carries
-``ON DELETE CASCADE``, so removing a reference category also removes the rows filing posts
-under it. That is the designed behaviour of the association rather than a side effect to guard
-against, and it means a downgrade is not information-preserving once ``seed.py`` has associated
-demonstration posts with these categories. Re-upgrading restores the categories; it does not
-restore associations that depended on them.
+**A row this revision did not insert is never removed.** Not a category an administrator created
+through ``POST /api/v1/admin/categories``, not one an early ``make seed`` wrote, and not one
+somebody added by hand - even when it carries a reference slug and was adopted on the way up.
+Each of those has an identity its own writer assigned, and the ``IN`` list names none of them. A
+bare ``DELETE FROM categories`` would be worse still, and a slug-scoped delete was the defect
+recorded two sections above.
+
+**A category with posts filed under it is left in place.** The statement carries a second
+predicate, ``NOT EXISTS (SELECT 1 FROM post_categories WHERE category_id = categories.id)``,
+because ``post_categories.category_id`` cascades: deleting a filed category silently removes the
+rows filing posts under it, and re-upgrading would restore the category without restoring a single
+filing. So a downgrade after ``seed.py`` has associated demonstration posts leaves those
+categories behind rather than taking the associations with them. It is not silent - the rows are
+visibly still there - and it is reversible in the direction that matters: nothing is lost, and a
+subsequent ``upgrade`` adopts each survivor through the same guard that adopts a seeded row.
+
+The two predicates are deliberately ``AND``-ed rather than the second being applied as a
+pre-check in Python. A read-then-branch would need a live connection and would render nothing
+usable under ``alembic downgrade --sql``, where there is no database to ask; as one statement the
+offline script stays self-contained and stays conditional.
 
 Verified by the up/down/up cycle, including a single-step ``downgrade -1`` followed by a
-re-``upgrade`` - the case that would fail on a duplicate-slug unique violation if
-``downgrade()`` had not removed its own rows - and by confirming that a category inserted by
-hand beforehand survives that downgrade untouched.
+re-``upgrade`` - the case that would fail on a duplicate unique violation if ``downgrade()`` had
+not removed its own rows - by confirming that a category inserted by hand beforehand and adopted
+on the way up survives that downgrade untouched, and by confirming that a reference category with
+a post filed under it survives it too, with its filing intact.
 """
 
+import uuid
 from collections.abc import Sequence
+from typing import Final
 
 import sqlalchemy as sa
 from alembic import op
@@ -160,23 +200,51 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
-# The three columns this revision writes, and nothing else.
+# The four columns this revision writes, and nothing else.
 #
 # sa.table()/sa.column() rather than a MetaData-bound Table or app.models.Category: this is a
 # frozen description of `categories` as it stands at revision 0003, which is precisely the
-# coupling a migration wants. `id`, `created_at` and `updated_at` are omitted so that they never
-# reach the INSERT column list and PostgreSQL applies the server defaults 0001 gave them.
+# coupling a migration wants. `created_at` and `updated_at` are omitted so that they never reach
+# the INSERT column list and PostgreSQL applies the server defaults 0001 gave them; `id` is
+# present because it is this revision's provenance mark - see "Four columns" in the docstring.
 #
 # The types are stated rather than left to default because alembic renders every value through
 # `table.c[<key>].type` when `alembic upgrade head --sql` compiles this revision offline. CITEXT
-# is also what makes the case-insensitive comparison in downgrade() faithful to the real column
-# instead of an accident of how the literals below happen to be capitalised.
+# is also what makes the case-insensitive comparison in the insert guard faithful to the real
+# column instead of an accident of how the literals below happen to be capitalised, and UUID is
+# what renders each identifier inline as a quoted literal rather than as a placeholder.
 categories_table = sa.table(
     "categories",
+    sa.column("id", postgresql.UUID(as_uuid=True)),
     sa.column("name", sa.Text()),
     sa.column("slug", postgresql.CITEXT()),
     sa.column("description", sa.Text()),
 )
+
+
+# The association, named for one reason only: downgrade() must not delete a category that a post
+# is filed under, and answering that question is a correlated EXISTS against this table. No column
+# of it is ever written here, and `post_id` is declared only so the construct describes the table
+# as 0001 left it rather than a partial view of it.
+post_categories_table = sa.table(
+    "post_categories",
+    sa.column("post_id", postgresql.UUID(as_uuid=True)),
+    sa.column("category_id", postgresql.UUID(as_uuid=True)),
+)
+
+
+# The namespace the eight identifiers below are derived from. Frozen, like every other value in a
+# revision: it is written out as a literal rather than computed from a string at import time so
+# that nothing about these identifiers can drift, and it is reproducible in one line for anybody
+# who wants to check it -
+#
+#     uuid.uuid5(uuid.NAMESPACE_URL, "urn:blitzy-blog:migration:0003:reference-categories")
+#     -> UUID('cb1eda83-96bb-5b68-ad7b-56df357a9128')
+#
+# Version 5 rather than 4: a random namespace would have to be recorded somewhere to be usable,
+# and version 5 makes the derivation itself the record. Version 3 (MD5) is avoided because there
+# is no reason to reach for a broken digest even where collision resistance is not load-bearing.
+PROVENANCE_NAMESPACE: Final[uuid.UUID] = uuid.UUID("cb1eda83-96bb-5b68-ad7b-56df357a9128")
 
 
 # The taxonomy, mirroring app.db.seed.REFERENCE_CATEGORIES value for value: same names, same
@@ -255,25 +323,54 @@ REFERENCE_CATEGORIES: tuple[dict[str, str], ...] = (
 )
 
 
-# The slugs downgrade() removes, projected from the rows upgrade() inserts rather than written
-# out a second time. Two hand-maintained lists can disagree; one list and a projection of it
-# cannot, and that is what makes the up/down/up cycle safe to rely on rather than merely likely
-# to work.
-REFERENCE_SLUGS: tuple[str, ...] = tuple(row["slug"] for row in REFERENCE_CATEGORIES)
+def reference_category_id(slug: str) -> uuid.UUID:
+    """Return the identifier this revision gives the reference category with *slug*.
+
+    A version-5 UUID over :data:`PROVENANCE_NAMESPACE` and the slug, so the value is a pure
+    function of data this revision already owns: the same eight identifiers arise on every
+    database this history is applied to, and two different slugs cannot produce one identifier.
+
+    This is the provenance mark. :func:`upgrade` writes it and :func:`downgrade` deletes by it, so
+    a row that does not carry one was written by somebody else and is not this revision's to
+    remove.
+
+    Args:
+        slug: The reference category's slug, exactly as :data:`REFERENCE_CATEGORIES` states it.
+            The slug rather than the name because the slug is the permanent one - a name could in
+            principle be re-cased without changing which category it is, and an identifier derived
+            from it would then change with it.
+
+    Returns:
+        The frozen identifier for that category.
+    """
+    return uuid.uuid5(PROVENANCE_NAMESPACE, slug)
+
+
+# The rows downgrade() removes, projected from the rows upgrade() inserts rather than written out a
+# second time. Two hand-maintained lists can disagree; one list and a projection of it cannot, and
+# that is what makes the up/down/up cycle safe to rely on rather than merely likely to work.
+REFERENCE_IDS: tuple[uuid.UUID, ...] = tuple(
+    reference_category_id(row["slug"]) for row in REFERENCE_CATEGORIES
+)
 
 
 def _guarded_insert(row: dict[str, str]) -> postgresql.Insert:
     """Build the reconciling insert for one reference category.
 
-    The statement is ``INSERT INTO categories (name, slug, description) SELECT <literals>
-    WHERE NOT EXISTS (SELECT 1 FROM categories WHERE slug = <slug> OR lower(name) = <folded
-    name>) ON CONFLICT DO NOTHING`` - one round trip, no read-then-branch, and therefore
+    The statement is ``INSERT INTO categories (id, name, slug, description) SELECT <literals>
+    WHERE NOT EXISTS (SELECT 1 FROM categories WHERE id = <id> OR slug = <slug> OR lower(name) =
+    <folded name>) ON CONFLICT DO NOTHING`` - one round trip, no read-then-branch, and therefore
     renderable offline. See the module docstring for why both writers need it.
 
-    The predicate mirrors ``app.db.seed.seed_categories`` value for value, which is the whole
-    point: two writers that disagree about what "already present" means would each skip a
-    different set.
+    The slug and name halves of the predicate mirror ``app.db.seed.seed_categories`` value for
+    value, which is the whole point: two writers that disagree about what "already present" means
+    would each skip a different set.
 
+    * **id.** This revision's own provenance mark, and the term ``seed.py`` has no counterpart for
+      because it never writes one. It is not redundant with the slug: a reference category whose
+      slug *and* name were later edited by hand would satisfy neither of the other two terms, and
+      the insert would then collide on ``pk_categories`` with the row it is the identifier of.
+      Naming it turns that collision into a skip.
     * **slug.** ``categories.slug`` is ``citext``, so ``=`` folds case in the database and the
       comparison resolves through ``ix_categories_slug``.
     * **name.** ``categories.name`` is plain ``TEXT`` under the case-SENSITIVE
@@ -303,26 +400,32 @@ def _guarded_insert(row: dict[str, str]) -> postgresql.Insert:
 
     Args:
         row: One entry of :data:`REFERENCE_CATEGORIES` - ``name``, ``slug`` and ``description``.
+            The identifier is not read from it; it is derived from the slug by
+            :func:`reference_category_id`, so the taxonomy statement stays a statement about the
+            taxonomy and the provenance mark stays derived rather than typed.
 
     Returns:
         The insert to execute, with every value bound as a literal of its column's own type so
         that ``literal_binds`` renders it inline under ``--sql``.
     """
+    row_id = reference_category_id(row["slug"])
     already_present = (
         sa.select(sa.literal(1))
         .select_from(categories_table)
         .where(
             sa.or_(
+                categories_table.c.id == sa.literal(row_id, postgresql.UUID(as_uuid=True)),
                 categories_table.c.slug == sa.literal(row["slug"], postgresql.CITEXT()),
                 sa.func.lower(categories_table.c.name)
                 == sa.literal(row["name"].casefold(), sa.Text()),
             )
         )
     )
-    # `id`, `created_at` and `updated_at` are absent from the column list, so 0001's server
-    # defaults - gen_random_uuid() and now() - supply all three. That omission is the reason this
-    # revision is not the source of identity for eight rows.
+    # `created_at` and `updated_at` are absent from the column list, so 0001's `now()` default
+    # supplies both: an audit column is worth nothing if its writer chooses its value. `id` IS
+    # supplied, and only because the way down needs to recognise this row again later.
     values = sa.select(
+        sa.literal(row_id, postgresql.UUID(as_uuid=True)).label("id"),
         sa.literal(row["name"], sa.Text()).label("name"),
         sa.literal(row["slug"], postgresql.CITEXT()).label("slug"),
         sa.literal(row["description"], sa.Text()).label("description"),
@@ -330,7 +433,7 @@ def _guarded_insert(row: dict[str, str]) -> postgresql.Insert:
 
     return (
         postgresql.insert(categories_table)
-        .from_select(["name", "slug", "description"], values)
+        .from_select(["id", "name", "slug", "description"], values)
         .on_conflict_do_nothing()
     )
 
@@ -362,20 +465,45 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # --- Removal, restricted to this revision's own rows -------------------------------------
-    # Scoped to REFERENCE_SLUGS, and never a bare `DELETE FROM categories`. A category an
-    # administrator created through POST /api/v1/admin/categories is not this revision's to
-    # remove, and a blanket delete would take it along with the eight that are.
+    # Two predicates, and the revision is only reversible because of both.
+    #
+    # 1. `id IN REFERENCE_IDS` - PROVENANCE. These are the identifiers `upgrade` writes, derived
+    #    from the slugs by `reference_category_id`, and a row that does not carry one was written
+    #    by somebody else: an administrator through POST /api/v1/admin/categories, an early
+    #    `make seed`, or a hand insert. Those rows are ADOPTED on the way up, deliberately, and
+    #    scoping this delete by slug instead - which is what it used to do - destroyed them on the
+    #    way down together with their post_categories filings. A bare `DELETE FROM categories`
+    #    would be worse again.
+    #
+    # 2. `NOT EXISTS (post_categories WHERE category_id = categories.id)` - NO SILENT CASCADE.
+    #    post_categories.category_id carries ON DELETE CASCADE, so deleting a category that posts
+    #    are filed under removes those filings, and re-upgrading restores the category without
+    #    restoring one of them. A reference category with posts against it is therefore left in
+    #    place. Nothing is lost, the surviving row is plainly visible, and the guard in `upgrade`
+    #    adopts it if this revision is applied again.
     #
     # A Core delete() construct rather than sa.text(): alembic applies `literal_binds` only when
-    # compiling something that is not a TextClause, so a text statement carrying bound
-    # parameters would render placeholders instead of values under `--sql` and produce a
-    # rollback script that could not be replayed. This construct renders
-    # `DELETE FROM categories WHERE categories.slug IN ('engineering', ...)` in both modes.
+    # compiling something that is not a TextClause, so a text statement carrying bound parameters
+    # would render placeholders instead of values under `--sql` and produce a rollback script that
+    # could not be replayed. This construct renders
+    # `DELETE FROM categories WHERE categories.id IN ('136f082b-...', ...) AND NOT (EXISTS (SELECT
+    # 1 FROM post_categories WHERE post_categories.category_id = categories.id))` in both modes,
+    # with every identifier inline.
     #
-    # `slug` is citext, so the comparison folds case in the database: a reference slug somebody
-    # stored with different capitalisation is still matched, and still removed.
-    #
-    # No DDL here either - there is nothing structural to reverse. post_categories.category_id
-    # cascades, so the rows filing posts under these categories go with them; that is the
-    # association's designed behaviour, and the module docstring records what it costs.
-    op.execute(categories_table.delete().where(categories_table.c.slug.in_(REFERENCE_SLUGS)))
+    # No DDL here either - there is nothing structural to reverse.
+    filed_under = (
+        sa.select(sa.literal(1))
+        .select_from(post_categories_table)
+        .where(post_categories_table.c.category_id == categories_table.c.id)
+    )
+    op.execute(
+        categories_table.delete().where(
+            categories_table.c.id.in_(
+                [
+                    sa.literal(reference_id, postgresql.UUID(as_uuid=True))
+                    for reference_id in REFERENCE_IDS
+                ]
+            ),
+            ~filed_under.exists(),
+        )
+    )

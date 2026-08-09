@@ -36,6 +36,15 @@
 // href, and the click handler never calls `preventDefault()`. Intercepting the
 // click would take back everything the anchor was chosen for.
 //
+// The corollary is a rule, because getting it wrong compiles and lints cleanly:
+// THE CALLBACK MUST NOT NAVIGATE. The anchor is the navigation, and the callback
+// fires alongside it, so a navigator passed in runs a SECOND transition for one
+// click - two history entries, the route's data fetched twice, and a back button
+// that looks broken. In particular, never pass `usePagination`'s `goToPage`
+// here: it calls `router.push`, and that hook documents the same prohibition
+// from its side. `goToPage` is for affordances that are not anchors at all, such
+// as a "jump to page" select, where nothing else would navigate.
+//
 // ---------------------------------------------------------------------------
 // 2. THREE SURFACES, ONE CONTROL - WHICH IS WHY THE PROPS ARE PLAIN NUMBERS
 //
@@ -383,19 +392,34 @@ type PaginationProps = Pick<PaginationSource, 'page' | 'pages'> &
      */
     ariaLabel?: string;
     /**
-     * Optional callback fired when a page link is clicked, **in addition to**
-     * navigating.
+     * Optional **side-effect-only** callback fired when a page link is clicked,
+     * in addition to navigating.
      *
-     * For side effects that belong to the click rather than to the destination:
-     * closing a drawer, recording an event, scrolling a long list back to its
-     * top. It receives the target page. It is never awaited, its result is
-     * discarded, and it cannot cancel navigation - the anchor is the navigation
-     * and this is enhancement on top of it.
+     * SIDE EFFECTS ONLY. For work that belongs to the click rather than to the
+     * destination: closing a drawer, recording an event, scrolling a long list
+     * back to its top. It receives the target page, is never awaited, has its
+     * result discarded, and cannot cancel navigation - the anchor is the
+     * navigation and this is enhancement on top of it.
+     *
+     * **It must not navigate.** Passing `usePagination`'s `goToPage` here - which
+     * this file used to show as the recommended client usage - produces TWO
+     * transitions for one click: the callback pushes, and then the anchor
+     * navigates to the same place. The reader gets two history entries, so their
+     * back button appears to do nothing, and on a slow connection the duplicated
+     * transition is visible. `goToPage` exists for a caller with no anchor to
+     * click (a page-size control, a keyboard shortcut, a jump-to-page field), and
+     * that is the only thing it is for.
+     *
+     * Which is exactly why it must not navigate. Passing something that changes
+     * the route - `usePagination`'s `goToPage`, a bare `router.push`, a
+     * `location.assign` - produces two transitions for one click, because the
+     * link has already performed the first. See section 1 of this file's header,
+     * and `goToPage`'s own documentation, which states the prohibition from the
+     * other side and names what that function is for instead.
      *
      * A function is not serializable, so a Server Component cannot pass this.
-     * That is by design: it is optional precisely so the server-rendered feed
-     * and profile can render the control without one. `usePagination`'s
-     * `goToPage` is the ready-made value for a client caller that wants it.
+     * That is by design: it is optional precisely so the server-rendered feed and
+     * profile can render the control without one.
      */
     onPageChange?: (page: number) => void;
     /**
@@ -419,9 +443,10 @@ type PaginationProps = Pick<PaginationSource, 'page' | 'pages'> &
  * Every URL comes from `hrefForPage`, which preserves the `q`, `category` and
  * `sort` parameters already on the URL and omits `page` entirely for page one so
  * that page one keeps a single canonical address. `onPageChange` is optional
- * enhancement fired alongside navigation and never in place of it. All page
- * arithmetic - the window, the bounds, the clamping - belongs to
- * `@/hooks/use-pagination` and is not duplicated here.
+ * enhancement fired alongside navigation and never in place of it - and never a
+ * second navigation; see the prop's own note. All page arithmetic - the window,
+ * the bounds, the clamping - belongs to `@/lib/pagination`, reached through
+ * `@/hooks/use-pagination`, and is not duplicated here or in any consumer.
  *
  * Renders `null` when there is at most one page: a single-page result has nothing
  * to navigate, and an empty landmark is noise in a screen reader's landmark
@@ -443,11 +468,23 @@ type PaginationProps = Pick<PaginationSource, 'page' | 'pages'> &
  * );
  * ```
  *
- * @example A client island that also wants the callback
+ * @example A client island that also wants the side-effect callback
  * ```tsx
  * 'use client';
- * const pagination = usePagination(page);
- * return <Pagination {...pagination} onPageChange={pagination.goToPage} />;
+ * // Note what is NOT passed: `usePagination`'s `goToPage`. The anchors already
+ * // navigate, so a callback that navigates as well fires the same transition
+ * // twice. Give `onPageChange` the side effect and nothing more.
+ * return (
+ *   <Pagination
+ *     page={page.page}
+ *     pages={page.pages}
+ *     total={page.total}
+ *     page_size={page.page_size}
+ *     onPageChange={() => {
+ *       tableRef.current?.scrollIntoView({ block: 'start' });
+ *     }}
+ *   />
+ * );
  * ```
  *
  * @example Two controls on one screen, told apart in the landmark list
@@ -465,7 +502,8 @@ type PaginationProps = Pick<PaginationSource, 'page' | 'pages'> &
  * @param className - Appended to the landmark's classes.
  * @param ariaLabel - Accessible name of the landmark; defaults to
  *   `'Pagination'`.
- * @param onPageChange - Optional callback fired with the target page on click.
+ * @param onPageChange - Optional side-effect callback fired with the target page
+ *   on click. Must not navigate; see the prop's own note.
  * @param hrefForPage - Optional override for URL construction.
  * @returns The rendered control, or `null` when there is at most one page.
  */

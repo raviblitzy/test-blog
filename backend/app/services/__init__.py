@@ -65,11 +65,26 @@ rediscovered seven times below.
   it speaks no HTTP, because ``app.api`` owns the wire.
 * **Session-injected, never session-owning.** Every class takes the request-scoped
   :class:`~sqlalchemy.ext.asyncio.AsyncSession` in its constructor and holds it for exactly one
-  unit of work. None of them imports ``app.db.session``, so a service cannot open a connection
-  of its own and cannot read configuration, and none of them commits: the caller supplies the
-  session - ``get_db`` in the API tier, the transactional fixture in the suite - and the caller
-  owns the transaction. That single uniform constructor is what lets a router build any service
-  from the one session it was handed.
+  unit of work. None of them imports ``app.db.session``, so a service cannot open a connection of
+  its own and cannot read configuration. The caller supplies the session - ``get_db`` in the API
+  tier, the transactional fixture in the suite - and that single uniform constructor is what lets
+  a router build any service from the one session it was handed.
+* **This layer draws the transaction boundary, and each mutating method commits its own unit of
+  work.** ``app.repositories`` flushes and never commits, and ``get_db`` commits nothing on the
+  way out - deliberately, because an automatic commit there would persist a half-finished use
+  case, exactly what a transaction exists to prevent. So the boundary has to be drawn somewhere
+  that knows when an operation is *complete*, and that is here: a read commits nothing, and a
+  write commits once, on success, after the last of its steps. There are twenty-five such commits
+  across the seven service modules - seven in ``post_service``; four each in ``admin_service``,
+  ``auth_service`` and ``comment_service``; three in ``category_service``; two in
+  ``like_service``; and one in ``profile_service.update_self`` - and every one of them is the last
+  statement of a completed unit of work rather than a flush in disguise.
+
+  What a service never does is *undo*. It issues no ``rollback`` and closes no session:
+  ``get_db`` owns both, so a domain exception raised anywhere in this layer unwinds through it and
+  the whole unit of work is discarded together. That is why a service can raise from the middle of
+  a multi-step write - a slug derived, categories associated, and then a conflict - and leave
+  nothing behind.
 * **Domain objects out, typed exceptions up.** A service returns a mapped instance, a page of
   them, or a schema, and it signals failure with the typed domain errors declared in
   ``app.core.exceptions`` rather than a framework exception. Turning ``NotFoundError`` into a 404
@@ -78,13 +93,12 @@ rediscovered seven times below.
 
 The import direction runs one way
 ---------------------------------
-This file imports its seven siblings. **No sibling imports this package.** Five real edges run
+This file imports its seven siblings. **No sibling imports this package.** Four real edges run
 inside this folder, and every one of them names the module it needs rather than this package::
 
     from app.services.post_service import can_view_post  # comment_service, like_service
     from app.services.category_service import CategoryService  # admin_service
     from app.services.comment_service import CommentService  # admin_service
-    from app.services.post_service import ALL_POST_STATUSES  # admin_service
 
 Spelling any of those ``from app.services import ...`` instead would be a genuine circular import
 rather than a matter of taste. Resolving this package means running the import block below, and
@@ -144,7 +158,7 @@ time anything imports this package, which means it is a start-up failure of the 
 # The import edge runs ONE WAY: this file imports all seven siblings, and no sibling may ever
 # import `app.services`. A sibling that needs a peer names that peer's module directly -
 # `comment_service` and `like_service` do so for `can_view_post`, and `admin_service` for
-# `CategoryService`, `CommentService` and `ALL_POST_STATUSES`. Rewriting any of them as
+# `CategoryService` and `CommentService`. Rewriting any of them as
 # `from app.services import ...` would close a real circular import through this barrel: the
 # block below would still be part-way through when the sibling asked the half-built package for a
 # name it had not bound yet, and the result is an ImportError at start-up rather than a warning.

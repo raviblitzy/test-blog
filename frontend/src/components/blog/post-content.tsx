@@ -27,9 +27,12 @@
 // The corollary is a hard constraint on everything below: NO hook, NO state, NO
 // effect, NO ref, NO event handler and NO browser API in this file. Nothing here
 // needs one, and anything that did would belong in a client island that wraps
-// this component rather than inside it. `next/link` is the only import with an
-// internal hook, and that hook is Link's own - a Server Component may render a
-// Client Component, and Next.js server-renders it into the same initial HTML.
+// this component rather than inside it. The constraint extends to what this file
+// IMPORTS: `@/components/ui/badge-link` carries no directive of its own for
+// exactly this reason, and the `next/link` it renders is the one hook-bearing
+// element in the tree - Link's own, which is fine, because a Server Component may
+// render a Client Component and Next.js server-renders it into the same initial
+// HTML.
 //
 // ---------------------------------------------------------------------------
 // 2. SANITISATION HAPPENS TWICE, ON PURPOSE
@@ -59,6 +62,13 @@
 //      restricts `href` to http/https/irc/ircs/mailto/xmpp and `src` to
 //      http/https - which is what makes a `javascript:` link arrive as an anchor
 //      with no href.
+//
+// What sanitisation does NOT do is decide whether a request should be made at
+// all. A surviving `https:` image URL is safe to EMIT and is still a request the
+// reader's browser makes, unasked, to a host the post's author chose - which
+// hands that host the reader's IP address, user agent and referring URL whether
+// or not anything is rendered from it. That is a privacy decision rather than an
+// injection one, so it is taken separately. See note 5.
 //   c. `dangerouslySetInnerHTML` appears nowhere in this file.
 //
 // The default schema needs NO widening. It already permits `className` on `code`
@@ -89,22 +99,51 @@
 // not decorative.
 //
 // Everything this file adds on top resolves to a semantic token from that same
-// file - `text-primary`, `text-accent`, `outline-ring`, and the category pill's
-// tone by way of `badgeVariants`. There is no literal colour, no pixel
-// dimension, no radius value and no `style` prop anywhere below, and no
-// stylesheet or CSS module is introduced: globals.css is this tier's only
+// file - `text-primary`, `text-accent` and `outline-ring` - and the category
+// pill's entire appearance and interaction comes from the design system's
+// `BadgeLink` rather than from a class list assembled here. There is no literal
+// colour, no pixel dimension, no radius value and no `style` prop anywhere below,
+// and no stylesheet or CSS module is introduced: globals.css is this tier's only
 // stylesheet.
+//
+// ---------------------------------------------------------------------------
+// 5. AN INLINE IMAGE IS FETCHED ONLY FROM AN ADMITTED HOST
+//
+// `@/lib/utils` owns this deployment's remote-image host policy: one list, read
+// by `next.config.ts` for the optimiser and by `isAllowedImageUrl` for every
+// component that renders a stored URL. The `img` override below asks that
+// predicate BEFORE it emits an element, because an `<img src>` that reaches the
+// DOM has already made its request - there is no later moment at which the
+// decision can be taken.
+//
+// A body image is exactly the case the policy exists for. Its host is chosen by
+// whoever wrote the post, so an unadmitted URL may be an ordinary photograph on
+// an unlisted CDN or a one-pixel beacon whose only purpose is to collect the
+// data note 2 describes, and nothing about the URL distinguishes the two. So an
+// unadmitted image is not rendered: its `alt` text is rendered in its place,
+// which is what alt text IS - the image's textual equivalent - and a decorative
+// image with no alt text leaves nothing behind at all.
+//
+// Admitting a host is a reviewed CODE change and deliberately not a deployment
+// setting: one entry in `IMAGE_HOST_ALLOWLIST` in `@/lib/utils`, which is where
+// `next.config.ts` also derives `images.remotePatterns` from, so the optimiser and
+// every render site read one list. It is source code rather than an environment
+// variable for two reasons - `next.config.ts` is evaluated once at build time, so
+// an environment-supplied list would read as run-time configuration while behaving
+// as a build-time constant; and this list decides which third parties a reader's
+// browser is asked to contact, which warrants review rather than a redeploy. There
+// is no per-component list here, and adding one would be the second source of truth
+// that policy exists to prevent.
 
-import Link from 'next/link';
 import type { JSX } from 'react';
 import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
 import remarkGfm from 'remark-gfm';
 
-import { badgeVariants } from '@/components/ui/badge';
+import { BadgeLink } from '@/components/ui/badge-link';
 import { categoryFeedPath } from '@/lib/seo';
 import type { CategorySummary } from '@/lib/types';
-import { cn } from '@/lib/utils';
+import { cn, isAllowedImageUrl } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Pipeline
@@ -295,6 +334,21 @@ const CONTENT_LINK_CLASSES = cn(
 const CONTENT_IMAGE_CLASSES = 'h-auto max-w-full rounded-md';
 
 /**
+ * The text an image from an unadmitted host degrades to - see note 5 in the header.
+ *
+ * `italic` and `text-muted-foreground` are what stop the substituted alt text reading as though the
+ * author had written it as prose: it is set apart the way a caption is, which is the closest thing
+ * the type scale has to "this stands in for something". Both resolve past the typography plugin for
+ * the reason {@link CONTENT_LINK_CLASSES} records - the plugin's selectors sit in the `components`
+ * layer and a utility sits in `utilities`, which the engine emits afterwards.
+ *
+ * No border, no box and no reserved space: an image that is not rendered leaves a line of text
+ * rather than a frame with a hole in it, which is the same degradation `post-card.tsx` applies when
+ * the policy refuses a cover image.
+ */
+const WITHHELD_IMAGE_CLASSES = 'text-muted-foreground italic';
+
+/**
  * A fenced code block.
  *
  * The typography plugin already sets `overflow-x: auto` on `pre`; this restates it so that the
@@ -320,30 +374,6 @@ const PRE_CLASSES = 'max-w-full overflow-x-auto';
  * does not need.
  */
 const TABLE_SCROLL_CLASSES = 'max-w-full overflow-x-auto';
-
-/**
- * A category pill, which is also a link.
- *
- * The appearance comes entirely from the design system: `badgeVariants({ variant: 'category' })` is
- * the pill's own tone triple - ground, text and boundary - from src/components/ui/badge.tsx, so no
- * colour is chosen here. What is NOT done is nesting a `<Badge>` inside an anchor, and that is the
- * badge primitive's own instruction rather than a preference: it renders a non-interactive `<span>`
- * with no focus ring, it documents that it "must not become" interactive, and it exports
- * `badgeVariants` expressly so that "a category chip that navigates is a `<Link>`" can carry the
- * pill's appearance on the focusable element itself. Applying the variant to the anchor also puts
- * the focus ring around the pill's own rounded shape instead of around an inline box inside it.
- *
- * The three utilities added on top are the interaction states the primitive deliberately does not
- * provide. `accent` is the token globals.css designates as the emphasis step primary hovers to, so
- * the hover is one step more emphatic in the direction of the active theme with no per-theme
- * branching; both the text and the boundary move, so the state is not signalled by colour alone.
- */
-const CATEGORY_PILL_CLASSES = cn(
-  badgeVariants({ variant: 'category' }),
-  'hover:border-accent hover:text-accent',
-  'focus-visible:outline-ring focus-visible:outline-2 focus-visible:outline-offset-2',
-  'motion-safe:transition-colors motion-safe:ease-out',
-);
 
 /**
  * The pill row itself. The engine's preflight already removes list markers, margin and padding from
@@ -384,6 +414,35 @@ const EXTERNAL_HREF_PATTERN = /^(?:[a-z][a-z\d+\-.]*:|\/\/)/i;
  */
 function isExternalHref(href: string | undefined): boolean {
   return href !== undefined && EXTERNAL_HREF_PATTERN.test(href);
+}
+
+/**
+ * Whether an authored link still has somewhere to go once the sanitiser has finished with it.
+ *
+ * Two ways an anchor arrives here with no destination, and both are ordinary rather than exotic:
+ *
+ *   * The sanitiser DROPPED the href. Its protocol allow-list rejects `javascript:`, `data:` and
+ *     every other scheme outside http/https/irc/ircs/mailto/xmpp - and it drops the offending
+ *     ATTRIBUTE while keeping the element, so `[click me](javascript:alert(1))` reaches this override
+ *     as an `<a>` with `href === undefined`.
+ *   * The author wrote no target at all. `[text]()` is valid Markdown and yields `href === ''`,
+ *     which the sanitiser has no reason to touch: an empty value carries no scheme, so it is treated
+ *     as relative and passes through untouched.
+ *
+ * Both answer `false`, and both must, for the same reason: an element with no destination is not a
+ * link, and an `<a href="">` is worse than one - it is focusable, it looks clickable, and activating
+ * it reloads the current page. Rendering either as a styled anchor would advertise a navigation that
+ * cannot happen, which is precisely the affordance a sanitiser removing a `javascript:` URL was
+ * trying to take away.
+ *
+ * Whitespace counts as empty. `[text](   )` is the same non-destination as `[text]()` with extra
+ * characters in it.
+ *
+ * @param href - The href as it survived sanitisation, or `undefined` when it did not survive.
+ * @returns `true` when the value can actually be navigated to, `false` for absent, empty or blank.
+ */
+function hasNavigableHref(href: string | undefined): href is string {
+  return typeof href === 'string' && href.trim().length > 0;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -483,14 +542,35 @@ const MARKDOWN_COMPONENTS: Components = {
    * `next/link` is deliberately not used here either. The sanitiser hands this override a plain
    * string href which may be external, a `mailto:`, or nothing at all, and routing those through a
    * client-side navigator would be fragile for no benefit. Internal links in authored prose are
-   * ordinary anchors and are followed with a full navigation. The category pills further down DO use
-   * `next/link`, because their hrefs are ones this component builds itself.
+   * ordinary anchors and are followed with a full navigation. The category pills further down are a
+   * different case and DO navigate through the router, because their hrefs are ones this component
+   * builds itself - which is why they are `BadgeLink`s rather than anchors.
    *
    * The sanitiser's schema permits one `className` on an anchor - `data-footnote-backref`, on the
    * return arrow of a GFM footnote - so the authored value is merged rather than discarded.
+   *
+   * ### An anchor with no destination is not rendered as an anchor
+   *
+   * When {@link hasNavigableHref} says no - the sanitiser dropped a `javascript:` href, or the author
+   * wrote `[text]()` - the author's text is emitted inside a plain `<span>` and the anchor is not
+   * built at all. The alternative, which this file did do and which the styling made worse, is an
+   * `<a>` with the link colour, the hover step and the focus ring but nothing to navigate to: a
+   * visitor reads it as a link, a keyboard user lands on it, a screen reader announces it as a link,
+   * and activating it either does nothing or reloads the page. Removing an unsafe scheme and then
+   * still advertising the click is the sanitiser's work undone at the last step.
+   *
+   * The span deliberately carries NO `CONTENT_LINK_CLASSES`: the text should read as the surrounding
+   * prose, because that is what it now is. It is also NOT spread with the anchor's props - there is no
+   * attribute on a dropped link worth keeping, and spreading would put `href`, `title` and the hast
+   * `node` on an element that has no use for any of them. The authored `className` is the one
+   * exception, forwarded so the GFM footnote hook survives the degradation.
    */
   a: (props) => {
     const { children, className: authoredClassName, href } = props;
+
+    if (!hasNavigableHref(href)) {
+      return <span className={authoredClassName}>{children}</span>;
+    }
 
     return (
       <a
@@ -504,38 +584,74 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 
   /*
-   * An inline content image.
+   * An inline content image, rendered only when this deployment admits its host.
    *
-   * This renders a plain `<img>`, and `next/image` is not an option rather than not a preference. A
-   * content image's host is chosen by whoever authored the post, so the set of hosts is unbounded
-   * and cannot be enumerated in next.config.ts's `images.remotePatterns` - and the optimiser THROWS
-   * at runtime on a host it was not told about. (The allow-list in `@/lib/utils` exists for the
-   * post COVER image and for avatars, which are single fields this tier can police before they
-   * reach `next/image`; an arbitrary image inside a body of prose is a different problem.) The
-   * sanitiser's `src` protocol allow-list - http and https only - is what makes the URL safe to
-   * emit.
+   * THE GUARD IS THE POINT AND IT HAS TO COME FIRST. `isAllowedImageUrl` is `@/lib/utils`'s
+   * single remote-image host policy - the same list next.config.ts derives `images.remotePatterns`
+   * from - and it is asked before any element is produced, because an `<img src>` that reaches the
+   * DOM has already made its request. The sanitiser is no help here: it restricts the `src`
+   * PROTOCOL, which makes a URL safe to emit and says nothing about whether a request to the host
+   * behind it should be made at all. See note 5 in the header for what that request discloses.
    *
-   * `alt` falls back to the empty string, which is the CORRECT decorative treatment rather than a
-   * shrug: `![](url)` is an author saying the image carries no information the surrounding prose
-   * does not, and an empty `alt` is how that is communicated to assistive technology. Inventing text
-   * here would be worse than saying nothing.
+   * The predicate is total - a missing `src`, a relative path, an unparseable string, plain `http`,
+   * an embedded credential and an unlisted host all answer "no" without throwing - so there is no
+   * `try`/`catch` and no null check of our own here.
+   *
+   * When the answer is no the image degrades to its own alt text, and when there is no alt text it
+   * degrades to nothing: `![](url)` is an author stating that the image carries no information the
+   * surrounding prose does not, so there is nothing to substitute and a stand-in would be noise.
+   * The authored `className` is deliberately NOT carried onto the substitute - a class written for
+   * an image is not a class for a line of text - and it is still merged on the branch that renders
+   * a real image.
+   *
+   * When the answer is yes, a plain `<img>` is emitted rather than `next/image`, and that remains a
+   * constraint rather than a preference: Markdown's image syntax carries only a URL and alt text, so
+   * there is no width and height to declare, and `next/image` requires either both or `fill` inside
+   * a positioned ancestor whose aspect ratio has been reserved. Neither is available for an image
+   * that appears mid-paragraph, and inventing a pair would introduce the pixel literals the token
+   * discipline forbids while distorting every image whose real ratio differs from the guess.
+   *
+   * `alt` still falls back to the empty string on that branch, which is the CORRECT decorative
+   * treatment rather than a shrug - an empty `alt` is how "this image carries no information" is
+   * communicated to assistive technology, and inventing text would be worse than saying nothing.
    *
    * `loading="lazy"` and `decoding="async"` keep a long article's images off the critical path.
    * `loading="lazy"` has a second, less obvious effect worth knowing: React stops emitting a
    * `<link rel="preload" as="image">` for the element during server rendering, so a lazy image does
    * not get preloaded and lazy-loaded at the same time.
+   *
+   * `referrerPolicy="no-referrer"` is the one privacy control this element needs, and it is the exact
+   * counterpart of the `rel="noreferrer"` the anchor override applies. The host is chosen by whoever
+   * wrote the post, so every content image is an automatic, unattended request to a third party the
+   * READER never chose - and without this attribute the browser sends the full URL of the page being
+   * read as the `Referer` header. On this product that URL is the post's canonical address, so an
+   * image host learns which article each visitor is reading, from the visitor's own IP, with no
+   * interaction at all. `no-referrer` rather than `origin` or `strict-origin` because the site's
+   * origin is public information the image host already has from the request itself, so sending it
+   * again buys the reader nothing; and because the image still loads either way - a host that varies
+   * its response on the referrer is hotlink protection, which is a reason to host the image properly
+   * rather than a reason to leak the path.
    */
   img: (props) => {
-    const { alt, className: authoredClassName } = props;
+    const { alt, className: authoredClassName, src } = props;
+
+    if (!isAllowedImageUrl(typeof src === 'string' ? src : null)) {
+      const description = typeof alt === 'string' ? alt.trim() : '';
+
+      return description.length === 0 ? null : (
+        <span className={WITHHELD_IMAGE_CLASSES}>{description}</span>
+      );
+    }
 
     return (
-      // eslint-disable-next-line @next/next/no-img-element -- content image hosts are author-supplied and unbounded, so they cannot be enumerated in next.config.ts's images.remotePatterns and next/image would throw at runtime.
+      // eslint-disable-next-line @next/next/no-img-element -- Markdown carries no image dimensions, so next/image cannot be used without inventing a width and height (it requires both, or `fill` inside a ratio-reserved ancestor); the host policy this rule protects is enforced above by isAllowedImageUrl.
       <img
         {...withoutHastNode(props)}
         alt={alt ?? ''}
         className={cn(CONTENT_IMAGE_CLASSES, authoredClassName)}
         decoding="async"
         loading="lazy"
+        referrerPolicy="no-referrer"
       />
     );
   },
@@ -646,9 +762,12 @@ interface PostContentProps {
  * ### Accessibility
  *
  * No `<h1>` can reach the DOM from here. Every interactive element - each content link and each
- * category pill - is a real anchor with real text content and a visible `:focus-visible` indicator.
- * The pill row is a labelled `<nav>` landmark, so it is reachable as "Categories" and is
- * distinguishable from the site's own navigation.
+ * category pill - is a real anchor with real text content and a visible `:focus-visible` indicator,
+ * and the pills carry the design system's own 24px minimum target. The converse holds too: an
+ * authored link whose href the sanitiser dropped is rendered as plain text rather than as an anchor,
+ * so nothing in the output is announced as a link, focusable or styled as clickable without having
+ * somewhere to go. The pill row is a labelled `<nav>` landmark, so it is reachable as "Categories"
+ * and is distinguishable from the site's own navigation.
  *
  * @param content - The author's Markdown, or any of its empty forms.
  * @param categories - Categories to render as links to the filtered feed. Omit to render none.
@@ -703,12 +822,16 @@ export function PostContent({
          * apart from the site header's navigation. The label is the only ARIA in this file: the list,
          * the items and the anchors all carry their own semantics already.
          *
-         * Each pill is a real crawlable anchor, which is the point of rendering them server-side at
-         * all - a category is discoverable from a post without executing any client JavaScript. The
-         * href comes from `categoryFeedPath`, never from a hand-built query string: a category has no
-         * route of its own in this product, its page IS the category-filtered feed, and that one
-         * function is what keeps this component, the feed's own filter control and the generated
-         * sitemap from disagreeing about how a category is addressed.
+         * Each pill is `BadgeLink`, the design system's own pill-shaped link, and NOT a class list
+         * assembled here: the appearance, the wrapping behaviour for a long category name, the 24px
+         * minimum target, the hover step and the focus ring are all declared once in
+         * src/components/ui/badge-link.tsx, so this row and the feed card's footer cannot drift apart
+         * the way two hand-rolled copies did. It renders one real crawlable anchor, which is the point
+         * of rendering the row server-side at all - a category is discoverable from a post without
+         * executing any client JavaScript. The href comes from `categoryFeedPath`, never from a
+         * hand-built query string: a category has no route of its own in this product, its page IS the
+         * category-filtered feed, and that one function is what keeps this component, the feed's own
+         * filter control and the generated sitemap from disagreeing about how a category is addressed.
          *
          * The link text is the category's `name`, which is both the visible label and the accessible
          * name, and it satisfies the descriptive-link-text floor without any additional markup.
@@ -717,9 +840,7 @@ export function PostContent({
           <ul className={CATEGORY_LIST_CLASSES}>
             {pills.map((category) => (
               <li key={category.id}>
-                <Link className={CATEGORY_PILL_CLASSES} href={categoryFeedPath(category)}>
-                  {category.name}
-                </Link>
+                <BadgeLink href={categoryFeedPath(category)}>{category.name}</BadgeLink>
               </li>
             ))}
           </ul>

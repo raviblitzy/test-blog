@@ -15,12 +15,16 @@ place is what makes the answer to "where does this value come from?" a single lo
 what makes ``.env.example`` an enforced contract rather than documentation that drifts
 away from the code.
 
-Eleven variables, and exactly three tolerated strangers
-------------------------------------------------------
+Eleven variables, and exactly four tolerated strangers
+-----------------------------------------------------
 The eleven fields of :class:`Settings` mirror the eleven backend keys in the
-repository-root ``.env.example`` field for field and name for name. The three keys in
-that file's FRONTEND block belong to the Next.js tier - they are inlined into the client
-bundle at build time, and are public by design - so they are deliberately absent here.
+repository-root ``.env.example`` field for field and name for name. The four keys in
+that file's FRONTEND block belong to the Next.js tier, so they are deliberately absent
+here: the three ``NEXT_PUBLIC_`` values are inlined into the client bundle at build time
+and are public by design, and ``API_INTERNAL_BASE_URL`` is read only while the
+presentation tier renders on a server. Fifteen keys in total, and there is no sixteenth:
+``.env.example`` is the whole of the configuration this application reads, in either
+tier.
 
 One ``.env`` nonetheless has to serve both tiers, and the mechanism that allows it is
 deliberately narrow. ``extra`` is ``"forbid"``, and a single ``mode="before"`` model
@@ -204,19 +208,23 @@ _ENV_FILES: Final[tuple[Path, Path]] = (_REPO_ROOT / ".env", _BACKEND_DIR / ".en
 # ---------------------------------------------------------------------------------------
 # The four keys this model tolerates but does not declare
 #
-# The FRONTEND block of .env.example. They are inlined into the Next.js bundle at build
-# time and are public by design, so they carry no secret and mean nothing to this tier -
-# but one .env serves both tiers, so they arrive here anyway. Listing them by exact name is
-# what lets `extra` stay "forbid": these four are dropped, and every other unrecognised
-# key in an env file stops the process. A name added to .env.example's FRONTEND block must
-# be added here too, or the service will refuse to start with it present.
+# The FRONTEND block of .env.example. Three are inlined into the Next.js bundle at build
+# time and are public by design; the fourth, API_INTERNAL_BASE_URL, is deliberately NOT
+# `NEXT_PUBLIC_`-prefixed - it is read only while the presentation tier renders on a
+# server, where the API may answer on an internal hostname the browser cannot resolve, and
+# a public prefix would ship that hostname to every reader. None of the four carries a
+# secret and none means anything to this tier - but one .env serves both tiers, so they
+# arrive here anyway. Listing them by exact name is what lets `extra` stay "forbid": these
+# four are dropped, and every other unrecognised key in an env file stops the process. A
+# name added to .env.example's FRONTEND block must be added here too, or the service will
+# refuse to start with it present.
 # ---------------------------------------------------------------------------------------
 _FRONTEND_ENV_KEYS: Final[frozenset[str]] = frozenset(
     {
         "NEXT_PUBLIC_API_BASE_URL",
         "NEXT_PUBLIC_SITE_URL",
         "NEXT_PUBLIC_SITE_NAME",
-        "NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST",
+        "API_INTERNAL_BASE_URL",
     }
 )
 
@@ -419,6 +427,18 @@ _CORS_EXPECTED: Final[str] = (
     "Example: CORS_ALLOW_ORIGINS=http://localhost:3000,http://127.0.0.1:3000"
 )
 
+# The port each scheme implies, and therefore the port a browser OMITS from the `Origin`
+# header it sends. `https://example.com:443` and `https://example.com` are the same origin,
+# but `CORSMiddleware` compares strings, so only the second spelling can ever match a real
+# request. Canonicalisation below drops the redundant port rather than leaving an entry that
+# is correct in intent and dead in practice.
+_CORS_DEFAULT_PORTS: Final[Mapping[str, int]] = MappingProxyType({"http": 80, "https": 443})
+
+# IPv6 literals arrive bracketed in a URL and `urlsplit().hostname` unwraps them, so the
+# brackets have to be restored when an origin is rebuilt from its parts. Without this,
+# `http://[::1]:3000` would canonicalise to the unparseable `http://::1:3000`.
+_IPV6_HOST_MARKER: Final[str] = ":"
+
 
 # ---------------------------------------------------------------------------------------
 # Rate-limit expression
@@ -487,7 +507,7 @@ class Settings(BaseSettings):
         case_sensitive=True,
         # FAIL CLOSED on anything unrecognised. One .env serves both tiers, so it carries
         # the four client keys from the FRONTEND block of .env.example that this model does
-        # not declare - and `_drop_frontend_keys` below removes exactly those three, by
+        # not declare - and `_drop_frontend_keys` below removes exactly those four, by
         # name, before validation runs. Everything else unknown is a startup failure, which
         # is what turns `DATABSE_URL` or `ENVIRONMNET` from a silent fallback to a default
         # into an error naming the key. `extra="ignore"` would suppress both cases alike.
@@ -685,7 +705,7 @@ class Settings(BaseSettings):
     @model_validator(mode="before")
     @classmethod
     def _drop_frontend_keys(cls, values: Any) -> Any:
-        """Remove the four public client keys, by exact name, before validation runs.
+        """Remove the four presentation-tier keys, by exact name, before validation runs.
 
         This is the whole of the tolerance that lets one ``.env`` serve both tiers, and it
         is deliberately an exact-name allow-list rather than ``extra="ignore"``. Running in
@@ -926,7 +946,7 @@ class Settings(BaseSettings):
     @field_validator("CORS_ALLOW_ORIGINS")
     @classmethod
     def _validate_cors_allow_origins(cls, value: list[str]) -> list[str]:
-        """Require each entry to be a bare http/https origin, with no credential in it.
+        """Require a non-empty list of bare http/https origins, and return them canonicalised.
 
         ``CORSMiddleware`` compares the browser's ``Origin`` header against these entries
         verbatim, so anything that is not exactly an origin can never match: a trailing
@@ -934,6 +954,46 @@ class Settings(BaseSettings):
         None of those produces a server error - they produce an unexplained CORS failure in
         the client, days later, in someone else's browser. Each is a startup failure here
         instead.
+
+        Two consequences of that verbatim comparison are handled by rewriting rather than by
+        rejecting, because both spellings are *correct* in intent and only one of them can
+        ever match a real request:
+
+        * **Case.** ``Origin`` is sent with a lower-case scheme and host. ``HTTPS://API.EXAMPLE``
+          is the same origin by every specification and a dead entry by string comparison, so
+          the scheme and host are lower-cased here.
+        * **A redundant default port.** A browser omits ``:443`` from an ``https`` origin and
+          ``:80`` from an ``http`` one, so ``https://example.com:443`` never matches either. The
+          default port for the scheme is dropped; a non-default port is kept, because it is part
+          of the origin.
+
+        The list is then de-duplicated, preserving first-occurrence order, since two spellings
+        that canonicalise to one origin are one origin. Order is preserved rather than sorted so
+        the entry positions this method reports stay the ones an operator wrote.
+
+        **An empty list is refused.** ``CORS_ALLOW_ORIGINS=`` parses to no origins at all, and
+        a service that starts with an empty allow-list is the worst of both outcomes: it reports
+        itself healthy, serves every request made by a tool, and fails every request made by the
+        browser tier it exists to serve - in the browser, with a message that names CORS and not
+        this variable. The variable has no default for exactly this reason, and an empty value is
+        the same mistake as an absent one.
+        """
+        if not value:
+            raise ValueError(
+                "CORS_ALLOW_ORIGINS resolved to an empty list, so no browser origin would be "
+                "permitted and every request from the Next.js tier would fail in the browser "
+                "while the API reported itself healthy. Set it to the origins that must be "
+                f"allowed: {_CORS_EXPECTED}"
+            )
+        return cls._canonical_cors_origins(value)
+
+    @classmethod
+    def _canonical_cors_origins(cls, value: list[str]) -> list[str]:
+        """Validate every entry of a non-empty origin list and return the canonical form.
+
+        Split out from :meth:`_validate_cors_allow_origins` so the emptiness rule and the
+        per-entry rules are each readable on their own; the two are only ever called as one
+        step, in that order.
 
         Two rejections are security rather than correctness. A scheme other than ``http`` or
         ``https`` is a value a browser can never send an ``Origin`` for, so accepting it
@@ -950,6 +1010,10 @@ class Settings(BaseSettings):
 
         Positions are reported, never values. An index tells the operator which entry to fix
         without copying a possibly credential-bearing string into stderr.
+
+        Returns:
+            The origins in canonical form - lower-cased scheme and host, redundant default port
+            removed, duplicates collapsed - or the single-element wildcard list unchanged.
         """
         if _CORS_WILDCARD in value:
             if len(value) == 1:
@@ -962,20 +1026,25 @@ class Settings(BaseSettings):
                 "only real origins."
             )
 
+        canonical: list[str] = []
         for index, origin in enumerate(value):
             position = f"entry {index + 1} of {len(value)}"
             parts = urlsplit(origin)
+            scheme = parts.scheme.lower()
+            # Bound once rather than read twice: `hostname` is a property, so a second access
+            # would not carry the narrowing the emptiness check below establishes.
+            hostname = parts.hostname
 
             if not parts.scheme:
                 raise ValueError(
                     f"CORS_ALLOW_ORIGINS {position} declares no scheme: {_CORS_EXPECTED}"
                 )
-            if parts.scheme.lower() not in _CORS_ALLOWED_SCHEMES:
+            if scheme not in _CORS_ALLOWED_SCHEMES:
                 raise ValueError(
                     f"CORS_ALLOW_ORIGINS {position} uses a scheme a browser never sends an "
                     f"Origin header for. Only http and https are accepted: {_CORS_EXPECTED}"
                 )
-            if not parts.hostname:
+            if not hostname:
                 raise ValueError(f"CORS_ALLOW_ORIGINS {position} names no host: {_CORS_EXPECTED}")
             if parts.username or parts.password:
                 raise ValueError(
@@ -1000,7 +1069,18 @@ class Settings(BaseSettings):
                     f"CORS_ALLOW_ORIGINS {position} is not a bare origin - it carries a "
                     f"path, query or fragment, or a trailing slash: {_CORS_EXPECTED}"
                 )
-        return value
+
+            # `urlsplit` unwraps an IPv6 literal, so the brackets are restored before the
+            # authority is rebuilt - otherwise `http://[::1]:3000` would become the
+            # unparseable `http://::1:3000`.
+            host = f"[{hostname}]" if _IPV6_HOST_MARKER in hostname else hostname
+            # The scheme is guaranteed present in this table by the membership check above.
+            authority = host if port in (None, _CORS_DEFAULT_PORTS[scheme]) else f"{host}:{port}"
+            rebuilt = f"{scheme}://{authority}"
+            if rebuilt not in canonical:
+                canonical.append(rebuilt)
+
+        return canonical
 
     @field_validator("AUTH_RATE_LIMIT")
     @classmethod
@@ -1133,11 +1213,55 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Whether this process is running the local development configuration.
 
-        app.core.logging selects its human-readable renderer on this, and app.main gates
-        the /openapi.json, /docs and /redoc surface on it. Expressing the comparison once
-        keeps the literal ``"development"`` out of every call site.
+        ``app.core.logging`` selects its human-readable renderer on this. It does **not**
+        gate the documentation surface: ``app.main`` serves ``/openapi.json``
+        unconditionally, because the machine-readable contract is not a deployment-stage
+        decision, and withdraws only the two human renderings ``/docs`` and ``/redoc`` -
+        keyed on :attr:`is_production`, so they are present in development, test and
+        staging alike. Expressing the comparison once keeps the literal ``"development"``
+        out of every call site.
         """
         return self.ENVIRONMENT == "development"
+
+    @property
+    def cors_wildcard_origin(self) -> bool:
+        """Whether this deployment admits every origin.
+
+        The one shape of allow-list that is not a list of origins, and the primitive the
+        credential decision below is expressed in terms of. ``app.core.exceptions`` needs it
+        directly: for a wildcard deployment the outer-500 response carries
+        ``Access-Control-Allow-Origin: *`` rather than the requesting origin, and carries no
+        ``Vary: Origin`` because the answer does not depend on the request.
+
+        A wildcard can only appear as the entire list, which
+        :meth:`_validate_cors_allow_origins` guarantees, so the membership test is exact
+        rather than a scan for a substring.
+        """
+        return _CORS_WILDCARD in self.CORS_ALLOW_ORIGINS
+
+    @property
+    def cors_allow_credentials(self) -> bool:
+        """Whether credentialed cross-origin requests may be permitted for this deployment.
+
+        Credentials are permitted for a named allow-list and refused for the wildcard, and the
+        refusal is the point. ``Access-Control-Allow-Origin: *`` combined with
+        ``Access-Control-Allow-Credentials: true`` is a combination the fetch specification
+        forbids, and Starlette works around the browser's refusal by echoing the requesting
+        origin back instead - which turns a deliberate "this read-only surface is public" into
+        "every site on the web may make authenticated requests with the visitor's cookies and
+        tokens". Deriving it from the configured list means a deployment cannot arrive at that
+        combination by setting one variable.
+
+        Declared here rather than in ``app.main`` because there are now two readers of the
+        decision - the ``CORSMiddleware`` registration and the outer-500 handler in
+        ``app.core.exceptions``, which has to answer a cross-origin failure that never reaches
+        that middleware - and one policy with two call sites is a policy, while two
+        implementations of it are a future divergence.
+
+        Expressed as the negation of :attr:`cors_wildcard_origin` rather than as a second
+        membership test, so the two cannot come to disagree.
+        """
+        return not self.cors_wildcard_origin
 
     @property
     def is_production(self) -> bool:

@@ -143,6 +143,7 @@ import type { JSX } from 'react';
 import { PostCard, PostCardSkeleton } from '@/components/blog/post-card';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Pagination } from '@/components/ui/pagination';
+import { derivePagination, FIRST_PAGE, formatResultRange } from '@/lib/pagination';
 import type { Page, PostSummary } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -318,71 +319,18 @@ const RANGE_CLASSES = 'text-sm text-muted-foreground';
 
 /* -------------------------------------------------------------------------------------------------
  * Result range
+ *
+ * There is no arithmetic here any more, and that is the fix rather than an omission. This file used to
+ * carry its own `positiveIntegerOr` and `resultSummary`, with a note acknowledging that the sentence was
+ * duplicated verbatim in `components/admin/data-table.tsx` and that a shared module "would be a larger
+ * change than the duplication it saves". It was not: the duplication existed only because the arithmetic
+ * lived in `@/hooks/use-pagination`, and this component is a SERVER component - no `'use client'`, so the
+ * rows reach the initial HTML for the SEO requirement - which cannot call a hook at all.
+ *
+ * `@/lib/pagination` is that arithmetic with the hook removed, so this file now calls exactly what the
+ * client-side control and the administrative grid call. One range calculation, one sentence, three
+ * consumers.
  * ---------------------------------------------------------------------------------------------- */
-
-/** The first page of any collection, 1-based. Named so the arithmetic below reads as intent. */
-const FIRST_PAGE = 1;
-
-/**
- * Coerce an untrusted numeric field to a positive integer.
- *
- * The envelope's fields are typed `number`, which still admits `0`, a negative, a fraction, `NaN` and
- * either infinity - all of which a hand-built fixture or a partially-populated first render can
- * legitimately carry. Each resolves to the supplied fallback rather than propagating into a rendered
- * label, because "Showing NaN-NaN of 47 results" is worse than no label at all.
- *
- * @param value - The field as it arrived.
- * @param fallback - What to use when `value` is not a usable count.
- * @returns `value` truncated to an integer when it is finite and at least one, else `fallback`.
- */
-function positiveIntegerOr(value: number, fallback: number): number {
-  return Number.isFinite(value) && value >= FIRST_PAGE ? Math.trunc(value) : fallback;
-}
-
-/**
- * Compose the "Showing X-Y of N results" line, or `null` when there is nothing to summarise.
- *
- * Derived entirely from the envelope's own fields, and no more page arithmetic than that.
- * `@/hooks/use-pagination` is this tier's single implementation of windowing, and this deliberately
- * does not become a second one - it reproduces no page count, no window and no bounds. What it does
- * is a range calculation over four numbers that arrived together.
- *
- * The last index is `first + items.length - 1` rather than `page * page_size`, which is what makes
- * the label correct on a partial final page: the OBSERVED row count is authoritative for how many
- * rows are on screen, so page four of a 47-row collection at a window of 12 reads "Showing 37-47 of
- * 47 results" without needing to know it is the last page.
- *
- * The wording matches `components/admin/data-table.tsx` verbatim so every windowed surface in the
- * product phrases its range identically. It is duplicated rather than imported because
- * `@/lib/format` is not among this file's declared dependencies and that helper is private to the
- * administrative grid; the sentence is one template literal, and inventing a shared module for it
- * would be a larger change than the duplication it saves.
- *
- * @param page - The envelope currently on screen.
- * @returns The rendered sentence, or `null` for an empty window - where a range would say nothing
- *   the empty panel beside it has not already said.
- */
-function resultSummary(page: Page<PostSummary>): string | null {
-  const rowCount = page.items.length;
-
-  if (rowCount === 0) {
-    return null;
-  }
-
-  const pageNumber = positiveIntegerOr(page.page, FIRST_PAGE);
-  // Falls back to the observed row count rather than to a guessed window size, so a zeroed
-  // `page_size` still produces the honest "Showing 1-3 of 3 results" instead of a wrong offset.
-  const windowSize = positiveIntegerOr(page.page_size, rowCount);
-
-  const first = (pageNumber - FIRST_PAGE) * windowSize + 1;
-  const last = first + rowCount - 1;
-  // `total` is the unwindowed count and cannot legitimately be below `last`, since both come out of
-  // the same SQL statement; `last` is the fallback for a fixture that never set it.
-  const total = positiveIntegerOr(page.total, last);
-
-  // An en dash for a numeric range, escaped so this file stays ASCII-only like its siblings.
-  return `Showing ${first}\u2013${last} of ${total} ${total === 1 ? 'result' : 'results'}`;
-}
 
 /* -------------------------------------------------------------------------------------------------
  * PostList
@@ -540,7 +488,10 @@ export function PostList({
    * `null` for an empty window, which doubles as the gate for the range line - see note 5. Computed
    * before the JSX so the footer's own condition stays a plain boolean comparison.
    */
-  const summary = isLoading ? null : resultSummary(page);
+  // One derivation, used for the range sentence and for the control's own gate, so the two cannot
+  // disagree about whether this window has rows.
+  const derived = derivePagination(page);
+  const summary = isLoading ? null : formatResultRange(derived);
 
   /*
    * The page control is gated on the envelope's own count and NOT on whether there are rows, so a
@@ -549,7 +500,7 @@ export function PostList({
    * anyway, because the footer must not render an empty wrapper around a component that decided to
    * render nothing.
    */
-  const showsPagination = !isLoading && page.pages > FIRST_PAGE;
+  const showsPagination = !isLoading && derived.pages > FIRST_PAGE;
 
   return (
     <div className={cn(ROOT_CLASSES, className)}>

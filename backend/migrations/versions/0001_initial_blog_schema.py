@@ -155,15 +155,37 @@ def upgrade() -> None:
     # text-search configuration can reach it. IF NOT EXISTS keeps the block idempotent
     # against an environment that was provisioned with them already present.
     #
-    # DEPLOYMENT PREREQUISITE, and the one thing in this revision that is not self-contained:
-    # `CREATE EXTENSION` requires a superuser role, or an extension already installed in the
-    # target database. A least-privilege application role - the right thing to run the service
-    # under - therefore fails on this block rather than on anything below it. Two ways to
-    # satisfy it, and both are ordinary: install the three extensions once as a privileged role
-    # before the first `alembic upgrade head` (IF NOT EXISTS then makes this block a no-op), or
-    # run migrations under a role that may create them while the service itself connects as the
-    # restricted one. The local Compose database runs as a superuser, which is why this is a
-    # note rather than a failure anybody has seen here.
+    # DEPLOYMENT PREREQUISITE, and the one thing in this revision that is not self-contained -
+    # but NOT a superuser requirement. All three of these are TRUSTED extensions, which means
+    # PostgreSQL (13 and later) lets a role install them with nothing more than the CREATE
+    # privilege on the current database. Verified on PostgreSQL 18.4: `pg_available_extension_
+    # versions` reports `trusted = t` for every available version of citext, pg_trgm and
+    # unaccent, and a role created NOSUPERUSER NOCREATEDB NOCREATEROLE installed all three in a
+    # database it owned and then exercised them - `'A'::citext = 'a'::citext`, `similarity()`,
+    # `unaccent('cafe')` - without ever holding superuser.
+    #
+    # So the least-privilege path is the ordinary one, and it is the recommended one: grant the
+    # migration role CREATE on the database and run `alembic upgrade head` as that role. Owning
+    # the database carries it implicitly; otherwise it is one statement, executed once, by the
+    # database owner or a superuser:
+    #
+    #     GRANT CREATE ON DATABASE <database> TO <migration_role>;
+    #
+    # Without it the block fails here rather than on anything below, with
+    # `permission denied to create extension "citext"` and the hint `Must have CREATE privilege
+    # on current database to create this extension` - measured, not paraphrased. The failure is
+    # atomic: the transaction rolls back and the database stays at its previous revision.
+    #
+    # Superuser is required only for an UNTRUSTED extension, and this revision installs none.
+    # The contrast is worth knowing when a later revision wants one: the same role, holding the
+    # same database CREATE privilege, is refused `CREATE EXTENSION file_fdw` (which reports
+    # `trusted = f`) with the different hint `Must be superuser to create this extension`. If
+    # such a dependency is ever added, install it once out of band as a privileged role and keep
+    # the `IF NOT EXISTS` form below so the migration stays a no-op against it.
+    #
+    # `IF NOT EXISTS` also covers the environment provisioned with these three already present -
+    # a managed instance that ships them, or an image whose entrypoint created them - in which
+    # case this block needs no privilege at all beyond connecting.
     #
     # No extension is installed for UUID generation: gen_random_uuid() is a PostgreSQL 18
     # built-in, verified available with only these three installed.

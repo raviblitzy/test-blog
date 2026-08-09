@@ -25,14 +25,16 @@ one error document from the handlers ``app.core.exceptions`` registers.
 
 What assembly consists of
 -------------------------
-Seven acts, all inside :func:`create_app`, in the order they appear there:
+Seven acts, all inside :func:`create_app`, in the order they appear there. The middleware
+chain is four registrations rather than one, which is why the numbered steps in the function
+run to eight:
 
 1. **OpenAPI metadata** - a title naming the blog service, the version, a description of the
    contract and one tag object per tag any router attaches. The retired ``FastAPI()`` supplied
    none of the four, so the generated document described the API without ever naming it.
 2. **The documentation surface** - :data:`OPENAPI_URL` is always served; ``/docs`` and ``/redoc``
    are withdrawn in production. See *The documentation surface* below.
-3. **The middleware chain** - three wrappers in the one order that is correct. See *Middleware
+3. **The middleware chain** - four wrappers in the one order that is correct. See *Middleware
    order* below.
 4. **The rate limiter** - bound to ``app.state.limiter``, which is how *slowapi* reaches it from
    a decorated route.
@@ -42,18 +44,25 @@ Seven acts, all inside :func:`create_app`, in the order they appear there:
    unprefixed.
 7. **The lifespan** - structured logging configured before the first request, the connection pool
    disposed on the way out.
+8. **The published document** - :func:`~app.api.v1.responses.customise_openapi`, which publishes
+   the error media type the handlers actually send and the optional-credential reads' true
+   security alternatives. Both are properties of the finished document rather than of any route,
+   so they are applied to the artifact once every route above is mounted - which is why this is
+   the last statement of assembly.
 
 Middleware order
 ----------------
 ``Starlette.add_middleware`` inserts at the front of the chain, so **first registered ends up
 innermost**. The registration order below produces::
 
-    ServerErrorMiddleware          <- outermost; renders the handler keyed on bare Exception
-      RequestContextMiddleware     <- registered LAST: correlates, logs, sets X-Request-ID
-        SecurityHeadersMiddleware  <- hardens every response, preflights included
-          CORSMiddleware           <- built from settings.CORS_ALLOW_ORIGINS
-            ExceptionMiddleware    <- runs the handlers app.core.exceptions registers
-              Router -> endpoint
+    ServerErrorMiddleware            <- outermost; renders the handler keyed on bare Exception
+      RequestContextMiddleware       <- registered LAST: correlates, logs, sets X-Request-ID
+        SecurityHeadersMiddleware    <- hardens every response, preflights included
+          CORSMiddleware             <- built from settings.CORS_ALLOW_ORIGINS
+            ExceptionMiddleware      <- registered FIRST: catches what escapes the one below,
+                                        so an unhandled 500 is rendered INSIDE the CORS layer
+              ExceptionMiddleware    <- the framework's own; runs the registered handlers
+                Router -> endpoint
 
 which is exactly the order ``app.middleware`` and ``app.middleware.security_headers`` require, and
 each position is load-bearing:
@@ -65,13 +74,24 @@ each position is load-bearing:
   registered inside it would never run for a preflight, leaving every preflight response
   unhardened. It also sits outside ``ExceptionMiddleware``, so a problem document is hardened
   exactly like a 200.
-* ``CORSMiddleware`` is innermost of the three, which is what lets the two wrappers above it act
-  on the responses it generates itself.
+* ``CORSMiddleware`` sits above the added ``ExceptionMiddleware`` and below the other two, which
+  is what lets the two wrappers above it act on the responses it generates itself *and* lets it
+  act on the 500 the wrapper below it renders.
+* The added ``ExceptionMiddleware`` is registered **first**, therefore innermost of the four, and
+  that position is the entire reason it exists. Starlette hoists a handler registered for bare
+  ``Exception`` onto ``ServerErrorMiddleware``, outside everything ``add_middleware`` adds, and
+  offers no way to move it: a 500 rendered only there never passes through ``CORSMiddleware``, so
+  a browser is handed a cross-origin failure with no readable body instead of the problem
+  document. Installing the same handler on an inner wrapper means every failure at or below it is
+  rendered while CORS is still on the stack. ``app.core.exceptions.inner_exception_handlers``
+  supplies the map, so both dispatch sites render one document from one implementation.
 
-One response escapes the chain and cannot be made not to: Starlette hoists a handler registered
-for bare ``Exception`` onto ``ServerErrorMiddleware``, outside everything ``add_middleware`` adds.
-``app.core.exceptions`` closes that from the other side by applying the same security headers and
-the same ``X-Request-ID`` to the 500 document it renders.
+One response still escapes the chain, and now only one: a failure raised by
+``RequestContextMiddleware`` or ``SecurityHeadersMiddleware`` themselves, which are above the
+inner wrapper. ``ServerErrorMiddleware`` answers that one, and ``app.core.exceptions`` closes it
+from the other side by applying the same security headers and the same ``X-Request-ID`` to the
+500 document it renders there. It carries no CORS header, and cannot - but reaching it requires a
+defect in one of two wrappers that only set headers and bind a log context.
 
 The documentation surface
 -------------------------
@@ -125,7 +145,7 @@ reintroduce anything a worker could hold privately.
 """
 
 import tomllib
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
@@ -134,11 +154,18 @@ from typing import Any, Final
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
+from starlette.middleware.exceptions import ExceptionMiddleware
 
+from app.api.v1.responses import customise_openapi
 from app.api.v1.router import API_V1_PREFIX, api_router
 from app.api.v1.routers.health import router as health_router
 from app.core.config import settings
-from app.core.exceptions import REQUEST_ID_HEADER, register_exception_handlers
+from app.core.exceptions import (
+    CORS_EXPOSE_HEADERS,
+    REQUEST_ID_HEADER,
+    inner_exception_handlers,
+    register_exception_handlers,
+)
 from app.core.logging import configure_logging, get_logger
 from app.core.rate_limit import limiter
 from app.db.session import engine
@@ -196,19 +223,30 @@ before it expires. `POST /api/v1/auth/logout` revokes a refresh token. Authority
 on the server for every protected operation - an author may act only on their own posts and
 comments, and the `/api/v1/admin` namespace requires the `ADMIN` role.
 
+Four read operations accept a credential without requiring one - the feed, a post by slug, a
+post's comment thread and its like summary - and each declares two security alternatives, the
+first of which is none. They answer an anonymous caller with the public projection and enrich
+the answer when a credential is present. A credential that is *presented and unusable* is
+still refused with `401` on those routes rather than being degraded to anonymous, so an
+expired session is reported to the client that needs to refresh it.
+
 ### Collections
 
 Every list operation returns the same page envelope - `items`, `total`, `page`, `page_size`
-and `pages` - and accepts `page` and `page_size` query parameters. Single-resource reads
-return the resource representation directly, with no wrapper.
+and `pages` - and accepts `page` and `page_size` query parameters. There is exactly one
+deliberate exception: `GET /api/v1/categories` answers with a bare JSON array and takes no
+page window at all, because the taxonomy is administrator-curated and bounded and a filter
+control offered only some of its terms would silently hide the posts filed under the rest.
+Single-resource reads return the resource representation directly, with no wrapper.
 
 ### Errors
 
-Every failure at every status code returns one problem document: `type`, `title`, `status`,
-`detail`, `instance` and `request_id`, with an `errors` array of field-level failures on a
-validation rejection. `type` is a stable URI reference, so a client can branch on it instead
-of parsing prose. `request_id` matches the `X-Request-ID` response header on the same
-response, which is the value to quote when reporting a problem.
+Every failure at every status code returns one problem document, served as
+`application/problem+json`: `type`, `title`, `status`, `detail`, `instance` and `request_id`,
+with an `errors` array of field-level failures on a validation rejection. `type` is a stable
+URI reference, so a client can branch on it instead of parsing prose. `request_id` matches the
+`X-Request-ID` response header on the same response, which is the value to quote when
+reporting a problem.
 """
 """Markdown description of the contract, rendered by ``/docs`` and ``/redoc``.
 
@@ -378,12 +416,12 @@ credentialed cross-origin request carry anything the browser would otherwise hav
 send.
 """
 
-_CORS_WILDCARD_ORIGIN: Final[str] = "*"
-"""The one entry in an origin list that is not an origin.
-
-``app.core.config`` accepts it only as the entire list, and only deliberately. Recognising it
-here is what lets :func:`_credentials_allowed` refuse to pair it with credentials.
-"""
+# The origin list's one non-origin entry, the wildcard, is recognised in `app.core.config`
+# rather than here: `settings.cors_wildcard_origin` answers whether the deployment admits every
+# origin and `settings.cors_allow_credentials` refuses to pair that with credentials. Both are
+# read below. The decision was previously made in this module, and moving it removed the second
+# implementation that appeared as soon as `app.core.exceptions` needed the same answer for the
+# 500 rendered outside `CORSMiddleware`.
 
 
 # ---------------------------------------------------------------------------------------
@@ -494,29 +532,6 @@ def _openapi_tags() -> list[dict[str, Any]]:
     return [{"name": name, "description": description} for name, description in _TAG_DESCRIPTIONS]
 
 
-def _credentials_allowed(origins: Sequence[str]) -> bool:
-    """Decide whether credentialed cross-origin requests may be permitted for *origins*.
-
-    Credentials are permitted for a named allow-list and refused for the wildcard, and the
-    refusal is the point. ``Access-Control-Allow-Origin: *`` combined with
-    ``Access-Control-Allow-Credentials: true`` is a configuration the fetch specification
-    forbids, and Starlette works around the browser's refusal by echoing the requesting origin
-    back instead - which turns a deliberate "this read-only surface is public" into "every site
-    on the web may make authenticated requests with the visitor's cookies and tokens". Deciding
-    it here, from the configured list, means a deployment cannot arrive at that combination by
-    setting one variable.
-
-    Args:
-        origins: The configured origin allow-list, exactly as ``app.core.config`` validated it.
-            A wildcard can only appear as the entire list, which that validation guarantees.
-
-    Returns:
-        Whether ``allow_credentials`` may be enabled: ``True`` for a named allow-list,
-        ``False`` when the list is the wildcard.
-    """
-    return _CORS_WILDCARD_ORIGIN not in origins
-
-
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """Configure logging on the way in, dispose the connection pool on the way out.
@@ -524,6 +539,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     The context-manager form rather than the deprecated ``@app.on_event`` decorators, so startup
     and its matching shutdown are written next to each other and the ``finally`` guarantees the
     pool is released even when the served lifetime ends in an exception.
+
+    Shutdown is recorded unconditionally, and a failure to release the pool is recorded beside it
+    rather than in place of it. See the comments in the ``finally`` for why nothing raised there
+    may escape: it would replace the exception that caused the shutdown in the first place.
 
     **Startup performs no I/O.** No connection is opened, no query is issued, no migration is
     applied and nothing is seeded. That is a requirement rather than an economy: schema evolution
@@ -575,11 +594,44 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         # instead of leaving the server to reap them - which is what produces the "connection was
         # garbage collected" warnings that make a clean shutdown indistinguishable from a leak.
         # `app.db.session` documents this call as the only disposal in the process.
-        await engine.dispose()
+        #
+        # NESTED, and both halves of that matter.
+        #
+        # Nothing raised in this block may escape. A `finally` reached while an exception is
+        # already propagating - the served lifetime ended in a failure, or the server is
+        # cancelling startup - REPLACES that exception with anything raised here, so a disposal
+        # that fails would erase the reason the process was shutting down and leave an operator
+        # reading about a connection pool instead of the real fault. The disposal outcome is
+        # therefore recorded, never re-raised.
+        #
+        # And the shutdown record is written whatever happens. Putting the log line after an
+        # unguarded `await` made the process's last line conditional on the pool releasing
+        # cleanly, so the one shutdown worth investigating - the one where disposal failed - was
+        # the one that produced no shutdown record at all.
+        disposed = True
+        try:
+            await engine.dispose()
+        except Exception as exc:
+            disposed = False
+            # `exception_type` and nothing else: a driver's message can name the host, the port,
+            # the database and the user it was talking to, and this is the same rule
+            # `app.core.exceptions` applies to the 500 it renders. The class name is enough to
+            # tell a pool timeout from a driver fault, and the frames are of no use here because
+            # the call site is this one line.
+            logger.error(
+                "application shutdown incomplete",
+                version=application.version,
+                environment=settings.ENVIRONMENT,
+                exception_type=type(exc).__name__,
+            )
+
         logger.info(
             "application shutdown",
             version=application.version,
             environment=settings.ENVIRONMENT,
+            # So one field answers "did this process release its connections?" without the
+            # reader having to correlate two records.
+            pool_disposed=disposed,
         )
 
 
@@ -593,7 +645,7 @@ def create_app() -> FastAPI:
     application that has already been built. Nothing is cached, and no state is shared between two
     applications this returns.
 
-    The seven acts of assembly, in the order performed:
+    The eight acts of assembly, in the order performed:
 
     1. Construct the application with its OpenAPI metadata, response class and lifespan.
     2. Register ``CORSMiddleware`` from settings.
@@ -603,6 +655,7 @@ def create_app() -> FastAPI:
     5. Bind the rate limiter to application state.
     6. Register every exception handler, exactly once.
     7. Mount the versioned aggregate and the unprefixed probes.
+    8. Install the OpenAPI document corrections, once every route above is mounted.
 
     Returns:
         An application ready to serve: metadata populated, middleware chained, limiter bound,
@@ -648,42 +701,81 @@ def create_app() -> FastAPI:
     )
 
     # ---------------------------------------------------------------------------------------
-    # 2-4. The middleware chain
+    # 2-5. The middleware chain
     #
     # ORDER IS LOAD-BEARING. `add_middleware` inserts at the front, so first registered ends up
-    # INNERMOST. Read the three calls below as the stack upside down, and see "Middleware order"
+    # INNERMOST. Read the four calls below as the stack upside down, and see "Middleware order"
     # in the module docstring for why each position is the only correct one. Reordering them
-    # does not fail - it silently stops hardening preflight responses, or silently drops the
-    # correlation identifier from requests that fail inside another wrapper.
+    # does not fail - it silently stops hardening preflight responses, silently drops the
+    # correlation identifier from requests that fail inside another wrapper, or silently turns
+    # an unhandled 500 back into an unreadable cross-origin failure.
     # ---------------------------------------------------------------------------------------
 
-    # 2. Innermost of the three. Configured entirely from settings: no origin literal appears
-    #    here, and `app.core.config` has already split the comma-separated value and rejected
-    #    anything that is not a bare http/https origin.
+    # 2. INNERMOST, and it has to be inside CORS rather than outside it.
+    #
+    #    Starlette hoists a handler registered for bare `Exception` onto
+    #    `ServerErrorMiddleware`, which `build_middleware_stack` places outside every wrapper
+    #    added here - so a 500 rendered only there never passes through `CORSMiddleware`, reaches
+    #    the browser without `Access-Control-Allow-Origin`, and is reported to client code as an
+    #    opaque network failure instead of the problem document the contract promises. The
+    #    framework offers no way to move that registration inwards, so the same handler is
+    #    installed a second time here, on an `ExceptionMiddleware` sitting immediately outside
+    #    the framework's own: every failure at or below this point is rendered while the CORS
+    #    wrapper is still on the stack. `app.core.exceptions.inner_exception_handlers` owns the
+    #    map, so both dispatch sites render one document from one implementation.
+    #
+    #    Step 7's `register_exception_handlers` stays exactly as it was - it is what answers a
+    #    failure raised by one of the two wrappers ABOVE this one, which nothing here can catch.
+    application.add_middleware(
+        ExceptionMiddleware,
+        handlers=inner_exception_handlers(),
+        # Never Starlette's traceback response, in any environment: `_render_unhandled` reveals
+        # nothing at all, and `debug=True` here would bypass it. The application object is
+        # likewise never constructed with `debug`.
+        debug=False,
+    )
+
+    # 3. Configured entirely from settings: no origin literal appears here, and
+    #    `app.core.config` has already split the comma-separated value and rejected anything
+    #    that is not a bare http/https origin.
     application.add_middleware(
         CORSMiddleware,
         # A copy, so the middleware cannot be handed a reference to the live settings list.
+        # Every entry has been canonicalised by `app.core.config` - lower-cased scheme and host,
+        # a redundant default port dropped - which is what makes this verbatim comparison match
+        # the `Origin` header a browser actually sends.
         allow_origins=tuple(settings.CORS_ALLOW_ORIGINS),
-        # Never unconditionally true - see `_credentials_allowed` for the combination it
-        # refuses and why the browser refuses it too.
-        allow_credentials=_credentials_allowed(settings.CORS_ALLOW_ORIGINS),
+        # Never unconditionally true - see `Settings.cors_allow_credentials` for the combination
+        # it refuses and why the browser refuses it too.
+        allow_credentials=settings.cors_allow_credentials,
         allow_methods=CORS_ALLOWED_METHODS,
         allow_headers=CORS_ALLOWED_HEADERS,
-        # Without this the correlation identifier is set on the response and then hidden from
-        # the very client that would quote it in a bug report: a browser exposes only the CORS
-        # safelist to script unless the server names the header here. It is the exact name
-        # `app.middleware.request_context` writes, imported rather than repeated.
-        expose_headers=(REQUEST_ID_HEADER,),
+        # A browser exposes only the CORS safelist to script unless the server names a header
+        # here, so anything the client is expected to ACT on has to appear in this tuple:
+        #
+        #   X-Request-ID      the correlation identifier, otherwise set on the response and then
+        #                     hidden from the very client that would quote it in a bug report.
+        #   Retry-After       sent with every 429 from the rate-limited authentication routes. A
+        #                     sign-in form that cannot read it retries immediately and is refused
+        #                     again, which reads to the person at the keyboard as a broken form.
+        #   WWW-Authenticate  sent with every 401. Without it the browser cannot distinguish
+        #                     "present a credential" from "your credential was refused", which is
+        #                     the distinction that decides whether the client rotates its token
+        #                     or abandons the session.
+        #
+        # Imported from `app.core.exceptions`, which writes the same list by hand onto the one 500
+        # that never reaches this middleware, so the two cannot describe different headers.
+        expose_headers=CORS_EXPOSE_HEADERS,
     )
 
-    # 3. Outside CORS, so an OPTIONS preflight - which CORSMiddleware answers itself, without
+    # 4. Outside CORS, so an OPTIONS preflight - which CORSMiddleware answers itself, without
     #    calling anything beneath it - is hardened like every other response. `enable_hsts` is
     #    required by that class rather than defaulted, so the question cannot be skipped at the
     #    one point that can answer it; `settings.is_production` is the answer wherever the
     #    deployment stage and TLS termination coincide.
     application.add_middleware(SecurityHeadersMiddleware, enable_hsts=settings.is_production)
 
-    # 4. LAST, therefore OUTERMOST. Every request gets an identifier and a bound log context
+    # 5. LAST, therefore OUTERMOST. Every request gets an identifier and a bound log context
     #    before any other wrapper can fail, and every response carries it back out. Both
     #    keyword arguments are left at their defaults deliberately: the header name is the
     #    constant `expose_headers` above and the 500 handler both agree on, and the quiet-path
@@ -691,7 +783,7 @@ def create_app() -> FastAPI:
     application.add_middleware(RequestContextMiddleware)
 
     # ---------------------------------------------------------------------------------------
-    # 5. The rate limiter
+    # 6. The rate limiter
     #
     # `slowapi` reaches the limiter back through `request.app.state.limiter` when a decorated
     # route is called, so this binding is not bookkeeping: without it every rate-limited
@@ -701,13 +793,13 @@ def create_app() -> FastAPI:
     #
     # slowapi's own `_rate_limit_exceeded_handler` is deliberately NOT registered. It would
     # emit slowapi's response body, making 429 the single status in this API that does not
-    # return the documented problem document. Step 6 registers the one that does, with the
+    # return the documented problem document. Step 7 registers the one that does, with the
     # `Retry-After` header derived from the tripped limit's own window.
     # ---------------------------------------------------------------------------------------
     application.state.limiter = limiter
 
     # ---------------------------------------------------------------------------------------
-    # 6. The error contract - one call, one rendering site
+    # 7. The error contract - one call, one rendering site
     #
     # This is the direct remedy for the three duplicated `HTTPException(status_code=404,
     # detail="Item not found")` raises the retired module carried at three separate call
@@ -724,7 +816,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(application)
 
     # ---------------------------------------------------------------------------------------
-    # 7. Routes - mounted here, declared nowhere in this file
+    # 8. Routes - mounted here, declared nowhere in this file
     #
     # Two includes, and the asymmetry between them is deliberate.
     # ---------------------------------------------------------------------------------------
@@ -732,7 +824,7 @@ def create_app() -> FastAPI:
     # BARE. `api_router` was constructed with `prefix=API_V1_PREFIX` already applied, so passing
     # a prefix here as well would double the segment: every path would become
     # `/api/v1/api/v1/...` and the entire API would answer 404 while the process reported itself
-    # perfectly healthy. This one call carries all thirty-seven versioned operations.
+    # perfectly healthy. This one call carries all thirty-eight versioned operations.
     application.include_router(api_router)
 
     # UNPREFIXED, and the only unversioned paths in the service. `/healthz` and `/readyz` must
@@ -741,6 +833,30 @@ def create_app() -> FastAPI:
     # `tags=["health"]` and writes its paths absolute precisely because nothing supplies them
     # for it here.
     application.include_router(health_router)
+
+    # ---------------------------------------------------------------------------------------
+    # 8. The published document - LAST, and after every route is mounted
+    #
+    # Two facts about this API cannot be expressed on a route and are therefore applied to the
+    # finished document, both of them corrections to what the framework would otherwise
+    # publish:
+    #
+    #   * Every error body is `application/problem+json`. `app.core.exceptions` sends every
+    #     problem document with that media type, while a declared `response_model` is published
+    #     under the response class's own `application/json` - a media type no failure in this
+    #     service ever returns. There is no per-response override, and declaring a `content`
+    #     block by hand publishes BOTH types or loses the schema reference.
+    #   * The four reads that resolve an OPTIONAL principal declare anonymous AND bearer as
+    #     alternatives. The framework sees the security scheme in the dependency tree and
+    #     publishes bearer as a requirement, which would make a generated client refuse a call
+    #     any anonymous visitor can make.
+    #
+    # Ordering is load-bearing in one direction only: this must run after the routes exist,
+    # because it operates on the document those routes produce. It does not generate the
+    # document here - generation stays lazy and cached, on the first request to
+    # `OPENAPI_URL` - so this call costs nothing at startup.
+    # ---------------------------------------------------------------------------------------
+    customise_openapi(application)
 
     return application
 

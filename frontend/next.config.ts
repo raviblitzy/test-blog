@@ -43,11 +43,15 @@
 //   9. A SECOND copy of the remote-image host list. `src/lib/utils.ts` owns it -
 //      see the `images` block below for why that has to be the only copy.
 //
-// The one deployment-specific value this module reads is the remote-image host
-// allow-list, and it does not read it directly: it imports the resolved list from
-// src/lib/utils.ts, which is the module every rendering component asks as well.
-// The API origin belongs to the client module that calls it and the canonical
-// site origin belongs to the metadata helpers, so neither appears here.
+// THIS MODULE READS NO ENVIRONMENT VARIABLE, and there is no fourth NEXT_PUBLIC_
+// key behind the host list. `.env.example` declares fifteen variables - eleven
+// backend fields, the three public values NEXT_PUBLIC_API_BASE_URL,
+// NEXT_PUBLIC_SITE_URL and NEXT_PUBLIC_SITE_NAME, and the server-only
+// API_INTERNAL_BASE_URL - and the host allow-list is
+// deliberately not among them: it is declared in source, in src/lib/utils.ts,
+// which is the module every rendering component asks as well. The API origin
+// belongs to the client module that calls it and the canonical site origin
+// belongs to the metadata helpers, so neither appears here either.
 
 import type { NextConfig } from 'next';
 
@@ -80,24 +84,30 @@ const nextConfig: NextConfig = {
     // rejected, while `pathname` is `/**` because these are delivery CDNs whose
     // path shape is theirs, not ours.
     //
-    // THE LIST IS DERIVED, NOT DECLARED, AND THAT IS THE POINT.
+    // THE LIST IS DERIVED HERE AND DECLARED THERE, AND THAT IS THE POINT.
     //
-    // `IMAGE_HOST_ALLOWLIST` resolves in src/lib/utils.ts from
-    // NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST (documented in .env.example), defaulting
-    // to the four delivery hosts the seeded content uses. The same module exports
-    // the `isAllowedImageUrl` predicate that every component asks before handing
-    // a stored URL to next/image or to an avatar, so the optimiser's list and the
-    // components' list are the same list by construction.
+    // `IMAGE_HOST_ALLOWLIST` is a source-code constant in src/lib/utils.ts - four
+    // named delivery hosts, each with its reason written beside it. The same
+    // module exports the `isAllowedImageUrl` predicate that every component asks
+    // before handing a stored URL to next/image or to an avatar, so the
+    // optimiser's list and the components' list are the same list by
+    // construction.
     //
     // Writing the hosts out again here would recreate exactly the defect this
     // derivation removes. The service accepts any absolute http(s) URL for
     // cover_image_url and avatar_url (pydantic.HttpUrl), so the two tiers already
     // disagree about what is storable; the presentation tier's answer must at
     // least be single-valued, or a stored cover renders through the optimiser on
-    // one surface and as a broken request on another. Admitting a host is a
-    // configuration change - one entry in NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST -
-    // rather than an edit here, so an operator can keep this tier in step with
-    // whatever the service has been allowed to store without a redeploy of code.
+    // one surface and as a broken request on another.
+    //
+    // EVERY ENTRY ARRIVES GRAMMAR-CHECKED. src/lib/utils.ts validates the list
+    // against `isBareHostname` at the point of declaration and throws otherwise,
+    // so no scheme, userinfo, port, path, query, fragment or wildcard can reach
+    // the map below - and `**`, which this framework reads as "any host" and
+    // which would turn the optimiser into an open proxy for arbitrary remote
+    // content, is unrepresentable rather than merely discouraged. Because that
+    // module is the only way to reach the list, the check cannot be bypassed by
+    // adding a second caller here.
     remotePatterns: IMAGE_HOST_ALLOWLIST.map((hostname) => ({
       protocol: 'https' as const,
       hostname,

@@ -85,14 +85,10 @@ import {
   apiPost,
   type RequestOptions,
 } from '@/lib/api/client';
-import type {
-  Page,
-  PostCreate,
-  PostDetail,
-  PostSort,
-  PostSummary,
-  PostUpdate,
-} from '@/lib/types';
+import { encodePathSegment } from '@/lib/paths';
+import { pageOf, postDetailSchema, postSummarySchema } from '@/lib/types';
+import type { Page, PostCreate, PostDetail, PostSort, PostSummary, PostUpdate } from '@/lib/types';
+import { MAX_SEARCH_TERM_LENGTH } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
  * Paths
@@ -151,8 +147,18 @@ const POSTS_PATH = '/posts';
  * @param pathKey - The post's slug for the read, or its server-generated identifier for a mutation.
  * @returns The namespace-relative path of that one post.
  */
-function postResourcePath(pathKey: string): string {
-  return `${POSTS_PATH}/${encodeURIComponent(pathKey)}`;
+function postResourcePath(pathKey: string, operation: string): string {
+  // Through the tier's ONE encoder. `encodeURIComponent` alone leaves `.` and `..` intact, so
+  // `getPost('..')` composed `/posts/../admin/users` - a SUCCESSFUL request against a route this
+  // wrapper never named, rather than the 404 a caller would expect.
+  return `${POSTS_PATH}/${encodePathSegment(pathKey, {
+    operation,
+    parameterName: operation === 'getPost' ? 'slug' : 'id',
+    hint:
+      operation === 'getPost'
+        ? 'Read the slug from PostSummary.slug or from the blog route path segment.'
+        : 'Pass the UUID the API emitted for the post.',
+  })}`;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -268,6 +274,33 @@ export interface ListPostsParams {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
+ * Refuse a search term longer than the service accepts, before a request is spent on it.
+ *
+ * Mirrors the service's own bound rather than restating its policy: the number is
+ * {@link MAX_SEARCH_TERM_LENGTH}, imported from the contract types, and the service publishes it as
+ * `maxLength` on every `q` parameter. Absence and a blank term are left alone - the client module's
+ * query builder drops them and the service treats a whitespace-only term as no filter - so this
+ * checks exactly one thing.
+ *
+ * Thrown rather than truncated, and thrown rather than sent, because the service refuses an
+ * over-long term with the uniform problem document: shortening it would answer a question the
+ * caller did not ask, and sending it would spend a round trip to be told so.
+ *
+ * @param term - The caller's `q`, or `undefined`/`null` when no term was supplied.
+ * @param caller - The exported function's name, so the message names the call the author wrote.
+ * @throws {RangeError} When the term is longer than {@link MAX_SEARCH_TERM_LENGTH} characters.
+ */
+function assertSearchTermLength(term: string | null | undefined, caller: string): void {
+  if (term !== undefined && term !== null && term.length > MAX_SEARCH_TERM_LENGTH) {
+    throw new RangeError(
+      `${caller}: q must be at most ${String(MAX_SEARCH_TERM_LENGTH)} characters, received ` +
+        `${String(term.length)}. The service refuses a longer term with 422 rather than ` +
+        `truncating it, so cap the search input at that length instead of sending it.`,
+    );
+  }
+}
+
+/**
  * Read a page of the feed: `GET /posts`.
  *
  * The most requested route in the product, and the one place where search, category filtering,
@@ -311,8 +344,11 @@ export function listPosts(
   params: ListPostsParams = {},
   options?: PostRequestOptions,
 ): Promise<Page<PostSummary>> {
-  return apiGet<Page<PostSummary>>(POSTS_PATH, {
+  assertSearchTermLength(params.q, 'listPosts');
+
+  return apiGet(POSTS_PATH, pageOf(postSummarySchema), {
     ...options,
+    anonymousFallback: true,
     // Each of the six is forwarded raw. Blank members are dropped by the client module's query
     // builder, so an unfiltered request produces `/posts` rather than a string of empty parameters.
     query: {
@@ -354,7 +390,10 @@ export function listPosts(
  * ```
  */
 export function getPost(slug: string, options?: PostRequestOptions): Promise<PostDetail> {
-  return apiGet<PostDetail>(postResourcePath(slug), options);
+  return apiGet(postResourcePath(slug, 'getPost'), postDetailSchema, {
+    ...options,
+    anonymousFallback: true,
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -403,7 +442,7 @@ export function getPost(slug: string, options?: PostRequestOptions): Promise<Pos
  * ```
  */
 export function createPost(input: PostCreate, options?: PostRequestOptions): Promise<PostDetail> {
-  return apiPost<PostDetail>(POSTS_PATH, input, options);
+  return apiPost(POSTS_PATH, postDetailSchema, input, options);
 }
 
 /**
@@ -450,7 +489,7 @@ export function updatePost(
 ): Promise<PostDetail> {
   // `changes` is handed over as it was received. Serialisation omits absent members, which is what
   // makes the update partial; rebuilding the object here is what would make it total.
-  return apiPatch<PostDetail>(postResourcePath(id), changes, options);
+  return apiPatch(postResourcePath(id, 'updatePost'), postDetailSchema, changes, options);
 }
 
 /**
@@ -479,7 +518,7 @@ export function updatePost(
  * ```
  */
 export function deletePost(id: string, options?: PostRequestOptions): Promise<void> {
-  return apiDeleteNoContent(postResourcePath(id), options);
+  return apiDeleteNoContent(postResourcePath(id, 'deletePost'), options);
 }
 
 /**
@@ -513,7 +552,12 @@ export function deletePost(id: string, options?: PostRequestOptions): Promise<vo
  */
 export function publishPost(id: string, options?: PostRequestOptions): Promise<PostDetail> {
   // `undefined` for the body is the explicit no-body form; it is not a placeholder for one.
-  return apiPost<PostDetail>(`${postResourcePath(id)}/publish`, undefined, options);
+  return apiPost(
+    `${postResourcePath(id, 'publishPost')}/publish`,
+    postDetailSchema,
+    undefined,
+    options,
+  );
 }
 
 /**
@@ -541,6 +585,10 @@ export function publishPost(id: string, options?: PostRequestOptions): Promise<P
  * ```
  */
 export function unpublishPost(id: string, options?: PostRequestOptions): Promise<PostDetail> {
-  return apiPost<PostDetail>(`${postResourcePath(id)}/unpublish`, undefined, options);
+  return apiPost(
+    `${postResourcePath(id, 'unpublishPost')}/unpublish`,
+    postDetailSchema,
+    undefined,
+    options,
+  );
 }
-

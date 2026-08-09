@@ -100,7 +100,9 @@
  */
 
 import { apiGet, apiPatch, type RequestOptions } from '@/lib/api/client';
+import { encodePathSegment } from '@/lib/paths';
 
+import { pageOf, postSummarySchema, userMeSchema, userPublicSchema } from '@/lib/types';
 import type { Page, PostSummary, UserMe, UserPublic, UserUpdate } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
@@ -297,7 +299,17 @@ function authorSegment(username: string, operation: string): string {
     );
   }
 
-  return encodeURIComponent(username);
+  // The reserved-segment and absence checks above answer with information the shared encoder
+  // cannot, so they stay. The URL rules are the encoder's: notably a DOT SEGMENT, which is
+  // unreserved and therefore survives percent-encoding, so `/users/../auth/me` would be composed,
+  // resolved by the URL grammar and answered by a route this wrapper never named.
+  return encodePathSegment(username, {
+    operation,
+    parameterName: 'username',
+    hint:
+      "The handle comes from the profile route's own path segment; check that it was read " +
+      'under the name the segment declares.',
+  });
 }
 
 /**
@@ -440,7 +452,7 @@ function toSelfUpdateBody(changes: UserUpdate): UserUpdate {
  * ```
  */
 export function updateMe(changes: UserUpdate, options?: SelfUpdateOptions): Promise<UserMe> {
-  return apiPatch<UserMe>(SELF_PROFILE_PATH, toSelfUpdateBody(changes), options);
+  return apiPatch(SELF_PROFILE_PATH, userMeSchema, toSelfUpdateBody(changes), options);
 }
 
 /**
@@ -479,7 +491,10 @@ export function updateMe(changes: UserUpdate, options?: SelfUpdateOptions): Prom
 export function getProfile(username: string, options?: ProfileReadOptions): Promise<UserPublic> {
   const segment = authorSegment(username, 'getProfile');
 
-  return apiGet<UserPublic>(`${AUTHOR_PROFILE_PATH_PREFIX}${segment}`, options);
+  return apiGet(`${AUTHOR_PROFILE_PATH_PREFIX}${segment}`, userPublicSchema, {
+    ...options,
+    anonymousFallback: true,
+  });
 }
 
 /**
@@ -537,8 +552,9 @@ export function getUserPosts(
   const segment = authorSegment(username, 'getUserPosts');
   const path = `${AUTHOR_PROFILE_PATH_PREFIX}${segment}${AUTHOR_POSTS_PATH_SUFFIX}`;
 
-  return apiGet<Page<PostSummary>>(path, {
+  return apiGet(path, pageOf(postSummarySchema), {
     ...options,
+    anonymousFallback: true,
     // Both members are omitted from the URL when absent - the client module drops an undefined
     // query value - so the default call produces a bare path rather than one carrying blanks.
     query: {

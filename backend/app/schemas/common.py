@@ -70,14 +70,16 @@ load-bearing. Not ``app.models``, not ``app.core.config``, not the environment: 
 module performs no I/O, reaches no database and reads no setting, which is what lets a test
 import it with nothing running.
 
-The one name this module exports beyond the two models is :func:`omit_null_default`, and the
-direction of that dependency is worth noting: the five partial-update schemas import it *from
-here*, so this module gains no import of its own by being the place the pattern is declared.
+Three names are exported beyond the two models, and the direction of each dependency is worth
+noting: the five partial-update schemas import :func:`omit_null_default` *from here*, and the two
+routers with a search parameter import :data:`SearchTerm` and
+:data:`MAX_SEARCH_TERM_LENGTH` *from here*. So this module gains no import of its own by being
+the place each shared rule is declared.
 """
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Final
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
 from pydantic.json_schema import SkipJsonSchema
 
 from app.core.pagination import Page
@@ -129,6 +131,81 @@ def omit_null_default(json_schema: dict[str, Any]) -> None:
     """
     json_schema.pop("default", None)
 
+
+MAX_SEARCH_TERM_LENGTH: Final[int] = 256
+"""Longest free-text search term any listing in this service accepts.
+
+Every ``?q=`` parameter in the API is bounded by this one number - the public feed and the three
+administrative listings - so a term that one surface refuses cannot be accepted by another.
+
+The bound exists because an unbounded term is not merely untidy. It is parsed by PostgreSQL's
+full-text query parser, matched against a trigram index, and written into a structured log line,
+so its length is multiplied by the work each of those does; a megabyte of ``q`` would be a
+megabyte of parsing, of index probing and of log volume for a request that cannot usefully match
+anything. 256 characters is far longer than any real search - it is roughly three sentences -
+and short enough that none of those three costs can be driven by the caller.
+
+Enforced by :data:`SearchTerm`, published as ``maxLength`` on each parameter in
+``/openapi.json``, and mirrored by ``MAX_SEARCH_TERM_LENGTH`` in ``frontend/src/lib/types.ts``
+so a client refuses an over-long term before spending a request on it. Deliberately off
+``__all__``: it is shared machinery reachable at this module address, exactly as the length
+bounds in ``app.schemas.category`` and ``app.schemas.post`` are.
+"""
+
+
+def _normalise_search_term(value: str | None) -> str | None:
+    """Collapse a submitted search term's whitespace, and fold an empty result to ``None``.
+
+    One normalisation for every ``?q=`` in the service, so "no filter" has exactly one meaning
+    on the wire. Without it each surface decides for itself whether ``"   "`` is a term, and a
+    search box that submits its blank value would add a predicate matching everything on one
+    listing and be ignored on another.
+
+    Two things happen, and only two. Runs of whitespace - including the ``%20`` a URL-encoded
+    space arrives as, tabs and newlines - collapse to single spaces, and leading and trailing
+    whitespace disappears with them; a result with no characters left becomes ``None``. Nothing
+    else is touched: the term is **not** lower-cased, quoted, tokenised or stripped of
+    punctuation, because ``websearch_to_tsquery`` parses its own operator syntax and a reader who
+    typed ``"exact phrase" -excluded`` on purpose must have it reach the parser intact.
+
+    Args:
+        value: The submitted term, or ``None`` when the parameter was omitted.
+
+    Returns:
+        The whitespace-collapsed term, or ``None`` when the parameter was absent or carried no
+        non-whitespace character.
+    """
+    if value is None:
+        return None
+    # `str.split()` with no argument splits on arbitrary whitespace runs and discards empties,
+    # so joining its result performs the collapse and the strip in one pass.
+    collapsed = " ".join(value.split())
+    return collapsed or None
+
+
+SearchTerm = Annotated[
+    str | None,
+    StringConstraints(max_length=MAX_SEARCH_TERM_LENGTH),
+    AfterValidator(_normalise_search_term),
+]
+"""The ``?q=`` query parameter, bounded and normalised, for every listing that accepts one.
+
+Used as the annotation of the parameter itself, with the route supplying only its own
+description::
+
+    q: Annotated[SearchTerm, Query(description="Free-text search term ...")] = None
+
+**The order of the two metadata entries is load-bearing.** The constraint is applied before the
+validator, so an over-long term is refused as a ``422`` naming ``q`` while it is still the string
+the caller sent - the length a client is told about is the length it submitted. Reversing them
+makes the framework apply ``max_length`` to the validator's *result*, which raises a
+``TypeError`` on a blank term the moment it normalises to ``None``. Verified by execution: in
+this order an absent, blank, padded, at-bound and over-bound term answer ``None``, ``None``, the
+collapsed term, the term, and ``422`` respectively.
+
+Composing it with a route's ``Query(...)`` is safe because nested ``Annotated`` flattens
+left-to-right, which keeps the constraint ahead of the validator however the route annotates it.
+"""
 
 ValidationErrors = Annotated[list["ValidationErrorItem"], Field(min_length=1)]
 """A non-empty list of field-level failures.

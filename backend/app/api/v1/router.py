@@ -36,7 +36,7 @@ path families that live under different parents: the thread reached through the 
 it (``/posts/{post_id}/comments``) and the comment addressed by its own identifier
 (``/comments/{comment_id}``). Both are included below, under different prefixes, and merging
 them is an application-wide start-up failure rather than a tidy-up. Seven modules, eight
-includes, thirty-seven operations.
+includes, thirty-eight operations.
 
 .. important::
    **Read this before mounting or importing.** Three ways to get this wrong, all of them quiet
@@ -73,7 +73,7 @@ service is on the ``admin`` include below. That placement is load-bearing, not s
 ``app.api.v1.routers.admin`` constructs a bare router specifically so the gate can live on the
 mount: a gate on the mount covers every operation beneath it, including one added long after
 this file was written by someone who never read this paragraph, so the guarantee becomes a
-property of the composition instead of thirteen separate acts of remembering. Declaring it in
+property of the composition instead of fourteen separate acts of remembering. Declaring it in
 both places would document the same requirement twice in ``/openapi.json`` and protect nothing
 further.
 
@@ -88,21 +88,22 @@ Layering
 --------
 This file sits at the very top of the one-way chain - routes delegate to services, services to
 repositories, repositories own the queries, models own the schema - and it imports downwards no
-further than it must. It reaches ``app.core.dependencies`` for the gate and ``app.schemas`` for
-the error model, and it touches ``app.services``, ``app.repositories``, ``app.models`` and
-``app.db`` not at all. There is no ``HTTPException`` here either: services raise the typed
-``AppError`` family and the handlers registered by ``app.main`` render every failure as one
-:class:`~app.schemas.common.ProblemDetail`, so the three duplicated ad-hoc 404 raises of the
-retired module have no successor in this layer.
+further than it must. It reaches ``app.core.dependencies`` for the gate and
+``app.api.v1.responses`` for the error contract - a sibling in this same tier, which is why the
+error model itself is not imported here - and it touches ``app.services``, ``app.repositories``,
+``app.models`` and ``app.db`` not at all. There is no ``HTTPException`` here either: services
+raise the typed ``AppError`` family and the handlers registered by ``app.main`` render every
+failure as one :class:`~app.schemas.common.ProblemDetail`, so the three duplicated ad-hoc 404
+raises of the retired module have no successor in this layer.
 """
 
-from typing import Any, Final
+from typing import Final
 
 from fastapi import APIRouter, Depends, status
 
+from app.api.v1.responses import ProblemResponses, problem_response
 from app.api.v1.routers import admin, auth, categories, comments, likes, posts, users
 from app.core.dependencies import require_admin
-from app.schemas import ProblemDetail
 
 __all__ = ["API_V1_PREFIX", "api_router", "router"]
 
@@ -130,36 +131,31 @@ silently re-route every route in the service.
 #
 # The gate is attached on the `admin` include below, so the two statuses it introduces are
 # documented on the same call rather than left as undeclared bodies a client generator has
-# to guess at. `ProblemDetail` is the model on both, because this API has exactly one error
-# shape for every failure at every status code.
+# to guess at. Both entries come from `app.api.v1.responses.problem_response`, because this
+# API has exactly one error shape for every failure at every status code and exactly one
+# media type for it - and that helper is the single place either is decided.
 #
-# `app.api.v1.routers.admin` declares the same pair on each of its thirteen routes; the
+# `app.api.v1.routers.admin` declares the same pair on each of its fourteen routes; the
 # wording below is deliberately consistent with it rather than a second, competing
 # description of the same condition.
 # ---------------------------------------------------------------------------------------
 
-_ADMIN_GATE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_401_UNAUTHORIZED: {
-        "model": ProblemDetail,
-        "description": (
-            "No usable credential was presented: the `Authorization` header was absent or "
-            "malformed, or the bearer token was expired, of the wrong type, or names an "
-            "account that no longer exists. Obtain a fresh access token from "
-            "`POST /api/v1/auth/login` or `POST /api/v1/auth/refresh` and retry."
-        ),
-    },
-    status.HTTP_403_FORBIDDEN: {
-        "model": ProblemDetail,
-        "description": (
-            "The credential is valid but the account may not use this namespace - it holds "
-            "`READER` or `AUTHOR` rather than `ADMIN`, or it has been deactivated. The body "
-            "does not disclose which role would have sufficed."
-        ),
-    },
+_ADMIN_GATE_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_401_UNAUTHORIZED: problem_response(
+        "No usable credential was presented: the `Authorization` header was absent or "
+        "malformed, or the bearer token was expired, of the wrong type, or names an "
+        "account that no longer exists. Obtain a fresh access token from "
+        "`POST /api/v1/auth/login` or `POST /api/v1/auth/refresh` and retry."
+    ),
+    status.HTTP_403_FORBIDDEN: problem_response(
+        "The credential is valid but the account may not use this namespace - it holds "
+        "`READER` or `AUTHOR` rather than `ADMIN`, or it has been deactivated. The body "
+        "does not disclose which role would have sufficed."
+    ),
 }
 """401 and 403, declared on the include that gates the administrative namespace.
 
-Both apply uniformly to all thirteen operations beneath the mount, because the gate does. The
+Both apply uniformly to all fourteen operations beneath the mount, because the gate does. The
 pair is declared once, on the include, for the same reason the gate itself is: a per-route
 declaration holds only for as long as every future author remembers it.
 """

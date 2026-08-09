@@ -8,14 +8,18 @@ and ``app.services.like_service`` import rather than re-derive.
 
 Authority lives here, not in the route
 --------------------------------------
-An author may act only on their own posts; an administrator may act on any. That comparison is
-made in this module and nowhere else, so the rule holds no matter which entry point invokes it
-and is testable without an HTTP request:
+Post authority has two halves and a mutation must satisfy both. The **capability**: only an
+account holding ``AUTHOR`` or ``ADMIN`` may author at all, so demoting an author to ``READER``
+actually revokes something rather than merely relabelling the row. The **ownership rule**: an
+author may act only on their own posts, while an administrator may act on any. Both comparisons
+are made in this module by calling the predicates ``app.core.dependencies`` declares -
+``ensure_can_author`` and ``ensure_can_modify`` - so each rule has one definition, holds no
+matter which entry point invokes it, and is testable without an HTTP request:
 
 .. code-block:: python
 
     service = PostService(session)
-    post = await service.publish(post_id, actor=principal)  # ForbiddenError if not theirs
+    post = await service.publish(post_id, actor=principal)  # 403 if READER, or if not theirs
 
 A router's job is to resolve the principal, call one method here and let
 ``app.core.exceptions`` translate whatever is raised. A client-side route guard and a hidden
@@ -69,8 +73,22 @@ cleaned at two boundaries: here on write, and again where it is rendered. Neithe
 for the other, and this module never assumes the client will cover for it. The allow-lists are
 module-level named constants so they can be reviewed in one place - see
 :data:`CONTENT_ALLOWED_TAGS`.
+
+The write-side pass is itself two passes, because the field is Markdown that may embed HTML and
+each syntax hides what the other cannot see. :func:`_sanitize_markdown_urls` neutralises a link,
+image, autolink or reference definition whose destination names a scheme outside
+:data:`CONTENT_ALLOWED_PROTOCOLS` - ``[text](javascript:...)`` carries no markup, so an HTML
+sanitiser reads it as prose and passes it through intact - and ``bleach.clean`` then handles
+markup written out longhand. Running only one of the two leaves a live vector, and the value both
+protect is the *stored* one, which is what makes every consumer of ``GET /api/v1/posts/{slug}``
+safe rather than only the renderer in this repository.
+
+Both passes are CPU-bound over a body of up to a hundred thousand characters, so neither runs on
+the event loop: :func:`_sanitize_content_off_loop` and :func:`_sanitize_excerpt_off_loop` are what
+the write paths call.
 """
 
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -78,17 +96,19 @@ from types import MappingProxyType
 from typing import Final
 
 import bleach
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import PageParams, ensure_can_modify, is_admin
+from app.core.concurrency import run_cpu_bound
+from app.core.dependencies import PageParams, ensure_can_author, ensure_can_modify, is_admin
 from app.core.exceptions import ConflictError, NotFoundError
 from app.core.logging import get_logger, log_safe_text
 from app.core.pagination import Page, build_page
 from app.core.slug import slugify_title, unique_slug
 from app.models import Category, Post, PostStatus, User
 from app.repositories import CategoryRepository, PostRepository, PostSort, UserRepository
-from app.schemas.post import PostCreate, PostSummary, PostUpdate
+from app.schemas.post import DEFAULT_POST_SORT_OPTION, PostCreate, PostSummary, PostUpdate
 
 __all__ = [
     "ALL_POST_STATUSES",
@@ -232,6 +252,165 @@ past a scheme check; ``file:`` addresses the reader's own machine. bleach drops 
 attribute when its value carries an unlisted scheme, so ``<a href="javascript:...">`` survives
 as a plain ``<a>`` with its text intact rather than disappearing and taking the sentence with
 it.
+
+The same three schemes govern the **Markdown** link and image destinations
+:func:`_sanitize_markdown_urls` inspects, so the policy is one set for both syntaxes rather
+than an HTML rule and a Markdown rule that could drift apart.
+"""
+
+_URL_STRIPPED_CHARACTERS: Final[str] = "\t\n\r"
+"""The characters a URL parser removes from *anywhere* inside a URL: tab, line feed, return.
+
+Not a stylistic detail - it is the reason a scheme allow-list gets walked past. WHATWG URL
+removes exactly these three from the whole input before parsing, so a tab in the middle of
+``javascript`` still resolves to the ``javascript`` scheme in a browser while being an unknown
+string to a naive comparison.
+
+Space is deliberately **absent**. Leading and trailing spaces are stripped from a URL, but an
+interior space is percent-encoded rather than removed, so ``foo bar:`` is not a scheme - and
+treating it as one would defuse ``[text](foo bar)``, which Markdown never read as a link in the
+first place.
+"""
+
+_MARKDOWN_SCHEME_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"""
+    \A
+    [\x00-\x20]*                     # leading C0 controls and spaces, which a URL parser strips
+    (?P<scheme>
+        [a-zA-Z]                     # a scheme must open with a letter
+        [a-zA-Z0-9+.\-\t\n\r]*       # then scheme characters, interleaved padding tolerated
+    )
+    [\x00-\x20]*                     # and padding immediately before the colon
+    :
+    """,
+    re.VERBOSE,
+)
+"""Matches the scheme of a Markdown destination, tolerating the padding a browser tolerates.
+
+Anchored, so it answers "does this destination *open* with a scheme" and never finds one later
+in the string - ``/a/b:c`` is a relative path whose colon is part of a segment, not a scheme.
+
+Three kinds of padding are admitted, and each because a browser admits it: C0 controls and
+spaces before the scheme, the three characters in :data:`_URL_STRIPPED_CHARACTERS` *inside* the
+scheme name, and padding immediately before the colon. A pattern built on ``\\s`` alone, or one
+that ended the scheme at the first unexpected character, would read a tab-interrupted
+``javascript`` as no scheme at all, pass it through as safe, and hand a live script URL to
+whichever renderer received the row - which is the classic way a scheme allow-list is walked
+past. :func:`_destination_scheme` removes the padding from the captured value before comparing.
+"""
+
+_MARKDOWN_CODE_SPAN_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?P<fence>`+)(?:.|\n)*?\1")
+"""Matches an inline code span: a backtick run, its content, and a run of the same length.
+
+CommonMark closes a code span with a backtick run of *exactly* the opening length, which the
+back-reference expresses. Non-greedy, so ```` ``a`` and ``b`` ```` is two spans rather than one.
+"""
+
+_MARKDOWN_FENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})[^\n]*\n"
+    r"(?:.*?\n)??"
+    r"(?:(?P=indent)?(?P=fence)[`~]*[ \t]*$|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+"""Matches a fenced code block, closed or left open at the end of the document.
+
+Both fence characters, three or more of them, and a closing fence of at least the opening
+length. An unclosed fence runs to the end of the input, which is what CommonMark specifies and
+what stops a trailing ``` from making the rest of a document look like prose.
+"""
+
+_MARKDOWN_DESTINATION: Final[str] = (
+    r"(?:"
+    r"<[^<>\n]*>"  # an angle-bracketed destination
+    r"|"
+    r"(?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*\))+"  # or a bare one, parens balanced once
+    r")"
+)
+"""Sub-pattern for a Markdown link destination, in either of its two spellings.
+
+The bare form permits **one level of balanced parentheses**, which is what CommonMark itself
+permits and what a real destination needs: ``javascript:fetch('/x')`` and
+``https://en.wikipedia.org/wiki/Foo_(bar)`` both carry a parenthesised tail, and a class that
+simply excluded ``(`` would fail to match either - leaving the link unmatched and, for the first
+of the two, unneutralised. Backslash escapes are consumed as single units, so an escaped closing
+parenthesis inside a destination does not close it early.
+
+One level and not arbitrary nesting, deliberately: a recursive pattern is not expressible here
+and an unbounded one would backtrack, which on a body of a hundred thousand characters is a
+denial-of-service surface of its own. Anything this does not match is caught by
+:func:`_break_unsafe_link_syntax`, which is why the bound is safe rather than merely pragmatic.
+"""
+
+_MARKDOWN_INLINE_LINK_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"""
+    (?P<bang>!?)                     # an image when present, a link when not
+    \[(?P<label>[^\]]*)\]            # the visible text
+    \(
+        [ \t]*
+        (?P<destination>"""
+    + _MARKDOWN_DESTINATION
+    + r""")
+        (?P<title>[ \t]+(?:"[^"]*"|'[^']*'|\([^)\n]*\))\s*)?
+        [ \t]*
+    \)
+    """,
+    re.VERBOSE,
+)
+"""Matches an inline Markdown link or image and captures its destination and title separately.
+
+The label class excludes ``]`` rather than balancing brackets, which keeps the expression
+linear and cannot backtrack pathologically on a body of up to a hundred thousand characters. A
+nested-bracket label is therefore matched from its innermost ``]``; that produces a *shorter*
+match, never a missed destination, so the scheme check still sees the URL.
+"""
+
+_MARKDOWN_LINK_OPENING_PATTERN: Final[re.Pattern[str]] = re.compile(r"\]\(")
+"""Matches the two characters that open an inline destination, and nothing else.
+
+The anchor for the safety net. It cannot fail to find a link, because ``](`` is the one thing
+every inline link and image must contain - which is exactly the property
+:func:`_break_unsafe_link_syntax` needs and the structural pattern above cannot promise.
+"""
+
+_MARKDOWN_TRAILING_SCHEME_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"""
+    [\x00-\x20]*                     # optional padding after the opening parenthesis
+    <?                               # the angle-bracketed spelling of a destination
+    [\x00-\x20]*
+    (?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-\t\n\r]*)
+    [\x00-\x20]*
+    :
+    """,
+    re.VERBOSE,
+)
+"""The scheme matcher the safety net applies at a position inside the document.
+
+Identical in meaning to :data:`_MARKDOWN_SCHEME_PATTERN` and deliberately *not* anchored with
+``\\A``, because it is used through ``Pattern.match(text, position)`` - which anchors at the
+position it is given, while ``\\A`` would keep insisting on the start of the whole string and
+never match. Matching at a position rather than against a slice is what keeps the net linear: a
+document with a thousand links would otherwise copy a tail per link.
+"""
+
+_MARKDOWN_AUTOLINK_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"<(?P<destination>[^<>\s]+:[^<>\s]*)>"
+)
+"""Matches a CommonMark autolink - a scheme-bearing URI inside angle brackets."""
+
+_MARKDOWN_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"""
+    ^(?P<prefix>[ \t]{0,3}\[(?P<label>[^\]]+)\]:[ \t]*)
+    (?P<destination><[^<>\n]*>|\S+)
+    (?P<suffix>[ \t]*(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\))?[ \t]*)$
+    """,
+    re.VERBOSE | re.MULTILINE,
+)
+"""Matches a link reference definition - ``[label]: destination "title"`` on its own line.
+
+Indented at most three spaces, because four opens an indented code block instead. Reference
+definitions matter as much as inline links: a body may carry ``[x][ref]`` far from the
+``[ref]: javascript:...`` line that arms it, so a sanitiser that inspected only inline
+destinations would leave the whole indirect form untouched.
 """
 
 _NO_TAGS: Final[frozenset[str]] = frozenset()
@@ -281,6 +460,107 @@ _SLUG_CONFLICT: Final[str] = (
     "A post with a conflicting URL slug was created concurrently. Retry the request."
 )
 
+_CATEGORY_FILING_CONFLICT: Final[str] = (
+    "This post's category filings were changed concurrently. Reload the post and retry."
+)
+
+_SLUG_UNIQUE_INDEX: Final[str] = "ix_posts_slug"
+"""Name of the unique index that makes a duplicate slug unstorable.
+
+Not invented: the index is produced by ``unique=True, index=True`` on ``Post.slug`` under the
+``"ix": "ix_%(column_0_label)s"`` convention in ``app.db.base``, revision ``0001`` creates it
+under that name, and PostgreSQL reports it as the ``constraint_name`` on the violation -
+confirmed by execution against PostgreSQL 18.4, which answered ``SQLSTATE 23505`` with
+``diag.constraint_name = 'ix_posts_slug'``.
+"""
+
+_POST_CATEGORIES_PRIMARY_KEY: Final[str] = "pk_post_categories"
+"""Composite primary key ``(post_id, category_id)`` on the filing association."""
+
+_POST_CATEGORIES_CATEGORY_FK: Final[str] = "fk_post_categories_category_id_categories"
+"""Foreign key from a filing to the category it names."""
+
+_CONFLICT_CONSTRAINTS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        # Two concurrent creates of the same title. The taken-slug set was read a moment before
+        # the INSERT, so the loser of the race arrives here; a retry sees the row that won and
+        # derives the next free suffix, which is why this is reported as contention.
+        _SLUG_UNIQUE_INDEX: _SLUG_CONFLICT,
+        # Two concurrent writers filing this post under the same category. The ORM computes the
+        # association delta from the membership it loaded, so a filing added in between is a row
+        # the delta does not know about.
+        _POST_CATEGORIES_PRIMARY_KEY: _CATEGORY_FILING_CONFLICT,
+        # A category deleted after `_resolve_categories` confirmed it existed. The identifier was
+        # valid when the request was validated, so this is contention rather than a bad request -
+        # and the 404 that a genuinely unknown identifier earns is raised before any statement.
+        _POST_CATEGORIES_CATEGORY_FK: _CATEGORY_FILING_CONFLICT,
+    }
+)
+"""The only integrity failures this service is willing to translate, and what each becomes.
+
+Everything absent from this mapping is re-raised. That is the point of expressing it as an
+allow-list: a check violation on ``ck_posts_published_at_required``, a foreign key to a deleted
+author, a ``NOT NULL`` violation - each says something has gone wrong *here*, in this service,
+and reporting one as "somebody else got there first" would send a client to retry a request that
+cannot succeed while hiding the defect behind ordinary-looking contention.
+
+Read-only, for the reason recorded on :data:`CONTENT_ALLOWED_ATTRIBUTES`: ``Final`` stops the
+name being rebound but nothing stops a mutable mapping being edited, and an entry added here at
+runtime would widen error translation process-wide with no diff to review.
+"""
+
+_TRANSLATABLE_SQLSTATES: Final[frozenset[str]] = frozenset({"23505", "23503"})
+"""``unique_violation`` and ``foreign_key_violation`` - the two classes that can be contention.
+
+Checked alongside the constraint name rather than instead of it, so one differently-classed
+error that happens to name the same object cannot satisfy the test. Deliberately excluded:
+``23514`` (``check_violation``) and ``23502`` (``not_null_violation``), neither of which a
+concurrent request can cause - both mean this service assembled a row it should not have.
+"""
+
+
+def _conflict_detail(error: IntegrityError) -> str | None:
+    """Classify an integrity failure, returning the conflict to report or ``None`` to re-raise.
+
+    One classifier shared by :meth:`PostService.create` and :meth:`PostService.update`, so the
+    two paths cannot disagree about which failures are contention. Before it existed, ``create``
+    reported *every* integrity error as a slug collision - masking a check violation, a dangling
+    author and a missing column behind one misleading ``409`` - while ``update`` translated
+    nothing at all, so the concurrent category-filing race it can genuinely lose surfaced as an
+    unhandled ``500``.
+
+    Args:
+        error: The failure SQLAlchemy raised, wrapping the driver's own exception in ``orig``.
+
+    Returns:
+        The ``detail`` for a :class:`~app.core.exceptions.ConflictError` when the failure is one
+        of the recognised races in :data:`_CONFLICT_CONSTRAINTS`; ``None`` when it is anything
+        else, which the caller must re-raise untouched.
+
+    Note:
+        The discriminator is the driver's diagnostic, never a substring search of the message.
+        ``psycopg`` populates ``diag.constraint_name`` from the server's own error fields, so the
+        comparison is against the identity PostgreSQL reports; matching on message text would
+        depend on the server's locale and on wording that is free to change between releases.
+
+        Written defensively about the *shape* of ``orig`` rather than about the outcome: a driver
+        exposing no ``diag`` yields ``None`` and the failure propagates. Failing closed means an
+        unrecognised error is reported as an error.
+
+        Renaming any of the three constraints is a change this mapping has to make with it, and
+        forgetting is visible rather than silent - a genuine slug race would answer ``500`` where
+        the published contract promises ``409``.
+    """
+    diagnostic = getattr(error.orig, "diag", None)
+    if diagnostic is None:
+        return None
+    if getattr(error.orig, "sqlstate", None) not in _TRANSLATABLE_SQLSTATES:
+        return None
+    constraint = getattr(diagnostic, "constraint_name", None)
+    if not isinstance(constraint, str):
+        return None
+    return _CONFLICT_CONSTRAINTS.get(constraint)
+
 
 # ---------------------------------------------------------------------------------------
 # Lifecycle visibility
@@ -312,6 +592,262 @@ membership under review here if a fourth state is ever added.
 """
 
 
+def _normalise_scheme(scheme: str) -> str:
+    """Reduce a captured scheme to the spelling a URL parser would resolve it as.
+
+    Args:
+        scheme: The scheme exactly as written, padding included.
+
+    Returns:
+        The scheme with every character in :data:`_URL_STRIPPED_CHARACTERS` removed and the rest
+        lower-cased, which is the form :data:`CONTENT_ALLOWED_PROTOCOLS` is written in.
+
+    Note:
+        Shared by :func:`_destination_scheme` and by the safety net in
+        :func:`_break_unsafe_link_syntax`, so the two cannot disagree about what a padded or
+        mixed-case scheme reduces to. Two copies of this three-line reduction is exactly how one
+        of them ends up comparing ``JAVA\tSCRIPT`` against an allow-list of lower-case names and
+        concluding it is unknown, therefore safe.
+    """
+    for stripped in _URL_STRIPPED_CHARACTERS:
+        scheme = scheme.replace(stripped, "")
+    return scheme.lower()
+
+
+def _destination_scheme(destination: str) -> str | None:
+    """Report the URL scheme a Markdown destination opens with, lower-cased.
+
+    Args:
+        destination: A link or image destination, already stripped of any surrounding angle
+            brackets.
+
+    Returns:
+        The scheme in lower case with its internal padding removed, or ``None`` when the
+        destination carries none - a relative path, a bare fragment, a query, or a
+        protocol-relative ``//host/path``. All four are safe by construction: none of them can
+        name a scheme, so the document they resolve against decides, and that document is the
+        site's own.
+
+    Note:
+        The padding is removed *after* the match rather than being excluded by the pattern,
+        because a browser resolves ``java\\tscript:x`` and ``jav\\nascript:x`` as
+        ``javascript:``. Comparing the padded spelling against the allow-list would find no
+        match, conclude "no scheme", and pass exactly the value the check exists to catch. See
+        :data:`_URL_STRIPPED_CHARACTERS` for which characters are stripped, and why a space is
+        not one of them.
+    """
+    match = _MARKDOWN_SCHEME_PATTERN.match(destination)
+    if match is None:
+        return None
+    return _normalise_scheme(match.group("scheme"))
+
+
+def _is_safe_destination(destination: str) -> bool:
+    """Report whether a Markdown destination may keep its link.
+
+    Args:
+        destination: The raw destination as written, angle brackets included if present.
+
+    Returns:
+        ``True`` when the destination carries no scheme at all, or carries one named in
+        :data:`CONTENT_ALLOWED_PROTOCOLS`; ``False`` otherwise.
+    """
+    inner = destination.strip()
+    if inner.startswith("<") and inner.endswith(">"):
+        inner = inner[1:-1]
+    scheme = _destination_scheme(inner)
+    return scheme is None or scheme in CONTENT_ALLOWED_PROTOCOLS
+
+
+def _code_spans(raw: str) -> list[tuple[int, int]]:
+    """Locate every region of a Markdown document that renders as literal text.
+
+    Fenced code blocks, in both fence characters and whether or not they are closed, and inline
+    code spans. Nothing inside either is a link to a Markdown renderer, so nothing inside either
+    may be rewritten by :func:`_sanitize_markdown_urls`.
+
+    Args:
+        raw: The submitted body.
+
+    Returns:
+        Non-overlapping ``(start, end)`` half-open ranges, in ascending order.
+
+    Note:
+        Fences are collected first and a code span is accepted only when it lies entirely outside
+        every fence. The order matters: a fenced block may legitimately contain unbalanced
+        backticks, so a span search run first would pair a backtick inside the block with the
+        fence marker that closes it and swallow the boundary.
+
+        Ranges rather than placeholder substitution, and that is the difference between a correct
+        implementation and a nearly-correct one. Substituting a sentinel - ``\\x00<index>\\x00``,
+        say - assumes the document contains no occurrence of the sentinel, and an author's body is
+        untrusted input that can contain anything: a body carrying the sentinel's own spelling
+        would have its text replaced by an unrelated code block, or raise an index error and
+        answer 500. Working in offsets removes the assumption instead of hardening it.
+    """
+    spans: list[tuple[int, int]] = [match.span() for match in _MARKDOWN_FENCE_PATTERN.finditer(raw)]
+
+    for match in _MARKDOWN_CODE_SPAN_PATTERN.finditer(raw):
+        start, end = match.span()
+        overlaps_fence = any(
+            start < fence_end and fence_start < end for fence_start, fence_end in spans
+        )
+        if not overlaps_fence:
+            spans.append((start, end))
+
+    spans.sort()
+    return spans
+
+
+def _break_unsafe_link_syntax(text: str) -> str:
+    """Make any inline destination this module could not parse inert, without deleting anything.
+
+    The safety net, and the reason the structural rewrite above is allowed to be a regular
+    expression at all. :data:`_MARKDOWN_INLINE_LINK_PATTERN` has to bound its destination
+    somewhere - one level of balanced parentheses, no newline in a title - and every bound is a
+    spelling it will not match. An unmatched link is a link left untouched, which for a
+    ``javascript:`` destination is precisely the outcome that must not be possible. So this pass
+    asks a question that has no bound: for every ``](`` in the document, does what follows open
+    with a scheme this policy refuses?
+
+    Where it does, the *link syntax* is broken rather than the text removed: a space is inserted
+    between the label's ``]`` and the ``(``, which is enough for Markdown to stop reading the two
+    as a link and render both as ordinary characters. Nothing is deleted, so an author can see
+    exactly what they wrote and why it did not become a link, and the destination cannot become
+    an ``href`` in any renderer because there is no longer a link for it to belong to.
+
+    Args:
+        text: The body, after the structural rewrite and with code regions still masked.
+
+    Returns:
+        The body with every unparsed unsafe destination defused. In the ordinary case the
+        structural pass has already removed them all and this returns its argument unchanged.
+
+    Note:
+        The scheme is read from the text *following* the ``](`` with the same anchored matcher
+        the structural pass uses, so the two agree about what a scheme is and about the padding a
+        browser tolerates. Only the head of the destination is examined, which is why no bound on
+        the destination's length is needed here.
+    """
+
+    def defuse(match: re.Match[str]) -> str:
+        # Matched at a position in `text` rather than against a copy of its tail, so a document
+        # with many links stays linear - see `_MARKDOWN_TRAILING_SCHEME_PATTERN`.
+        scheme_match = _MARKDOWN_TRAILING_SCHEME_PATTERN.match(text, match.end())
+        if scheme_match is None:
+            # No scheme follows, so the destination is relative, a fragment, a query or
+            # protocol-relative. All four resolve against this site's own document.
+            return match.group(0)
+        if _normalise_scheme(scheme_match.group("scheme")) in CONTENT_ALLOWED_PROTOCOLS:
+            return match.group(0)
+        return "] ("
+
+    return _MARKDOWN_LINK_OPENING_PATTERN.sub(defuse, text)
+
+
+def _sanitize_markdown_urls(raw: str) -> str:
+    """Neutralise Markdown link and image destinations whose scheme is not permitted.
+
+    The **Markdown** half of the write-side content policy, and the half an HTML sanitiser
+    cannot supply. ``posts.content`` is stored as Markdown and rendered as Markdown, so
+    ``[Click here](javascript:fetch('/steal'))`` contains no markup for :func:`bleach.clean` to
+    inspect: it passes the HTML pass through byte for byte and becomes
+    ``<a href="javascript:...">`` in whichever renderer receives it. This function is what makes
+    the *stored representation* safe, so every consumer of ``GET /api/v1/posts/{slug}`` is
+    protected rather than only the one renderer in this repository.
+
+    Four constructs carry a destination, and all four are covered, because leaving any one of
+    them would leave the vector intact by a different spelling:
+
+    * an inline link, ``[text](destination)``
+    * an inline image, ``![alt](destination)``
+    * an autolink, ``<scheme:rest>``
+    * a link reference definition, ``[label]: destination``, which arms every ``[text][label]``
+      in the document from a line that may be nowhere near them
+
+    Args:
+        raw: The submitted body exactly as it arrived, before the HTML pass.
+
+    Returns:
+        The body with every unsafe destination removed and its visible text preserved: a link
+        becomes its label, an image becomes its alt text, an autolink becomes its own literal
+        characters, and a reference definition's destination becomes an empty fragment so the
+        definition still parses and resolves nowhere. Safe destinations, and every other
+        character of the document, are returned untouched.
+
+    Note:
+        **Code is left alone, and that is a correctness requirement rather than a nicety.** A
+        technical article legitimately contains ``[x](javascript:void(0))`` inside a fenced
+        block or a code span as the *subject* of the prose, where Markdown renders it as text
+        and it is inert. Rewriting it would corrupt the author's example to remove a risk that
+        was never there, so the document is split on the ranges :func:`_code_spans` reports -
+        fenced blocks in both fence characters, closed or unclosed, and inline code spans - and
+        only the gaps between them are rewritten. Indented code blocks are not excluded: an
+        indented line is still parsed for nothing but text, and the one construct that *is*
+        position-sensitive there, the reference definition, already refuses an indent of four or
+        more spaces in :data:`_MARKDOWN_REFERENCE_PATTERN`.
+
+        **The link is dropped and the text kept**, which is the same choice bleach makes for
+        ``<a href="javascript:...">``: it removes the attribute and leaves the sentence
+        readable. Deleting the label with it would silently edit an author's paragraph, and
+        rejecting the whole submission would make a defensible article unpublishable over one
+        bad URL.
+
+        **Two layers, not one.** The four patterns above remove an unsafe link precisely and
+        keep its text; :func:`_break_unsafe_link_syntax` then guarantees that anything they could
+        not parse is inert anyway. A regular expression over Markdown necessarily bounds what it
+        matches, and every bound is a spelling that would otherwise slip through - so the second
+        layer is what makes the guarantee unconditional rather than dependent on the first
+        layer's coverage.
+
+        This runs *before* the HTML pass, on the raw text, so Markdown syntax is still intact -
+        after bleach a bare ``<`` has become ``&lt;`` and an autolink is no longer recognisable
+        as one.
+    """
+
+    def rewrite_inline(match: re.Match[str]) -> str:
+        if _is_safe_destination(match.group("destination")):
+            return match.group(0)
+        # The label for a link, the alt text for an image. Both are the visible content, so
+        # keeping them is what leaves the sentence intact.
+        return match.group("label")
+
+    def rewrite_autolink(match: re.Match[str]) -> str:
+        if _is_safe_destination(match.group("destination")):
+            return match.group(0)
+        # The angle brackets are dropped with the link. What remains is ordinary text, and the
+        # HTML pass that follows escapes anything in it that could open a tag.
+        return match.group("destination")
+
+    def rewrite_reference(match: re.Match[str]) -> str:
+        if _is_safe_destination(match.group("destination")):
+            return match.group(0)
+        # The definition is kept and pointed at an empty fragment rather than deleted. Deleting
+        # it would turn every `[text][label]` that used it into literal brackets in the middle
+        # of a paragraph; pointing it at `#` leaves the prose reading as the author wrote it.
+        return f"{match.group('prefix')}#{match.group('suffix')}"
+
+    def clean(segment: str) -> str:
+        segment = _MARKDOWN_INLINE_LINK_PATTERN.sub(rewrite_inline, segment)
+        segment = _MARKDOWN_AUTOLINK_PATTERN.sub(rewrite_autolink, segment)
+        segment = _MARKDOWN_REFERENCE_PATTERN.sub(rewrite_reference, segment)
+        # Last, and on the result of the three above: whatever they could not parse is defused
+        # here rather than left to a renderer. See `_break_unsafe_link_syntax`.
+        return _break_unsafe_link_syntax(segment)
+
+    # Rewrite the gaps between the code regions and copy the code regions through untouched. The
+    # common case - a body with no code in it at all - is one segment and one pass.
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in _code_spans(raw):
+        pieces.append(clean(raw[cursor:start]))
+        pieces.append(raw[start:end])
+        cursor = end
+    pieces.append(clean(raw[cursor:]))
+
+    return "".join(pieces)
+
+
 def _sanitize_content(raw: str) -> str:
     """Clean author-authored Markdown for storage, keeping the document intact.
 
@@ -324,11 +860,21 @@ def _sanitize_content(raw: str) -> str:
             carry a non-whitespace character by ``app.schemas.post.PostContent``.
 
     Returns:
-        The body with every element outside :data:`CONTENT_ALLOWED_TAGS` removed, every
-        attribute outside :data:`CONTENT_ALLOWED_ATTRIBUTES` dropped, every URL scheme outside
+        The body with every unsafe **Markdown** destination neutralised by
+        :func:`_sanitize_markdown_urls`, then every element outside
+        :data:`CONTENT_ALLOWED_TAGS` removed, every attribute outside
+        :data:`CONTENT_ALLOWED_ATTRIBUTES` dropped, every URL scheme outside
         :data:`CONTENT_ALLOWED_PROTOCOLS` refused, and every comment stripped.
 
     Note:
+        **Two passes, in this order, because the field is Markdown that may embed HTML.** The
+        Markdown pass runs first, while ``[x](javascript:…)`` is still recognisable as a link
+        and before bleach escapes the ``<`` an autolink needs; the HTML pass then handles any
+        markup the author wrote out longhand. Either pass alone leaves a live vector: bleach
+        sees no markup in a Markdown link, and the Markdown pass does not parse HTML. The
+        stored value is what both protect, so every consumer of the API inherits the result and
+        none of them has to repeat it.
+
         ``strip=True`` removes a disallowed element rather than escaping it into visible text.
         A reader of ``<script>alert(1)</script>`` is shown ``alert(1)``, not a literal script
         tag rendered as prose. The schema promises exactly this - "a submission is never
@@ -347,7 +893,7 @@ def _sanitize_content(raw: str) -> str:
     # is `Any`, and binding it here is what keeps the function's declared return type honest
     # without a `# type: ignore`.
     cleaned: str = bleach.clean(
-        raw,
+        _sanitize_markdown_urls(raw),
         tags=CONTENT_ALLOWED_TAGS,
         attributes=_bleach_attributes(CONTENT_ALLOWED_ATTRIBUTES),
         protocols=CONTENT_ALLOWED_PROTOCOLS,
@@ -394,6 +940,53 @@ def _sanitize_excerpt(raw: str) -> str | None:
     return cleaned.strip() or None
 
 
+async def _sanitize_content_off_loop(raw: str) -> str:
+    """Run :func:`_sanitize_content` in a worker thread, leaving the event loop free.
+
+    Sanitisation is pure CPU over a string that ``app.schemas.post.PostContent`` bounds at a
+    hundred thousand characters, and it is two passes: a set of regular-expression rewrites and
+    a full HTML parse. On the event loop that is time no other request can use - a handful of
+    concurrent article submissions would stall the feed, the comment threads and the readiness
+    probe together, which turns an ordinary authoring burst into a availability problem.
+
+    ``run_in_threadpool`` is FastAPI's own mechanism for running synchronous work off the loop -
+    the same one it uses for a synchronous route handler - so no dependency is added and
+    cancellation behaves as it does everywhere else in the application: a client that
+    disconnects mid-sanitisation cancels the awaiting task while the worker is allowed to
+    finish, so the bounded pool is never leaked to abandoned work.
+
+    Offloaded unconditionally rather than above a size threshold. A thread hop costs tens of
+    microseconds against the several database round trips this request already makes, so a
+    threshold would buy nothing measurable while leaving the small-input path doing exactly what
+    this function exists to stop.
+
+    Args:
+        raw: The submitted body.
+
+    Returns:
+        The sanitised body, exactly what :func:`_sanitize_content` returns.
+    """
+    return await run_in_threadpool(_sanitize_content, raw)
+
+
+async def _sanitize_excerpt_off_loop(raw: str) -> str | None:
+    """Run :func:`_sanitize_excerpt` in a worker thread, for the reason on its sibling.
+
+    Args:
+        raw: The submitted excerpt.
+
+    Returns:
+        The stripped text, or ``None`` when nothing survives.
+
+    Note:
+        The excerpt is bounded far tighter than the body, so this hop is about consistency as
+        much as capacity: both text members of a submission are cleaned the same way, off the
+        loop, so no future widening of the excerpt's bound can reintroduce a stall that nobody
+        thinks to look for.
+    """
+    return await run_in_threadpool(_sanitize_excerpt, raw)
+
+
 def _omit_blank(value: str | None) -> str | None:
     """Fold a whitespace-only filter argument to ``None``, so it narrows nothing.
 
@@ -437,13 +1030,21 @@ def _default_sort_for(q: str | None) -> PostSort:
     argument always wins over this; the ranking itself belongs to
     ``app.repositories.post_repository`` and is not reimplemented here.
 
+    **This is reachable only because the route lets ``sort`` be absent.**
+    ``app.api.v1.routers.posts`` declares the parameter as ``PostSortOption | None = None`` and
+    forwards it unchanged for exactly that reason: a route-level default would substitute a value
+    before this function was consulted, and every search that named no ordering would then be
+    answered by recency - the ranked query composed by the repository would never run.
+
     Args:
-        q: The caller's search term, or ``None``.
+        q: The caller's search term, or ``None``. Whitespace alone counts as absent, through
+            :func:`_omit_blank`, so a blank search box browses rather than searching.
 
     Returns:
-        ``"relevance"`` when a term is present, ``"recent"`` otherwise.
+        ``"relevance"`` when a term is present, and :data:`DEFAULT_POST_SORT_OPTION` - the wire
+        contract's own browse default, imported rather than restated - otherwise.
     """
-    return "recent" if _omit_blank(q) is None else "relevance"
+    return DEFAULT_POST_SORT_OPTION if _omit_blank(q) is None else "relevance"
 
 
 # ---------------------------------------------------------------------------------------
@@ -485,6 +1086,14 @@ def visible_statuses_for(
         including an authenticated reader browsing someone else's work.
 
     Note:
+        **A viewer that is not ``None`` is an ACTIVE account**, guaranteed by
+        ``app.core.dependencies.get_current_user_optional``, which resolves a deactivated
+        account as anonymous rather than as a principal. So this predicate does not test
+        ``is_active`` and must not start to: the widening below would otherwise have to
+        remember the check, as would ``can_view_post`` and ``_visible_comment_statuses``, and a
+        suspended author would keep reading their own drafts through whichever of the three
+        forgot.
+
         An authenticated author browsing the *unscoped* feed gets the public set, not their own
         drafts mixed in. That is deliberate: the home feed is a shared surface whose ``total``
         and page boundaries would otherwise differ per caller, and an author's unpublished work
@@ -522,6 +1131,11 @@ def can_view_post(post: Post, viewer: User | None) -> bool:
         draft and an authenticated reader reading someone else's draft or archived post.
 
     Note:
+        **A viewer that is not ``None`` is an ACTIVE account** - see the note on
+        :func:`visible_statuses_for`. Deactivation is enforced once, in the resolver, so a
+        suspended author reaches this predicate as an anonymous caller and is refused their own
+        draft.
+
         The ownership test reads ``post.author_id``, a mapped column that is always present,
         and never ``post.author``, a relationship that is unloaded on anything
         ``PostRepository.get_for_update`` returns. Touching an unloaded relationship under an
@@ -534,31 +1148,6 @@ def can_view_post(post: Post, viewer: User | None) -> bool:
     if viewer is None:
         return False
     return viewer.id == post.author_id or is_admin(viewer)
-
-
-async def _load_relations(post: Post) -> Post:
-    """Load ``author`` and ``categories`` on a post fetched without eager loaders.
-
-    ``PostRepository.get_for_update`` attaches no loader options - its purpose is a lock over
-    one row - so the entity a mutating method holds carries its own columns and nothing else.
-    A response model needs the byline and the category badges, so they are requested here,
-    after the write has been committed.
-
-    ``awaitable_attrs`` is the accessor ``app.db.base`` provides for exactly this, and it is
-    used the way that module prescribes: as a safety valve on a single entity, never inside a
-    loop. A listing must not come through here - it eager-loads both relationships in the one
-    composed statement instead, which is what keeps the feed at two round trips however many
-    posts it returns.
-
-    Args:
-        post: A persistent post whose relationships may be unloaded.
-
-    Returns:
-        The same instance, with both relationships loaded.
-    """
-    await post.awaitable_attrs.author
-    await post.awaitable_attrs.categories
-    return post
 
 
 class PostService:
@@ -659,9 +1248,12 @@ class PostService:
 
         Note:
             **One composed statement, plus its one count.** The repository is asked exactly
-            once and the rows it returns already carry ``author`` and ``categories``, so
-            projecting them issues no follow-up query. If a member of ``PostSummary`` were ever
-            missing here that would be a loader option to add to the repository's statement, and
+            once and the rows it returns already carry ``author`` and ``categories``, narrowed to
+            the columns ``PostSummary`` serialises, so projecting them issues no follow-up query.
+            A member missing from that projection does not degrade quietly: reading a deferred
+            column under an async session raises ``MissingGreenlet``, so the profile is enforced by
+            the runtime rather than by review. If a member of ``PostSummary`` were ever
+            missing here that would be a column to add to the repository's projection, and
             never a reason to iterate.
 
             Public callers see published posts only. That is not enforced by a filter written
@@ -684,6 +1276,11 @@ class PostService:
             author_id=author_id,
             statuses=visible_statuses_for(viewer, author_id),
             sort=_default_sort_for(q) if sort is None else sort,
+            # The compact projection, named explicitly rather than inherited from the
+            # repository's default: this listing serialises `PostSummary`, which carries neither
+            # `content` nor any private `users` column, so the statement is told to fetch neither.
+            # A feed page under the wide profile moved every article body it then discarded.
+            projection="summary",
             limit=window.limit,
             offset=window.offset,
         )
@@ -804,11 +1401,13 @@ class PostService:
 
         return [known[category_id] for category_id in wanted]
 
-    async def _get_for_update(self, post_id: uuid.UUID, *, actor: User) -> Post:
+    async def _get_for_update(
+        self, post_id: uuid.UUID, *, actor: User, with_relations: bool = True
+    ) -> Post:
         """Lock one post for writing and confirm the actor may write it.
 
         The shared preamble of :meth:`update`, :meth:`delete`, :meth:`publish` and
-        :meth:`unpublish`, so the two failure modes are ordered identically on all four paths
+        :meth:`unpublish`, so the three failure modes are ordered identically on all four paths
         and the ordering is stated once. Writing it per method is how four copies of one rule
         drift apart - and how one of them ends up answering ``403`` for a row that does not
         exist.
@@ -816,32 +1415,52 @@ class PostService:
         Args:
             post_id: The post's server-generated identifier, from the URL path.
             actor: The resolved principal attempting the mutation.
+            with_relations: Whether the repository should eager-load ``author`` and
+                ``categories`` alongside the locked row. ``True`` by default because three of
+                the four callers render the post afterwards, and :meth:`update` additionally
+                needs the existing ``categories`` collection loaded before it can assign a
+                replacement. :meth:`delete` passes ``False``: it answers ``204`` with no body,
+                so a byline it will not render is a statement with no consumer.
 
         Returns:
-            The locked post. Its own columns are populated; its relationships are not - see
-            :func:`_load_relations`.
+            The locked post, with ``author`` and ``categories`` loaded unless
+            ``with_relations`` was ``False``. The loading is the repository's - no relationship
+            is ever reached for from this module.
 
         Raises:
+            ForbiddenError: The actor holds ``READER``, or holds ``AUTHOR`` and did not write
+                this post. Both are raised by the predicates in
+                ``app.core.dependencies`` - ``ensure_can_author`` for the role and
+                ``ensure_can_modify`` for the ownership - which are the one definition of each
+                comparison; this module does not restate either.
             NotFoundError: No post carries that identifier.
-            ForbiddenError: The actor neither wrote the post nor holds ``ADMIN``. Raised by
-                ``ensure_can_modify``, which is the one definition of that comparison; this
-                module does not restate it.
 
         Note:
-            ``SELECT ... FOR UPDATE`` is taken before the authority check rather than after, so
+            **Three checks, in this order, and the order is the interesting part.** The role
+            check runs first because it depends on nothing but the principal, so a ``READER``
+            is refused without a row being read or a lock being taken - and the refusal is
+            identical for every identifier, so it separates no post from any other. The lock
+            comes next, then the ownership check.
+
+            ``SELECT ... FOR UPDATE`` is taken before the ownership check rather than after, so
             two requests that both read a draft and both decide to publish it cannot interleave
             between the read and the write: the second blocks until the first's transaction
             ends and then observes its outcome. The lock is released by the commit each caller
             performs.
 
-            Not-found is resolved first, and for an unpublished post that ordering is also what
-            keeps its existence private: a caller who may not modify a draft learns nothing
-            here that a caller who may not *see* it would not already have learned from
-            :meth:`get_by_slug`.
+            Not-found is resolved before ownership, and for an unpublished post that ordering
+            is also what keeps its existence private: a caller who may not modify a draft
+            learns nothing here that a caller who may not *see* it would not already have
+            learned from :meth:`get_by_slug`.
         """
-        post = await self._posts.get_for_update(post_id)
+        # The role gate, before anything is read. `AUTHOR` or `ADMIN`; a demoted account is
+        # refused here, which is what makes the demotion an administrator performs effective.
+        ensure_can_author(actor)
+
+        post = await self._posts.get_for_update(post_id, with_relations=with_relations)
         if post is None:
             raise NotFoundError(_POST_NOT_FOUND)
+        ensure_can_author(actor)
         ensure_can_modify(actor, post.author_id)
         return post
 
@@ -887,6 +1506,7 @@ class PostService:
             with ``published_at`` unset.
 
         Raises:
+            ForbiddenError: The principal holds ``READER``. Raised by ``ensure_can_author``.
             NotFoundError: A supplied category identifier names no category.
             ConflictError: The derived slug was taken between the moment the taken set was read
                 and the moment the row was inserted. See the note.
@@ -897,11 +1517,15 @@ class PostService:
             runs, which is what stops an author publishing by accident and what keeps the
             publication instant and the lifecycle state written together.
 
-            No role is required beyond authentication, which is the contract the endpoint
-            table states: a reader who writes their first post is an author by doing so. The
-            ``AUTHOR`` role exists to describe an account, not to gate this call, and gating it
-            would make the account a new registration receives unable to use the authoring
-            screens it is shown.
+            **``AUTHOR`` or ``ADMIN`` is required, and authorship is not granted by writing.**
+            A self-registered account already holds ``AUTHOR`` - ``app.services.auth_service``
+            assigns it at registration - so this gate costs a new reader nothing and the
+            authoring screens work the moment an account exists. What it does cost is the one
+            case it exists for: an account an administrator has demoted to ``READER`` through
+            ``PATCH /api/v1/admin/users/{id}``, or a reader account created by
+            ``app.db.seed``, cannot write. Promoting such an account here instead - "a reader
+            who writes their first post becomes an author" - would make the demotion revoke
+            nothing at all, because the very next write would hand the role straight back.
 
             **Both text members are sanitised before anything is stored.** The client sanitises
             again where it renders, and this half is not skipped on the strength of that: the
@@ -911,16 +1535,32 @@ class PostService:
             ``search_vector`` is never assigned. It is a generated column, so committing this
             insert is what derives it - there is no trigger to fire and no index to maintain.
         """
+        # The role gate, first and before any read: authoring is an authority this principal
+        # either holds or does not, and it does not depend on anything in the payload.
+        ensure_can_author(author)
+
         # Resolved before the row is built so that a bad identifier fails the request before any
         # slug is reserved or any INSERT is attempted.
         categories = await self._resolve_categories(payload.category_ids)
+
+        # Sanitised on a bounded worker thread rather than on this one. Parsing untrusted markup
+        # costs time in proportion to its length, and `PostContent` admits up to 100 000
+        # characters, so a single large submission would otherwise stall every other request this
+        # worker is serving for the duration. Hoisted out of the constructor below because it is
+        # awaited; the values are what the entity is built from.
+        content = await run_cpu_bound(_sanitize_content, payload.content)
+        excerpt = (
+            None
+            if payload.excerpt is None
+            else await run_cpu_bound(_sanitize_excerpt, payload.excerpt)
+        )
 
         post = Post(
             author_id=author.id,
             title=payload.title,
             slug=await self._derive_slug(payload.title),
-            excerpt=None if payload.excerpt is None else _sanitize_excerpt(payload.excerpt),
-            content=_sanitize_content(payload.content),
+            excerpt=excerpt,
+            content=content,
             # `HttpUrl` validated the scheme and the host; the column is text, and the schema
             # names `str(value)` as the coercion this layer owes it.
             cover_image_url=(
@@ -934,26 +1574,42 @@ class PostService:
         )
 
         try:
-            await self._posts.add(post)
+            # Insert, flush, and load the byline and badges the response needs - all inside the
+            # transaction, so the COMMIT below is the last database action this request takes.
+            # The ordering is the point: a load issued after the commit could fail on a post that
+            # is already durable, and the client would then see an error for a post that exists -
+            # and a retried create would collide with the slug the first attempt reserved.
+            persisted = await self._posts.add_with_relations(post)
             await self._session.commit()
         except IntegrityError as error:
             # The slug is de-duplicated against the slugs that existed a moment ago, so two
             # concurrent creates of the same title can still collide on `ix_posts_slug`. The
             # unique index is the backstop and this is its translation: a conflict with the
             # database's current state, which a retry resolves because the retry sees the row
-            # that won. Rolled back first - the transaction is aborted, so anything else issued
-            # on this session would fail too.
+            # that won.
+            #
+            # Rolled back FIRST and unconditionally - the transaction is aborted either way, so
+            # anything else issued on this session would fail too - and only then is the failure
+            # classified. `_conflict_detail` recognises the slug race and the category-filing
+            # races and nothing else: a check violation, a dangling author or a missing required
+            # column is re-raised untouched, so a defect in this service surfaces as one instead
+            # of being reported to the author as somebody else's title.
             await self._session.rollback()
-            raise ConflictError(_SLUG_CONFLICT) from error
+            detail = _conflict_detail(error)
+            if detail is None:
+                raise
+            raise ConflictError(detail) from error
+
+        await self._session.commit()
 
         get_logger(__name__).info(
             "post created",
-            post_id=str(post.id),
-            slug=log_safe_text(post.slug),
+            post_id=str(persisted.id),
+            slug=log_safe_text(persisted.slug),
             author_id=str(author.id),
             category_count=len(categories),
         )
-        return await _load_relations(post)
+        return persisted
 
     async def update(self, post_id: uuid.UUID, payload: PostUpdate, *, actor: User) -> Post:
         """Apply a partial update for ``PATCH /api/v1/posts/{id}``.
@@ -968,7 +1624,8 @@ class PostService:
             payload: The members that are changing. ``title``, ``content`` and ``category_ids``
                 refuse an explicit null; ``excerpt`` and ``cover_image_url`` accept one, and it
                 means "clear this".
-            actor: The resolved principal. Must own the post or hold ``ADMIN``.
+            actor: The resolved principal. Must hold ``AUTHOR`` or ``ADMIN``, and must own
+                the post unless it holds ``ADMIN``.
 
         Returns:
             The updated post, with ``author`` and ``categories`` loaded.
@@ -976,7 +1633,8 @@ class PostService:
         Raises:
             NotFoundError: No post carries that identifier, or a supplied category identifier
                 names no category.
-            ForbiddenError: The actor neither wrote the post nor holds ``ADMIN``.
+            ForbiddenError: The actor holds ``READER``, or holds ``AUTHOR`` and did not
+                write this post.
 
         Note:
             **The slug is not re-derived, and that is a guarantee rather than an omission.** A
@@ -1017,10 +1675,20 @@ class PostService:
         if payload.title is not None:
             post.title = payload.title
         if payload.content is not None:
-            post.content = _sanitize_content(payload.content)
+            # Off the event loop, for the reason `create` records. The row is held under
+            # `FOR UPDATE` while this runs, which is the narrow cost of sanitising after the
+            # authority check rather than before it: an unauthorised caller must not be able to
+            # spend this worker's CPU, so the lock is taken first and held across the offload.
+            # The lock is on one post, so the only request it can delay is another edit of that
+            # same post.
+            post.content = await run_cpu_bound(_sanitize_content, payload.content)
 
         if "excerpt" in provided:
-            post.excerpt = None if payload.excerpt is None else _sanitize_excerpt(payload.excerpt)
+            post.excerpt = (
+                None
+                if payload.excerpt is None
+                else await run_cpu_bound(_sanitize_excerpt, payload.excerpt)
+            )
         if "cover_image_url" in provided:
             post.cover_image_url = (
                 None if payload.cover_image_url is None else str(payload.cover_image_url)
@@ -1028,36 +1696,56 @@ class PostService:
 
         if payload.category_ids is not None:
             categories = await self._resolve_categories(payload.category_ids)
-            # The current membership has to be loaded before it can be replaced: SQLAlchemy
-            # computes the delta against it, and the locked fetch above attaches no loaders, so
-            # assigning to an unloaded collection would raise `MissingGreenlet`. The rows
-            # `post_categories` gains and loses are the ORM's to emit - this module never writes
-            # to the association table itself.
-            await post.awaitable_attrs.categories
+            # The current membership is already loaded - `_get_for_update` asked the repository
+            # for it - which is what makes this assignment legal: SQLAlchemy computes the delta
+            # against the existing collection, and assigning to an unloaded one under an async
+            # session raises `MissingGreenlet`. The rows `post_categories` gains and loses are the
+            # ORM's to emit; this module never writes to the association table itself.
             post.categories = categories
 
-        await self._posts.save(post)
+        # Flush the UPDATE and re-read the row with its relations, inside the transaction, so the
+        # response is fully materialised before anything is made durable and the COMMIT below is
+        # the last database action of the request.
+        try:
+            updated = await self._posts.save_with_relations(post)
+        except IntegrityError as error:
+            # The same classifier :meth:`create` uses, and it belongs here for a reason that is
+            # easy to miss: this method never touches the slug, but it *does* rewrite
+            # ``post_categories``, whose primary key is ``(post_id, category_id)``. The ORM
+            # computes that association's delta from the membership it loaded, so a filing added
+            # concurrently - or a category deleted after `_resolve_categories` confirmed it -
+            # raises an integrity error on a request that was perfectly valid. Untranslated it
+            # became a 500 describing a constraint; classified here it is either a recognised
+            # conflict a retry resolves or a genuine defect re-raised as one, never the wrong one
+            # of the two.
+            await self._session.rollback()
+            detail = _conflict_detail(error)
+            if detail is None:
+                raise
+            raise ConflictError(detail) from error
         await self._session.commit()
 
         get_logger(__name__).info(
             "post updated",
-            post_id=str(post.id),
-            slug=log_safe_text(post.slug),
+            post_id=str(updated.id),
+            slug=log_safe_text(updated.slug),
             actor_id=str(actor.id),
             changed=sorted(provided),
         )
-        return await _load_relations(post)
+        return updated
 
     async def delete(self, post_id: uuid.UUID, *, actor: User) -> None:
         """Delete a post for ``DELETE /api/v1/posts/{id}``.
 
         Args:
             post_id: The post's identifier, from the URL path.
-            actor: The resolved principal. Must own the post or hold ``ADMIN``.
+            actor: The resolved principal. Must hold ``AUTHOR`` or ``ADMIN``, and must own
+                the post unless it holds ``ADMIN``.
 
         Raises:
             NotFoundError: No post carries that identifier.
-            ForbiddenError: The actor neither wrote the post nor holds ``ADMIN``.
+            ForbiddenError: The actor holds ``READER``, or holds ``AUTHOR`` and did not
+                write this post.
 
         Note:
             **The post's comments, likes and category filings are not deleted here.** Every one
@@ -1070,7 +1758,10 @@ class PostService:
             without ceasing to exist, and :meth:`unpublish` for one that should return to
             drafting.
         """
-        post = await self._get_for_update(post_id, actor=actor)
+        # `with_relations=False`: this path answers 204 with no body, so the byline and the
+        # category badges have no consumer and the two batched loader statements would be work
+        # with no output.
+        post = await self._get_for_update(post_id, actor=actor, with_relations=False)
 
         # Captured before the row goes: the instance is deleted after the commit below, so
         # reading either attribute for the audit line afterwards would fail.
@@ -1096,7 +1787,8 @@ class PostService:
 
         Args:
             post_id: The post's identifier, from the URL path.
-            actor: The resolved principal. Must own the post or hold ``ADMIN``.
+            actor: The resolved principal. Must hold ``AUTHOR`` or ``ADMIN``, and must own
+                the post unless it holds ``ADMIN``.
 
         Returns:
             The published post, with ``author`` and ``categories`` loaded, its ``status`` set to
@@ -1104,7 +1796,8 @@ class PostService:
 
         Raises:
             NotFoundError: No post carries that identifier.
-            ForbiddenError: The actor neither wrote the post nor holds ``ADMIN``.
+            ForbiddenError: The actor holds ``READER``, or holds ``AUTHOR`` and did not
+                write this post.
 
         Note:
             **Idempotent.** Publishing a post that is already published returns it unchanged
@@ -1129,9 +1822,10 @@ class PostService:
         if post.status is PostStatus.PUBLISHED:
             # Nothing to write. The commit is still issued, and deliberately: it ends the
             # transaction that holds this row's `FOR UPDATE` lock, which would otherwise be held
-            # for the remainder of the request against a post nobody is changing.
+            # for the remainder of the request against a post nobody is changing. Nothing is read
+            # after it - the locked fetch already returned the relations this response needs.
             await self._session.commit()
-            return await _load_relations(post)
+            return post
 
         # `posts.slug` is NOT NULL, so a persisted post always carries one and this branch is
         # defence in depth rather than an expected path: NOT NULL does not forbid the empty
@@ -1142,17 +1836,23 @@ class PostService:
         post.published_at = post.published_at if post.published_at is not None else _utc_now()
         post.status = PostStatus.PUBLISHED
 
-        await self._posts.save(post)
+        # Flush and re-read with relations inside the transaction; the COMMIT is then the last
+        # database action, so a failure cannot leave a published post beside an error response.
+        published = await self._posts.save_with_relations(post)
         await self._session.commit()
 
+        # Narrowed for the type checker rather than asserted: the assignment above guarantees a
+        # non-null instant, and `save_with_relations` re-read the row, so this cannot be None. The
+        # audit line formats it, and a bare `.isoformat()` on an optional would not type-check.
+        published_at = published.published_at
         get_logger(__name__).info(
             "post published",
-            post_id=str(post.id),
-            slug=log_safe_text(post.slug),
+            post_id=str(published.id),
+            slug=log_safe_text(published.slug),
             actor_id=str(actor.id),
-            published_at=post.published_at.isoformat(),
+            published_at=None if published_at is None else published_at.isoformat(),
         )
-        return await _load_relations(post)
+        return published
 
     async def unpublish(self, post_id: uuid.UUID, *, actor: User) -> Post:
         """Return a post to ``DRAFT`` for ``POST /api/v1/posts/{id}/unpublish``.
@@ -1163,14 +1863,16 @@ class PostService:
 
         Args:
             post_id: The post's identifier, from the URL path.
-            actor: The resolved principal. Must own the post or hold ``ADMIN``.
+            actor: The resolved principal. Must hold ``AUTHOR`` or ``ADMIN``, and must own
+                the post unless it holds ``ADMIN``.
 
         Returns:
             The post, with ``author`` and ``categories`` loaded, its ``status`` set to ``DRAFT``.
 
         Raises:
             NotFoundError: No post carries that identifier.
-            ForbiddenError: The actor neither wrote the post nor holds ``ADMIN``.
+            ForbiddenError: The actor holds ``READER``, or holds ``AUTHOR`` and did not
+                write this post.
 
         Note:
             **``published_at`` is deliberately preserved, not cleared.** The column records when
@@ -1191,19 +1893,21 @@ class PostService:
         post = await self._get_for_update(post_id, actor=actor)
 
         if post.status is PostStatus.DRAFT:
-            # Already drafted. Commit to release the row lock, as in `publish`.
+            # Already drafted. Commit to release the row lock, as in `publish`, and read nothing
+            # after it - the locked fetch already returned the relations this response needs.
             await self._session.commit()
-            return await _load_relations(post)
+            return post
 
         post.status = PostStatus.DRAFT
 
-        await self._posts.save(post)
+        # Flush and re-read with relations inside the transaction; the COMMIT is last.
+        drafted = await self._posts.save_with_relations(post)
         await self._session.commit()
 
         get_logger(__name__).info(
             "post unpublished",
-            post_id=str(post.id),
-            slug=log_safe_text(post.slug),
+            post_id=str(drafted.id),
+            slug=log_safe_text(drafted.slug),
             actor_id=str(actor.id),
         )
-        return await _load_relations(post)
+        return drafted

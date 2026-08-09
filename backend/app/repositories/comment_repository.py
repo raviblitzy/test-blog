@@ -186,16 +186,45 @@ account is removed.
 
 No indexed column is ever wrapped in a function here.
 
+A thread response is bounded in SQL, not trimmed afterwards
+----------------------------------------------------------
+``page_size`` bounds the *roots* of a thread page, and roots alone are not the size of the
+response: every root carries its reply tree, and ``app.schemas.comment.CommentPublic.replies``
+serialises all of it. Nothing about ``comments`` limits how many replies one comment may attract,
+so an unbounded descent means a twenty-item page can carry an unbounded number of rows and an
+unbounded number of five-thousand-character bodies - reachable through the one write path any
+authenticated reader has, which makes it a resource-exhaustion surface rather than a slow query.
+
+Two bounds are therefore part of the statement itself, applied by PostgreSQL before a row is
+returned rather than by Python after the graph has been materialised:
+
+* :data:`MAX_THREAD_DEPTH` caps how far the recursive term descends.
+* :data:`MAX_THREAD_DESCENDANTS` caps how many descendant rows the whole page may carry.
+
+The row cap is ordered ``(depth, created_at, id)`` - **depth-major, and that is what makes
+truncation coherent rather than arbitrary.** Every node at a shallower depth is returned before any
+node at a deeper one, so if a node is retained its parent is retained too, and the retained set is
+always a valid forest: :func:`_attach_replies` can never be handed a reply whose parent is missing.
+Cutting on ``created_at`` alone could keep a grandchild while dropping its parent, and the reply
+would then be silently reparented or silently dropped.
+
+So the worst case a thread page can produce is ``page_size`` roots plus
+:data:`MAX_THREAD_DESCENDANTS` descendants, whatever shape the discussion has - and the ordinary
+case is unaffected, because an ordinary thread has neither eight levels nor two hundred replies.
+
 Deliberately absent
 -------------------
 No reply-count aggregate: a count of a collection that is already loaded is ``len()`` at the layer
-that renders it. No depth cap: how deeply a reply may nest is a rule about what may be *created*,
-and rules about creation live in ``app.services.comment_service``, so this module reads whatever
-depth exists rather than truncating it. No moderation policy, no ownership rule, no sanitisation,
-no logging - request correlation is bound once by ``app.middleware.request_context`` and the
-services log against it. And no session or engine: a repository is *session-bound*, constructed
-with the ``AsyncSession`` that ``app.core.dependencies.get_db`` yielded, so ``app.db.session`` is
-not imported here.
+that renders it. No moderation policy, no ownership rule, no sanitisation, no logging - request
+correlation is bound once by ``app.middleware.request_context`` and the services log against it.
+And no session or engine: a repository is *session-bound*, constructed with the ``AsyncSession``
+that ``app.core.dependencies.get_db`` yielded, so ``app.db.session`` is not imported here.
+
+The *creation* rule about nesting is still not here: whether a reply may be written at a given
+depth is authority over input and belongs to ``app.services.comment_service``, which asks this
+module for the depth through :meth:`CommentRepository.reply_depth_for_parent` and then decides.
+:data:`MAX_THREAD_DEPTH` is the different question of how much of an existing thread one response
+may carry, which is a property of the statement and therefore belongs here.
 """
 
 from __future__ import annotations
@@ -205,14 +234,52 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Final
 
-from sqlalchemy import ColumnElement, Select, func, select
+from sqlalchemy import ColumnElement, Select, func, literal, select
 from sqlalchemy.orm import QueryableAttribute, aliased, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.comment import Comment, CommentStatus
+from app.models.user import User
 from app.repositories.base import UUIDPrimaryKeyRepository
 
-__all__ = ["CommentRepository"]
+__all__ = ["MAX_THREAD_DEPTH", "MAX_THREAD_DESCENDANTS", "CommentRepository"]
+
+
+MAX_THREAD_DEPTH: Final[int] = 8
+"""How many generations below a root :meth:`CommentRepository.list_for_post` descends.
+
+A bound on the *response*, and deliberately not the same rule as
+``app.services.comment_service.MAX_REPLY_DEPTH``, which bounds what may be *created*. The two carry
+the same number on purpose: eight is the deepest reply the request path will accept, so a thread
+written entirely through the API is returned complete, and the cap costs a reader nothing.
+
+They are separate constants because they answer to different things. The service's cap protects the
+data from an untrusted writer looping replies onto its own replies. This one protects the
+*statement* from data the service never saw: ``app.db.seed``, the test factories and a data
+migration all write comments without passing through the request path, so the read path cannot
+assume the created-depth rule ever applied. Without a bound here, one hand-written chain of ten
+thousand replies would make every subsequent read of that thread descend ten thousand levels.
+
+Beyond this depth a reply is present in the database, visible in the administrative moderation
+queue, and simply not carried by the public thread response - which is the honest outcome for a
+structure no reader could act on anyway, and the alternative to it is an unbounded response.
+"""
+
+MAX_THREAD_DESCENDANTS: Final[int] = 200
+"""How many descendant rows one page of :meth:`CommentRepository.list_for_post` may carry in total.
+
+The bound that actually makes a thread response finite. Depth alone does not: a single root with
+fifty thousand direct replies is one level deep, and ``CommentPublic.replies`` would serialise every
+one of them. This is a cap on rows rather than on levels, applied as a ``LIMIT`` inside the
+statement, so PostgreSQL stops producing rows rather than Python discarding them afterwards.
+
+Two hundred against a default ``page_size`` of twenty is ten replies per root on average, and a
+worst case of two hundred bodies at ``app.schemas.comment.BODY_MAX_LENGTH`` characters each - a
+bounded payload for a page of a discussion, where the alternative was unbounded. A reader who
+reaches that ceiling on one page sees the shallowest replies, because the cap is applied under a
+depth-major ordering; the deeper tail is still moderable and still readable one page along, since
+paging the roots changes which trees are drawn from.
+"""
 
 
 _LIKE_ESCAPE: Final = "\\"
@@ -222,6 +289,27 @@ Declared once and passed to the ``ilike()`` call built from it. A pattern escape
 character and matched with another is not a subtle bug - it is a moderator's search silently
 treating their ``%`` as a wildcard.
 """
+
+
+_PUBLIC_AUTHOR_COLUMNS: Final = (
+    # The six members app.schemas.user.UserPublic declares - the whole of a rendered byline, and
+    # the whole of what any comment response is entitled to show about its author.
+    #
+    # Everything else on `users` is deferred, and `password_hash` is the reason this tuple exists
+    # rather than being an optimisation: a thread page that loaded whole `User` entities pulled
+    # every participant's argon2id hash out of the database and held it in the session's identity
+    # map for the duration of the request. `email`, `role` and `is_active` are withheld for the
+    # same reason - none is a member of any response model a public caller receives.
+    #
+    # `id` is included automatically by load_only, being the primary key, and is what the batched
+    # `selectin` lookup keys on.
+    User.username,
+    User.display_name,
+    User.bio,
+    User.avatar_url,
+    User.created_at,
+)
+"""The ``users`` columns a rendered byline needs, and no others."""
 
 
 def _containment_pattern(term: str) -> str:
@@ -387,9 +475,10 @@ def _thread_order(reply: Comment) -> tuple[datetime, uuid.UUID]:
 def _attach_replies(roots: Sequence[Comment], descendants: Sequence[Comment]) -> None:
     """Assemble the fetched rows into trees by populating every ``replies`` collection.
 
-    The in-memory half of :meth:`CommentRepository.list_for_post`. The recursive statement returns
-    a post's descendants as one flat sequence, and this function turns that sequence into the
-    nested shape ``app.schemas.comment.CommentPublic`` serialises, by grouping each row under the
+    The in-memory half of :meth:`CommentRepository.list_for_post` and of
+    :meth:`CommentRepository.load_visible_replies`. The recursive statement returns the descendants
+    of the given roots as one flat sequence, and this function turns that sequence into the nested
+    shape ``app.schemas.comment.CommentPublic`` serialises, by grouping each row under the
     identifier in its own ``parent_id`` and sorting each group into thread order.
 
     It issues **no SQL at all** and cannot: every value it reads - ``id``, ``parent_id``,
@@ -397,7 +486,8 @@ def _attach_replies(roots: Sequence[Comment], descendants: Sequence[Comment]) ->
     through :func:`~sqlalchemy.orm.attributes.set_committed_value`.
 
     Args:
-        roots: This page of top-level comments.
+        roots: The comments to nest under - this page of top-level comments, or the single
+            comment a mutating route is answering with.
         descendants: Every comment reachable from those roots through ``parent_id``, at any depth,
             already narrowed to the caller's moderation states. Order is irrelevant - the grouping
             below does not depend on it.
@@ -441,12 +531,13 @@ def _attach_replies(roots: Sequence[Comment], descendants: Sequence[Comment]) ->
 class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
     """Data access for the ``comments`` relation: threaded reads, the queue, and one lookup.
 
-    Four methods, and between them they back every comment-shaped surface in the API::
+    Five methods, and between them they back every comment-shaped surface in the API::
 
-        GET  /api/v1/posts/{id}/comments   -> list_for_post(post_id, statuses=(APPROVED,), ...)
-        POST /api/v1/posts/{id}/comments   -> get_parent(...) to validate a reply, then add(...)
-        GET  /api/v1/admin/comments        -> list_moderation_queue(...)
-        GET  /api/v1/admin/stats           -> count_comments()
+        GET   /api/v1/posts/{id}/comments  -> list_for_post(post_id, statuses=(APPROVED,), ...)
+        POST  /api/v1/posts/{id}/comments  -> get_parent(...) to validate a reply, then add(...)
+        PATCH /api/v1/comments/{id}        -> save(...), then load_visible_replies(comment, ...)
+        GET   /api/v1/admin/comments       -> list_moderation_queue(...)
+        GET   /api/v1/admin/stats          -> count_comments()
 
     Everything else a comment needs is inherited from
     :class:`~app.repositories.base.BaseRepository` and is deliberately not re-implemented here:
@@ -480,14 +571,23 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         appear on two consecutive pages and would leave ``total`` describing a set the client
         cannot reconstruct.
 
-        **Depth is not capped.** ``comments.parent_id`` puts no bound on how deeply a reply may
-        nest, ``app.schemas.comment.CommentPublic.replies`` is recursive without limit, and a
-        reply to a reply is therefore an ordinary, storable comment. So this method returns the
-        entire subtree under each root: the descendants come from one recursive common table
-        expression over ``parent_id``, and :func:`_attach_replies` nests them. Loading only the
-        first level would drop every deeper reply from the response with nothing raised and
-        nothing logged - the comment would be in the database, visible in the moderation queue,
-        and permanently invisible to the reader it answers.
+        **Replies are nested at every depth, and the response is bounded in SQL.**
+        ``comments.parent_id`` puts no bound on how deeply a reply may nest and
+        ``app.schemas.comment.CommentPublic.replies`` is recursive without limit, so a reply to a
+        reply is an ordinary, storable comment and loading only the first level would drop every
+        deeper one from the response with nothing raised and nothing logged. This method therefore
+        descends: the descendants come from one recursive common table expression over ``parent_id``
+        and :func:`_attach_replies` nests them.
+
+        The descent is bounded, though, and by the statement rather than by trust in the data.
+        ``page_size`` bounds only the roots, and a root may attract any number of replies, so an
+        unbounded descent made a twenty-item page carry an unbounded number of five-thousand
+        character bodies - through the one write path every authenticated reader has.
+        :data:`MAX_THREAD_DEPTH` caps how far the recursion goes and
+        :data:`MAX_THREAD_DESCENDANTS` caps how many descendant rows the page may carry in total, so
+        the worst case is ``page_size`` roots plus two hundred descendants whatever shape the
+        discussion has. Both live in the statement, and the row cap is applied under a depth-major
+        ordering so that the retained set is always a valid forest - see :meth:`_descendants_of`.
 
         Args:
             post_id: The post whose thread to read. Compared for equality against the leading
@@ -510,11 +610,11 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
                 ``total``, never an error, which is how a client detects it has run off the end.
 
         Returns:
-            ``(rows, total)`` - this page of top-level comments, each with ``author`` loaded and
-            its complete ``replies`` tree loaded and ordered, every node in that tree also carrying
-            its own ``author`` and its own ``replies``, plus the number of top-level comments
-            matching the filters. Deliberately not a ``Page``: the service projects the rows and
-            calls ``build_page(list(rows), total, page, page_size)``.
+            ``(rows, total)`` - this page of top-level comments, each with ``author`` loaded and its
+            ``replies`` tree loaded and ordered to the bounds above, every node in that tree also
+            carrying its own ``author`` and its own ``replies``, plus the number of top-level
+            comments matching the filters. Deliberately not a ``Page``: the service projects the
+            rows and calls ``build_page(list(rows), total, page, page_size)``.
 
         Note:
             **One predicate set, four uses.** :func:`_status_criteria` produces the moderation
@@ -540,17 +640,19 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             public filter got the FIRST result back, and the unapproved reply was returned to the
             filtered caller.
 
-            **Bounded statements, whatever the page size or the depth.** Measured against
-            SQLAlchemy 2.0.51: five in total - the count, the roots window, one batched
-            ``selectin`` for the roots' authors, one recursive statement returning every descendant
-            at every depth, and one batched ``selectin`` for those descendants' authors. None of
-            them is per row and none is per level, which is the property a recursive CTE buys over
-            walking :attr:`~app.models.comment.Comment.replies` one generation at a time - that
-            would be one statement per level, and under an ``AsyncSession`` each of those levels
-            would be a lazy load raising ``MissingGreenlet`` instead. ``selectinload`` is used for
-            the many-to-one ``author`` as well: it keys its extra ``SELECT`` on the fetched
-            identifiers, so it multiplies no rows, which is what lets the count be a plain
-            ``count(*)`` and the rows need no ``.unique()``.
+            **Bounded statements AND bounded rows, whatever the page size or the depth.** Measured
+            against SQLAlchemy 2.0.51: five statements in total - the count, the roots window, one
+            batched ``selectin`` for the roots' authors, one recursive statement returning the
+            bounded descendant set, and one batched ``selectin`` for those descendants' authors.
+            None of them is per row and none is per level, which is the property a recursive CTE
+            buys over walking :attr:`~app.models.comment.Comment.replies` one generation at a time -
+            that would be one statement per level, and under an ``AsyncSession`` each of those
+            levels would be a lazy load raising ``MissingGreenlet`` instead. A fixed statement count
+            was never the whole story, though: five statements can still return an unbounded number
+            of rows, which is why :data:`MAX_THREAD_DESCENDANTS` bounds the fourth one.
+            ``selectinload`` is used for the many-to-one ``author`` as well: it keys its extra
+            ``SELECT`` on the fetched identifiers, so it multiplies no rows, which is what lets the
+            count be a plain ``count(*)`` and the rows need no ``.unique()``.
 
             **The tree is nested and ordered in memory, not by a further query.**
             :func:`_attach_replies` groups the descendants under their parents and sorts each
@@ -578,10 +680,12 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             # LIMIT/OFFSET is how a row lands on two consecutive pages while another lands on
             # none.
             .order_by(Comment.created_at.asc(), Comment.id.asc())
-            # The byline every rendered comment needs. `replies` is deliberately NOT loaded here:
-            # a relationship loader can only follow one generation, and this thread has no depth
-            # limit, so the whole subtree is fetched by `_descendants_of` below instead.
-            .options(selectinload(Comment.author))
+            # The byline every rendered comment needs, narrowed to the six public fields - a
+            # thread renders a username, a display name and an avatar, never an email address, a
+            # role or a password hash. `replies` is deliberately NOT loaded here: a relationship
+            # loader can only follow one generation, so the subtree is fetched by
+            # `_descendants_of` below, which bounds it by depth and by row count.
+            .options(selectinload(Comment.author).load_only(*_PUBLIC_AUTHOR_COLUMNS))
             # The status filter must hold whatever this unit of work has already loaded, so the
             # loader is told to overwrite rather than to skip. Measured on SQLAlchemy 2.0.51:
             # without this option, a session that read the thread unfiltered and then read it
@@ -624,40 +728,66 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         *,
         statuses: Sequence[CommentStatus] | None,
     ) -> Sequence[Comment]:
-        """Fetch every comment below *root_ids*, at any depth, in one statement.
+        """Fetch the comments below *root_ids* in one statement, bounded by depth and by row count.
 
-        The recursive half of :meth:`list_for_post`, kept separate so that the paging statement and
-        the descent statement are each readable on their own. It renders as::
+        The recursive half of :meth:`list_for_post` and of :meth:`load_visible_replies`, kept
+        separate so that the paging statement and the descent statement are each readable on their
+        own, and so that both callers descend by one definition. It renders as::
 
             WITH RECURSIVE comment_descendants AS (
-                SELECT ... FROM comments
+                SELECT ..., 1 AS depth FROM comments
                  WHERE parent_id IN (:roots) AND status IN (:states)      -- anchor
                 UNION ALL
-                SELECT reply.* FROM comments AS reply, comment_descendants
+                SELECT reply.*, comment_descendants.depth + 1
+                  FROM comments AS reply, comment_descendants
                  WHERE reply.parent_id = comment_descendants.id
-                   AND reply.status IN (:states)                          -- recursive term
+                   AND reply.status IN (:states)
+                   AND comment_descendants.depth < :max_depth             -- recursive term
             )
             SELECT ... FROM comment_descendants
+             ORDER BY depth, created_at, id
+             LIMIT :max_descendants
 
         Args:
-            root_ids: The identifiers of this page's top-level comments. Never empty - the caller
-                skips the call rather than issuing an empty ``IN``.
-            statuses: Exactly what :meth:`list_for_post` received, so the tree and its roots cannot
+            root_ids: The identifiers to descend from - this page's top-level comments, or the
+                single comment a mutating route is answering with. Never empty: a caller with no
+                roots skips the call rather than issuing an empty ``IN``.
+            statuses: Exactly what the calling method received, so the tree and its roots cannot
                 disagree about what is visible. The predicate is built from it for **both** terms:
                 on the anchor it filters the first generation, and on the recursive term it filters
                 every generation after it and prunes whatever hangs below an excluded comment.
 
         Returns:
-            The descendants as a flat sequence, each with ``author`` loaded, in no particular
-            order - :func:`_attach_replies` nests and sorts them. Empty when no root has a reply
+            At most :data:`MAX_THREAD_DESCENDANTS` descendants, none deeper than
+            :data:`MAX_THREAD_DEPTH` generations below its root, as a flat sequence with ``author``
+            loaded - :func:`_attach_replies` nests and sorts them. Empty when no root has a reply
             the caller may see.
 
         Note:
+            **Both bounds are in the statement, and neither is a post-filter.** The depth cap is a
+            predicate on the recursive term, so PostgreSQL stops descending rather than descending
+            and discarding; the row cap is a ``LIMIT``, so it stops producing rows. Materialising an
+            unbounded graph and trimming it in Python would have already paid the cost the bounds
+            exist to avoid - the rows would have been read, transferred and hydrated into ORM
+            instances before anything was discarded.
+
+            **The ordering is depth-major, and that is a correctness requirement rather than a
+            preference.** ``ORDER BY depth, created_at, id`` returns every node at a shallower depth
+            before any node at a deeper one, so a retained node's parent is always retained too and
+            the truncated set is a valid forest. Ordering by ``created_at`` alone could keep a
+            grandchild whose parent fell outside the limit, and :func:`_attach_replies` would then
+            drop it silently - a reply present in the response's row set but attached to nothing.
+            ``id`` is the final tiebreaker for the usual reason: ``created_at`` comes from a
+            per-transaction clock, so a batch of replies shares one instant and the cut has to fall
+            in the same place on every read.
+
             **The rows are hydrated straight out of the common table expression.** The anchor
-            selects the whole entity, so the expression carries every mapped column, and
-            :func:`~sqlalchemy.orm.aliased` maps it back onto :class:`~app.models.comment.Comment`.
-            That makes this one statement rather than two: selecting only identifiers here would
-            need a second pass over ``comments`` to fetch the rows behind them.
+            selects the whole entity plus the depth counter, so the expression carries every mapped
+            column, and :func:`~sqlalchemy.orm.aliased` maps it back onto
+            :class:`~app.models.comment.Comment`. That makes this one statement rather than two:
+            selecting only identifiers here would need a second pass over ``comments`` to fetch the
+            rows behind them. ``depth`` is a member of the expression but not of the entity, so it
+            is ordered by and never mapped.
 
             **The recursive term uses its own alias.** Both ends of a self-reference are the same
             table, so the term needs a distinct name to join the working set against, and the status
@@ -673,14 +803,19 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             ``Index Cond: ((parent_id = comment_descendants.id) AND (status = ...))``, so the cost
             follows the size of the thread rather than the size of the relation.
 
-            **Termination is structural.** ``comments.parent_id`` is acyclic in practice because a
-            reply names a comment that already existed when it was written, so the working set
-            shrinks to nothing and the expression stops. ``UNION ALL`` rather than ``UNION``
-            because the tree admits no duplicate - each comment has exactly one parent, so it is
-            reached exactly once - and ``UNION`` would pay for a de-duplication that can never
+            **Termination no longer rests on the data being well-shaped.** ``comments.parent_id`` is
+            acyclic in practice - a reply names a comment that already existed - so the working set
+            would shrink to nothing on its own, but the depth predicate makes termination a property
+            of the statement instead of an assumption about the rows. ``UNION ALL`` rather than
+            ``UNION`` because the tree admits no duplicate - each comment has exactly one parent, so
+            it is reached exactly once - and ``UNION`` would pay for a de-duplication that can never
             remove a row.
+
+            **The author loader is narrowed to the public byline fields.** A rendered comment shows
+            a username, a display name and an avatar; it never shows an email address, a role or a
+            password hash, so the batched ``selectin`` statement selects none of them.
         """
-        anchor = select(Comment).where(
+        anchor = select(Comment, literal(1).label("depth")).where(
             Comment.parent_id.in_(root_ids),
             *_status_criteria_on(Comment.status, statuses),
         )
@@ -688,19 +823,292 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
 
         reply = aliased(Comment, name="reply")
         descent = descent.union_all(
-            select(reply).where(
+            select(reply, (descent.c.depth + 1).label("depth")).where(
                 reply.parent_id == descent.c.id,
                 *_status_criteria_on(reply.status, statuses),
+                # The depth bound, on the recursive term rather than on the final select: a
+                # generation the expression must not carry is a generation it must not fetch.
+                descent.c.depth < MAX_THREAD_DEPTH,
             )
         )
 
         node = aliased(Comment, descent, name="descendant")
         result = await self.session.execute(
             select(node)
-            .options(selectinload(node.author))
+            # Depth-major, then thread order, then the primary key - see the note above for why
+            # the leading key must be depth.
+            .order_by(descent.c.depth.asc(), node.created_at.asc(), node.id.asc())
+            .limit(MAX_THREAD_DESCENDANTS)
+            .options(selectinload(node.author).load_only(*_PUBLIC_AUTHOR_COLUMNS))
             .execution_options(populate_existing=True)
         )
         return result.scalars().all()
+
+    async def reply_depth_for_parent(self, parent_id: uuid.UUID, *, max_depth: int) -> int | None:
+        """Report how deep a reply to *parent_id* would sit, in one statement.
+
+        The measurement behind ``app.services.comment_service.MAX_REPLY_DEPTH``. Depth is not a
+        stored column, so it has to be derived by walking ``parent_id`` upwards - and walking it one
+        generation per round trip is what this method exists to replace: the service used to follow
+        the ``parent`` relationship in a loop, issuing a primary-key query per ancestor for every
+        reply created. Here the walk is a recursive common table expression, so any depth costs one
+        statement.
+
+        It renders as::
+
+            WITH RECURSIVE ancestry AS (
+                SELECT id, parent_id, 1 AS depth FROM comments WHERE id = :parent_id
+                UNION ALL
+                SELECT c.id, c.parent_id, ancestry.depth + 1
+                  FROM comments AS c, ancestry
+                 WHERE c.id = ancestry.parent_id AND ancestry.depth <= :max_depth
+            )
+            SELECT max(depth) FROM ancestry
+
+        Args:
+            parent_id: The comment being replied to.
+            max_depth: The caller's cap. The ascent stops one step past it, which is all the
+                caller needs: the only question asked of the result is whether the cap has been
+                exceeded, so the exact depth of a pathological chain is not worth the round trips
+                to establish. Passed in rather than read from a constant here, because the cap is
+                the service's rule - see :data:`MAX_THREAD_DEPTH` for the different bound this
+                module does own.
+
+        Returns:
+            ``1`` when *parent_id* is a top-level comment, ``2`` when it is a reply to one, and so
+            on - the depth a *reply to it* would occupy. Exact up to ``max_depth``; beyond that it
+            returns the first value that exceeds the cap rather than the true depth. ``None`` when
+            no comment carries that identifier, which the service reports as an invalid parent.
+
+        Note:
+            **The ascent is bounded, so a pathological chain cannot make the measurement expensive
+            either.** ``depth <= max_depth`` on the recursive term stops the expression a step past
+            the cap; a ten-thousand-deep chain written outside the request path is answered in the
+            same one statement as a two-deep one.
+
+            **It selects three columns, not entities.** No ``Comment`` is hydrated: the expression
+            carries ``id``, ``parent_id`` and the counter, and the outer statement reduces them to a
+            single integer. Nothing enters the session's identity map, so this measurement cannot
+            leave a stale ancestor behind for a later read to find.
+
+            **The access path is the primary key** at every step - ``c.id = ancestry.parent_id`` -
+            so the ascent is an index probe per generation inside one statement rather than a scan.
+        """
+        anchor = select(
+            Comment.id.label("id"),
+            Comment.parent_id.label("parent_id"),
+            literal(1).label("depth"),
+        ).where(Comment.id == parent_id)
+        ancestry = anchor.cte("ancestry", recursive=True)
+
+        ancestor = aliased(Comment, name="ancestor")
+        ancestry = ancestry.union_all(
+            select(
+                ancestor.id.label("id"),
+                ancestor.parent_id.label("parent_id"),
+                (ancestry.c.depth + 1).label("depth"),
+            ).where(
+                ancestor.id == ancestry.c.parent_id,
+                # One step past the cap is enough to answer "has it been exceeded".
+                ancestry.c.depth <= max_depth,
+            )
+        )
+
+        # `max(...)` over an empty expression yields one row holding NULL rather than no rows, so
+        # `scalar_one_or_none` returns None for an identifier that matches nothing - which is the
+        # "no such parent" answer the service needs. The result is bound to an annotated local
+        # because the aggregate's Python type is `Any` to the type checker, and binding it here is
+        # what keeps this method's declared return type honest without a cast.
+        result = await self.session.execute(select(func.max(ancestry.c.depth)))
+        depth: int | None = result.scalar_one_or_none()
+        return depth
+
+    async def get_with_author(
+        self, comment_id: uuid.UUID, *, for_update: bool = False
+    ) -> Comment | None:
+        """Fetch one comment with its byline loaded, optionally holding a row lock.
+
+        The read behind every single-comment response. ``app.schemas.comment.CommentPublic`` and
+        ``app.schemas.admin.AdminComment`` both render an author, and a lazy access under an
+        ``AsyncSession`` raises ``MissingGreenlet`` - so the byline is requested here, in the layer
+        that owns queries, rather than reached for from a service through ``awaitable_attrs``.
+
+        Args:
+            comment_id: The comment's identifier.
+            for_update: Whether to take ``SELECT ... FOR UPDATE`` on the comment row. ``True`` for
+                the read-check-write sequences behind edit, delete and moderation, so two requests
+                that both read a comment and both decide to act on it cannot interleave between the
+                read and the write.
+
+        Returns:
+            The comment with ``author`` loaded, or ``None`` when no row carries that key. Absence is
+            not an error here - the service turns it into a ``404``.
+
+        Note:
+            **The lock covers ``comments`` and nothing else.** ``FOR UPDATE`` applies to the
+            rows the primary statement returns; ``author`` arrives through ``selectinload``'s
+            separate unlocked statement, so no account is held under a write lock because a byline
+            had to be rendered.
+
+            **``replies`` is deliberately left unloaded, and that is a security property.** The
+            relationship is the ownership edge - one generation, unfiltered by moderation state - so
+            handing a caller an unfiltered collection is precisely the leak
+            :meth:`list_for_post` builds its status-filtered descent to prevent. A single-resource
+            response carries no thread, so a router must project these entities with the explicit
+            constructor form ``app.schemas.comment`` documents, leaving ``replies`` to its empty
+            default rather than validating the whole model.
+
+            **``populate_existing`` makes this a re-read.** Without it a caller could take the lock
+            and then make its decision from a stale in-session copy, which is exactly the hazard the
+            lock was acquired to remove.
+        """
+        stmt = select(Comment).where(Comment.id == comment_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self.session.execute(
+            stmt.options(
+                selectinload(Comment.author).load_only(*_PUBLIC_AUTHOR_COLUMNS)
+            ).execution_options(populate_existing=True)
+        )
+        return result.scalars().first()
+
+    async def add_with_author(self, comment: Comment) -> Comment:
+        """Insert a comment and return it with its byline loaded.
+
+        What ``comment_service.create`` calls instead of
+        :meth:`~app.repositories.base.UUIDPrimaryKeyRepository.add`. ``add`` flushes and refreshes,
+        and a refresh expires every relationship, so a service that needed the byline afterwards had
+        to load it itself - after its commit, which is what made a failed load able to leave a
+        durable comment beside an error response.
+
+        Args:
+            comment: A transient comment built by the service from validated input, carrying no
+                ``id`` - identity is ``gen_random_uuid()``'s.
+
+        Returns:
+            The same instance, persistent, with the generated ``id``, the audit timestamps and
+            ``author`` loaded.
+
+        Note:
+            The INSERT is flushed here, so the three foreign keys and every constraint apply now
+            and a violation surfaces at this call rather than at some later commit. Nothing is
+            committed: the transaction boundary is the service's, and this method exists precisely
+            so the service can finish assembling its response before committing.
+        """
+        self.session.add(comment)
+        await self.session.flush()
+        return await self.reload_with_author(comment)
+
+    async def save_with_author(self, comment: Comment) -> Comment:
+        """Flush a mutated comment and return it with its byline loaded.
+
+        What the edit and moderation paths call instead of
+        :meth:`~app.repositories.base.BaseRepository.save`. It replaces that method's ``refresh``
+        rather than following it: :meth:`reload_with_author` re-reads every mapped column *and* the
+        author in one statement, so the re-derived ``updated_at`` is current for the same reason
+        ``refresh`` was mandatory, and the byline is present without a second round trip.
+
+        Args:
+            comment: A persistent comment already mutated in place. Calling this with nothing dirty
+                is harmless: the flush emits no ``UPDATE`` and the re-read returns the row.
+
+        Returns:
+            The same instance, reloaded, with ``author`` loaded.
+        """
+        await self.session.flush()
+        return await self.reload_with_author(comment)
+
+    async def reload_with_author(self, comment: Comment) -> Comment:
+        """Re-read one comment's columns and its byline in a single statement.
+
+        The shared tail of :meth:`add_with_author` and :meth:`save_with_author`, and the answer to
+        "who loads a relationship the response needs": this layer, as a statement, never a service
+        reaching through ``awaitable_attrs``.
+
+        Args:
+            comment: A persistent comment. Only its ``id`` is read, so it is safe to call
+                immediately after a flush when other attributes are expired.
+
+        Returns:
+            The same identity-mapped instance, with every column re-read and ``author`` populated.
+
+        Raises:
+            RuntimeError: The row is gone. Unreachable through the two callers - one has just
+                inserted it, the other holds it under ``FOR UPDATE`` - so it is raised rather than
+                returning ``None`` in order to keep both callers' return types non-optional instead
+                of pushing an impossible branch into the service.
+        """
+        stmt = (
+            select(Comment)
+            .where(Comment.id == comment.id)
+            .options(selectinload(Comment.author).load_only(*_PUBLIC_AUTHOR_COLUMNS))
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(stmt)
+        reloaded = result.scalars().first()
+        if reloaded is None:  # pragma: no cover - the caller holds the row in its transaction
+            raise RuntimeError(f"comment {comment.id} vanished inside its own transaction")
+        return reloaded
+
+    async def load_visible_replies(
+        self,
+        root: Comment,
+        *,
+        statuses: Sequence[CommentStatus] | None,
+    ) -> Comment:
+        """Populate one comment's ``replies`` with its whole visible subtree, at every depth.
+
+        The single-comment counterpart of :meth:`list_for_post`, and the second caller of
+        :meth:`_descendants_of`. It exists for the mutating routes: ``PATCH
+        /api/v1/comments/{comment_id}`` answers with a comment that may already have replies
+        beneath it, and a response whose ``replies`` were left at their empty default would tell a
+        client that the thread under the edited comment is empty. A client caching a thread and
+        replacing the edited node with that answer would then drop every descendant from the
+        rendered discussion - so the tree is loaded here rather than defaulted away.
+
+        The subtree is narrowed by the *same* ``statuses`` argument :meth:`list_for_post` takes, and
+        that is the whole reason this method exists instead of the relationship being read directly:
+        :attr:`~app.models.comment.Comment.replies` is the unfiltered ownership edge - one
+        generation, every moderation state - so following it would disclose a pending or rejected
+        reply to a caller who may not see it, and would only ever reach one level deep.
+
+        Args:
+            root: A persistent comment whose own columns are populated. Only ``id`` is read to
+                start the descent, so no lazy load can fire on the way in.
+            statuses: The moderation states this caller may see, exactly as
+                ``app.services.comment_service`` derived them for the owning post. ``None`` means
+                every state. The value is applied to every level of the descent, so the subtree
+                cannot be more visible than the thread listing would be for the same caller.
+
+        Returns:
+            The same instance, with ``replies`` populated to the full visible depth and every node
+            in the subtree carrying its own ``author`` and its own ``replies`` - the shape
+            ``app.schemas.comment.CommentPublic.model_validate`` may walk without touching an
+            unloaded attribute.
+
+        Note:
+            **Two statements, whatever the depth**: one recursive descent and one batched
+            ``selectin`` for the descendants' authors. The bound is the same one
+            :meth:`_descendants_of` documents, and it is why walking
+            :attr:`~app.models.comment.Comment.replies` generation by generation is not the
+            alternative - that is one statement per level, and under an ``AsyncSession`` each level
+            is a lazy load raising ``MissingGreenlet``.
+
+            **A leaf is populated too, with an empty list.** :func:`_attach_replies` assigns to
+            every node it is given, so a comment with no visible reply comes back with a loaded
+            empty collection rather than an unloaded one - which is what makes the returned value
+            safe to validate rather than merely usually safe.
+
+            **Nothing is written.** The collection is set through
+            :func:`~sqlalchemy.orm.attributes.set_committed_value`, so the instance is not made
+            dirty and the ``delete-orphan`` cascade on that relationship cannot mistake an absent
+            child for an orphan. :func:`_attach_replies` records that reasoning in full.
+        """
+        # One root, so the `IN` list is never empty and the call is never skipped - unlike
+        # `list_for_post`, which has to guard against a page with no rows at all.
+        descendants = await self._descendants_of([root.id], statuses=statuses)
+        _attach_replies((root,), descendants)
+        return root
 
     async def get_parent(self, parent_id: uuid.UUID, *, post_id: uuid.UUID) -> Comment | None:
         """Fetch a candidate parent comment, but only if it belongs to the given post.
@@ -770,9 +1178,9 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
                 not an error.
 
         Returns:
-            ``(rows, total)`` - this page of comments with ``author`` and ``post`` loaded, and the
-            number matching the filters. ``app.services.admin_service`` turns the pair into the
-            wire envelope through ``build_page``.
+            ``(rows, total)`` - this page of comments with ``author`` loaded, and the number
+            matching the filters. ``app.services.admin_service`` turns the pair into the wire
+            envelope through ``build_page``.
 
         Note:
             **Newest first**, because the queue is worked from the top and a moderator wants the
@@ -781,10 +1189,14 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             rather than decorative: ``created_at`` comes from a per-transaction clock, so a batch
             of comments written by one request shares an instant.
 
-            **Both relationships are loaded because the table renders both.** Each row shows who
-            wrote the comment and which post it is on, so ``author`` and ``post`` are requested in
-            the statement. Under an ``AsyncSession`` a lazy access would raise ``MissingGreenlet``
-            at render time, one layer away from the query that forgot to ask.
+            **The byline is loaded because the table renders it; the post is not, because the
+            table does not.** ``app.schemas.admin.AdminComment`` carries ``post_id`` - a column of
+            the comment row - and no post object, so requesting ``Comment.post`` fetched an entire
+            ``Post`` per distinct post on the page, body and search vector included, to serialise a
+            UUID that was already in hand. ``author`` is requested, narrowed to the six public
+            fields. Under an ``AsyncSession`` a lazy access would raise ``MissingGreenlet`` at
+            render time, one layer away from the query that forgot to ask - which is what makes
+            requesting exactly the response's needs, and nothing else, safe to do.
 
             **The search term is served by ``ix_comments_body_trgm``**, so the queue's text filter
             is an index scan rather than a pass over every comment ever written;
@@ -798,11 +1210,20 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             select(Comment)
             .where(*predicates)
             .order_by(Comment.created_at.desc(), Comment.id.desc())
-            # selectinload for both, though both are many-to-one: one strategy across this layer
-            # keeps the joinedload-against-a-collection trap - multiplied rows, a wrong count and
-            # a mandatory `.unique()` - out of reach entirely, and a batched IN lookup keyed on
-            # the page's foreign keys is at most two extra statements for the whole page.
-            .options(selectinload(Comment.author), selectinload(Comment.post))
+            # The byline only, narrowed to the six public author fields.
+            #
+            # `Comment.post` is deliberately NOT loaded. `app.schemas.admin.AdminComment` carries
+            # `post_id` - a column of this row - and no post object at all, so loading the related
+            # entity fetched a whole `Post` per distinct post on the page, including `content` (up
+            # to 100,000 characters) and the `search_vector` derived from it, for a table that
+            # renders none of it. An administrator who needs the article opens it by that id.
+            #
+            # selectinload rather than joinedload, though the relationship is many-to-one: one
+            # strategy across this layer keeps the joinedload-against-a-collection trap -
+            # multiplied rows, a wrong count and a mandatory `.unique()` - out of reach entirely,
+            # and a batched IN lookup keyed on the page's foreign keys is one extra statement for
+            # the whole page.
+            .options(selectinload(Comment.author).load_only(*_PUBLIC_AUTHOR_COLUMNS))
         )
 
         count_stmt: Select[tuple[int]] = (

@@ -258,6 +258,13 @@ export default defineConfig({
      * exactly as the contract requires: client code appends bare resource paths
      * such as /posts and never repeats the prefix.
      *
+     * Three entries, and there is no fourth to add. These are the whole of the
+     * FRONTEND block of .env.example, and the only NEXT_PUBLIC_ reads in this
+     * tier are src/lib/api/client.ts (the base URL) and src/lib/seo.ts (the site
+     * origin and name). The remote-image host allow-list is deliberately NOT
+     * configuration - src/lib/utils.ts declares it in source - so a test observes
+     * the shipped policy rather than one this file invented.
+     *
      * Neither URL is reachable from a component test: both name a loopback port
      * that nothing binds while this suite runs, so a component that fetched
      * without being told what to answer fails on a refused connection rather
@@ -271,8 +278,6 @@ export default defineConfig({
       NEXT_PUBLIC_API_BASE_URL: 'http://localhost:8000/api/v1',
       NEXT_PUBLIC_SITE_URL: 'http://localhost:3000',
       NEXT_PUBLIC_SITE_NAME: 'Modern Blog',
-      NEXT_PUBLIC_IMAGE_HOST_ALLOWLIST:
-        'images.unsplash.com,picsum.photos,res.cloudinary.com,avatars.githubusercontent.com',
     },
 
     /*

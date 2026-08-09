@@ -117,14 +117,50 @@ from collections.abc import Sequence
 from typing import Any, Final, Literal
 
 from sqlalchemy import ColumnElement, Select, Text, cast, distinct, func, or_, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 from sqlalchemy.sql.functions import Function
 
 from app.models.category import Category, post_categories
 from app.models.post import Post, PostStatus
+from app.models.user import User
 from app.repositories.base import UUIDPrimaryKeyRepository
 
-__all__ = ["PostRepository", "PostSort"]
+__all__ = ["PostProjection", "PostRepository", "PostSort"]
+
+
+PostProjection = Literal["detail", "summary", "admin"]
+"""How much of a post, and of its relations, a statement should actually fetch.
+
+Three profiles, one per response model the API declares over ``posts``, because the columns a
+projection *serialises* and the columns a statement *selects* are two different lists and letting
+them diverge is expensive in a way nothing fails on. ``posts.content`` is unbounded ``TEXT`` -
+bounded only by ``app.schemas.post``'s 100,000-character limit on the way in - and
+``posts.search_vector`` is a ``tsvector`` over the whole of it, so a twenty-row page of a listing
+that serialises neither still moved several megabytes out of the database, through psycopg, into
+ORM instances, and then discarded it.
+
+``"detail"``
+    Every mapped column, plus ``author`` and ``categories`` as whole entities. What
+    ``app.schemas.post.PostDetail`` needs, and what every *write* path needs: ``save`` re-reads
+    the row so the generated ``search_vector`` and the re-derived ``updated_at`` are current, and
+    a deferred column is a column that raises ``MissingGreenlet`` the moment something reads it
+    under an async session. Single-resource reads and mutations therefore never narrow.
+``"summary"``
+    The nine columns ``app.schemas.post.PostSummary`` declares, plus ``author_id``; the six
+    ``app.schemas.user.UserPublic`` declares on the author; and the three
+    ``app.schemas.category.CategorySummary`` declares on each category. Serves the home feed and
+    the public author profile - the two highest-traffic listings in the product.
+``"admin"``
+    The eight columns ``app.schemas.admin.AdminPost`` declares, plus ``author_id``, and the public
+    author fields. **No categories at all**, because that model does not carry them: loading the
+    association for a table that never renders it is one extra statement and one extra entity per
+    row for nothing.
+
+``author_id`` is in every profile and is not optional. ``selectinload`` on a many-to-one keys its
+batched ``SELECT ... WHERE id IN (...)`` on the local foreign key, so deferring it would make the
+loader fetch that column per row - turning the one batched statement this design depends on into
+an N+1. The comment on :func:`_with_relations` records the same requirement from the other side.
+"""
 
 
 PostSort = Literal["recent", "relevance"]
@@ -477,6 +513,73 @@ def _build_ordering(
     return clauses
 
 
+_SUMMARY_POST_COLUMNS: Final = (
+    # The nine members app.schemas.post.PostSummary declares over `posts`, plus `author_id`.
+    #
+    # Everything absent from this list is DEFERRED, and the two absences that matter are
+    # `content` - unbounded TEXT, up to 100,000 characters per row - and `search_vector`, a
+    # tsvector derived from the whole document. Neither is a member of PostSummary, so a feed page
+    # that fetched them moved the entire corpus of twenty articles in order to render twenty
+    # cards. `updated_at` is deferred for the same reason: PostSummary does not carry it.
+    #
+    # `author_id` is here because selectinload(Post.author) keys its batched IN lookup on it; see
+    # PostProjection. `id` is included by load_only automatically, being the primary key.
+    Post.author_id,
+    Post.title,
+    Post.slug,
+    Post.excerpt,
+    Post.cover_image_url,
+    Post.status,
+    Post.published_at,
+    Post.view_count,
+    Post.created_at,
+)
+"""The ``posts`` columns the ``"summary"`` projection selects. See :data:`PostProjection`."""
+
+_ADMIN_POST_COLUMNS: Final = (
+    # The eight members app.schemas.admin.AdminPost declares over `posts`, plus `author_id`.
+    #
+    # Narrower than the summary profile in three columns and wider in one: the administrative
+    # table shows `updated_at` (when a moderator last changed something) and renders neither the
+    # excerpt nor the cover image. `content` and `search_vector` are deferred here too.
+    Post.author_id,
+    Post.title,
+    Post.slug,
+    Post.status,
+    Post.published_at,
+    Post.view_count,
+    Post.created_at,
+    Post.updated_at,
+)
+"""The ``posts`` columns the ``"admin"`` projection selects. See :data:`PostProjection`."""
+
+_PUBLIC_AUTHOR_COLUMNS: Final = (
+    # The six members app.schemas.user.UserPublic declares. The four it withholds are `email`,
+    # `role`, `is_active` and `updated_at` - and `password_hash`, which is not a member of any
+    # response model in this API.
+    #
+    # That last one is why this tuple exists rather than being an optimisation: a listing that
+    # loaded whole `User` entities pulled every author's argon2id hash out of the database and
+    # held it in the session's identity map for the duration of the request. The projection is
+    # what keeps it in the `users` table.
+    User.username,
+    User.display_name,
+    User.bio,
+    User.avatar_url,
+    User.created_at,
+)
+"""The ``users`` columns a public byline needs. See :data:`PostProjection`."""
+
+_CATEGORY_SUMMARY_COLUMNS: Final = (
+    # The three members app.schemas.category.CategorySummary declares: the name to render, the
+    # slug to link to, and the id. `description`, `created_at` and `updated_at` are deferred -
+    # a badge shows none of them.
+    Category.name,
+    Category.slug,
+)
+"""The ``categories`` columns a badge needs. See :data:`PostProjection`."""
+
+
 def _with_relations[SelectT: Select[Any]](stmt: SelectT) -> SelectT:
     """Attach the eager loaders every rendered post needs, preserving the statement's type.
 
@@ -508,6 +611,60 @@ def _with_relations[SelectT: Select[Any]](stmt: SelectT) -> SelectT:
         a query.
     """
     return stmt.options(selectinload(Post.author), selectinload(Post.categories))
+
+
+def _with_projection[SelectT: Select[Any]](stmt: SelectT, projection: PostProjection) -> SelectT:
+    """Attach the loader profile a listing's response model actually needs.
+
+    The one place a projection is chosen, so that "which columns does this surface serialise" is
+    answered against :data:`PostProjection`'s table rather than restated per call site. Every
+    listing method routes through here, which is what keeps the feed, the profile and the
+    administrative table from drifting onto three different fetch shapes.
+
+    Args:
+        stmt: Any ``SELECT`` whose entity is :class:`~app.models.post.Post`.
+        projection: Which profile to apply - see :data:`PostProjection`.
+
+    Returns:
+        The same statement with the profile's loader options attached. Statements are generative,
+        so the argument is not mutated.
+
+    Note:
+        **A deferred column is not a slow column, it is an unreadable one.** Under an
+        ``AsyncSession`` an attribute left out of a ``load_only`` raises ``MissingGreenlet`` when
+        something touches it, rather than quietly issuing another query. That is the property that
+        makes these profiles safe to narrow: a projection that omits a member its response model
+        needs fails loudly and immediately, in the test that renders it, instead of returning a
+        subtly wrong payload. It is also why ``"detail"`` narrows nothing - a mutation re-reads its
+        row and a single-resource response carries the whole document.
+
+        **The loaders stay ``selectinload`` in every profile.** ``load_only`` narrows the columns a
+        loader fetches; it does not change the strategy, so the many-to-one ``author`` is still one
+        batched ``SELECT ... WHERE id IN (...)`` keyed on the page's ``author_id`` values, the
+        many-to-many ``categories`` is still one batched lookup through the association, and
+        neither multiplies rows - so ``total`` stays a plain count and no statement needs
+        ``.unique()``.
+
+        **Options are built at call time, not module scope.** ``selectinload`` and ``load_only``
+        inspect the mapper, which triggers registry configuration; evaluating them at import would
+        make merely importing this module require a fully configured registry, so an ``alembic``
+        command that only needs metadata would fail on the import rather than on a query.
+    """
+    if projection == "detail":
+        return _with_relations(stmt)
+
+    columns = _SUMMARY_POST_COLUMNS if projection == "summary" else _ADMIN_POST_COLUMNS
+    options = [
+        load_only(*columns),
+        selectinload(Post.author).load_only(*_PUBLIC_AUTHOR_COLUMNS),
+    ]
+    if projection == "summary":
+        # `AdminPost` carries no categories, so the admin profile does not pay for the association
+        # lookup at all. `PostSummary` renders a badge per category, so the summary profile does -
+        # narrowed to the three columns a badge shows.
+        options.append(selectinload(Post.categories).load_only(*_CATEGORY_SUMMARY_COLUMNS))
+
+    return stmt.options(*options)
 
 
 def _restrict[SelectT: Select[Any]](
@@ -607,6 +764,7 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
         author_id: uuid.UUID | None = None,
         statuses: Sequence[PostStatus] | None = (PostStatus.PUBLISHED,),
         sort: PostSort = DEFAULT_POST_SORT,
+        projection: PostProjection = "summary",
         limit: int,
         offset: int,
     ) -> tuple[Sequence[Post], int]:
@@ -641,6 +799,12 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
                 taken here** - authority belongs to ``app.services.post_service``.
             sort: ``"recent"`` (the default) or ``"relevance"``. With no search term,
                 ``"relevance"`` degrades to recency rather than raising.
+            projection: How much of each row to fetch - see :data:`PostProjection`. Defaults to
+                ``"summary"``, which is the shape every reader-facing listing serialises, because a
+                listing that accidentally inherits the widest profile is the defect this argument
+                exists to prevent: it costs ``posts.content`` per row and every private ``users``
+                column per author, silently. The administrative table passes ``"admin"``. No
+                listing passes ``"detail"``.
             limit: Rows per page. Non-positive yields no rows rather than an invalid ``LIMIT``;
                 request-supplied values are bounded well before they arrive here.
             offset: Rows to skip. An offset past the end returns an empty sequence beside the
@@ -648,10 +812,10 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
                 the end.
 
         Returns:
-            ``(rows, total)`` - the entities on this page with ``author`` and ``categories``
-            already loaded, and how many rows match in total ignoring the window.
-            Deliberately not a ``Page``: the service projects the rows into response schemas
-            and calls ``build_page(list(rows), total, page, page_size)``.
+            ``(rows, total)`` - the entities on this page loaded to the requested ``projection``,
+            and how many rows match in total ignoring the window. Deliberately not a ``Page``: the
+            service projects the rows into response schemas and calls
+            ``build_page(list(rows), total, page, page_size)``.
 
         Note:
             **Two statements, one predicate set.** :func:`_restrict` applies the joins and
@@ -670,6 +834,11 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
 
             **Loaders on the rows statement only.** An ORM loader option on a statement whose
             rows are never fetched is work with no output.
+
+            **The projection narrows the columns, never the predicates.** ``load_only`` changes
+            what the ``SELECT`` list carries; the ``WHERE``, the joins, the ordering and the count
+            are identical across all three profiles, so two callers asking for different
+            projections of the same filter set get the same rows and the same ``total``.
         """
         term = _normalise_term(q)
         # Built once here and threaded into BOTH builders. Two separate constructions would
@@ -689,7 +858,7 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
                 nulls_possible=_published_at_nullable(statuses),
             )
         )
-        rows_stmt = _with_relations(rows_stmt)
+        rows_stmt = _with_projection(rows_stmt, projection)
 
         # No ORDER BY, no LIMIT/OFFSET and no loader options: none of them changes a count, and
         # the sort PostgreSQL would perform for a result nobody reads is pure cost.
@@ -706,6 +875,7 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
         author_id: uuid.UUID,
         *,
         statuses: Sequence[PostStatus] | None = None,
+        projection: PostProjection = "summary",
         limit: int,
         offset: int,
     ) -> tuple[Sequence[Post], int]:
@@ -725,6 +895,9 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
                 ``app.services.profile_service`` is where that hard filter belongs. This
                 method will not choose it, because choosing who may see a draft is an
                 authority decision and authority does not live in the data layer.
+            projection: How much of each row to fetch, forwarded verbatim - see
+                :data:`PostProjection`. Defaults to ``"summary"``, which is what both callers
+                serialise.
             limit: Rows per page.
             offset: Rows to skip.
 
@@ -732,7 +905,11 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
             ``(rows, total)``, exactly as :meth:`list_posts` returns it.
         """
         return await self.list_posts(
-            author_id=author_id, statuses=statuses, limit=limit, offset=offset
+            author_id=author_id,
+            statuses=statuses,
+            projection=projection,
+            limit=limit,
+            offset=offset,
         )
 
     async def get_by_slug(self, slug: str, *, with_relations: bool = True) -> Post | None:
@@ -771,7 +948,9 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
         result = await self.session.execute(stmt)
         return result.scalars().first()
 
-    async def get_for_update(self, post_id: uuid.UUID) -> Post | None:
+    async def get_for_update(
+        self, post_id: uuid.UUID, *, with_relations: bool = False
+    ) -> Post | None:
         """Fetch one post by primary key, holding a row lock until the transaction ends.
 
         The first step of every mutating use case in ``app.services.post_service`` - update,
@@ -782,17 +961,26 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
 
         Args:
             post_id: The post's server-generated UUID.
+            with_relations: Whether to eager-load ``author`` and ``categories`` alongside the
+                locked row. ``False`` for a path that only needs the row's own columns - delete.
+                ``True`` for the paths that mutate and then render: ``update`` must have
+                ``categories`` loaded before it can assign a replacement membership (the ORM
+                computes the delta against the existing collection), and update, publish and
+                unpublish all render a ``PostDetail`` afterwards. Requesting them here is what
+                keeps that loading in this layer instead of leaving the service to reach through
+                ``awaitable_attrs``.
 
         Returns:
             The locked post, or ``None`` when no row carries that key. Absence is not an error
             here - the service turns it into a ``404``.
 
         Note:
-            **No eager loaders are attached, deliberately.** The point of the statement is a
-            lock over exactly one row of ``posts``. The publish and delete paths need the row's
-            own columns and nothing else, and a caller that does need the relations should fetch
-            them with :meth:`get_by_slug` or :meth:`get_by_id` once the transition is decided,
-            rather than widening the locked footprint.
+            **The lock covers ``posts`` and nothing else, in both modes.** ``FOR UPDATE`` applies
+            to the rows the primary statement returns; the eager loaders are ``selectinload``, so
+            ``author`` and ``categories`` arrive through separate unlocked ``SELECT ... WHERE id IN
+            (...)`` statements. The locked footprint is therefore identical either way - one row of
+            one relation - and no author account or category is held under a write lock because a
+            byline had to be rendered.
 
             **The row is re-read rather than served from the identity map.** An ORM ``SELECT``
             leaves an already-loaded instance's attributes untouched by default, so without
@@ -807,14 +995,112 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
             :meth:`~sqlalchemy.ext.asyncio.AsyncSession.get` would consult the identity map and
             could return without touching the database at all - taking no lock.
         """
+        stmt = select(Post).where(Post.id == post_id).with_for_update()
+        if with_relations:
+            stmt = _with_relations(stmt)
+        result = await self.session.execute(stmt.execution_options(populate_existing=True))
+        return result.scalars().first()
+
+    async def add_with_relations(self, post: Post) -> Post:
+        """Insert a post and return it with ``author`` and ``categories`` loaded.
+
+        The write-path counterpart of :meth:`get_for_update`, and what ``post_service.create``
+        calls instead of :meth:`~app.repositories.base.UUIDPrimaryKeyRepository.add`. The
+        difference is only which loading the *repository* does: ``add`` flushes and refreshes, and
+        a refresh expires every relationship, so a service that needed the byline afterwards had
+        to reach for it itself. This method leaves nothing for the caller to load.
+
+        Args:
+            post: A transient post built by the service from validated input. It must carry no
+                ``id`` - identity is ``gen_random_uuid()``'s - and its ``categories`` may already
+                be populated, which is how the association rows are written.
+
+        Returns:
+            The same instance, persistent, with the database-generated ``id``, the audit
+            timestamps, the generated ``search_vector``, and both relationships loaded.
+
+        Note:
+            **The INSERT is flushed here, so a unique violation surfaces at this call** rather
+            than at some later commit. That is what lets the service translate a slug collision
+            into a ``409`` at the point it happened, with its own transaction still intact enough
+            to roll back cleanly.
+
+            **Nothing is committed.** The transaction boundary belongs to the service, and this
+            method exists precisely so the service can finish assembling its response *before*
+            committing - which is the property that makes commit the last database action of the
+            request.
+        """
+        self.session.add(post)
+        await self.session.flush()
+        return await self.reload_with_relations(post)
+
+    async def save_with_relations(self, post: Post) -> Post:
+        """Flush a mutated post and return it with ``author`` and ``categories`` loaded.
+
+        What the update, publish and unpublish paths call instead of
+        :meth:`~app.repositories.base.BaseRepository.save`. It replaces that method's ``refresh``
+        rather than following it: :meth:`reload_with_relations` re-reads every mapped column of the
+        row *and* both relationships in one statement, so the re-derived ``updated_at`` and the
+        regenerated ``search_vector`` are current for the same reason ``refresh`` was mandatory,
+        and the byline is present without a second round trip.
+
+        Args:
+            post: A persistent post already mutated in place. Calling this with nothing dirty is
+                harmless: the flush emits no ``UPDATE`` and the re-read simply returns the row.
+
+        Returns:
+            The same instance, reloaded, with both relationships loaded.
+
+        Note:
+            Strictly fewer statements than the sequence it replaces. ``save`` was a flush plus a
+            ``refresh``, after which the service touched two unloaded relationships - four round
+            trips, two of them lazy loads issued from a layer that owns no queries. This is a flush
+            plus one re-read plus the two batched loader statements, and every one of them is
+            issued here.
+        """
+        await self.session.flush()
+        return await self.reload_with_relations(post)
+
+    async def reload_with_relations(self, post: Post) -> Post:
+        """Re-read one post's columns and both its relationships in a single statement.
+
+        The shared tail of :meth:`add_with_relations` and :meth:`save_with_relations`, and the
+        answer to "who loads a relationship the response needs". Under an ``AsyncSession`` a lazy
+        access raises ``MissingGreenlet``, and reaching through ``awaitable_attrs`` from a service
+        would put a query in a layer that is not allowed to contain one - so the load is requested
+        as a statement, here, where every other query over ``posts`` lives.
+
+        Args:
+            post: A persistent post. Only its ``id`` is read, so it is safe to call immediately
+                after a flush when other attributes are expired.
+
+        Returns:
+            The same identity-mapped instance, with every column re-read and ``author`` and
+            ``categories`` populated.
+
+        Raises:
+            RuntimeError: The row is gone. Unreachable through the two callers - both hold the row
+                inside their own transaction, one having just inserted it and the other under
+                ``FOR UPDATE`` - so it is raised rather than returning ``None`` in order to keep
+                the return type of both callers non-optional instead of pushing an impossible
+                branch into the service.
+
+        Note:
+            ``populate_existing`` is what makes this a re-read rather than a no-op: an ORM
+            ``SELECT`` leaves an already-loaded instance's attributes as they are, so without it
+            the freshly generated ``search_vector`` and the re-derived ``updated_at`` would stay
+            expired and the first thing to read either would raise.
+        """
         stmt = (
-            select(Post)
-            .where(Post.id == post_id)
-            .with_for_update()
+            _with_relations(select(Post))
+            .where(Post.id == post.id)
             .execution_options(populate_existing=True)
         )
         result = await self.session.execute(stmt)
-        return result.scalars().first()
+        reloaded = result.scalars().first()
+        if reloaded is None:  # pragma: no cover - the caller holds the row in its transaction
+            raise RuntimeError(f"post {post.id} vanished inside its own transaction")
+        return reloaded
 
     async def slugs_starting_with(self, prefix: str) -> set[str]:
         """Return every existing slug that begins with ``prefix``.

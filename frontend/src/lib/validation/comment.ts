@@ -116,6 +116,8 @@
 
 import { z } from 'zod';
 
+import { codePointLength } from '@/lib/text';
+
 import type { CommentCreate, CommentUpdate } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
@@ -236,6 +238,16 @@ const PARENT_ID_MESSAGE =
  * contract: anyone who changes it has to re-check, by parsing directly, that a padded body of
  * exactly the ceiling length is still accepted and a whitespace-only one is still refused.
  *
+ * **The ceiling is measured in code points, not in UTF-16 code units.** `codePointLength` from
+ * `@/lib/utils` is the tier's single measurement and the reason is arithmetic: the service's
+ * `max_length=5000` counts Python code points, while zod's `.max()` reads
+ * `String.prototype.length`, which counts UTF-16 code units and therefore scores every character
+ * above `U+FFFF` twice. A five-thousand-character comment written in emoji measures ten thousand to
+ * `.max()`, so the ceiling would refuse, in the reader's own words, a comment the API would have
+ * stored. The floor stays `.min()` because {@link BODY_MIN_LENGTH} is `1`, and at one the two units
+ * cannot disagree - a string has a code point exactly when it has a code unit - so a refinement
+ * there would add a second spelling of the same check.
+ *
  * The trim is the only transformation applied. It is string-to-string, so it does not disturb the
  * inferred output type, and it is the sole difference between what a reader typed and what is
  * submitted: nothing here strips, escapes or rewrites markup.
@@ -254,7 +266,9 @@ function commentBodySchema(emptyMessage: string): z.ZodString {
     })
     .trim()
     .min(BODY_MIN_LENGTH, { error: emptyMessage })
-    .max(BODY_MAX_LENGTH, { error: BODY_TOO_LONG_MESSAGE });
+    .refine((value) => codePointLength(value) <= BODY_MAX_LENGTH, {
+      error: BODY_TOO_LONG_MESSAGE,
+    });
 }
 
 /* -------------------------------------------------------------------------------------------------

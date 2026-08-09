@@ -126,12 +126,13 @@ logger of its own - and a line on the happy path would be a line on every profil
 the product.
 """
 
-from typing import Annotated, Any, Final
+from typing import Annotated, Final
 
 from fastapi import APIRouter, Path, status
 
+from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import CurrentUser, DbSession, PageParamsDep
-from app.schemas import Page, PostSummary, ProblemDetail, UserMe, UserPublic, UserUpdate
+from app.schemas import Page, PostSummary, UserMe, UserPublic, UserUpdate
 from app.services import ProfileService
 
 __all__ = ["router"]
@@ -178,73 +179,82 @@ _UsernamePath = Annotated[
 # ---------------------------------------------------------------------------------------
 # Documented failure modes
 #
-# Module constants rather than dict literals inside the decorators: `model` is what puts
-# each failure body into the generated document, so a client generator emits a type for it
-# instead of leaving the error path untyped, and naming them keeps the decorators readable.
+# Module constants rather than dict literals inside the decorators, and every one of them
+# built by `app.api.v1.responses.problem_response`: that helper names the model - which is
+# what puts each failure body into the generated document, so a client generator emits a type
+# for it instead of leaving the error path untyped - and it is the single place the published
+# error media type is decided.
 #
-# `ProblemDetail` throughout, because there is exactly one error shape in this API. The 422
-# entries deliberately override the framework's own `HTTPValidationError`: this service
-# registers a `RequestValidationError` handler that renders a validation failure as the same
-# problem document, with per-field detail under `errors`, so the default schema would
-# document a body it never emits.
+# One error shape throughout, because there is exactly one in this API. The 422 entries
+# deliberately override the framework's own `HTTPValidationError`: this service registers a
+# `RequestValidationError` handler that renders a validation failure as the same problem
+# document, with per-field detail under `errors`, so the default schema would document a body
+# it never emits. That is why `GET /{username}` declares a 422 it cannot in practice reach -
+# see the entry's own note.
+#
+# 403 belongs to `PATCH /me` alone. It resolves `CurrentUser`, which refuses a DEACTIVATED
+# principal before the handler is entered; the two profile reads resolve no principal at all,
+# so neither an authority check nor a credential rejection is reachable on them.
 # ---------------------------------------------------------------------------------------
 
-_SELF_UPDATE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_401_UNAUTHORIZED: {
-        "model": ProblemDetail,
-        "description": (
-            "No usable credential was presented, or the one presented was malformed, "
-            "expired or of the wrong type. `type` is `/errors/unauthorized` and the "
-            "response carries a `WWW-Authenticate: Bearer` challenge. This route has no "
-            "anonymous behaviour to fall back on: the record being edited is identified by "
-            "the credential itself."
-        ),
-    },
-    status.HTTP_422_UNPROCESSABLE_CONTENT: {
-        "model": ProblemDetail,
-        "description": (
-            "The body did not validate. `type` is `/errors/validation-error` and `errors` "
-            "names each rejected member. Reached by a value out of range - a blank "
-            "`display_name`, an `avatar_url` that is not an absolute http(s) URL, an "
-            "explicit `display_name: null` - and equally by any member the schema does not "
-            "declare: `UserUpdate` forbids unknown members, so a body proposing `role`, "
-            "`is_active`, `email`, `username` or `id` is rejected here rather than being "
-            "quietly discarded."
-        ),
-    },
+_SELF_UPDATE_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_401_UNAUTHORIZED: problem_response(
+        "No usable credential was presented, or the one presented was malformed, "
+        "expired or of the wrong type. `type` is `/errors/unauthorized` and the "
+        "response carries a `WWW-Authenticate: Bearer` challenge. This route has no "
+        "anonymous behaviour to fall back on: the record being edited is identified by "
+        "the credential itself."
+    ),
+    status.HTTP_403_FORBIDDEN: problem_response(
+        "The credential is genuine but the account has been deactivated, so it holds no "
+        "authority - not even over itself. `type` is `/errors/forbidden`. This is the only "
+        "state that produces it here: there is no path parameter and no identifier in the "
+        "body, so the record being written is always the caller's own and no ownership "
+        "comparison exists to fail. Re-authenticating will not clear it; an administrator "
+        "must reactivate the account."
+    ),
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "The body did not validate. `type` is `/errors/validation-error` and `errors` "
+        "names each rejected member. Reached by a value out of range - a blank "
+        "`display_name`, an `avatar_url` that is not an absolute http(s) URL, an "
+        "explicit `display_name: null` - and equally by any member the schema does not "
+        "declare: `UserUpdate` forbids unknown members, so a body proposing `role`, "
+        "`is_active`, `email`, `username` or `id` is rejected here rather than being "
+        "quietly discarded."
+    ),
 }
 
-_PROFILE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_404_NOT_FOUND: {
-        "model": ProblemDetail,
-        "description": (
-            "No visible account holds this handle. `type` is `/errors/not-found`. An "
-            "unclaimed handle and a deactivated account are reported identically, on "
-            "purpose: whether a deactivated account exists is not something an anonymous "
-            "caller is entitled to learn, and a distinguishable answer would confirm it."
-        ),
-    }
+_PROFILE_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_404_NOT_FOUND: problem_response(
+        "No visible account holds this handle. `type` is `/errors/not-found`. An "
+        "unclaimed handle and a deactivated account are reported identically, on "
+        "purpose: whether a deactivated account exists is not something an anonymous "
+        "caller is entitled to learn, and a distinguishable answer would confirm it."
+    ),
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "The request line did not satisfy the contract. `type` is "
+        "`/errors/validation-error` and `errors` names the offending parameter. Declared "
+        "because the framework documents a validation rejection on every operation that "
+        "parses a parameter, and this service renders every such rejection as the problem "
+        "document above rather than as the framework's own shape. **No value of `username` "
+        "reaches it today** - the handle is an unconstrained string here on purpose, so that "
+        "an unclaimable handle answers 404, which is the honest report that nobody holds it."
+    ),
 }
 
-_PROFILE_POSTS_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_404_NOT_FOUND: {
-        "model": ProblemDetail,
-        "description": (
-            "No visible account holds this handle - the same rule, and the same body, as "
-            "`GET /users/{username}`. Raised before any post is selected, so an unknown "
-            "author costs one index probe rather than a listing, and an unknown profile "
-            "can never present as an author who has simply written nothing."
-        ),
-    },
-    status.HTTP_422_UNPROCESSABLE_CONTENT: {
-        "model": ProblemDetail,
-        "description": (
-            "The page window was out of range: `page` below 1, or `page_size` outside "
-            "1-100. `type` is `/errors/validation-error`. Note that a page *past the last "
-            "one* is not an error - it is a 200 whose `items` list is empty beside the real "
-            "`total` and `pages`, so a client can tell it has run off the end."
-        ),
-    },
+_PROFILE_POSTS_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_404_NOT_FOUND: problem_response(
+        "No visible account holds this handle - the same rule, and the same body, as "
+        "`GET /users/{username}`. Raised before any post is selected, so an unknown "
+        "author costs one index probe rather than a listing, and an unknown profile "
+        "can never present as an author who has simply written nothing."
+    ),
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "The page window was out of range: `page` below 1, or `page_size` outside "
+        "1-100. `type` is `/errors/validation-error`. Note that a page *past the last "
+        "one* is not an error - it is a 200 whose `items` list is empty beside the real "
+        "`total` and `pages`, so a client can tell it has run off the end."
+    ),
 }
 
 

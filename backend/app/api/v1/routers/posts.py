@@ -15,18 +15,21 @@ Paths are shown as composed. ``app.api.v1.router`` attaches ``/api/v1/posts`` an
 ``GET /api/v1/posts/{slug}``
     Public. Answers ``PostDetail`` - see :func:`get_post`.
 ``POST /api/v1/posts``
-    Authenticated. Answers ``PostDetail`` at 201 - see :func:`create_post`.
+    Author or administrator. Answers ``PostDetail`` at 201 - see :func:`create_post`.
 ``PATCH /api/v1/posts/{post_id}``
-    Owner or administrator. Answers ``PostDetail`` - see :func:`update_post`.
+    Owning author, or administrator. Answers ``PostDetail`` - see :func:`update_post`.
 ``DELETE /api/v1/posts/{post_id}``
-    Owner or administrator. Answers 204 with no body - see :func:`delete_post`.
+    Owning author, or administrator. Answers 204 with no body - see :func:`delete_post`.
 ``POST /api/v1/posts/{post_id}/publish``
-    Owner or administrator. Answers ``PostDetail`` - see :func:`publish_post`.
+    Owning author, or administrator. Answers ``PostDetail`` - see :func:`publish_post`.
 ``POST /api/v1/posts/{post_id}/unpublish``
-    Owner or administrator. Answers ``PostDetail`` - see :func:`unpublish_post`.
+    Owning author, or administrator. Answers ``PostDetail`` - see :func:`unpublish_post`.
 
-"Owner or administrator" is a single comparison made in ``app.services.post_service``, never
-here - see "What this module does not do" below.
+Authority on a mutation is two rules, not one: the principal must hold ``AUTHOR`` or
+``ADMIN`` at all, and - unless it holds ``ADMIN`` - must be the post's own author. Both are
+single comparisons made in ``app.services.post_service``, never here; see "What this module
+does not do" below. A principal an administrator has demoted to ``READER`` is refused every
+one of these five operations, which is what makes the demotion mean something.
 
 Reads address a post by slug, mutations by identifier
 -----------------------------------------------------
@@ -71,8 +74,13 @@ item_id`` out independently in three handlers. That predicate now exists once, i
 repository layer's shared lookup, reached only through the service.
 
 **No authority comparison.** No role check, no ``author_id == principal.id``, and no call to
-the administrator predicate. ``PostService`` decides, so the same rule holds no matter which
-entry point invokes it and is unit-testable without an HTTP request in the picture.
+any authority predicate. ``PostService`` decides - it calls ``ensure_can_author`` for the role
+and ``ensure_can_modify`` for the ownership - so the same two rules hold no matter which entry
+point invokes them and both are unit-testable without an HTTP request in the picture. The five
+mutation signatures declare ``AuthorUser`` so the capability appears in the published contract
+and an anonymous or demoted caller is refused before any handler body runs - but that annotation
+is a GATE, not the enforcement point: what the signature says is "somebody entitled is asking",
+and what the service decides is "may they act on THIS post".
 
 **No framework exception.** The framework's own HTTP exception type appears nowhere in this
 file, where the retired module raised it with a 404 and the detail ``"Item not found"`` at
@@ -129,17 +137,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query, status
 
-from app.core.dependencies import CurrentUser, DbSession, OptionalUser, PageParamsDep
-from app.schemas import (
-    Page,
-    PostCreate,
-    PostDetail,
-    PostSortOption,
-    PostSummary,
-    PostUpdate,
-    ProblemDetail,
-)
-from app.schemas.post import DEFAULT_POST_SORT_OPTION
+from app.api.v1.responses import OPTIONAL_AUTHENTICATION, ProblemResponses, problem_response
+from app.core.dependencies import AuthorUser, DbSession, OptionalUser, PageParamsDep
+from app.schemas import Page, PostCreate, PostDetail, PostSortOption, PostSummary, PostUpdate
+from app.schemas.common import MAX_SEARCH_TERM_LENGTH, SearchTerm
 from app.services import PostService
 
 __all__ = ["router"]
@@ -169,16 +170,23 @@ __all__ = ["router"]
 # The repository layer is deliberately NOT imported in order to reach `PostSort` itself: the
 # API tier does not reach past the service layer, and `PostSort` is not published on the
 # service barrel's surface either - which is precisely why the schema layer publishes its own.
+#
+# THERE IS NO DEFAULT CONSTANT HERE, AND ADDING ONE BACK WOULD BE A DEFECT. The `sort`
+# parameter below is `PostSortOption | None` with a default of `None`, because the ordering a
+# caller who expressed no preference should get is not a constant - it is a function of
+# whether they searched. `PostService.list_feed` answers it through `_default_sort_for`: a
+# term means `relevance`, no term means `recent`. Spelling `recent` as this signature's
+# default is what made the relevance default unreachable - the service's rule keys off
+# `sort is None`, so a route that always sent a value meant a search was never ranked - and
+# the AAP requires relevance ranking when a term is present (R3). `None` here is therefore
+# "the caller expressed no preference", which is information the service needs and which a
+# defaulted signature destroys before it can be used.
+#
+# The two other listings over the same repository - the profile listing and the
+# administrative table - pass no `sort` at all, so they take
+# `post_repository.DEFAULT_POST_SORT`. That constant remains the storage-side default; it is
+# the *wire* default that could not survive being a constant.
 # ---------------------------------------------------------------------------------------
-
-_DEFAULT_SORT: Final[PostSortOption] = DEFAULT_POST_SORT_OPTION
-"""Ordering applied when a caller expresses no preference: newest published first.
-
-Taken from ``app.schemas.post`` rather than written as a literal in the signature below, so
-that the feed, the profile listing and the administrative table cannot drift onto different
-defaults. It is the ordering the composite index on the lifecycle state and the publication
-instant exists to serve, which makes it the cheapest as well as the most useful default.
-"""
 
 
 # ---------------------------------------------------------------------------------------
@@ -219,10 +227,12 @@ router-level dependency, because all three are the aggregate's to attach.
 # ---------------------------------------------------------------------------------------
 # Documented failure modes
 #
-# Every entry names `ProblemDetail` as its model, so `/openapi.json` describes the one
-# document `app.core.exceptions` actually emits - `type`, `title`, `status`, `detail`,
-# `instance`, and `errors` on a 422 - and a generated client gets one error type for the whole
-# API instead of a different shape per route.
+# Every entry is built by `app.api.v1.responses.problem_response`, which is the one place in
+# this package that names `ProblemDetail` and the one place the published media type is
+# decided. So `/openapi.json` describes the one document `app.core.exceptions` actually emits
+# - `type`, `title`, `status`, `detail`, `instance`, and `errors` on a 422 - under the one
+# media type it emits it as, and a generated client gets one error type for the whole API
+# instead of a different shape per route.
 #
 # Declaring 422 is not optional, even where nothing but a malformed path parameter can cause
 # one. FastAPI documents a 422 automatically on any operation that validates a parameter or a
@@ -233,146 +243,149 @@ router-level dependency, because all three are the aggregate's to attach.
 # operations below carry an entry - each of the seven validates at least a query parameter, a
 # path parameter or a body.
 #
-# The set is exactly what each route can PRODUCE, and no more. Enumerating a status the code
-# cannot emit would make the document advertise a branch a client can never take, which is
-# the same class of defect as declaring no response model at all. Two consequences are worth
-# recording, because both were checked against the service rather than assumed:
+# The set is exactly what each route can PRODUCE, and no more, in both directions: a status the
+# code cannot emit makes the document advertise a branch a client can never take, and a status
+# the code CAN emit but does not declare leaves a client with an undocumented body to parse.
+# Both are the same class of defect as declaring no response model at all. Three consequences
+# are worth recording, because all three were checked against the service rather than assumed:
 #
-#   * 409 appears on `POST ""` ALONE. `ConflictError` has exactly one raise site in
-#     `app.services.post_service` - the slug unique-index collision translated in `create`.
-#     `update`, `publish` and `unpublish` never raise it: the slug is deliberately not
-#     re-derived on a retitle, and both transitions are documented idempotent, so publishing
-#     an already-published post returns it unchanged instead of rejecting it. A 409 documented
-#     on those three would be unreachable.
+#   * 409 appears on `POST ""` AND on `PATCH /{post_id}`, and on those two alone.
+#     `app.services.post_service` translates exactly two integrity failures into
+#     `ConflictError` - a slug unique-index collision, which only `create` can cause because
+#     the slug is deliberately not re-derived on a retitle, and a concurrent change to a post's
+#     category filings, which both methods can cause because both rewrite `post_categories`.
+#     `publish` and `unpublish` write neither, and both are documented idempotent, so a 409 on
+#     those two would be unreachable. Every other integrity failure is re-raised rather than
+#     reported as contention, so a 409 from this router always means "somebody else got there
+#     first" and a retry is always the right response to it.
 #   * 404 appears on both public reads AND on `POST ""`. Creating a post with an unknown
 #     category identifier is a `NotFoundError`, and so is filtering the feed by a username
 #     that names no account - the latter reported rather than answered with an empty page, so
 #     a mistyped filter stays distinguishable from an author who has published nothing.
+#   * 422 is declared on all seven operations and never left to the framework. See the note
+#     above for why the default is inaccurate rather than merely terse.
 #
 # 401 appears on the two public reads as well as on the five mutations, and that is not a
 # contradiction: `OptionalUser` tolerates an ABSENT credential, but a credential that is
 # present and unusable - malformed, expired, or naming an account that no longer exists - is
 # still rejected, because silently degrading a broken session to anonymous would hide the
-# expiry from the client that needs to refresh it.
+# expiry from the client that needs to refresh it. A DEACTIVATED account is the one case that
+# is neither: `OptionalUser` resolves it as anonymous, so a public read succeeds with the
+# public projection and no 403 is reachable on either of the two reads.
+#
+# 403 appears on ALL FIVE mutations, including the collection route. Two rules produce it, and
+# the collection route is subject to the first: `ensure_can_author` refuses a `READER`
+# outright, and `ensure_can_modify` refuses an `AUTHOR` acting on somebody else's post. A
+# deactivated account is refused by `AuthorUser` with the same status before either runs.
+#
+# THE TWO PUBLIC READS ALSO CARRY `openapi_extra=OPTIONAL_AUTHENTICATION`, which is a
+# declaration about the credential rather than about a failure. Both resolve `OptionalUser`, so
+# the framework finds the bearer scheme in the dependency tree and would publish it as
+# REQUIRED - making a generated client refuse a call any anonymous visitor may make, and making
+# the interactive documentation hide it behind an authorisation prompt. The marker publishes
+# both alternatives, anonymous first. See `app.api.v1.responses` for why it cannot be written
+# as a `security` override.
 # ---------------------------------------------------------------------------------------
 
-_ProblemResponses = dict[int | str, dict[str, Any]]
-"""Shape of a route's ``responses=`` map. Aliased so each constant below is annotated
-explicitly rather than having its type inferred from a literal nested in a decorator."""
-
-_UNAUTHORIZED_ON_READ: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "A credential was presented and could not be used - malformed, expired, of the wrong "
-        "token type, or naming an account that no longer exists. Omitting the "
-        "`Authorization` header entirely is **not** an error on this route: an anonymous "
-        "caller is served the public projection. A client seeing this should refresh its "
-        "access token and retry."
-    ),
-}
+_UNAUTHORIZED_ON_READ: Final[dict[str, Any]] = problem_response(
+    "A credential was presented and could not be used - malformed, expired, of the wrong "
+    "token type, or naming an account that no longer exists. Omitting the "
+    "`Authorization` header entirely is **not** an error on this route: an anonymous "
+    "caller is served the public projection. A client seeing this should refresh its "
+    "access token and retry."
+)
 """401 on the two public reads, whose principal is optional but not ignorable."""
 
-_UNAUTHORIZED_ON_WRITE: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "No usable `Authorization: Bearer` credential was presented. Every mutation on this "
-        "resource requires an authenticated principal, because the post's author is taken "
-        "from the principal and could never be taken from the request body."
-    ),
-}
+_UNAUTHORIZED_ON_WRITE: Final[dict[str, Any]] = problem_response(
+    "No usable `Authorization: Bearer` credential was presented. Every mutation on this "
+    "resource requires an authenticated principal, because the post's author is taken "
+    "from the principal and could never be taken from the request body."
+)
 """401 on the five mutations."""
 
-_FORBIDDEN_ON_WRITE: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "The caller is authenticated but may not act on this post: they neither wrote it nor "
-        "hold `ADMIN`. Also returned when the account has been deactivated. The check is "
-        "made server-side in the service layer, so hiding the control in a client changes "
-        "nothing about it."
-    ),
-}
-"""403 on the four routes that address an existing post by identifier."""
+_FORBIDDEN_ON_WRITE: Final[dict[str, Any]] = problem_response(
+    "The caller is authenticated but may not act on this post. Three states produce it: "
+    "the account holds `READER`, so it may not author at all; it holds `AUTHOR` but "
+    "neither wrote this post nor holds `ADMIN`; or it has been deactivated. The response "
+    "does not say which - naming the missing authority would tell a caller which account "
+    "state to go and change. Every check is made server-side in the service layer, so "
+    "hiding the control in a client changes nothing about it."
+)
+"""403 on all five mutations - see :func:`create_post` for why the collection route needs it."""
 
-_POST_NOT_FOUND: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "No post is addressable that way. A draft the caller may not read answers this "
-        "identically to a post that does not exist - deliberately, because a distinguishable "
-        "403 would let an unauthorised caller confirm that unpublished content exists and "
-        "enumerate it."
-    ),
-}
+_POST_NOT_FOUND: Final[dict[str, Any]] = problem_response(
+    "No post is addressable that way. A draft the caller may not read answers this "
+    "identically to a post that does not exist - deliberately, because a distinguishable "
+    "403 would let an unauthorised caller confirm that unpublished content exists and "
+    "enumerate it."
+)
 """404 wherever a single post is addressed, by slug or by identifier."""
 
-_VALIDATION_FAILED: Final[dict[str, Any]] = {
-    "model": ProblemDetail,
-    "description": (
-        "The request did not satisfy the contract. The problem document carries an `errors` "
-        "list naming each offending field and why it was rejected. Reached by an out-of-range "
-        "`page_size`, a `sort` value outside the two accepted ones, a path identifier that is "
-        "not a UUID, or a body that omits a required member, violates a length bound or "
-        "carries a member the schema forbids."
-    ),
-}
+_VALIDATION_FAILED: Final[dict[str, Any]] = problem_response(
+    "The request did not satisfy the contract. The problem document carries an `errors` "
+    "list naming each offending field and why it was rejected. Reached by an out-of-range "
+    "`page_size`, a `sort` value outside the two accepted ones, a path identifier that is "
+    "not a UUID, or a body that omits a required member, violates a length bound or "
+    "carries a member the schema forbids."
+)
 """422 on all seven operations - see the note above on why it is always declared."""
 
-_FEED_RESPONSES: Final[_ProblemResponses] = {
+_CATEGORY_FILING_CONFLICT: Final[dict[str, Any]] = problem_response(
+    "This post's category filings were changed concurrently: another writer filed it under "
+    "a category this request was also filing, or deleted a category this request had already "
+    "confirmed. The association's composite primary key and its foreign key are the "
+    "backstops, and this is their translation. Reload the post and retry - the retry sees "
+    "the filings as they now stand."
+)
+"""409 on create and update, the two routes that rewrite ``post_categories``."""
+
+_FEED_RESPONSES: Final[ProblemResponses] = {
     status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED_ON_READ,
-    status.HTTP_404_NOT_FOUND: {
-        "model": ProblemDetail,
-        "description": (
-            "The `author` filter names no account. Reported rather than answered with an "
-            "empty page, so a mistyped username is distinguishable from an author who has "
-            "published nothing. A `category` that matches nothing is **not** an error - a "
-            "filter over a taxonomy legitimately selects zero posts."
-        ),
-    },
+    status.HTTP_404_NOT_FOUND: problem_response(
+        "The `author` filter names no account. Reported rather than answered with an "
+        "empty page, so a mistyped username is distinguishable from an author who has "
+        "published nothing. A `category` that matches nothing is **not** an error - a "
+        "filter over a taxonomy legitimately selects zero posts."
+    ),
     status.HTTP_422_UNPROCESSABLE_CONTENT: _VALIDATION_FAILED,
 }
 
-_DETAIL_RESPONSES: Final[_ProblemResponses] = {
+_DETAIL_RESPONSES: Final[ProblemResponses] = {
     status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED_ON_READ,
     status.HTTP_404_NOT_FOUND: _POST_NOT_FOUND,
     status.HTTP_422_UNPROCESSABLE_CONTENT: _VALIDATION_FAILED,
 }
 
-_CREATE_RESPONSES: Final[_ProblemResponses] = {
-    status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED_ON_WRITE,
-    status.HTTP_404_NOT_FOUND: {
-        "model": ProblemDetail,
-        "description": (
-            "One of the submitted `category_ids` names no category. Reported before the post "
-            "is inserted, so a bad identifier never reserves a slug or leaves a half-filed "
-            "draft behind."
-        ),
-    },
-    status.HTTP_409_CONFLICT: {
-        "model": ProblemDetail,
-        "description": (
-            "The slug derived from the title was taken between the moment the taken set was "
-            "read and the moment the row was inserted - two concurrent creates of the same "
-            "title. The `citext` unique index on `posts.slug` is the backstop and this is its "
-            "translation; a retry resolves it, because the retry sees the row that won and "
-            "derives the next free suffix."
-        ),
-    },
-    status.HTTP_422_UNPROCESSABLE_CONTENT: _VALIDATION_FAILED,
-}
-
-_UPDATE_RESPONSES: Final[_ProblemResponses] = {
+_CREATE_RESPONSES: Final[ProblemResponses] = {
     status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED_ON_WRITE,
     status.HTTP_403_FORBIDDEN: _FORBIDDEN_ON_WRITE,
-    status.HTTP_404_NOT_FOUND: {
-        "model": ProblemDetail,
-        "description": (
-            "No post carries that identifier, or one of the submitted `category_ids` names no "
-            "category."
-        ),
-    },
+    status.HTTP_404_NOT_FOUND: problem_response(
+        "One of the submitted `category_ids` names no category. Reported before the post "
+        "is inserted, so a bad identifier never reserves a slug or leaves a half-filed "
+        "draft behind."
+    ),
+    status.HTTP_409_CONFLICT: problem_response(
+        "A concurrent write got there first, in one of two ways. Either the slug derived "
+        "from the title was taken between the moment the taken set was read and the moment "
+        "the row was inserted - two concurrent creates of the same title, with the `citext` "
+        "unique index on `posts.slug` as the backstop - or a category this post was being "
+        "filed under changed underneath the insert. A retry resolves both: it sees the row "
+        "that won and derives the next free suffix, and it re-reads the taxonomy."
+    ),
     status.HTTP_422_UNPROCESSABLE_CONTENT: _VALIDATION_FAILED,
 }
 
-_MUTATION_RESPONSES: Final[_ProblemResponses] = {
+_UPDATE_RESPONSES: Final[ProblemResponses] = {
+    status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED_ON_WRITE,
+    status.HTTP_403_FORBIDDEN: _FORBIDDEN_ON_WRITE,
+    status.HTTP_404_NOT_FOUND: problem_response(
+        "No post carries that identifier, or one of the submitted `category_ids` names no category."
+    ),
+    status.HTTP_409_CONFLICT: _CATEGORY_FILING_CONFLICT,
+    status.HTTP_422_UNPROCESSABLE_CONTENT: _VALIDATION_FAILED,
+}
+
+_MUTATION_RESPONSES: Final[ProblemResponses] = {
     status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED_ON_WRITE,
     status.HTTP_403_FORBIDDEN: _FORBIDDEN_ON_WRITE,
     status.HTTP_404_NOT_FOUND: _POST_NOT_FOUND,
@@ -396,6 +409,9 @@ identifier and the principal, and whose failure modes are therefore identical.""
     response_model=Page[PostSummary],
     status_code=status.HTTP_200_OK,
     responses=_FEED_RESPONSES,
+    # Anonymous OR bearer, in that order - not bearer as a requirement. See the marker's note
+    # above the response constants.
+    openapi_extra=OPTIONAL_AUTHENTICATION,
     summary="List posts",
     description=(
         "The home feed. Composes free-text search, category filtering, author filtering, "
@@ -406,9 +422,11 @@ identifier and the principal, and whose failure modes are therefore identical.""
         "which is how an author's workspace lists its drafts, by calling this route "
         "authenticated with `author=<their own username>`.\n\n"
         "Every parameter narrows the result independently, and all of them are optional, so "
-        "the bare path is the default feed: published posts, newest first. A page past the "
-        "last one is not an error - it answers 200 with an empty `items` list beside the real "
-        "`total` and `pages`, which is how a client detects it has run off the end."
+        "the bare path is the default feed: published posts, newest first. Adding `q` without "
+        "`sort` ranks the page by relevance instead - the ordering follows what was asked, so "
+        "a search returns its best matches and a browse returns the newest posts. A page past "
+        "the last one is not an error - it answers 200 with an empty `items` list beside the "
+        "real `total` and `pages`, which is how a client detects it has run off the end."
     ),
 )
 async def list_posts(
@@ -416,12 +434,18 @@ async def list_posts(
     window: PageParamsDep,
     viewer: OptionalUser,
     q: Annotated[
-        str | None,
+        SearchTerm,
         Query(
             description=(
                 "Free-text search term, matched against the post's title, excerpt and body "
-                "through the generated search vector. Omit it to browse rather than search. A "
-                "whitespace-only value is treated as absent."
+                "through the generated search vector. Omit it to browse rather than search.\n\n"
+                f"At most {MAX_SEARCH_TERM_LENGTH} characters; a longer term is refused with "
+                "`422` rather than truncated, because a silently shortened search returns "
+                "results for a query the caller did not make. Whitespace runs are collapsed "
+                "and a whitespace-only value is treated as absent. Nothing else is altered - "
+                "the term reaches the full-text parser as typed, so its operator syntax "
+                "survives.\n\n"
+                "Supplying a term with no `sort` ranks the page by relevance; see `sort`."
             ),
         ),
     ] = None,
@@ -447,16 +471,20 @@ async def list_posts(
         ),
     ] = None,
     sort: Annotated[
-        PostSortOption,
+        PostSortOption | None,
         Query(
             description=(
-                "`recent` orders by publication instant, newest first, and is the default. "
-                "`relevance` ranks against the search vector, best match first, and is "
-                "meaningful only alongside `q` - with no term it degrades to recency rather "
-                "than failing."
+                "`recent` orders by publication instant, newest first. `relevance` ranks "
+                "against the search vector, best match first, and is meaningful only alongside "
+                "`q` - with no term it degrades to recency rather than failing.\n\n"
+                "**Omitting it is not the same as sending `recent`.** With no `sort`, the "
+                "ordering follows the request: a search (`q` present) is ranked by "
+                "`relevance`, because asking a question means asking for the best answer, and "
+                "a browse (no `q`) is ordered by `recent`. Send `sort=recent` alongside `q` to "
+                "search and still read newest-first."
             ),
         ),
-    ] = _DEFAULT_SORT,
+    ] = None,
 ) -> Page[PostSummary]:
     """Answer the feed for ``GET /api/v1/posts``.
 
@@ -469,10 +497,16 @@ async def list_posts(
         viewer: The resolved principal, or ``None`` for an anonymous caller. Passed straight
             through, because *which lifecycle states are in scope* is the service's decision
             and making it here would give draft confidentiality a second definition.
-        q: Free-text search term, or ``None``.
+        q: Free-text search term, or ``None``. Bounded to
+            :data:`~app.schemas.common.MAX_SEARCH_TERM_LENGTH` characters and whitespace-
+            collapsed by :data:`~app.schemas.common.SearchTerm` before this function is
+            entered, so nothing here trims, folds or measures it.
         category: Category slug to filter by, or ``None``.
         author: Author username to filter by, or ``None``.
-        sort: Requested ordering, defaulting to :data:`_DEFAULT_SORT`.
+        sort: The caller's requested ordering, or ``None`` when they expressed none - which is
+            **passed through as ``None``** rather than defaulted here. The default is
+            conditional on ``q`` and the service owns it; see the note above the router on why
+            substituting a value at this boundary is what made relevance ranking unreachable.
 
     Returns:
         The page of :class:`~app.schemas.post.PostSummary` the service assembled, returned
@@ -506,6 +540,9 @@ async def list_posts(
     response_model=PostDetail,
     status_code=status.HTTP_200_OK,
     responses=_DETAIL_RESPONSES,
+    # Anonymous OR bearer, in that order - a draft's own author is served their draft here, and
+    # an anonymous visitor is served the published post, so neither alternative may be dropped.
+    openapi_extra=OPTIONAL_AUTHENTICATION,
     summary="Read one post by its canonical slug",
     description=(
         "Returns one post in full, including its body, addressed by the slug that is its "
@@ -555,11 +592,20 @@ async def get_post(
 # ---------------------------------------------------------------------------------------
 # Mutations
 #
-# All five take `CurrentUser`, so an anonymous request is rejected before any of these bodies
-# runs, and all five address the post by its server-generated UUID rather than by slug. None
-# of them contains an authority comparison: `PostService` resolves the row, then applies the
-# one ownership rule - author or `ADMIN` - in that order, so a caller with no authority over a
-# post that does not exist gets 404 rather than a 403 that would confirm it exists.
+# All five take `AuthorUser`, so an anonymous request is rejected before any of these bodies
+# runs and so is one from an account holding `READER` - authoring is a capability of the
+# `AUTHOR` and `ADMIN` roles, and without that gate an administrative demotion would revoke
+# nothing, since every other check on this path is ownership-scoped and a demoted author still
+# owns the posts they wrote. All five address the post by its server-generated UUID rather than
+# by slug.
+#
+# `AuthorUser` is a gate, not the enforcement point. None of these bodies contains an authority
+# comparison: `PostService` re-checks the same capability through `ensure_can_author` and then
+# applies the ownership rule through `ensure_can_modify`, so the rules hold for any entry point
+# rather than only for a request that happens to declare this dependency. On the four routes
+# that address an existing post the service resolves the row FIRST, so a caller with no
+# authority over a post that does not exist gets 404 rather than a 403 that would confirm it
+# exists.
 # ---------------------------------------------------------------------------------------
 
 
@@ -581,13 +627,15 @@ async def get_post(
         "`author_id` are all server-owned: the schema rejects any request that names one, the "
         "slug is derived from the title and de-duplicated, and the author is taken from the "
         "presented credential.\n\n"
-        "No role beyond authentication is required. A reader who writes their first post "
-        "becomes an author by doing so."
+        "Requires the `AUTHOR` or `ADMIN` role, which a self-registered account holds from "
+        "the moment it is created - so signing up is the whole of the path to authoring. An "
+        "account an administrator has demoted to `READER` is refused with `403`, and writing "
+        "does not promote it back."
     ),
 )
 async def create_post(
     db: DbSession,
-    author: CurrentUser,
+    author: AuthorUser,
     payload: PostCreate,
 ) -> PostDetail:
     """Create a draft for ``POST /api/v1/posts``.
@@ -595,7 +643,8 @@ async def create_post(
     Args:
         db: The request-scoped session.
         author: The authenticated, active principal. The post's ``author_id`` is taken from
-            here and could not have come from the body - the schema forbids the member.
+            here and could not have come from the body - the schema forbids the member. The
+            service refuses it with 403 unless it holds ``AUTHOR`` or ``ADMIN``.
         payload: The validated request body.
 
     Returns:
@@ -639,7 +688,7 @@ async def create_post(
 )
 async def update_post(
     db: DbSession,
-    actor: CurrentUser,
+    actor: AuthorUser,
     post_id: UUID,
     payload: PostUpdate,
 ) -> PostDetail:
@@ -647,7 +696,8 @@ async def update_post(
 
     Args:
         db: The request-scoped session.
-        actor: The authenticated, active principal. Must own the post or hold ``ADMIN``, which
+        actor: The authenticated, active principal. Must hold ``AUTHOR`` or ``ADMIN`` and must
+            own the post unless it holds ``ADMIN``, which
             the service enforces.
         post_id: The post's server-generated identifier. Typed :class:`~uuid.UUID`, so a
             malformed value is a 422 naming the parameter before this body runs.
@@ -689,14 +739,15 @@ async def update_post(
 )
 async def delete_post(
     db: DbSession,
-    actor: CurrentUser,
+    actor: AuthorUser,
     post_id: UUID,
 ) -> None:
     """Delete a post for ``DELETE /api/v1/posts/{post_id}``.
 
     Args:
         db: The request-scoped session.
-        actor: The authenticated, active principal. Must own the post or hold ``ADMIN``.
+        actor: The authenticated, active principal. Must hold ``AUTHOR`` or ``ADMIN``, and
+            must own the post unless it holds ``ADMIN``.
         post_id: The post's server-generated identifier.
 
     Returns:
@@ -739,14 +790,15 @@ async def delete_post(
 )
 async def publish_post(
     db: DbSession,
-    actor: CurrentUser,
+    actor: AuthorUser,
     post_id: UUID,
 ) -> PostDetail:
     """Transition a post to published for ``POST /api/v1/posts/{post_id}/publish``.
 
     Args:
         db: The request-scoped session.
-        actor: The authenticated, active principal. Must own the post or hold ``ADMIN``.
+        actor: The authenticated, active principal. Must hold ``AUTHOR`` or ``ADMIN``, and
+            must own the post unless it holds ``ADMIN``.
         post_id: The post's server-generated identifier.
 
     Returns:
@@ -787,14 +839,15 @@ async def publish_post(
 )
 async def unpublish_post(
     db: DbSession,
-    actor: CurrentUser,
+    actor: AuthorUser,
     post_id: UUID,
 ) -> PostDetail:
     """Return a post to draft for ``POST /api/v1/posts/{post_id}/unpublish``.
 
     Args:
         db: The request-scoped session.
-        actor: The authenticated, active principal. Must own the post or hold ``ADMIN``.
+        actor: The authenticated, active principal. Must hold ``AUTHOR`` or ``ADMIN``, and
+            must own the post unless it holds ``ADMIN``.
         post_id: The post's server-generated identifier.
 
     Returns:

@@ -84,7 +84,7 @@
  *
  * | Standard                         | How this module satisfies it                                                                          |
  * | -------------------------------- | ----------------------------------------------------------------------------------------------------- |
- * | Layered separation of concerns   | Paths and return types only; two outward imports; no transport primitive, no React, no cache, no state |
+ * | Layered separation of concerns   | Paths, one segment guard and return types; two outward imports; no transport primitive and no state    |
  * | Explicit API contracts           | Every function returns the declared {@link LikeSummary}; wire names stay snake_case, untranslated      |
  * | API versioning                   | Namespace-relative paths only; the version namespace is composed once, by the client module            |
  * | Secure-by-default authentication | Both mutations require a credential; the read deliberately does not, and never forces its absence      |
@@ -94,7 +94,66 @@
  */
 
 import { apiDelete, apiGet, apiPut, type RequestOptions } from '@/lib/api/client';
+import { encodePathSegment } from '@/lib/paths';
+import { likeSummarySchema } from '@/lib/types';
 import type { LikeSummary } from '@/lib/types';
+
+/* -------------------------------------------------------------------------------------------------
+ * Path composition
+ *
+ * Two literals, and one guard between a caller's argument and either of them. The guard is the same
+ * one `@/lib/api/comments` applies to its identifiers, written out here rather than shared because a
+ * wrapper importing a sibling wrapper is the one import edge this folder does not have - see the
+ * module header. Duplicating eight lines is the price of that, and it is the right price.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Turn the caller's post identifier into one safe path segment, or reject it.
+ *
+ * Two separate things, and the distinction matters:
+ *
+ * 1. **A blank identifier is refused, loudly.** `''` or whitespace would compose `/posts//like`,
+ *    which the service answers with a `404` or a `422` whose cause is nowhere near the mistake that
+ *    produced it - a control wired to an undefined `post.id` reads as a missing post rather than as a
+ *    missing prop.
+ * 2. **What survives is percent-encoded.** `@/lib/api/client` interpolates a path into the request URL
+ *    verbatim - correctly, since encoding a whole path would destroy its separators - so encoding a
+ *    *segment* is this module's job. For the canonical hyphenated UUID the API emits this is a no-op.
+ *    For anything else it is containment: a stray `/`, `?`, `#` or `..` stays inside the segment
+ *    instead of restructuring the request. Unencoded, `a/../../auth/login` reaches a different
+ *    endpoint entirely once the URL is normalised, and `x?y=1` turns the rest of the path into a query.
+ *
+ * Deliberately **not** a format check. Whether an identifier names a real post, and whether it is a
+ * well-formed UUID, are decided server-side and reported as `404` and `422`; a third copy of that rule
+ * here would be the copy that has to be found and changed if identity ever stops being a UUID.
+ *
+ * @param postId - The identifier as the caller supplied it.
+ * @returns The trimmed, percent-encoded value, ready to interpolate.
+ * @throws Error when `postId` is empty or whitespace alone. A programming error in the caller,
+ * surfaced as a **rejection** rather than a synchronous throw because all three functions below are
+ * `async` - which is what lets a caller handle it in the same `catch` as every transport failure.
+ */
+function postSegment(postId: string, operation: string): string {
+  // Through the tier's ONE encoder rather than a local copy of half the rule. A blank value was
+  // already refused here; a DOT SEGMENT was not, and that is the case percent-encoding cannot
+  // cover - `..` is unreserved, so `/posts/../auth/me/like` is composed, resolved by the URL
+  // grammar and answered successfully by a route this wrapper never addressed.
+  return encodePathSegment(postId, {
+    operation,
+    parameterName: 'postId',
+    hint: 'Pass the UUID the API emitted for the post.',
+  });
+}
+
+/** `/posts/{post_id}/like` - the mutation path, for {@link likePost} and {@link unlikePost}. */
+function likePath(postId: string, operation: string): string {
+  return `/posts/${postSegment(postId, operation)}/like`;
+}
+
+/** `/posts/{post_id}/likes` - the read path, plural, for {@link getLikes}. */
+function likesPath(postId: string, operation: string): string {
+  return `/posts/${postSegment(postId, operation)}/likes`;
+}
 
 /* -------------------------------------------------------------------------------------------------
  * Mutations - PUT and DELETE on /posts/<post_id>/like
@@ -122,12 +181,12 @@ import type { LikeSummary } from '@/lib/types';
  * unreachable service, or a cancelled request. Failures are already normalised by the client module;
  * nothing is re-mapped here.
  */
-export function likePost(postId: string, options?: RequestOptions): Promise<LikeSummary> {
+export async function likePost(postId: string, options?: RequestOptions): Promise<LikeSummary> {
   // Bodyless on purpose: the post is addressed by the path and the account comes from the resolved
   // principal, so there is no third value for a client to send. The explicit `undefined` is the
   // client module's own signal for "no body and no content-type header" - `{}` would instead send an
   // empty JSON object, which this route neither expects nor needs.
-  return apiPut<LikeSummary>(`/posts/${postId}/like`, undefined, options);
+  return await apiPut(likePath(postId, 'likePost'), likeSummarySchema, undefined, options);
 }
 
 /**
@@ -153,12 +212,12 @@ export function likePost(postId: string, options?: RequestOptions): Promise<Like
  * @throws `ApiError` for every failure - no credential or an expired one, an unknown post, an
  * unreachable service, or a cancelled request.
  */
-export function unlikePost(postId: string, options?: RequestOptions): Promise<LikeSummary> {
+export async function unlikePost(postId: string, options?: RequestOptions): Promise<LikeSummary> {
   // The recorded exception, restated at the call site so it survives future editing: this deletion
   // answers with the settled summary, so it uses the body-parsing deletion helper. Switching to the
   // no-content helper - or declaring this as returning nothing - would discard the count the caller
   // came for and force an extra read on every interaction. Bodyless for the same reason as the like.
-  return apiDelete<LikeSummary>(`/posts/${postId}/like`, options);
+  return await apiDelete(likePath(postId, 'unlikePost'), likeSummarySchema, options);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -191,7 +250,7 @@ export function unlikePost(postId: string, options?: RequestOptions): Promise<Li
  * @throws `ApiError` when no post carries that identifier, when it is an unpublished post this
  * viewer may not see, or when the service cannot be reached. Absence of a credential is not a failure.
  */
-export function getLikes(postId: string, options?: RequestOptions): Promise<LikeSummary> {
+export async function getLikes(postId: string, options?: RequestOptions): Promise<LikeSummary> {
   // No credential check, no early throw, and no skipping the call for an anonymous reader. "No
   // bearer required" means this must succeed without one, not that one is refused when held.
   //
@@ -200,5 +259,8 @@ export function getLikes(postId: string, options?: RequestOptions): Promise<Like
   // reader - a silent defect, because the count itself would still be perfectly correct. That flag
   // exists for reading as the public would; omitting it is what lets the client module attach a held
   // credential and report the caller's own state truthfully. No branching is needed here at all.
-  return apiGet<LikeSummary>(`/posts/${postId}/likes`, options);
+  return await apiGet(likesPath(postId, 'getLikes'), likeSummarySchema, {
+    ...options,
+    anonymousFallback: true,
+  });
 }

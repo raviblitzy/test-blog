@@ -159,6 +159,27 @@ make a rendered line read as something other than what was logged.
 anything that is not an address at all. And the ``HTTP_LOG_FIELD_*`` constants fix the field
 names both layers use, because two events describing one request under different keys cannot
 be correlated by a query.
+
+Redaction, applied to every record in every environment
+-------------------------------------------------------
+Bounding a value and neutralising its control characters does not make it safe to keep; it
+only makes it safe to *render*. A connection URL with a password in it, a bearer token, a
+signing key interpolated into a message and an address identifying a person are all perfectly
+printable, and a log record is retained, indexed and searched by more people than the request
+that produced it ever reached.
+
+:func:`redact_sensitive_text` removes those classes of value from a string, and
+:func:`redact_log_event` is the *structlog* processor that applies it to every string a record
+carries - the event message, every field, and the rendered exception, whether that arrived as
+the pretty traceback the development path produces or as the structured frames the JSON path
+produces. It is installed in **both** terminal chains, because a secret exposed only on a
+developer's terminal is still exposed: that terminal is scraped into a scrollback buffer, a CI
+transcript and a pasted bug report.
+
+It is a backstop and not a licence. The standing rule for callers is unchanged - log an
+identifier and a classification, never the value that failed - and the two structural defences
+remain: ``show_locals=False`` keeps a frame's variables out of a rendered traceback, and
+:func:`configure_logging` renders no setting it reads.
 """
 
 import ipaddress
@@ -166,7 +187,7 @@ import logging
 import re
 import sys
 import unicodedata
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from functools import cache
 from typing import Any, Final, TextIO
 
@@ -180,11 +201,14 @@ __all__ = [
     "HTTP_LOG_FIELD_PATH",
     "HTTP_LOG_FIELD_STATUS",
     "LOG_EXCEPTION_VALUE_MAX_LENGTH",
+    "LOG_REDACTION_PLACEHOLDER",
     "LOG_TEXT_MAX_LENGTH",
     "anonymised_client_network",
     "configure_logging",
     "get_logger",
     "log_safe_text",
+    "redact_log_event",
+    "redact_sensitive_text",
 ]
 
 
@@ -488,6 +512,198 @@ def _resolve_level(level_name: str) -> int:
     return logging.getLevelNamesMapping()[level_name]
 
 
+# ---------------------------------------------------------------------------------------
+# Redaction of sensitive values
+#
+# Seven patterns, each for a class of value this service is known to handle and none of
+# which may be retained in a log. They are applied in the order declared, and the order is
+# deliberate: userinfo is stripped from a URL before the address pattern runs, so a DSN's
+# `user:password@host` is removed as a credential rather than partially matched as an
+# address.
+#
+# Every pattern rewrites rather than drops, and the replacement is visible. A field that
+# silently loses its value looks like a field that never had one, which is how a reader
+# concludes a diagnostic is missing when it was in fact withheld.
+# ---------------------------------------------------------------------------------------
+
+LOG_REDACTION_PLACEHOLDER: Final[str] = "[redacted]"
+"""What replaces a redacted value. Deliberately conspicuous, and never an empty string.
+
+A reader who finds it knows a value was removed on purpose, which is a different fact from a
+field that was never populated. It is also what a test asserts on: the marker test in
+``backend/tests/unit/test_logging_redaction.py`` checks that the secret is gone *and* that this
+took its place, so a pattern that silently stopped matching would fail rather than pass quietly.
+"""
+
+_REDACTION_RULES: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
+    # 1. Userinfo in any URL. This is the DSN case - `postgresql+psycopg://user:pw@host/db`,
+    #    which `Settings.DATABASE_URL` holds and which psycopg quotes back in a connection
+    #    failure - and also `https://token@host`. The scheme class admits `+`, `.` and `-`
+    #    because `postgresql+psycopg` needs all three.
+    (
+        re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/@]+@"),
+        rf"\g<1>{LOG_REDACTION_PLACEHOLDER}@",
+    ),
+    # 2. A JSON Web Token. Three base64url segments after the `eyJ` that every JOSE header
+    #    begins with - specific enough that it cannot match an ordinary word, and it is the
+    #    exact shape of the access token this service signs.
+    (
+        re.compile(r"\beyJ[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]*"),
+        LOG_REDACTION_PLACEHOLDER,
+    ),
+    # 3. A credential following an HTTP authentication scheme, which covers the opaque refresh
+    #    token as well as the JWT above and a `Basic` pair. The scheme word is kept: it says
+    #    which credential was presented, which is a useful diagnostic and not a secret.
+    (
+        re.compile(r"(?i)\b(bearer|basic|digest)\s+[A-Za-z0-9._~+/=\-]{8,}"),
+        rf"\g<1> {LOG_REDACTION_PLACEHOLDER}",
+    ),
+    # 4. A named secret assigned in text: `password=...`, `JWT_SECRET_KEY: ...`,
+    #    `api_key="..."`. This is the shape a validation message, a repr and an f-string all
+    #    produce, and the name is preserved so the reader still learns WHICH value was
+    #    withheld. A quoted value is consumed whole so a space inside it cannot leave a tail
+    #    behind.
+    #
+    #    The lookahead is what makes the whole set idempotent and order-independent. Without it,
+    #    `password=[redacted]` would be re-matched - the value class stops at `]`, so a second
+    #    pass would produce `password=[redacted]]` - and `Authorization: Bearer [redacted]`
+    #    would have its scheme word eaten as though the word itself were the secret, discarding
+    #    the one part of that header worth keeping.
+    (
+        re.compile(
+            r"(?i)\b((?:jwt[_-]?)?(?:secret|password|passwd|pwd|token|credential|api[_-]?key"
+            r"|access[_-]?token|refresh[_-]?token|private[_-]?key|authorization|dsn)"
+            r"(?:[_-]?key)?)\s*[=:]\s*"
+            rf"(?!{re.escape(LOG_REDACTION_PLACEHOLDER)}|bearer\b|basic\b|digest\b)"
+            r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&)\]}]+)"
+        ),
+        rf"\g<1>={LOG_REDACTION_PLACEHOLDER}",
+    ),
+    # 5. An email address. Personal data, and the identity this service authenticates by, so
+    #    it is both PII and half of a credential pair. It is also what PostgreSQL quotes in
+    #    the DETAIL line of a unique-violation on `users.email`.
+    (
+        re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
+        LOG_REDACTION_PLACEHOLDER,
+    ),
+    # 6. The diagnostic tails a PostgreSQL error carries. `DETAIL` quotes the conflicting
+    #    key and its value verbatim, `CONTEXT` and `QUERY` quote statement text, and any of
+    #    them can therefore carry a row a reader authored. Consumed to the end of the line,
+    #    so this must run while the text still has its newlines - see `redact_log_event`.
+    (
+        re.compile(r"(?im)^[ \t]*(DETAIL|HINT|CONTEXT|QUERY)[ \t]*:.*$"),
+        rf"\g<1>: {LOG_REDACTION_PLACEHOLDER}",
+    ),
+    # 7. A PEM block. Nothing in this service logs one, and if anything ever does it must not
+    #    survive: the body is dropped and only the label is kept.
+    (
+        re.compile(r"(?s)-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----"),
+        LOG_REDACTION_PLACEHOLDER,
+    ),
+)
+
+_REDACTION_MAX_DEPTH: Final[int] = 4
+"""How far into a nested value :func:`redact_log_event` will walk.
+
+Four levels reach everything a record actually holds: the event dictionary, the ``exception``
+list, one frame dictionary inside it, and that frame's ``exc_notes`` list. The bound exists so a
+caller who logs a deeply nested or self-referential structure cannot turn one log line into
+unbounded work on the failure path.
+"""
+
+
+def redact_sensitive_text(value: str) -> str:
+    """Remove every class of sensitive value :data:`_REDACTION_RULES` recognises from *value*.
+
+    Applied to text that was composed elsewhere - an exception message, a validation message, a
+    driver diagnostic, a field a caller passed - and therefore to text nobody audited before it
+    became a log record. The rules are conservative about what they consume and explicit about
+    what they leave: a named secret keeps its name, a URL keeps its scheme and host, a
+    PostgreSQL diagnostic keeps the label that says which diagnostic it was. What a reader loses
+    is exactly the part that must not be retained.
+
+    Idempotent: running it twice changes nothing, because :data:`LOG_REDACTION_PLACEHOLDER`
+    matches none of the patterns. That matters because two processors and one call site all use
+    it, and a value can legitimately pass through more than one of them.
+
+    Args:
+        value: Text about to be written into a log record.
+
+    Returns:
+        The same text with every recognised secret, credential, address and database diagnostic
+        replaced by :data:`LOG_REDACTION_PLACEHOLDER`. Never raises, and never returns ``None``.
+    """
+    redacted = value
+    for pattern, replacement in _REDACTION_RULES:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _redact_value(value: Any, depth: int) -> Any:
+    """Apply :func:`redact_sensitive_text` to every string reachable within *depth* levels.
+
+    Strings are rewritten, containers are rebuilt, and anything else - an ``int``, a ``bool``,
+    ``None``, a UUID, a datetime - is returned untouched. Mappings and sequences are rebuilt
+    rather than mutated in place so a caller's own object is never modified by having been
+    logged, which would be a side effect no caller could anticipate.
+
+    Args:
+        value: The field value to walk.
+        depth: Remaining levels of nesting to descend. At zero, a container is returned as it
+            is; see :data:`_REDACTION_MAX_DEPTH`.
+
+    Returns:
+        The value with every reachable string redacted.
+    """
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if depth <= 0:
+        return value
+    if isinstance(value, Mapping):
+        return {key: _redact_value(item, depth - 1) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item, depth - 1) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(item, depth - 1) for item in value)
+    return value
+
+
+def redact_log_event(
+    _logger: object, _name: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Redact every string in a record, wherever in it that string lives.
+
+    The one processor that runs in **both** terminal chains, and the only defence in this module
+    that does not depend on which environment the process is configured for. Its position in each
+    chain is what makes it total:
+
+    * **After the exception renderer.** The development path turns ``exc_info`` into a formatted
+      traceback *string* and the JSON path turns it into a list of frame dictionaries; running
+      after either means this processor sees text in both cases rather than an exception object
+      it would have to render itself. That closes the gap this module previously had, where the
+      development path reached ``ConsoleRenderer`` without passing through any processing at all.
+    * **Before the bounding pass.** ``_sanitise_exception_values`` replaces newlines with U+FFFD,
+      and one of the rules here consumes a PostgreSQL ``DETAIL`` line to its end. Redacting first
+      is what leaves those newlines intact for it to anchor on.
+
+    Every field is walked, not a chosen subset, because a redaction list that has to be kept in
+    step with every call site in the service is a list that will fall behind one. The walk is
+    depth-bounded (:data:`_REDACTION_MAX_DEPTH`) and rebuilds containers rather than mutating
+    them, so logging a structure never changes it.
+
+    Args:
+        _logger: The wrapped logger. Unused, part of the *structlog* processor signature.
+        _name: The method name. Unused, part of the same signature.
+        event_dict: The event being rendered.
+
+    Returns:
+        The same mapping, its values replaced in place and returned as the chain requires.
+    """
+    for key, value in list(event_dict.items()):
+        event_dict[key] = _redact_value(value, _REDACTION_MAX_DEPTH)
+    return event_dict
+
+
 def _shared_processors() -> list[Processor]:
     """Build the processors every record passes through, whatever emitted it.
 
@@ -555,12 +771,12 @@ def _sanitise_exception_values(
     path, wherever it was raised and whoever wrote it - which is the only way to get that
     guarantee without auditing every ``raise`` in the codebase forever.
 
-    What this cannot do is remove a secret somebody deliberately interpolated into a message,
-    and it does not pretend to: the traceback renderer is already constructed with
-    ``show_locals=False`` so a frame's variables are never serialised, and the standing rule
-    for callers is that a message names what failed rather than the value that failed. The
-    development path renders tracebacks as a single formatted string for a human reading a
-    terminal and is deliberately left alone; the structured path is the one that ships.
+    What this does **not** do is remove a secret somebody interpolated into a message. That is
+    :func:`redact_log_event`'s job, which runs immediately before this processor and covers the
+    development path as well - so the two are complementary rather than alternatives: redaction
+    decides what may be retained, and this decides how what remains may be rendered. The
+    structural guarantee is unchanged either way, because the traceback renderer is constructed
+    with ``show_locals=False`` so a frame's variables are never serialised at all.
 
     Args:
         _logger: The wrapped logger. Unused, part of the *structlog* processor signature.
@@ -603,6 +819,14 @@ def _terminal_processors(*, development: bool) -> list[Processor]:
     an aligned, readable line. Colours are enabled only when stdout is a terminal, so a
     captured or redirected stream carries no ANSI escapes.
 
+    :func:`redact_log_event` is in **both** returned chains, immediately after the exception
+    renderer and before the terminal renderer, and that symmetry is the point. A developer's
+    terminal is not a private sink - it is scraped into a scrollback buffer, a CI transcript and
+    a pasted bug report - so a chain that redacted only the shipping path would be deciding that
+    a leaked credential is acceptable as long as it leaked locally. Placing it after the
+    exception renderer is what lets one processor cover both representations: a formatted
+    traceback string here, a list of frame dictionaries there.
+
     Every other environment gets structured frames and one JSON object per line.
     ``ExceptionDictTransformer`` is constructed explicitly instead of using the
     ``structlog.processors.dict_tracebacks`` shortcut for one reason: the shortcut defaults
@@ -625,10 +849,12 @@ def _terminal_processors(*, development: bool) -> list[Processor]:
     if development:
         return [
             structlog.processors.format_exc_info,
+            redact_log_event,
             structlog.dev.ConsoleRenderer(colors=sys.stdout.isatty()),
         ]
     return [
         structlog.processors.ExceptionRenderer(ExceptionDictTransformer(show_locals=False)),
+        redact_log_event,
         _sanitise_exception_values,
         structlog.processors.JSONRenderer(),
     ]

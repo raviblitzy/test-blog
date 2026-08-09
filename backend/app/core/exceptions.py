@@ -172,20 +172,26 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ExceptionHandler
 
 from app.core.logging import (
     HTTP_LOG_FIELD_METHOD,
     HTTP_LOG_FIELD_PATH,
     HTTP_LOG_FIELD_STATUS,
+    LOG_EXCEPTION_VALUE_MAX_LENGTH,
     get_logger,
     log_safe_text,
+    redact_sensitive_text,
 )
 
 __all__ = [
+    "CORS_EXPOSE_HEADERS",
     "PROBLEM_JSON_MEDIA_TYPE",
     "REQUEST_ID_CONTEXT_KEY",
     "REQUEST_ID_HEADER",
     "REQUEST_ID_MAX_LENGTH",
+    "RETRY_AFTER_HEADER",
+    "WWW_AUTHENTICATE_HEADER",
     "AppError",
     "AppValidationError",
     "ConflictError",
@@ -195,6 +201,7 @@ __all__ = [
     "NotFoundError",
     "TokenExpiredError",
     "UnauthorizedError",
+    "inner_exception_handlers",
     "is_usable_request_id",
     "register_exception_handlers",
 ]
@@ -227,6 +234,38 @@ provably equal rather than coincidentally equal. It also covers the one case the
 cannot reach: Starlette dispatches a handler registered for bare ``Exception`` through
 ``ServerErrorMiddleware``, which wraps the *outside* of the stack - outside everything added
 with ``add_middleware`` - so on that path nothing else would attach the header.
+"""
+
+# ---------------------------------------------------------------------------------------
+# The CORS headers the outer 500 has to write for itself
+#
+# These are header NAMES and one header VALUE, not policy. The policy - which origins are
+# admitted, and whether credentials may be paired with them - lives entirely in
+# `app.core.config`, and `_cors_headers_for` reads it from `settings` rather than deciding
+# anything here. That function's docstring explains why this one response cannot simply be left
+# to `CORSMiddleware`.
+# ---------------------------------------------------------------------------------------
+
+_CORS_ALLOW_ORIGIN_HEADER: Final[str] = "Access-Control-Allow-Origin"
+_CORS_ALLOW_CREDENTIALS_HEADER: Final[str] = "Access-Control-Allow-Credentials"
+_CORS_EXPOSE_HEADERS_HEADER: Final[str] = "Access-Control-Expose-Headers"
+_CORS_ALLOW_CREDENTIALS_VALUE: Final[str] = "true"
+
+_ORIGIN_REQUEST_HEADER: Final[str] = "Origin"
+"""The request header whose presence makes a response cross-origin."""
+
+_VARY_HEADER: Final[str] = "Vary"
+"""Set to ``Origin`` whenever the response body or headers depend on the requesting origin.
+
+Required for correctness rather than politeness: a shared cache that stored one origin's 500 and
+replayed it to another would replay the ``Access-Control-Allow-Origin`` header with it.
+"""
+
+_CORS_WILDCARD_ORIGIN: Final[str] = "*"
+"""The literal written when the deployment admits every origin.
+
+The *decision* is ``settings.cors_wildcard_origin``; this is only the value that decision emits,
+kept as a named constant so the string appears once.
 """
 
 _REQUEST_ID_STATE_KEY: Final[str] = "request_id"
@@ -375,9 +414,57 @@ _DETAIL_INVALID_FIELD: Final[str] = "This value is invalid."
 # Header and validation-mapping constants
 # ---------------------------------------------------------------------------------------
 
-_WWW_AUTHENTICATE_HEADER: Final[str] = "WWW-Authenticate"
+WWW_AUTHENTICATE_HEADER: Final[str] = "WWW-Authenticate"
+"""The RFC 6750 challenge header this module sends with every 401.
+
+Public, and imported by ``app.main`` rather than repeated there, because a browser cannot read
+a response header the service does not name in its CORS ``expose_headers`` list. A client that
+cannot see this header cannot distinguish "sign in" from "you are signed in and still refused",
+which is the distinction the challenge exists to carry - so the header name and the list that
+exposes it have to be the same string, and it is declared here beside the handler that writes it.
+"""
+
 _BEARER_CHALLENGE: Final[str] = "Bearer"
-_RETRY_AFTER_HEADER: Final[str] = "Retry-After"
+
+RETRY_AFTER_HEADER: Final[str] = "Retry-After"
+"""The delay header sent with a 429 from the rate-limited authentication routes.
+
+Public for the same reason as :data:`WWW_AUTHENTICATE_HEADER`: ``app.main`` names it in CORS
+``expose_headers`` so that browser code can honour the interval instead of retrying immediately
+and being refused again. Every authentication route is rate limited, so this is reachable on the
+ordinary sign-in path rather than only under attack.
+"""
+
+CORS_EXPOSE_HEADERS: Final[tuple[str, ...]] = (
+    REQUEST_ID_HEADER,
+    RETRY_AFTER_HEADER,
+    WWW_AUTHENTICATE_HEADER,
+)
+"""Response headers a browser is permitted to read from a cross-origin response.
+
+A browser exposes only the CORS-safelisted response headers to script unless the server names
+the rest, so anything the client is expected to ACT on has to appear here:
+
+* ``X-Request-ID`` - the correlation identifier, otherwise set on every response and hidden from
+  the very client that would quote it in a bug report.
+* ``Retry-After`` - sent with every 429 from the rate-limited authentication routes. A sign-in
+  form that cannot read it retries immediately and is refused again, which reads to the person at
+  the keyboard as a broken form.
+* ``WWW-Authenticate`` - sent with every 401. Without it browser code cannot distinguish "present
+  a credential" from "your credential was refused", which is the distinction that decides whether
+  the client rotates its token or abandons the session.
+
+Declared here rather than in ``app.main`` because there are **two** writers of it and they must
+agree. ``app.main`` passes it to ``CORSMiddleware`` as ``expose_headers`` for every ordinary
+response; :func:`_outer_response_headers` writes it by hand on the one response that never
+reaches that middleware - the 500 rendered by ``ServerErrorMiddleware``, which wraps the outside
+of the stack. Two hand-maintained lists would drift, and the drift would be invisible until
+someone tried to read the header off a 500. It is declared after the two header names it
+includes, because a module-level tuple can only reference what is already bound.
+"""
+
+_CORS_EXPOSE_HEADERS_VALUE: Final[str] = ", ".join(CORS_EXPOSE_HEADERS)
+"""The rendered ``Access-Control-Expose-Headers`` value, joined once from the tuple above."""
 
 # Fallback window for `Retry-After` when slowapi hands over an exception with no limit
 # attached - `RateLimitExceeded.limit` defaults to None at class level, so the attribute is
@@ -446,7 +533,7 @@ _NO_HEADERS: Final[Mapping[str, str]] = MappingProxyType({})
 # would tell an unauthenticated caller whether a token was expired, malformed or simply
 # absent, and one stable challenge string is easier for a client to match on.
 _BEARER_HEADERS: Final[Mapping[str, str]] = MappingProxyType(
-    {_WWW_AUTHENTICATE_HEADER: _BEARER_CHALLENGE}
+    {WWW_AUTHENTICATE_HEADER: _BEARER_CHALLENGE}
 )
 
 
@@ -1106,12 +1193,24 @@ async def _http_exception_handler(request: Request, exc: Exception) -> ORJSONRes
         # runs in the application lifespan after every import has completed. The request
         # identifier bound by `app.middleware.request_context` is already on the line, so an
         # operator can move from a caller's correlation header to this entry.
+        # `suppressed_detail` is the one field in this module that carries a message composed
+        # somewhere else, so it is redacted and bounded AT THE CALL SITE rather than left to the
+        # processor chain. Both are deliberate. `redact_sensitive_text` is what stops a framework
+        # detail that quoted a connection URL, an address or a token from being retained -
+        # `app.core.logging.redact_log_event` would catch it too, and the belt is cheap on a path
+        # already answering a 5xx. `log_safe_text` bounds it, because that processor is a
+        # *redaction* pass and not a length limit, and this field is the only unbounded one here:
+        # a detail built by interpolating a request body into a string would otherwise be an
+        # unbounded indexed field. `LOG_EXCEPTION_VALUE_MAX_LENGTH` rather than the shorter
+        # default, since this is an exception message and is bounded by the same rule as one.
         get_logger(__name__).error(
             "http_exception_detail_suppressed",
             http_method=request.method,
             http_path=request.url.path,
             http_status=error.status_code,
-            suppressed_detail=detail,
+            suppressed_detail=log_safe_text(
+                redact_sensitive_text(detail), limit=LOG_EXCEPTION_VALUE_MAX_LENGTH
+            ),
         )
         detail = _DETAIL_SERVER_ERROR
 
@@ -1154,7 +1253,7 @@ async def _rate_limit_handler(request: Request, exc: Exception) -> ORJSONRespons
         error_type=_ERROR_TYPE_RATE_LIMITED,
         title=_TITLE_RATE_LIMITED,
         detail=_DETAIL_RATE_LIMITED,
-        headers={_RETRY_AFTER_HEADER: str(_retry_after_seconds(error))},
+        headers={RETRY_AFTER_HEADER: str(_retry_after_seconds(error))},
     )
 
 
@@ -1212,21 +1311,104 @@ def _validated_request_id(request: Request) -> str | None:
     return None
 
 
-def _outer_response_headers(request_id: str | None) -> dict[str, str] | None:
+def _cors_headers_for(request: Request) -> dict[str, str]:
+    """Build the CORS headers ``CORSMiddleware`` would have written, for a response it never sees.
+
+    ``CORSMiddleware`` is registered with ``add_middleware`` and therefore runs **inside**
+    ``ServerErrorMiddleware``. When a bare ``Exception`` escapes, the inner stack has already
+    unwound, so the 500 rendered by :func:`_unhandled_exception_handler` carries no CORS headers
+    at all. To a browser that is not a 500 - it is a cross-origin violation, so the response is
+    opaque to script: the caller sees a network or CORS error, cannot read the problem document,
+    and cannot read the correlation identifier that would have let anyone find the incident in the
+    log. The one failure most in need of a diagnosable answer is the one that arrives without one.
+
+    This function closes that gap by writing the same headers for the same reasons, from the same
+    policy. It decides nothing: ``settings.CORS_ALLOW_ORIGINS`` is the validated, canonicalised
+    allow-list, ``settings.cors_wildcard_origin`` says whether the deployment admits every origin,
+    and ``settings.cors_allow_credentials`` says whether credentials may be paired with it. The
+    behaviour deliberately mirrors Starlette's for a simple (non-preflight) request:
+
+    * **Origin present and admitted** - echo that origin, add ``Vary: Origin`` because the answer
+      depends on the request, add ``Access-Control-Allow-Credentials: true`` when the deployment
+      permits credentials, and expose :data:`CORS_EXPOSE_HEADERS` so the client may actually read
+      the correlation header.
+    * **Wildcard deployment** - answer ``*`` and expose the same headers. No ``Vary``, because the
+      answer does not depend on the request, and never a credentials header: that pairing is
+      forbidden, which is precisely what ``settings.cors_allow_credentials`` refuses.
+    * **Origin present but not admitted** - write ``Vary: Origin`` and nothing else. The browser
+      blocks the response, which is the correct outcome for an origin this deployment does not
+      trust; the ``Vary`` keeps a shared cache from serving this refusal to an origin that *is*
+      trusted.
+    * **No Origin header** - not a cross-origin request. Nothing is written, so a container health
+      check or a ``curl`` sees exactly the headers it saw before.
+
+    Matching against the canonicalised list is what makes the comparison meaningful: the browser
+    sends a lower-cased origin with default ports omitted, and ``app.core.config`` rewrites every
+    configured entry into exactly that form, so ``https://Example.com:443`` in an env file matches
+    a real request here as well as it does in the middleware.
+
+    Args:
+        request: The request being answered. Only its ``Origin`` header is read.
+
+    Returns:
+        The CORS headers to attach, empty when the request is not cross-origin.
+    """
+    origin = request.headers.get(_ORIGIN_REQUEST_HEADER)
+    if not origin:
+        # Not cross-origin. Returning before the settings import below is what keeps a
+        # non-browser caller's 500 - a health check, a `curl`, the test client - on a path that
+        # constructs no configuration it does not need.
+        return {}
+
+    # Imported inside the function, and for the same reason `app.middleware.security_headers`
+    # does it: importing `app.core.config` CONSTRUCTS the settings singleton, and
+    # `app.core.logging` documents the resulting invariant as a requirement - `import
+    # app.core.logging`, and therefore `import app.core.exceptions` and `import app.middleware`,
+    # must stay free of any settings construction, so that they remain importable on a machine
+    # with no environment file. `app/middleware/__init__.py` records the same rule from the other
+    # side. A module-scope import here would make `import app.middleware` fail with six
+    # `Field required` errors before `app.main` had a chance to report anything useful, and would
+    # do it to `backend/migrations/env.py` and the unit suite as well. By the time a 500 is being
+    # rendered the application is assembled and the singleton exists, so the cost is one
+    # `sys.modules` lookup on a path that is already answering a failure.
+    from app.core.config import settings
+
+    if settings.cors_wildcard_origin:
+        return {
+            _CORS_ALLOW_ORIGIN_HEADER: _CORS_WILDCARD_ORIGIN,
+            _CORS_EXPOSE_HEADERS_HEADER: _CORS_EXPOSE_HEADERS_VALUE,
+        }
+
+    # `Vary` is written for every named-allow-list answer, admitted or not, because both answers
+    # are origin-dependent and a cache must not reuse either across origins.
+    headers = {_VARY_HEADER: _ORIGIN_REQUEST_HEADER}
+    if origin not in settings.CORS_ALLOW_ORIGINS:
+        return headers
+
+    headers[_CORS_ALLOW_ORIGIN_HEADER] = origin
+    headers[_CORS_EXPOSE_HEADERS_HEADER] = _CORS_EXPOSE_HEADERS_VALUE
+    if settings.cors_allow_credentials:
+        headers[_CORS_ALLOW_CREDENTIALS_HEADER] = _CORS_ALLOW_CREDENTIALS_VALUE
+    return headers
+
+
+def _outer_response_headers(request: Request, request_id: str | None) -> dict[str, str] | None:
     """Build the headers for a response rendered outside the middleware stack.
 
     ``ServerErrorMiddleware`` sits outside everything registered with ``add_middleware``, so the
-    500 problem document reaches the client without passing through either
-    ``app.middleware.request_context`` or ``app.middleware.security_headers``. Left alone it
-    would be the one response class in the whole service with no correlation identifier and no
-    baseline hardening on it - and it is the response class a caller is most likely to be
-    holding when they report a bug.
+    500 problem document reaches the client without passing through
+    ``app.middleware.request_context``, ``app.middleware.security_headers`` or
+    ``CORSMiddleware``. Left alone it would be the one response class in the whole service with no
+    correlation identifier, no baseline hardening and no cross-origin permission on it - and it is
+    the response class a caller is most likely to be holding when they report a bug.
 
-    Both are supplied here, from the definitions those modules own rather than from literals:
-    ``resolved_security_headers`` is the same function the middleware's constructor calls, so a
-    header added to the baseline appears here too, with no second list to remember.
+    All three are supplied here, from the definitions those modules own rather than from literals:
+    ``resolved_security_headers`` is the same function the header middleware's constructor calls,
+    so a header added to the baseline appears here too with no second list to remember, and
+    :func:`_cors_headers_for` reads the one origin policy in ``app.core.config``.
 
     Args:
+        request: The request being answered. Read only for its ``Origin`` header.
         request_id: The validated identifier, or ``None`` when the request has none.
 
     Returns:
@@ -1234,7 +1416,9 @@ def _outer_response_headers(request_id: str | None) -> dict[str, str] | None:
         happen while the baseline is non-empty, and is handled anyway so this function stays
         honest about its own contract.
     """
-    # Imported inside the function, and this is the one deferred import in the module.
+    # Imported inside the function. One of exactly two deferred imports in this module, and the
+    # only one here for a CYCLE - the other, in `_cors_headers_for`, is deferred to keep this
+    # module free of settings construction.
     #
     # `app/middleware/__init__.py` imports `request_context`, which imports THIS module, so a
     # module-scope `from app.middleware.security_headers import ...` here would ask Python to
@@ -1246,41 +1430,57 @@ def _outer_response_headers(request_id: str | None) -> dict[str, str] | None:
     from app.middleware.security_headers import resolved_security_headers
 
     headers = dict(resolved_security_headers())
+    headers.update(_cors_headers_for(request))
     if request_id is not None:
         headers[REQUEST_ID_HEADER] = request_id
     return headers or None
 
 
-async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJSONResponse:
-    """Last resort: render any unanticipated exception as a 500 that reveals nothing.
+async def _render_unhandled(
+    request: Request, exc: Exception, *, log_frames: bool
+) -> ORJSONResponse:
+    """Render any unanticipated exception as a 500 that reveals nothing. One document, two sites.
 
     The body is generic in **every** environment, development included. No exception class
     name, no message, no traceback, no SQL fragment, no configuration value - a caller learns
     that the request failed and nothing else. The incident stays fully diagnosable because the
-    exception is logged here with its frames, and because
-    ``structlog.contextvars.merge_contextvars`` is the first processor in the configured chain,
-    so the request identifier bound by ``app.middleware.request_context`` is already on the
-    line. The response header set below is what lets a caller quote that identifier.
+    exception is logged, and because ``structlog.contextvars.merge_contextvars`` is the first
+    processor in the configured chain, so the request identifier bound by
+    ``app.middleware.request_context`` is already on the line. The response header set below is
+    what lets a caller quote that identifier.
 
-    Two Starlette behaviours shape this handler, and both are worth knowing before changing it:
+    Two dispatch sites share this renderer, and ``log_frames`` is the only thing that differs
+    between them - see :func:`inner_exception_handlers` and :func:`register_exception_handlers`
+    for how each is installed:
 
-    1. A handler registered for bare ``Exception`` is dispatched by ``ServerErrorMiddleware``,
-       which ``build_middleware_stack`` places **outside** everything added with
-       ``add_middleware``. ``app.middleware.request_context`` therefore never sees this
-       response and cannot attach :data:`REQUEST_ID_HEADER` to it, so this handler attaches it
-       - reading the identifier the middleware left on ``request.state`` and omitting the
-       header when there is none, which is the case for a failure raised before the middleware
-       ran. The middleware and this handler must use the same header name, which is why the
-       name is a shared constant here rather than a literal in each.
-    2. ``ServerErrorMiddleware`` re-raises after this response has been sent, so the ASGI
-       server logs the failure as well. It also bypasses this handler entirely when the
-       application is constructed with ``debug=True``, in which case Starlette returns a
-       traceback to the client - which is exactly why ``debug`` must stay off outside local
-       development.
+    1. :func:`_inner_unhandled_exception_handler`, dispatched by the ``ExceptionMiddleware``
+       ``app.main`` registers **innermost**, so its response passes back out through
+       ``CORSMiddleware`` and is readable by browser code. Nothing above it ever sees the
+       exception, so this is the site that logs the frames.
+    2. :func:`_unhandled_exception_handler`, dispatched by ``ServerErrorMiddleware``, which
+       ``build_middleware_stack`` places **outside** everything added with ``add_middleware``.
+       Only a failure raised by a middleware *above* the inner site can reach it, and
+       ``app.middleware.request_context`` has already recorded that one with its frames, so
+       this site logs no traceback of its own.
+
+    Both sites attach :data:`REQUEST_ID_HEADER` and the baseline security headers themselves,
+    because site 2 is outside the middleware that would otherwise supply them and site 1 writes
+    values the outer middleware applies with ``setdefault`` semantics - so the two orderings
+    produce one header each rather than a duplicate. The middleware and this renderer must use
+    the same header name, which is why the name is a shared constant rather than a literal in
+    each.
+
+    ``ServerErrorMiddleware`` re-raises after site 2's response has been sent, so the ASGI
+    server reports the failure as well. It also bypasses site 2 entirely when the application is
+    constructed with ``debug=True``, in which case Starlette returns a traceback to the client -
+    which is exactly why ``debug`` must stay off outside local development.
 
     Args:
         request: The request being answered.
-        exc: The unhandled exception. Logged in full, never rendered.
+        exc: The unhandled exception. Logged, never rendered.
+        log_frames: Whether to attach the traceback to this module's record. ``True`` at the
+            inner site, where no other owner will serialise it; ``False`` at the outer one,
+            where ``app.middleware.request_context`` already has.
 
     Returns:
         A 500 problem document with a generic detail, carrying the correlation header when the
@@ -1298,15 +1498,19 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJS
     # damage; `None` when the failure happened before the middleware ran.
     request_id = _validated_request_id(request)
 
-    # No `exc_info`, and that omission is deliberate.
+    # Exactly one owner serialises the traceback, and `log_frames` is which.
     #
-    # `app.middleware.request_context` sits INSIDE `ServerErrorMiddleware`, so it has already
-    # seen this exception, logged it with its frames, and had the request identifier bound
-    # while it did. Repeating the traceback here would be the second serialisation of one
-    # exception, and uvicorn's re-raise would make a third - which is why
-    # `app.core.logging` filters that one out. One owner, one traceback: this record exists to
-    # say that a 500 problem document was RENDERED for that request, which is a fact the
-    # middleware cannot know.
+    # At the inner site nothing above this handler ever sees the exception - it is caught by the
+    # `ExceptionMiddleware` registered innermost - so `app.middleware.request_context` records
+    # only an access line for a 500 response and this record is the sole place the frames can
+    # appear. At the outer site the reverse holds: that middleware sits INSIDE
+    # `ServerErrorMiddleware`, so it has already seen the exception, logged it with its frames
+    # and had the request identifier bound while it did; repeating the traceback there would be
+    # the second serialisation of one exception, and uvicorn's re-raise would make a third -
+    # which is why `app.core.logging` filters that one out.
+    #
+    # Either way this record says that a 500 problem document was RENDERED for the request,
+    # which is a fact no middleware can know.
     #
     # `exception_type` carries the class name and nothing else. The exception's own message is
     # never placed in a field: a message is composed by whatever raised it and can quote a
@@ -1326,19 +1530,30 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJS
             REQUEST_ID_CONTEXT_KEY: request_id,
         },
         exception_type=type(exc).__name__,
+        exc_info=exc if log_frames else None,
     )
 
-    # This response is rendered OUTSIDE both `app.middleware.request_context` and
-    # `app.middleware.security_headers`, so neither can reach it: the baseline security headers
-    # are attached here instead, from the same definition the header middleware uses. Without
-    # this, the one response class most likely to be seen by a caller chasing a bug would be
-    # the only one leaving the service unhardened.
+    # This response is rendered OUTSIDE `app.middleware.request_context`,
+    # `app.middleware.security_headers` and `CORSMiddleware`, so none of the three can reach
+    # it: the baseline security headers and the cross-origin permission are attached here
+    # instead, each from the same definition its owner uses. Without this, the one response
+    # class most likely to be seen by a caller chasing a bug would be the only one leaving the
+    # service unhardened - and, for the separately-originated browser tier, the only one the
+    # caller could not read at all, because a cross-origin response with no
+    # `Access-Control-Allow-Origin` is opaque to script no matter what its body says.
+    #
+    # The INNER site - the same renderer dispatched by the `ExceptionMiddleware` registered as
+    # the innermost user middleware - does pass through both middlewares and through CORS, and
+    # both of those apply their headers with `setdefault` semantics, so attaching them here as
+    # well produces the same single header rather than a duplicate.
     #
     # The correlation header is NOT a special case any more - `_problem_response` writes
     # `X-Request-ID` on every error path from the same value it puts in the document, so this
     # path inherits it under the general rule. `_outer_response_headers` still carries it for
-    # the same reason, and both write the identical value, so the two cannot drift.
-    headers = _outer_response_headers(request_id)
+    # the same reason, and both write the identical value, so the two cannot drift. What that
+    # rule alone cannot do is make the header READABLE cross-origin, which is why
+    # `Access-Control-Expose-Headers` is written beside it.
+    headers = _outer_response_headers(request, request_id)
 
     return _problem_response(
         request=request,
@@ -1348,6 +1563,82 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJS
         detail=_DETAIL_INTERNAL,
         headers=headers,
     )
+
+
+async def _inner_unhandled_exception_handler(request: Request, exc: Exception) -> ORJSONResponse:
+    """Render a 500 from **inside** the CORS layer. The site a browser can actually read.
+
+    Dispatched by the ``ExceptionMiddleware`` ``app.main`` registers innermost, which is the
+    whole reason this site exists. Starlette hoists a handler keyed on bare ``Exception`` onto
+    ``ServerErrorMiddleware``, outside every wrapper ``add_middleware`` installs - so a 500
+    rendered only there leaves the service without the ``Access-Control-Allow-Origin`` header
+    the validated CORS policy would have added, and browser code receives an opaque network
+    failure instead of the documented problem document. Catching the exception here means the
+    response travels back out through ``CORSMiddleware`` like every other answer.
+
+    Args:
+        request: The request being answered.
+        exc: The unhandled exception. Logged with its frames here, because nothing above this
+            handler will see it.
+
+    Returns:
+        The same 500 problem document the outer site renders - one shape, two dispatch sites.
+    """
+    return await _render_unhandled(request, exc, log_frames=True)
+
+
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJSONResponse:
+    """Render a 500 from ``ServerErrorMiddleware``. The last resort behind the last resort.
+
+    Reachable only for a failure raised by a middleware *above* the inner site - the request
+    context or the security headers - since anything at or below it is caught there first. It is
+    kept registered precisely for that case: without it, such a failure would render as
+    Starlette's own bare ``Internal Server Error`` text rather than this API's one problem
+    document.
+
+    Args:
+        request: The request being answered.
+        exc: The unhandled exception. Not re-serialised here - ``app.middleware.request_context``
+            has already logged this one with its frames on its way out.
+
+    Returns:
+        The 500 problem document, with the baseline security headers and the correlation header
+        attached, because no middleware will reach this response.
+    """
+    return await _render_unhandled(request, exc, log_frames=False)
+
+
+def inner_exception_handlers() -> dict[type[Exception], ExceptionHandler]:
+    """The handler map for the ``ExceptionMiddleware`` ``app.main`` registers innermost.
+
+    ``app.main`` passes the returned mapping to
+    ``application.add_middleware(ExceptionMiddleware, handlers=...)`` as the FIRST registration,
+    which is what makes that middleware the innermost user wrapper - inside ``CORSMiddleware``
+    and immediately outside the framework's own exception middleware. Every failure at or below
+    it is therefore rendered *within* the CORS layer, so a browser can read the problem document
+    instead of seeing a cross-origin failure with no readable body.
+
+    Two keys, and both are needed:
+
+    * ``Exception`` is the one this exists for. Starlette routes a bare-``Exception``
+      registration to ``ServerErrorMiddleware`` at the very outside of the stack and offers no
+      way to place it anywhere else, so an inner middleware carrying the same handler is the
+      only way to catch an unhandled failure while the CORS wrapper is still on the stack.
+    * ``HTTPException`` overrides ``ExceptionMiddleware``'s own default for it, which is a
+      ``PlainTextResponse``. That default is unreachable in practice - the framework's inner
+      middleware handles the class first - but leaving it in place would mean one path through
+      this service could answer with something other than the problem document, and the point of
+      a single error contract is that no such path exists.
+
+    Returns:
+        A fresh mapping per call, so no caller can mutate a shared one. The values are the same
+        handlers :func:`register_exception_handlers` installs, so both dispatch sites render one
+        document shape from one implementation.
+    """
+    return {
+        Exception: _inner_unhandled_exception_handler,
+        StarletteHTTPException: _http_exception_handler,
+    }
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -1372,8 +1663,12 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     ``Exception`` is the one key Starlette treats specially: ``build_middleware_stack`` routes
     it to ``ServerErrorMiddleware`` at the very outside of the stack instead of to the inner
-    exception middleware. See :func:`_unhandled_exception_handler` for what that implies about
-    response headers.
+    exception middleware, and offers no way to place it anywhere else. That is why this
+    registration is only half of the unhandled-failure contract: it renders a 500 for a failure
+    raised *above* the CORS layer, while :func:`inner_exception_handlers` - installed by
+    ``app.main`` as the innermost middleware - renders one *inside* it, which is the only way a
+    browser can read the document. See :func:`_render_unhandled` for what each site logs and
+    which headers it attaches.
 
     Args:
         app: The application to install the handlers on. Mutated in place; nothing is returned,

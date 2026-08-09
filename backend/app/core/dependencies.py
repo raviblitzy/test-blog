@@ -12,9 +12,11 @@ has exactly one file to open:
   :func:`get_current_user_optional` does the same but tolerates its absence, for the public
   reads whose projection depends on who is asking; :func:`get_current_active_user` adds the
   deactivated-account check and is what a protected route should normally depend on.
-* **Authorisation.** :func:`require_admin` is the administrator gate, and
-  :func:`is_admin`, :func:`can_modify` and :func:`ensure_can_modify` are the pure
-  predicates the service layer calls so that one ownership rule is written once.
+* **Authorisation.** :func:`require_admin` gates the administrative namespace and
+  :func:`require_author` gates the authoring routes, while :func:`is_admin`,
+  :func:`can_author`, :func:`ensure_can_author`, :func:`can_modify` and
+  :func:`ensure_can_modify` are the pure predicates the service layer calls so that the two
+  halves of post authority - the capability and the ownership rule - are each written once.
 * **The request half of the pagination contract.** :class:`PageParams` normalises and
   bounds ``page`` and ``page_size`` for every list endpoint, so the feed, the profile
   listing and the administrative tables window identically and one client control pages
@@ -22,15 +24,18 @@ has exactly one file to open:
 
 The wiring vocabulary
 ---------------------
-Five :data:`~typing.Annotated` aliases are exported so that no router re-spells a
+Six :data:`~typing.Annotated` aliases are exported so that no router re-spells a
 ``Depends`` chain and every signature in the API reads the same way:
 
 =================  ==============================================================
 :data:`DbSession`  A request-scoped session.
 :data:`CurrentUser`  The authenticated, active principal. Rejects an absent, malformed
                    or expired credential with 401, and a deactivated account with 403.
-:data:`OptionalUser`  The principal when one was presented, ``None`` when the caller is
-                   anonymous. A *present but unusable* credential is still a 401.
+:data:`OptionalUser`  The **active** principal when one was presented, ``None`` when the
+                   caller is anonymous or their account has been deactivated. A *present but
+                   unusable* credential is still a 401.
+:data:`AuthorUser`  The authenticated, active principal, additionally required to hold
+                   ``AUTHOR`` or ``ADMIN``. The five post mutations declare this.
 :data:`AdminUser`  The authenticated, active principal, additionally required to hold
                    ``ADMIN``.
 :data:`PageParamsDep`  The validated page window.
@@ -63,7 +68,7 @@ window; the two meet in ``app.repositories.base``'s paginate primitive, and impo
 here would put FastAPI's request machinery inside a module the schema layer re-exports.
 :mod:`app.core.config` is not imported either, because nothing here is configurable: see
 :data:`MAX_PAGE_SIZE` for why the page bounds are module constants rather than a
-fifteenth environment key.
+sixteenth environment key.
 
 No route in this service raises a framework exception, and neither does any dependency
 here. Every rejection is a domain error from :mod:`app.core.exceptions`, which is what lets
@@ -74,10 +79,29 @@ operation alike.
 Authority is checked against the database, never against the token
 ------------------------------------------------------------------
 An access token carries a ``role`` claim, and this module ignores it for every decision.
-:func:`require_admin` compares the role on the freshly loaded ``User`` row, so demoting an
-administrator takes effect on their next request rather than whenever their current token
-happens to expire. The claim is a convenience for a client that wants to render a menu; it
-is not a capability.
+:func:`require_admin` and :func:`require_author` compare the role on the freshly loaded
+``User`` row, so demoting an administrator to an author, or an author to a reader, takes
+effect on their next request rather than whenever their current token happens to expire. The
+claim is a convenience for a client that wants to render a menu; it is not a capability.
+
+Deactivation withdraws authority on every path, including the optional one
+-------------------------------------------------------------------------
+``users.is_active`` is how an account is withdrawn without deleting the content it authored,
+and a withdrawn account carries no authority of any kind - not the ownership of its own
+drafts, and not a role it happened to hold. Both resolvers therefore enforce it, and they
+differ only in how they *report* it: :func:`get_current_active_user` refuses the request with
+a 403, because every operation behind it is one only a permitted account may perform, while
+:func:`get_current_user_optional` resolves the caller as anonymous, because every operation
+behind *it* has a public projection that a suspended reader is still entitled to receive.
+
+What must never happen is the third possibility - resolving a deactivated account as a
+*principal* on an optional-authentication route. The projections behind those routes widen
+for who is asking: a draft is visible to its author, every unpublished post to an
+administrator, an unapproved comment to the post's author. Handing an inactive row to that
+logic would leave suspension enforced on the write paths and silently unenforced on the read
+paths, so a suspended author would keep reading their own drafts and a suspended
+administrator would keep reading everybody's. The narrowing happens once, here, rather than
+in each of the visibility predicates that would otherwise each need to remember it.
 
 Client-side route guards are defence in depth and not a substitute. ``middleware.ts`` in
 the frontend keeps an anonymous visitor out of the dashboard and the administrative
@@ -101,9 +125,10 @@ Testability
 Two properties are load-bearing for the test suite and must survive any edit here.
 :func:`get_db` is a plain module-level function, neither wrapped in a factory nor memoised,
 so ``app.dependency_overrides[get_db]`` can swap in the per-test transaction that is rolled
-back after each test. And the three authority predicates take a user and an owner
-identifier and nothing else - no request, no session, no ``Depends`` - so the ownership rule
-is unit-testable from two constructed objects.
+back after each test. And the five authority predicates take a user - and, for
+the ownership pair, an owner identifier - and nothing else: no request, no session, no
+``Depends``, so both the capability rule and the ownership rule are unit-testable from
+constructed objects.
 """
 
 import dataclasses
@@ -128,12 +153,15 @@ __all__ = [
     "MIN_PAGE_SIZE",
     "TOKEN_URL",
     "AdminUser",
+    "AuthorUser",
     "CurrentUser",
     "DbSession",
     "OptionalUser",
     "PageParams",
     "PageParamsDep",
+    "can_author",
     "can_modify",
+    "ensure_can_author",
     "ensure_can_modify",
     "get_current_active_user",
     "get_current_user",
@@ -142,6 +170,7 @@ __all__ = [
     "is_admin",
     "oauth2_scheme",
     "require_admin",
+    "require_author",
 ]
 
 
@@ -180,7 +209,7 @@ without it ``?page_size=1000000`` is a legal request that becomes a full table s
 response the client cannot render and a memory profile no amount of indexing improves.
 
 It is a module constant and deliberately *not* a settings field. ``.env.example`` is a
-closed contract of fourteen variables that four other files are written against, and a
+closed contract of fifteen variables that four other files are written against, and a
 deployment able to raise this ceiling is a deployment able to turn every list endpoint
 into a denial-of-service vector. This is a property of the API contract, not of an
 environment.
@@ -514,7 +543,7 @@ async def get_current_user(token: _BearerToken, db: DbSession) -> User:
 
 
 async def get_current_user_optional(token: _BearerToken, db: DbSession) -> User | None:
-    """Resolve the principal when one was presented, and return ``None`` when none was.
+    """Resolve the **active** principal when one was presented, and ``None`` when none was.
 
     For the public reads whose *content* depends on who is asking. The feed and a post
     detail hide drafts from everyone except their author and an administrator; a like
@@ -524,7 +553,7 @@ async def get_current_user_optional(token: _BearerToken, db: DbSession) -> User 
     ``Authorization`` header itself - which is the duplication this module exists to
     prevent.
 
-    The asymmetry between the two failure modes is the whole point of the function:
+    The asymmetry between the three cases is the whole point of the function:
 
     * **No credential** is not an error. The caller is anonymous and the endpoint serves
       its public projection.
@@ -533,6 +562,10 @@ async def get_current_user_optional(token: _BearerToken, db: DbSession) -> User 
       that makes it exchange its refresh token and retry. Swallowing it would leave a reader
       holding a stale token, permanently served the anonymous view, with nothing in the
       response to tell them their session had lapsed - and no route to recovering it.
+    * **A usable credential naming a deactivated account** is neither. It is answered, and it
+      is answered anonymously: the account may still read what the public reads, and it may
+      read nothing further. See the note below for why that is a confidentiality
+      requirement rather than a courtesy.
 
     That asymmetry is only expressible because the credential arrives from
     :func:`_bearer_token` rather than from :data:`oauth2_scheme` directly. The scheme reports
@@ -547,7 +580,10 @@ async def get_current_user_optional(token: _BearerToken, db: DbSession) -> User 
         db: The request-scoped session.
 
     Returns:
-        The loaded principal, or ``None`` when the request was anonymous.
+        The loaded principal when the request carried a usable credential for an **active**
+        account, and ``None`` when the request was anonymous or the account it named has been
+        deactivated. A caller of this dependency therefore never has to ask whether the
+        principal it received is still permitted to act - if it received one, it is.
 
     Raises:
         UnauthorizedError: A credential was presented and could not be used - a scheme other
@@ -556,10 +592,25 @@ async def get_current_user_optional(token: _BearerToken, db: DbSession) -> User 
             raised by :func:`_bearer_token` before this function is entered.
 
     Note:
-        This resolver deliberately does **not** apply the deactivated-account check. It
-        answers "who is asking", and a deactivated account reading a public page is still
-        reading a public page. Anything a deactivated account must be barred from doing is
-        a protected operation and therefore depends on :data:`CurrentUser` instead.
+        **A deactivated account is resolved as anonymous, not as a principal, and that is a
+        confidentiality requirement.** Every projection behind an optional-authentication
+        route widens for a known caller: ``visible_statuses_for`` adds a viewer's own drafts
+        and gives an administrator every lifecycle state, ``can_view_post`` admits an author
+        to their own unpublished post, and ``_visible_comment_statuses`` shows a post's author
+        the unapproved comments on it. Returning an inactive row here would feed all three,
+        so suspending an account would stop it writing while leaving it reading exactly what
+        it read before - a suspended author still browsing their drafts, a suspended
+        administrator still browsing everybody's unpublished work.
+
+        It is answered rather than refused because the *operation* is public. A suspended
+        reader may read a published post, and refusing them with a 403 would withdraw access
+        to content anyone with no account at all can read. ``CurrentUser`` is where
+        deactivation becomes a refusal, and every operation that must be barred outright
+        depends on that instead - which is the whole of the difference between the two.
+
+        The check reads ``is_active`` on the freshly loaded row, so a suspension takes effect
+        on the account's very next request rather than whenever its access token happens to
+        expire.
     """
     # `is None` rather than a truthiness test, and the difference is the finding this
     # resolver exists to answer: an empty or non-Bearer credential is no longer represented
@@ -567,7 +618,14 @@ async def get_current_user_optional(token: _BearerToken, db: DbSession) -> User 
     if token is None:
         return None
 
-    return await _resolve_principal(token, db)
+    principal = await _resolve_principal(token, db)
+
+    # Narrowed to anonymous BEFORE the value leaves this function, so no visibility predicate
+    # downstream can be handed an inactive principal even by mistake - see the note above.
+    if not principal.is_active:
+        return None
+
+    return principal
 
 
 async def get_current_active_user(user: Annotated[User, Depends(get_current_user)]) -> User:
@@ -610,19 +668,22 @@ longer exists with 401, and a deactivated account with 403.
 """
 
 OptionalUser = Annotated[User | None, Depends(get_current_user_optional)]
-"""The principal when one was presented, ``None`` when the caller is anonymous.
+"""The active principal when one was presented, ``None`` when the caller is anonymous.
 
-For a public endpoint whose projection widens for a known caller. A *present but unusable*
-credential is still a 401 - see :func:`get_current_user_optional`.
+For a public endpoint whose projection widens for a known caller. Two values collapse into
+``None``: no credential at all, and a usable credential naming a deactivated account - so a
+projection built from this value can never widen for an account that has been withdrawn. A
+*present but unusable* credential is still a 401 - see :func:`get_current_user_optional`.
 """
 
 
 # ---------------------------------------------------------------------------------------
 # Authorisation
 #
-# One dependency and three pure predicates. The dependency gates a whole namespace; the
-# predicates are what a service calls when authority depends on the row being acted on,
-# which a dependency cannot know.
+# Two dependencies and five pure predicates. A dependency gates a whole namespace or route
+# on a capability the credential alone carries; the predicates are what a service calls,
+# both for that same capability and for the cases where authority depends on the row being
+# acted on - which a dependency cannot know, because the row is not loaded yet.
 # ---------------------------------------------------------------------------------------
 
 
@@ -677,6 +738,65 @@ AdminUser = Annotated[User, Depends(require_admin)]
 Declared as a parameter by an administrative handler that needs the principal itself. It is
 not a substitute for the router-level ``dependencies=[Depends(require_admin)]`` that gates
 the namespace - see :func:`require_admin`.
+"""
+
+
+async def require_author(user: CurrentUser) -> User:
+    """Require the principal to hold ``AUTHOR`` or ``ADMIN``. The authoring gate.
+
+    The capability half of post authority, and the half that authentication alone cannot
+    express. Every post mutation is *also* ownership-scoped by
+    :func:`ensure_can_modify` - an author may act on their own posts and nobody else's - but
+    ownership says nothing about whether a principal may author at all, and without this gate
+    ``READER`` is indistinguishable from ``AUTHOR`` everywhere in the service. That would make
+    ``PATCH /api/v1/admin/users/{id}``'s role field decorative: an administrator demoting an
+    author to ``READER`` would change a column and revoke nothing, because the demoted account
+    could still create, edit, publish, unpublish and delete its own posts.
+
+    It withdraws nothing from a person who signs up. ``app.services.auth_service`` grants
+    ``AUTHOR`` at registration precisely so the create-edit-publish flow works from the first
+    request, so this gate refuses exactly two populations: an account an administrator has
+    deliberately demoted, and the ``READER`` accounts reference data creates.
+
+    Declared as a dependency as well as a predicate so the refusal is visible in
+    ``/openapi.json`` on the routes that carry it, while
+    :func:`ensure_can_author` is what the service calls - see the note below.
+
+    Args:
+        user: The authenticated, active principal, resolved through :data:`CurrentUser` - so
+            an absent credential is already a 401 and a deactivated account already a 403
+            before this check is reached.
+
+    Returns:
+        The same principal, once confirmed to hold ``AUTHOR`` or ``ADMIN``.
+
+    Raises:
+        ForbiddenError: The principal holds ``READER``. 403 rather than 401, because the
+            credential is perfectly good and presenting a fresh one would change nothing.
+            Raised bare, so the response never names the role that would have sufficed.
+
+    Note:
+        **The dependency is defence in depth, not the enforcement point.**
+        ``app.services.post_service`` calls :func:`ensure_can_author` on every mutating
+        method, so the rule holds for any entry point - a background task, a future route, a
+        unit test - rather than only for a request that happens to declare this dependency.
+        The role is read from the loaded row and never from the token's ``role`` claim, for
+        the same reason :func:`require_admin` reads the row: a token minted before a demotion
+        carries the old claim until it expires.
+    """
+    if not can_author(user):
+        raise ForbiddenError
+
+    return user
+
+
+AuthorUser = Annotated[User, Depends(require_author)]
+"""The authenticated, active principal, additionally required to hold ``AUTHOR`` or ``ADMIN``.
+
+Declared by the five post-mutation handlers in ``app.api.v1.routers.posts``, which need the
+principal itself in order to attribute or authorise the change. It replaces
+:data:`CurrentUser` on those routes rather than sitting beside it: both resolve
+:func:`get_current_active_user`, so the gate costs no extra query and no second resolution.
 """
 
 
@@ -766,6 +886,77 @@ def ensure_can_modify(user: User, owner_id: UUID) -> None:
         enumerated by reading status codes.
     """
     if not can_modify(user, owner_id):
+        raise ForbiddenError
+
+
+def can_author(user: User) -> bool:
+    """Report whether a principal may author posts at all.
+
+    The *role* half of post-mutation authority, and the complement of :func:`can_modify`,
+    which is the *ownership* half. Both are needed and neither implies the other: ownership
+    answers "is this your post", and this answers "may you have posts in the first place".
+    A ``READER`` fails here even for a row they own, and an ``AUTHOR`` who passes here still
+    cannot touch a post belonging to somebody else.
+
+    Two states make the distinction real rather than theoretical. An administrator may demote
+    an account to ``READER`` through ``PATCH /api/v1/admin/users/{id}``, and
+    ``app.db.seed`` creates reader accounts directly. Without this predicate the ``role``
+    column would describe an account without constraining it, so a demotion would revoke
+    nothing and the administrative control that performs it would be decorative.
+
+    Args:
+        user: The principal attempting to author. Expected to have been loaded on this
+            request - a stale instance would answer with a role the database has changed.
+
+    Returns:
+        ``True`` for ``AUTHOR`` and for ``ADMIN``; ``False`` for ``READER``.
+
+    Note:
+        ``ADMIN`` passes because an administrator's authority is a superset of an author's on
+        every other post operation, and a rule that let an administrator edit and publish
+        anyone's post but not write their own would be an inconsistency with no purpose. An
+        administrator authoring content is ordinary for a blog, which is why
+        ``app.db.seed`` gives its administrator account posts of its own.
+
+        ``READER`` is not a broken state to be repaired on first use. A self-registered
+        account receives ``AUTHOR`` from ``app.services.auth_service`` precisely so that the
+        authoring flow is available immediately, so an account that holds ``READER`` holds it
+        because a seed or an administrator put it there - and silently promoting it on the
+        first write would undo that decision rather than honour it.
+
+    Examples:
+        >>> can_author(administrator)
+        True
+    """
+    return user.role is UserRole.AUTHOR or is_admin(user)
+
+
+def ensure_can_author(user: User) -> None:
+    """Raise unless the principal may author posts.
+
+    The form a service calls, matching :func:`ensure_can_modify` so that the two guards read
+    the same way at the top of a mutating method and neither can be mistaken for the other.
+    Every post mutation applies both: this one first, because it depends on nothing but the
+    principal, and the ownership guard once the row has been resolved.
+
+    Args:
+        user: The principal attempting to author.
+
+    Raises:
+        ForbiddenError: The principal holds ``READER``. Raised bare, so the response says
+            only that permission is lacking and never which role would have sufficed.
+
+    Note:
+        403 rather than 401, because the credential is perfectly good and refreshing it would
+        produce another credential for the same account - a 401 would send a well-behaved
+        client into a refresh-and-retry loop it could never exit.
+
+        On the operations that address an existing post, this check precedes the fetch, so a
+        ``READER`` is refused before the identifier is looked up at all. That ordering
+        discloses nothing an enumeration could use: the answer is the same 403 for every
+        identifier, real or invented, so it separates no post from any other.
+    """
+    if not can_author(user):
         raise ForbiddenError
 
 

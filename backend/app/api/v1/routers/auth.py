@@ -16,22 +16,23 @@ dependency injects:
 
 ===========================  ==========================================================
 ``POST   /register``         :meth:`~app.services.auth_service.AuthService.register`
-``POST   /login``            :meth:`~app.services.auth_service.AuthService.authenticate`
-                             then
-                             :meth:`~app.services.auth_service.AuthService.issue_token_pair`
+``POST   /login``            :meth:`~app.services.auth_service.AuthService.login`
 ``POST   /refresh``          :meth:`~app.services.auth_service.AuthService.rotate_refresh_token`
 ``POST   /logout``           :meth:`~app.services.auth_service.AuthService.logout`
 ``GET    /me``               no service call - the principal is already resolved by
                              ``app.core.dependencies``
 ===========================  ==========================================================
 
-Sign-in is the one handler that makes two service calls, and it is deliberate rather than
-leaked policy: ``authenticate`` answers "are these credentials correct" without writing
+**Every handler makes at most one service call**, sign-in included. Sign-in is a composition of
+two service methods - ``authenticate`` answers "are these credentials correct" without writing
 anything, and ``issue_token_pair`` writes a refresh-token row for an account whose authority is
-already established. Keeping them apart is what lets the credential rule be exercised without
-minting a token. ``AuthService.login`` is exactly this composition and behaves identically; the
-two steps are spelled out here so the sign-in path reads as the two distinct decisions it is.
-Any *other* handler needing a second call would mean a rule had escaped the service.
+already established - but that composition is ``AuthService.login``, and it belongs to the
+service rather than to the route. Transcribing the two steps into the handler put business
+orchestration in the API tier and left the service method that exists for it unused: two
+definitions of what signing in consists of, either of which could be changed without the other.
+The split between the two methods is still worth having, because it is what lets the credential
+rule be exercised without minting a token - but it is exercised through the service, not through
+a handler that knows the order.
 
 Paths and tags are not decided here
 -----------------------------------
@@ -125,10 +126,11 @@ per call site, each with its own literal status code and its own literal message
 Responses are bare representations
 ----------------------------------
 Each route declares a ``response_model``, sign-out declares ``204 No Content`` and returns an
-empty body, and every realistic failure status is declared in ``responses`` against
-:class:`~app.schemas.common.ProblemDetail` so a generated client has a type for it. No route
-wraps its result in a ``message``/``data`` envelope or answers a mutation with a bare
-``message``, which is what the retired application did on three of its five routes.
+empty body, and every *reachable* failure status is declared in ``responses`` - not merely the
+likely ones - each against the single problem document by way of
+:func:`~app.api.v1.responses.problem_response`, so a generated client has a type for it and a
+branch for it. No route wraps its result in a ``message``/``data`` envelope or answers a mutation
+with a bare ``message``, which is what the retired application did on three of its five routes.
 
 Nothing is logged, and no ORM entity is named
 ---------------------------------------------
@@ -150,24 +152,17 @@ because ``app.db.session`` sets ``expire_on_commit=False``, and cheap because ev
 than a relationship, so serialising one emits no query.
 """
 
-from typing import Annotated, Any, Final
+from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import ValidationError
 
+from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import CurrentUser, DbSession
 from app.core.exceptions import UnauthorizedError
 from app.core.rate_limit import auth_rate_limit
-from app.schemas import (
-    LoginRequest,
-    ProblemDetail,
-    RefreshRequest,
-    RegisterRequest,
-    TokenPair,
-    UserMe,
-    UserPublic,
-)
+from app.schemas import LoginRequest, RefreshRequest, RegisterRequest, TokenPair, UserMe, UserPublic
 from app.services import AuthService
 
 __all__ = ["router"]
@@ -176,83 +171,108 @@ __all__ = ["router"]
 # ---------------------------------------------------------------------------------------
 # The documented failure contract
 #
-# Every entry below names `ProblemDetail` as its model, which is what puts the failure body
-# into the generated document: without it a client generator emits no type for the error
-# case, and "every route declares its shapes" would hold only for success. Each status is
-# declared once as a single-entry mapping and the routes compose the ones they can actually
-# produce, so a description is written in one place and no route can document a status it
-# does not raise.
+# Every entry below is built by `app.api.v1.responses.problem_response`, which names
+# `ProblemDetail` as the model - what puts the failure body into the generated document, since
+# without it a client generator emits no type for the error case and "every route declares its
+# shapes" would hold only for success - and which is the single place the published error media
+# type is decided. Each status is declared once as a single-entry mapping and the routes compose
+# the ones they can actually produce, so a description is written in one place and no route
+# documents a status it does not raise.
 #
-# `int | str` keys because that is the type FastAPI accepts - it allows range keys such as
-# "4XX" - and the annotation is explicit rather than inferred from a literal nested in a
-# decorator argument.
+# WHICH ROUTE PRODUCES 403, AND WHY IT IS NOT UNIFORM. Three of the five can:
+#
+#   * `POST /login` - `AuthService.authenticate` refuses a correct credential for a
+#     DEACTIVATED account with 403. That disclosure is deliberate and predates this
+#     declaration: an account holder whose access has been withdrawn is told so, rather than
+#     being left to retype a password that is in fact correct.
+#   * `POST /logout` and `GET /me` - both resolve `CurrentUser`, which is
+#     `get_current_active_user`, which refuses a deactivated principal with 403 before the
+#     handler is entered.
+#
+# The other two cannot. `POST /register` creates the account it authenticates, so there is no
+# prior state to refuse. `POST /refresh` reports a deactivated account's token as 401 rather
+# than 403 - deliberately, because rotation must not become an oracle that distinguishes "this
+# token is unknown" from "this account is suspended"; see `AuthService.rotate_refresh_token`,
+# whose only raise is `UnauthorizedError`.
 # ---------------------------------------------------------------------------------------
 
-_UNAUTHORIZED: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_401_UNAUTHORIZED: {
-        "model": ProblemDetail,
-        "description": (
-            "The presented credential was absent, malformed, expired, revoked or simply "
-            "wrong. Deliberately undifferentiated: an unknown email address, a wrong "
-            "password, a refresh token that was never issued and one that has already been "
-            "spent all produce this same status with the same `type` of "
-            "`/errors/unauthorized`, so the route cannot be used to discover which accounts "
-            "or which tokens exist. The response carries `WWW-Authenticate: Bearer`. A "
-            "client should attempt a single refresh and fall back to sign-in if that is "
-            "refused too."
-        ),
-    }
+_UNAUTHORIZED: Final[ProblemResponses] = {
+    status.HTTP_401_UNAUTHORIZED: problem_response(
+        "The presented credential was absent, malformed, expired, revoked or simply "
+        "wrong. Deliberately undifferentiated: an unknown email address, a wrong "
+        "password, a refresh token that was never issued, one that has already been "
+        "spent, and one belonging to an account that has since been suspended or removed "
+        "all produce this same status with the same `type` of `/errors/unauthorized`, so "
+        "the route cannot be used to discover which accounts or which tokens exist. The "
+        "response carries `WWW-Authenticate: Bearer`. A client should attempt a single "
+        "refresh and fall back to sign-in if that is refused too."
+    )
 }
 
-_CONFLICT: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_409_CONFLICT: {
-        "model": ProblemDetail,
-        "description": (
-            "The email address or the username is already registered. Which of the two is "
-            "not reported, and neither is the address itself, because doing so would turn "
-            "registration into a way of testing whether an account exists. Matching is "
-            "case-insensitive at the database level, so an address or handle differing only "
-            "in capitalisation from an existing one conflicts."
-        ),
-    }
+_DEACTIVATED: Final[ProblemResponses] = {
+    status.HTTP_403_FORBIDDEN: problem_response(
+        "The credential is genuine but the account has been deactivated, so it holds no "
+        "authority at all. Distinguished from `401` on purpose and only where the "
+        "distinction costs nothing: a holder whose access has been withdrawn is told that "
+        "rather than being left to retype a password that is in fact correct. "
+        "Re-authenticating will not clear it, and no role change a client can make will "
+        "either - an administrator must reactivate the account at "
+        "`PATCH /api/v1/admin/users/{user_id}`."
+    )
 }
 
-_UNPROCESSABLE: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_422_UNPROCESSABLE_CONTENT: {
-        "model": ProblemDetail,
-        "description": (
-            "The submitted body failed validation before any rule was applied - a missing "
-            "field, a malformed email address, a username outside the permitted pattern, a "
-            "password below the length floor or short of the character-variety rule, or an "
-            "unexpected extra property. The problem document's `errors` array names each "
-            "offending field and is populated for this status only. Note that sign-in never "
-            "answers 422 for a *credential* that could not be correct: that is a 401, "
-            "because distinguishing malformed from wrong on the sign-in route would be a "
-            "disclosure."
-        ),
-    }
+_CONFLICT: Final[ProblemResponses] = {
+    status.HTTP_409_CONFLICT: problem_response(
+        "The email address or the username is already registered. Which of the two is "
+        "not reported, and neither is the address itself, because doing so would turn "
+        "registration into a way of testing whether an account exists. Matching is "
+        "case-insensitive at the database level, so an address or handle differing only "
+        "in capitalisation from an existing one conflicts."
+    )
 }
 
-_THROTTLED: Final[dict[int | str, dict[str, Any]]] = {
-    status.HTTP_429_TOO_MANY_REQUESTS: {
-        "model": ProblemDetail,
-        "description": (
-            "Too many requests from this client address. Applies to all five credential "
-            "routes, which are the only throttled routes in the service, and it counts "
-            "failed attempts as well as successful ones - a limit that only counted "
-            "successes would not bound guessing. The response carries `Retry-After` with "
-            "the remaining window in seconds."
-        ),
-    }
+_UNPROCESSABLE: Final[ProblemResponses] = {
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "The submitted body failed validation before any rule was applied - a missing "
+        "field, a malformed email address, a username outside the permitted pattern, a "
+        "password below the length floor or short of the character-variety rule, or an "
+        "unexpected extra property. The problem document's `errors` array names each "
+        "offending field and is populated for this status only. Note that sign-in never "
+        "answers 422 for a *credential* that could not be correct: that is a 401, "
+        "because distinguishing malformed from wrong on the sign-in route would be a "
+        "disclosure."
+    )
 }
 
-_REGISTER_RESPONSES: Final[dict[int | str, dict[str, Any]]] = (
-    _CONFLICT | _UNPROCESSABLE | _THROTTLED
+_THROTTLED: Final[ProblemResponses] = {
+    status.HTTP_429_TOO_MANY_REQUESTS: problem_response(
+        "Too many requests from this client address. Applies to all five credential "
+        "routes, which are the only throttled routes in the service, and it counts "
+        "failed attempts as well as successful ones - a limit that only counted "
+        "successes would not bound guessing. The response carries `Retry-After` with "
+        "the remaining window in seconds."
+    )
+}
+
+_REGISTER_RESPONSES: Final[ProblemResponses] = _CONFLICT | _UNPROCESSABLE | _THROTTLED
+"""Registration: no 401 and no 403 - it authenticates nothing and there is no prior account to
+refuse."""
+
+_ROTATION_RESPONSES: Final[ProblemResponses] = _UNAUTHORIZED | _UNPROCESSABLE | _THROTTLED
+"""Rotation: 401 covers every unexchangeable token, deactivation included. See the note above."""
+
+_SIGN_IN_RESPONSES: Final[ProblemResponses] = (
+    _UNAUTHORIZED | _DEACTIVATED | _UNPROCESSABLE | _THROTTLED
 )
-_CREDENTIAL_RESPONSES: Final[dict[int | str, dict[str, Any]]] = (
-    _UNAUTHORIZED | _UNPROCESSABLE | _THROTTLED
+"""Sign-in: 403 is separate from 401 here because the service distinguishes them."""
+
+_SIGN_OUT_RESPONSES: Final[ProblemResponses] = (
+    _UNAUTHORIZED | _DEACTIVATED | _UNPROCESSABLE | _THROTTLED
 )
-_PRINCIPAL_RESPONSES: Final[dict[int | str, dict[str, Any]]] = _UNAUTHORIZED | _THROTTLED
+"""Sign-out: takes a body *and* an access token, so it can fail every way sign-in can."""
+
+_PRINCIPAL_RESPONSES: Final[ProblemResponses] = _UNAUTHORIZED | _DEACTIVATED | _THROTTLED
+"""The principal read: no 422, because it takes no body, no path parameter and no query."""
 
 
 # ---------------------------------------------------------------------------------------
@@ -347,7 +367,7 @@ async def register(
     "/login",
     response_model=TokenPair,
     status_code=status.HTTP_200_OK,
-    responses=_CREDENTIAL_RESPONSES,
+    responses=_SIGN_IN_RESPONSES,
     summary="Sign in and obtain an access and refresh token pair",
     description=(
         "Verifies a credential and answers `200` with a freshly minted token pair. Send the "
@@ -375,9 +395,14 @@ async def login(
 ) -> TokenPair:
     """Verify a submitted credential and mint the pair it earns.
 
-    The one handler that makes two service calls, and the module docstring explains why that
-    is a composition rather than leaked policy. ``AuthService.login`` is the same two steps
-    behind one name and behaves identically.
+    One service call, like every other handler in this module. The two decisions behind it -
+    verify the credential, then mint the pair - are composed by
+    :meth:`~app.services.auth_service.AuthService.login`, which is where the order of the two
+    belongs: a handler that called ``authenticate`` and then ``issue_token_pair`` itself would
+    be a second definition of what signing in consists of, and the one in the service would go
+    unused. What is left here is the *boundary* translation, and only that: the password grant's
+    unconstrained ``username`` field is turned into this API's credential model, and a value that
+    could not be a credential at all is refused with the same 401 a wrong one earns.
 
     Why the form is converted rather than forwarded
     ----------------------------------------------
@@ -420,11 +445,13 @@ async def login(
         db: The request-scoped session, handed straight to the service.
 
     Returns:
-        A freshly minted :class:`~app.schemas.auth.TokenPair`.
+        A freshly minted :class:`~app.schemas.auth.TokenPair`, exactly as the service composed
+        it.
 
     Raises:
         UnauthorizedError: The credential is wrong, unknown, or could not be a credential at
-            all. One status, one body, one wording for all three.
+            all. One status, one body, one wording for all three - the first two raised by the
+            service, the third by the guard below.
         ForbiddenError: The credential was correct but the account is deactivated. Raised by
             the service, which is the only layer that can know it.
     """
@@ -433,9 +460,7 @@ async def login(
     except ValidationError:
         raise UnauthorizedError from None
 
-    service = AuthService(db)
-    user = await service.authenticate(credentials)
-    return await service.issue_token_pair(user)
+    return await AuthService(db).login(credentials)
 
 
 # ---------------------------------------------------------------------------------------
@@ -447,7 +472,7 @@ async def login(
     "/refresh",
     response_model=TokenPair,
     status_code=status.HTTP_200_OK,
-    responses=_CREDENTIAL_RESPONSES,
+    responses=_ROTATION_RESPONSES,
     summary="Rotate a refresh token for a new pair",
     description=(
         "Spends the presented refresh token and answers `200` with a new pair. A refresh "
@@ -502,9 +527,13 @@ async def refresh(
         that was presented, which is no longer valid.
 
     Raises:
-        UnauthorizedError: The token was never issued, has expired, has been revoked, or was
-            presented a second time. Undifferentiated by design.
-        ForbiddenError: The account the token belongs to has been deactivated.
+        UnauthorizedError: The token cannot be exchanged - never issued, expired, revoked,
+            presented a second time, or belonging to an account that has since been removed or
+            deactivated. Undifferentiated by design, and the *only* status this route refuses
+            with: a deactivated account is deliberately **not** separated out as a 403 here, as
+            it is on sign-in, because rotation is reached with an opaque token rather than with a
+            password and answering differently would make the route an oracle for which accounts
+            are suspended. ``responses`` on this operation declares no 403 for the same reason.
     """
     return await AuthService(db).rotate_refresh_token(payload.refresh_token)
 
@@ -518,7 +547,7 @@ async def refresh(
     "/logout",
     response_model=None,
     status_code=status.HTTP_204_NO_CONTENT,
-    responses=_CREDENTIAL_RESPONSES,
+    responses=_SIGN_OUT_RESPONSES,
     summary="Sign out by revoking a refresh token",
     description=(
         "Revokes the presented refresh token and answers `204` with an empty body. Requires "
@@ -528,10 +557,18 @@ async def refresh(
         "answering otherwise would report whether a given token exists and would fail the "
         "honest cases - a retried request, a second browser tab, a client signing out twice - "
         "for no benefit.\n\n"
-        "Only this session ends. The access token is a signed assertion with no server-side "
-        "record, so nothing can withdraw it before it expires - which is why its lifetime is "
-        "short and why a client must discard its copy locally. Other sessions for the same "
-        "account are untouched."
+        "Accepted, however, is not the same as inert. Presenting a refresh token that has "
+        "**already been revoked** is read the same way `POST /auth/refresh` reads it - as a "
+        "replay, whether from a leak or from a client that spent the token and re-sent it - and "
+        "it revokes every refresh token the account holds. That is what makes the request mean "
+        "what it says: whatever token succeeded the presented one is what is still keeping the "
+        "session alive. The answer is `204` either way, so nothing about the token's state is "
+        "disclosed.\n\n"
+        "An ordinary sign-out ends only its own session: its token has not been revoked yet, so "
+        "the rule above is not reached and other sessions for the same account are untouched. "
+        "The access token is a signed assertion with no server-side record, so nothing can "
+        "withdraw it before it expires - which is why its lifetime is short and why a client "
+        "must discard its copy locally."
     ),
 )
 @auth_rate_limit
@@ -567,12 +604,15 @@ async def logout(
         request: The incoming request, required by the rate limiter and otherwise unused.
         payload: The body carrying the refresh token to withdraw.
         db: The request-scoped session, handed straight to the service.
-        _principal: The authenticated, active account. Resolved so that an absent, malformed
-            or expired access token is refused before the body is acted on; unused thereafter.
+        _principal: The authenticated, active account. Resolved so that an absent, malformed or
+            expired access token is refused with 401 - and a deactivated account with 403 -
+            before the body is acted on; unused thereafter.
 
     Returns:
         ``None``. Success and "already signed out" are the same state, and reporting which one
-        occurred is the validity oracle the service deliberately does not build.
+        occurred is the validity oracle the service deliberately does not build - which is also
+        why the family revocation the service performs on an already-revoked token changes the
+        effect and not the answer.
     """
     await AuthService(db).logout(payload.refresh_token)
 

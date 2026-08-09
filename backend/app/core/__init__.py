@@ -6,7 +6,7 @@
 package depends on none of them in return. That one-way relationship is what keeps the
 layer boundaries reviewable, so it must never be inverted.
 
-The nine sibling modules this marker makes importable, in dependency order, own the
+The ten sibling modules this marker makes importable, in dependency order, own the
 concerns that have no other single owner:
 
 * ``password_policy`` - the single declaration of what makes a password acceptable: four
@@ -14,6 +14,10 @@ concerns that have no other single owner:
   nothing else - not even ``pydantic`` - which is what lets both ``config`` below and
   ``app.schemas.auth`` reach the same rule while only one of them needs a configured
   environment. The true root of the graph.
+* ``concurrency`` - the bounded worker-thread offload every CPU-bound call in a request path
+  goes through, so argon2 hashing and HTML sanitisation cannot stall the event loop and cannot
+  answer a request flood with a thread flood. Imports ``anyio`` and no sibling at all, which
+  puts it beside ``password_policy`` at the root of the graph.
 * ``config`` - the typed settings contract over the environment, and the only module in
   the repository permitted to read it. Imports ``password_policy`` and re-exports it, and
   imports no other sibling.
@@ -25,7 +29,8 @@ concerns that have no other single owner:
 * ``exceptions`` - the domain exception hierarchy plus the handlers that render every
   failure as one machine-readable problem document.
 * ``security`` - argon2id password hashing and verification, access-token issuance, and
-  refresh-token generation, hashing and decoding.
+  refresh-token generation, hashing and decoding. Imports ``concurrency`` for the awaitable
+  form of each password primitive, ``config`` for the signing parameters, and ``exceptions``.
 * ``rate_limit`` - the limiter and the decorators guarding the authentication routes.
 * ``dependencies`` - request-scoped injection: the database session, the resolved
   principal, the administrator guard and the normalised pagination parameters.

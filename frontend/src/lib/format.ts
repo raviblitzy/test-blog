@@ -340,15 +340,20 @@ export function formatMachineDate(value: DateInput): string {
 /**
  * Formats a non-negative tally for display, abbreviating large values.
  *
- * Applies to every count the API exposes: `view_count` on a post, `like_count` on a like summary
- * and `post_count` on a category. Values below {@link COMPACT_COUNT_THRESHOLD} are rendered
- * exactly; at or above it they are abbreviated, so a popular post reads `'1.2K'` rather than
- * `'1,234'`. Rounding is delegated to `Intl.NumberFormat`, which is consistent across
- * magnitudes and needs no dependency.
+ * Applies to the counts this tier actually presents: `like_count` on a like summary, `post_count` on
+ * a category, and the administrative overview totals. Values below
+ * {@link COMPACT_COUNT_THRESHOLD} are rendered exactly; at or above it they are abbreviated, so a
+ * much-liked post reads `'1.2K'` rather than `'1,234'`. Rounding is delegated to
+ * `Intl.NumberFormat`, which is consistent across magnitudes and needs no dependency.
  *
- * Zero is a real, meaningful tally — a post with no views yet — and renders as `'0'`, not as the
- * placeholder. Only genuinely absent input yields the placeholder. A negative or non-finite value
- * cannot be a tally, so it is treated as absent rather than displayed.
+ * `view_count` is deliberately not in that list. It is on the wire, but no endpoint in this product
+ * increments it, so it is not a measurement and no surface renders it as one - the register at the
+ * top of `src/components/blog/post-card.tsx` carries the full reasoning. Formatting it here would
+ * still be correct arithmetic; presenting the result would be the defect.
+ *
+ * Zero is a real, meaningful tally — a category with no posts filed under it yet — and renders as
+ * `'0'`, not as the placeholder. Only genuinely absent input yields the placeholder. A negative or
+ * non-finite value cannot be a tally, so it is treated as absent rather than displayed.
  *
  * @param value - The count to format.
  * @returns A display string such as `'0'`, `'999'`, `'1.2K'` or `'3.4M'`; or {@link EMPTY_VALUE}
