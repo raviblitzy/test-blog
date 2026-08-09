@@ -91,7 +91,7 @@ from app.core.dependencies import is_admin
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.core.logging import get_logger, log_safe_text
 from app.core.pagination import Page, build_page
-from app.models import Category, Comment, CommentStatus, Post, PostStatus, User, UserRole
+from app.models import Comment, CommentStatus, Post, PostStatus, User, UserRole
 from app.repositories import (
     CategoryRepository,
     CommentRepository,
@@ -1128,7 +1128,7 @@ class AdminService:
 
         return await self._category_service.list_paginated(q=q, page=page, page_size=page_size)
 
-    async def create_category(self, payload: CategoryCreate, *, actor: User) -> Category:
+    async def create_category(self, payload: CategoryCreate, *, actor: User) -> CategoryPublic:
         """Create a category, letting the delegate derive its slug.
 
         Behind ``POST /api/v1/admin/categories``. Categories are administrative reference data:
@@ -1141,8 +1141,10 @@ class AdminService:
             actor: The resolved principal. Must hold ``ADMIN``.
 
         Returns:
-            The persisted category, with its server-generated ``id``, its derived ``slug`` and both
-            timestamps populated from the database.
+            The persisted category as :class:`~app.schemas.category.CategoryPublic`, with its
+            server-generated ``id``, its derived ``slug``, its creation instant and a
+            ``post_count`` of zero - the same model the public taxonomy endpoints return, which is
+            what ``POST /api/v1/admin/categories`` declares as its response.
 
         Raises:
             ForbiddenError: The principal does not hold ``ADMIN``.
@@ -1158,6 +1160,15 @@ class AdminService:
             slug in this module would be a second URL policy, and a canonical address is precisely
             the thing that must have exactly one.
 
+            **The projection is the delegate's too, and it has to be.** ``CategoryPublic`` carries
+            ``post_count``, which is an aggregate rather than a member of the entity - not a stored
+            column, not a default and not a hybrid property - so a mapped ``Category`` carries five
+            of that model's six fields and validating one against it raises. Returning the row and
+            letting the route's ``response_model`` convert it would therefore fail at serialisation
+            time. ``CategoryService`` is the layer that knows the tally counts *published* posts
+            only, so asking it to project keeps that meaning declared exactly once and keeps this
+            surface reporting the same figure the home page's filter control shows.
+
             The delegate commits, so this method issues no commit of its own.
         """
         self._require_admin(actor)
@@ -1170,7 +1181,7 @@ class AdminService:
             slug=log_safe_text(category.slug),
             actor_id=str(actor.id),
         )
-        return category
+        return await self._category_service.get_public_by_slug(category.slug)
 
     async def update_category(
         self,
@@ -1178,7 +1189,7 @@ class AdminService:
         payload: CategoryUpdate,
         *,
         actor: User,
-    ) -> Category:
+    ) -> CategoryPublic:
         """Rename a category or edit its description, leaving its slug alone.
 
         Behind ``PATCH /api/v1/admin/categories/{category_id}``. A genuine partial update: only the
@@ -1191,7 +1202,9 @@ class AdminService:
             actor: The resolved principal. Must hold ``ADMIN``.
 
         Returns:
-            The updated category.
+            The updated category as :class:`~app.schemas.category.CategoryPublic`, its ``slug``
+            unchanged and its ``post_count`` the current published tally - the model
+            ``PATCH /api/v1/admin/categories/{category_id}`` declares as its response.
 
         Raises:
             ForbiddenError: The principal does not hold ``ADMIN``.
@@ -1207,6 +1220,12 @@ class AdminService:
             lives, and re-deriving here would both contradict it and put a second URL policy in the
             codebase.
 
+            **The projection is the delegate's, for the reason recorded on**
+            :meth:`create_category`: ``post_count`` is an aggregate the entity does not carry, so a
+            mapped row cannot validate against the response model. Addressing the projection by
+            ``slug`` is sound precisely *because* a rename leaves the slug alone - the identifier
+            used to read the row back is the one the update could not have moved.
+
             The delegate commits when there is something to write, and writes and commits nothing
             when the patch is empty. Either way this method does not commit on top of it.
         """
@@ -1221,7 +1240,7 @@ class AdminService:
             actor_id=str(actor.id),
             changed=sorted(payload.model_dump(exclude_unset=True)),
         )
-        return category
+        return await self._category_service.get_public_by_slug(category.slug)
 
     async def delete_category(self, category_id: uuid.UUID, *, actor: User) -> None:
         """Delete a category, subject to the delegate's in-use guard.
