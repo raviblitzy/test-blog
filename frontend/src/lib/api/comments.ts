@@ -102,7 +102,7 @@
 
 import { apiDeleteNoContent, apiGet, apiPatch, apiPost } from '@/lib/api/client';
 import { encodePathSegment } from '@/lib/paths';
-import type { RequestOptions } from '@/lib/api/client';
+import type { OptionalAuthRequestOptions, ProtectedRequestOptions } from '@/lib/api/client';
 import { commentPublicSchema, pageOf } from '@/lib/types';
 import type { CommentCreate, CommentPublic, CommentUpdate, Page } from '@/lib/types';
 
@@ -182,20 +182,36 @@ function commentPath(commentId: string, operation: string): string {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The per-call transport controls these four operations accept: everything `RequestOptions` offers
- * **except** `query`.
+ * The per-call transport controls the **read** accepts: `GET /posts/{id}/comments`.
  *
- * Forwarding the rest is what lets a Server Component decide how its data is cached
- * (`cache`, `next.revalidate`, `next.tags`), lets a client island cancel a request it no longer
- * needs (`signal`), and lets a caller deliberately withhold a credential it holds (`anonymous`) to
- * see a thread exactly as an anonymous reader would.
+ * The route resolves an **optional** principal - which moderation states are in scope is decided from
+ * the caller's credential, at every level of the thread - so this is the caller-aware mode. A held
+ * credential is attached by default, `anonymous` remains available for a caller that deliberately
+ * wants to see the thread exactly as a signed-out reader would, and `bearer` remains so a Server
+ * Component can read on behalf of one request. Forwarding the rest is what lets a Server Component
+ * decide how its data is cached (`cache`, `next.revalidate`, `next.tags`) and a client island cancel
+ * a request it no longer needs (`signal`).
  *
  * `query` is omitted rather than merged, and the omission is load-bearing: the only query surface
- * these routes have is the page window, {@link listComments} builds it from
+ * this route has is the page window, {@link listComments} builds it from
  * {@link ListCommentsParams}, and a second source for it could silently override the window a
  * caller asked for. Making that a compile error is cheaper than making it a bug.
+ *
+ * `anonymousFallback` is the wrapper's to set: a thread renders for a signed-out reader, so a held
+ * credential that has expired must not turn a public page into a failure.
  */
-export type CommentRequestOptions = Omit<RequestOptions, 'query'>;
+export type CommentReadOptions = Omit<OptionalAuthRequestOptions, 'query'>;
+
+/**
+ * The per-call transport controls the three **mutations** accept: create, edit and delete.
+ *
+ * All three require a credential and all three are ownership-scoped by the service - an author may
+ * act on their own comment, an administrator on any - so anonymity is not a mode they have and
+ * neither `anonymous` nor `anonymousFallback` exists here to ask for it. `bearer` is retained for a
+ * server-side caller acting on behalf of one request, and `query` is omitted because none of the
+ * three accepts a query parameter.
+ */
+export type CommentMutationOptions = Omit<ProtectedRequestOptions, 'query'>;
 
 /**
  * The page window for {@link listComments}, in the wire's own spelling.
@@ -303,7 +319,7 @@ function toUpdateDocument(input: CommentUpdate): CommentUpdate {
  * nested replies included. A caller whose credential the client is holding is additionally shown
  * the comments that principal is entitled to see - their own comment awaiting moderation, or, for an
  * administrator, the queue - which is why this is described as caller-aware rather than anonymous.
- * Pass `anonymous: true` through {@link CommentRequestOptions} to see the thread as an anonymous
+ * Pass `anonymous: true` through {@link CommentReadOptions} to see the thread as an anonymous
  * reader would even while a credential is held.
  *
  * ## The page counts threads, not comments - and it is returned untouched
@@ -345,7 +361,7 @@ function toUpdateDocument(input: CommentUpdate): CommentUpdate {
 export async function listComments(
   postId: string,
   params: ListCommentsParams = {},
-  options?: CommentRequestOptions,
+  options?: CommentReadOptions,
 ): Promise<Page<CommentPublic>> {
   // Both members are forwarded unconditionally because the client's query serialiser drops an
   // undefined one: a call that names no window therefore produces a bare path with no query string
@@ -405,7 +421,7 @@ export async function listComments(
 export async function createComment(
   postId: string,
   input: CommentCreate,
-  options?: CommentRequestOptions,
+  options?: CommentMutationOptions,
 ): Promise<CommentPublic> {
   return apiPost(
     threadPath(postId, 'createComment'),
@@ -460,7 +476,7 @@ export async function createComment(
 export async function updateComment(
   commentId: string,
   input: CommentUpdate,
-  options?: CommentRequestOptions,
+  options?: CommentMutationOptions,
 ): Promise<CommentPublic> {
   return apiPatch(
     commentPath(commentId, 'updateComment'),
@@ -507,7 +523,7 @@ export async function updateComment(
  */
 export async function deleteComment(
   commentId: string,
-  options?: CommentRequestOptions,
+  options?: CommentMutationOptions,
 ): Promise<void> {
   return apiDeleteNoContent(commentPath(commentId, 'deleteComment'), options);
 }

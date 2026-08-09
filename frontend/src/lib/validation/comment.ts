@@ -32,20 +32,26 @@
  * the build. What no type can express - the order of the checks inside the body rule - is recorded
  * on {@link commentBodySchema}.
  *
- * ## The one deliberate divergence, and why it is safe
+ * ## Both schemas mirror the wire exactly, including the update's optionality
  *
- * On the wire the update body is *optional*: the service treats an omitted member as "leave this
- * as it is", which makes an empty patch a valid no-op. `commentUpdateSchema` nevertheless requires
- * it, and that is a form-layer decision rather than a contradiction:
+ * On the wire the update body is *optional*: the service's model declares it optional and applies
+ * `model_dump(exclude_unset=True)`, so an omitted member means "leave this as it is" and `{}` is a
+ * valid no-op patch. `commentUpdateSchema` therefore marks it optional too, and `{}` parses.
  *
- * - The editor is a text area, so its form state always carries the member. The omission the
- *   service permits is unreachable from this form; the only thing a reader can actually do is
- *   submit it *blank*, which the service rejects.
- * - Requiring it turns that blank submission into an inline error naming the field, instead of a
- *   request that appears to succeed and changes nothing - the outcome that reads as a silently
- *   dropped edit.
- * - It stays assignable: a required member satisfies an optional one, which is what
- *   {@link WireCompatible} proves at compile time.
+ * It used to require it, on the argument that the editor is a text area whose state always carries
+ * the member, so the only thing a reader could actually do was submit it blank - which requiring it
+ * reports inline. The argument is a good one about the *editor* and a wrong one about this schema:
+ * these exports are the request mirror, they are what pins the client to the service's contract, and
+ * a mirror that is stricter than the thing it mirrors is simply an inaccurate mirror. It also made
+ * `{}` - a request the API accepts - unrepresentable through the module that exists to describe what
+ * the API accepts.
+ *
+ * **An editor that genuinely requires text composes that rule itself**, on top of the mirror, at the
+ * boundary that owns the interaction: `commentUpdateSchema.required()` re-imposes the member for a
+ * form whose submit button must refuse an empty text area, and the blank-text message below is
+ * already worded for exactly that case. That keeps two different rules in the two places they belong
+ * - what the API accepts here, what the form insists on there - instead of collapsing them into one
+ * that is wrong about the first.
  *
  * Null is accepted by neither schema, matching the service, which refuses an explicit null on both
  * routes because the column has no state such a value could describe.
@@ -62,11 +68,13 @@
  *
  * None of those keys is *spelled* anywhere in this module, deliberately: a search for one of them
  * across `src/lib/validation/` returning nothing is then a cheap, mechanical proof that no form in
- * this tier can set it, and prose quoting the key would defeat that check. Both schemas also drop
- * unrecognised keys during parsing rather than merely ignoring them, so a payload that arrives
- * carrying one cannot pass it on: what a caller submits is the *parsed* value, and the parsed value
- * only ever holds the members declared below. That is what keeps this form from ever tripping the
- * service's own refusal of unknown members.
+ * this tier can set it, and prose quoting the key would defeat that check. Both schemas are also
+ * **strict**, so a payload carrying an unrecognised key is rejected with that key named rather than
+ * silently shortened - which is exactly what the service does with `extra='forbid'`, so the two ends
+ * agree about the rule *and* about its consequence. Strictness applies to whatever is handed in, so a
+ * form whose state carries UI-only members (a reply-open flag, a draft marker) must project the wire
+ * members out before validating: `commentCreateSchema.parse({ body, parent_id })` rather than
+ * `.parse(formState)`.
  *
  * ## What this module deliberately does not do
  *
@@ -342,8 +350,10 @@ type WireCompatible<Wire, Form extends Wire> = Form;
  * turn a reply whose target went missing into a root comment with no error reported anywhere,
  * which is precisely the class of defect the check exists to catch.
  *
- * Parsing strips anything not declared here, so the value handed to the API can only ever hold
- * these two members.
+ * Parsing **rejects** anything not declared here rather than removing it, matching the service's own
+ * `extra='forbid'`, so a misspelled member is named in a field error instead of vanishing from a
+ * request that then appears to succeed. The value handed to the API can only ever hold these two
+ * members.
  *
  * @example
  * ```ts
@@ -358,7 +368,7 @@ type WireCompatible<Wire, Form extends Wire> = Form;
  * });
  * ```
  */
-export const commentCreateSchema = z.object({
+export const commentCreateSchema = z.strictObject({
   body: commentBodySchema(CREATE_BODY_EMPTY_MESSAGE),
   // Optional AND null-accepting, because the service accepts both spellings of "top-level". The
   // top-level format function is the current form; the equivalent method on a string schema is
@@ -393,30 +403,39 @@ export type CommentCreateFormValues = WireCompatible<
  * an operation this API has. A thread's shape is fixed when its rows are written.
  *
  * The body rule is the one creation uses, so an edit cannot exceed a limit a new comment could not.
- * It is required here even though the wire type permits omission; the module header records why
- * that is a form-layer decision rather than a contradiction.
+ * It is **optional**, exactly as the wire contract is: the service accepts a patch that sets nothing,
+ * so `{}` parses here too. A form that must refuse an empty text area re-imposes the member with
+ * `commentUpdateSchema.required()` - see the module header on why that rule belongs to the editor
+ * rather than to the request mirror. Note that optional is not nullable: `{ body: null }` is still a
+ * failure, matching the service, because the column has no state such a value could describe.
  *
  * @example
  * ```ts
  * commentUpdateSchema.parse({ body: 'Corrected: the cascade is recursive, not one level.' });
  * // => { body: 'Corrected: the cascade is recursive, not one level.' }
  *
- * // A supplied parent is dropped rather than honoured: this route cannot move a comment.
- * commentUpdateSchema.parse({ body: 'Fixed a typo.', parent_id: 'anything' });
- * // => { body: 'Fixed a typo.' }
+ * commentUpdateSchema.parse({}); // => {} - a no-op patch, which the service accepts
+ *
+ * // A supplied parent is REJECTED, not dropped: this route cannot move a comment, and a caller who
+ * // tried is told so rather than left believing the reply was re-parented.
+ * commentUpdateSchema.safeParse({ body: 'Fixed a typo.', parent_id: 'anything' }).success; // false
+ *
+ * // What an editor that insists on text uses instead:
+ * commentUpdateSchema.required().safeParse({}).success; // false
  * ```
  */
-export const commentUpdateSchema = z.object({
-  body: commentBodySchema(UPDATE_BODY_EMPTY_MESSAGE),
+export const commentUpdateSchema = z.strictObject({
+  body: commentBodySchema(UPDATE_BODY_EMPTY_MESSAGE).optional(),
 } satisfies MembersOf<CommentUpdate>);
 
 /**
  * The values {@link commentUpdateSchema} produces: what the comment editor submits.
  *
- * Pinned to the request contract by {@link WireCompatible}. The contract marks the member optional,
- * because the service accepts a patch that sets nothing; a required member satisfies that, and is
- * what lets the editor report a cleared text area inline instead of submitting a change that
- * silently amounts to nothing.
+ * Pinned to the request contract by {@link WireCompatible}, and now optional on both sides: the
+ * service accepts a patch that sets nothing, so the mirror admits `{}` as well. An editor that
+ * refuses a cleared text area does so with `commentUpdateSchema.required()`, whose inferred type
+ * narrows the member back to required for that form alone - the interaction rule lives with the
+ * interaction, and the request contract stays a faithful description of the request.
  */
 export type CommentUpdateFormValues = WireCompatible<
   CommentUpdate,

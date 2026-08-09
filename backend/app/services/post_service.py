@@ -1600,8 +1600,6 @@ class PostService:
                 raise
             raise ConflictError(detail) from error
 
-        await self._session.commit()
-
         get_logger(__name__).info(
             "post created",
             post_id=str(persisted.id),

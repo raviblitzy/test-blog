@@ -60,6 +60,16 @@
  *   as `@/lib/types` mirrors them. Re-spelling a field produces a type that compiles and a value
  *   that is `undefined`.
  *
+ * ## Credential modes: a wrapper states which kind of route it wraps
+ *
+ * {@link RequestOptions} is the full transport surface and is what the low-level entry points take,
+ * because this module has to be able to express every request - including the deliberately
+ * unauthenticated ones it issues itself. A namespace wrapper takes one of three narrower types
+ * instead: {@link PublicRequestOptions}, {@link OptionalAuthRequestOptions} or
+ * {@link ProtectedRequestOptions}. The credential mode belongs to the route, so encoding it in the
+ * wrapper's signature is what makes the two mistakes it prevents unrepresentable rather than merely
+ * discouraged - a public read cannot transmit a held bearer, and a protected call cannot drop one.
+ *
  * ## Path convention: callers pass namespace-relative paths
  *
  * A caller passes `/posts`, `/auth/login` or `/admin/users` - never `/api/v1/posts`. The version
@@ -373,6 +383,91 @@ export interface RequestOptions {
    */
   anonymousFallback?: boolean;
 }
+
+/* -------------------------------------------------------------------------------------------------
+ * Credential modes
+ *
+ * `RequestOptions` is the full transport surface and is what the low-level entry points below
+ * accept. It is deliberately permissive, because this module has to be able to express every kind of
+ * request - including the deliberately unauthenticated ones it issues itself, such as rotation.
+ *
+ * A namespace WRAPPER is not permissive. Every endpoint in this API belongs to exactly one of three
+ * credential modes, that mode is a property of the route rather than of the call site, and the three
+ * types below are how a wrapper states which one it is wrapping. The point is what each one makes
+ * UNREPRESENTABLE:
+ *
+ * - a public read cannot be talked into transmitting a bearer the caller happens to be holding, and
+ * - a protected mutation cannot be talked into dropping the bearer it requires.
+ *
+ * Neither mistake produces a type error under the plain `RequestOptions`, and neither is visible at
+ * the call site: the first quietly hands an unrelated service a credential it has no business
+ * seeing, and the second quietly turns an authenticated action into a `401` at best - or, on a route
+ * whose answer varies by principal, into the public projection silently standing in for the private
+ * one. So the mode is encoded in the type rather than left to a comment.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Options for a route that resolves **no principal at all**, where the wrapper forces anonymity.
+ *
+ * The public profile reads (`GET /users/{username}`, `GET /users/{username}/posts`) and both
+ * taxonomy reads (`GET /categories`, `GET /categories/{slug}`) are these: their handlers take
+ * neither a required nor an optional principal, so a bearer sent with them cannot change a single
+ * byte of the answer. Transmitting one anyway is a needless disclosure - the token travels, is
+ * available to anything logging the request, and buys nothing - so the wrapper sets
+ * `anonymous: true` itself and the caller has no member with which to countermand it.
+ *
+ * Four members are consequently absent, all for the same reason: with anonymity forced, none of them
+ * can do anything. `anonymous` is the wrapper's to set, `bearer` would be ignored, `allowRefresh`
+ * governs a rotation that a request carrying no credential cannot provoke, and `anonymousFallback`
+ * is a replay of exactly the request that is already being made. What remains - `query` where the
+ * wrapper does not own it, `signal`, `cache`, `next`, `timeoutMs` - is the whole of what a caller
+ * legitimately controls on a public read.
+ */
+export type PublicRequestOptions = Omit<
+  RequestOptions,
+  'anonymous' | 'bearer' | 'allowRefresh' | 'anonymousFallback'
+>;
+
+/**
+ * Options for a route that resolves an **optional** principal, where the credential mode is the
+ * caller's to choose.
+ *
+ * Four routes answer differently depending on who is asking and answer perfectly well to nobody:
+ * `GET /posts` and `GET /posts/{slug}` (an author or an administrator additionally sees drafts),
+ * `GET /posts/{id}/comments` (moderation state) and `GET /posts/{id}/likes` (whether the caller has
+ * liked). A held credential is therefore meaningful here and is attached by default, and `anonymous`
+ * remains available for the genuine case of wanting the public projection on purpose - previewing
+ * what a signed-out reader sees, say.
+ *
+ * `bearer` remains too, because that is how a Server Component makes an authenticated read: the
+ * credential store is a module global and so browser-only by construction, and a server render
+ * passes the token it resolved from its own request context instead.
+ *
+ * Only `anonymousFallback` is withheld. It is the wrapper's to set - a public read must not break
+ * for a reader whose held credential has expired in a background tab - and a caller has no
+ * information with which to make that decision better.
+ */
+export type OptionalAuthRequestOptions = Omit<RequestOptions, 'anonymousFallback'>;
+
+/**
+ * Options for a route that **requires** a credential, where anonymity is unrepresentable.
+ *
+ * Everything a reader has to be signed in to do: `POST /auth/logout`, `GET /auth/me`,
+ * `PATCH /users/me`, every post and comment mutation, like and unlike, and all fourteen
+ * administrative operations. Sending one of these without a credential cannot succeed, so the option
+ * that would do it is removed rather than documented as a mistake.
+ *
+ * `bearer` is retained, and is the reason this is an `Omit` rather than a bare `Pick`: a Server
+ * Component or a route handler acting on behalf of one request passes that request's own token, and
+ * rotation is disabled for it automatically because there is nowhere on a server to write a rotated
+ * pair. `allowRefresh` is retained for the one route whose body names a credential -
+ * `@/lib/api/auth#logout` sets it `false` and handles the unauthorised case itself.
+ *
+ * `anonymousFallback` is absent for the same reason `anonymous` is: replaying a protected request
+ * without a credential cannot produce the resource, and on a route whose public projection differs
+ * it would produce something worse than a failure - a plausible answer to a different question.
+ */
+export type ProtectedRequestOptions = Omit<RequestOptions, 'anonymous' | 'anonymousFallback'>;
 
 /**
  * {@link RequestOptions} plus a request body, for the low-level {@link apiRequest} and

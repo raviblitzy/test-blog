@@ -44,12 +44,24 @@ Four visibility rules, and where each one comes from
 2. **A comment thread is no more visible than the post it hangs off.** The draft rule is
    *imported*, not restated: :func:`~app.services.post_service.can_view_post` is the single
    declaration of "who may read this post", and :meth:`CommentService._load_visible_post` calls
-   it before either reading or writing a thread. The retired service demonstrated the
-   alternative, writing ``HTTPException(status_code=404, detail="Item not found")`` three separate
+   it before reading a thread, before writing to one, and before editing a comment inside one -
+   an edit returns the reply subtree beneath the comment, so it is a thread read as well as a row
+   write. Owning a comment is authority over that row and never over the discussion around it.
+   The retired service demonstrated the alternative, writing
+   ``HTTPException(status_code=404, detail="Item not found")`` three separate
    times (``app.py:L31``, ``L40``, ``L49``) and the identity predicate three separate times
    (``L28-29``, ``L36-37``, ``L45-46``); a rule with three definitions is a rule that will
    eventually have three behaviours. The dependency edge is deliberately one-way -
    ``post_service`` never imports this module.
+
+   The rule is also made to *hold* rather than merely to have been true when it was checked. The
+   post is read under ``SELECT ... FOR SHARE`` and the lock is kept until the transaction ends, so
+   a concurrent unpublish, archive or delete cannot land between the check and the thread query or
+   the insert it authorises. The same applies to a reply's parent, whose moderation state is read
+   under the same shared mode. Locks are always taken ``posts`` then ``comments`` - the global order
+   :meth:`~app.repositories.post_repository.PostRepository.get_for_share` documents - because
+   ``post_service.delete`` holds ``FOR UPDATE`` on a post while its cascade locks that post's
+   comments, and the reverse order would deadlock.
 3. **Only approved comments are visible publicly**, replies included.
    :func:`_visible_comment_statuses` decides which moderation states a viewer may see, and
    ``app.repositories.comment_repository`` applies that one set at every level of the thread - to
@@ -93,10 +105,18 @@ Transactions
 ------------
 ``app.repositories`` flushes but never commits, and ``app.core.dependencies.get_db`` never commits
 either, so the transaction boundary belongs to this layer - the layer that knows when a unit of
-work is complete. Each mutating method below therefore commits once, on success, and lets every
-exception propagate for ``get_db`` to roll back. Nothing here opens a transaction explicitly:
-``session.begin()`` is never called, so the suite's outer transaction-per-test fixture keeps
-working unchanged and a rolled-back test leaves no row behind.
+work is complete. Each mutating method below therefore commits **once**, on success, after the last
+of its steps, and lets every exception propagate for ``get_db`` to roll back. Nothing here opens a
+transaction explicitly: ``session.begin()`` is never called, so the suite's outer
+transaction-per-test fixture keeps working unchanged and a rolled-back test leaves no row behind.
+
+:meth:`CommentService.create` is the one method that also rolls back itself, and only on the
+``IntegrityError`` path: after an aborted flush the session refuses every further statement until it
+is rolled back, so the rollback is what makes the ``ConflictError`` reportable rather than a second
+failure on the way out. ``get_db``'s rollback remains the safety net behind it.
+
+That single commit is also what bounds the row locks the visibility gate takes: it releases them,
+which is why every method materialises its response *before* committing rather than after.
 """
 
 import uuid
@@ -577,6 +597,13 @@ class CommentService:
     rather than a style: a resource that does not exist is reported before authority is considered,
     and a resource the caller has no authority to know about is reported the same way as one that
     is missing.
+
+    A comment's visibility is its *post's* visibility, and every method that reads or returns thread
+    content applies that rule through :meth:`_load_visible_post`: the listing, the write, and the
+    edit - which returns a reply subtree and therefore has to. Owning a comment is authority over
+    that one row and never over the discussion around it, so the two questions are asked in that
+    order and both are asked. :meth:`delete` and :meth:`set_status` are the deliberate exceptions:
+    they return no thread content at all, so they ask only who may act on the row.
     """
 
     __slots__ = ("_comments", "_posts", "_session")
@@ -608,19 +635,24 @@ class CommentService:
     async def _load_visible_post(self, post_id: uuid.UUID, viewer: User | None) -> Post:
         """Fetch the post a thread hangs off, and confirm this viewer may see it.
 
-        The shared preamble of :meth:`list_for_post` and :meth:`create`, so that the two agree
-        about which posts have a reachable discussion. A comment thread cannot be more visible than
-        the article it is attached to: if the post is an unpublished draft belonging to somebody
-        else, then for this caller the thread does not exist either, in both directions - it cannot
-        be read and it cannot be written to.
+        The shared preamble of :meth:`list_for_post`, :meth:`create` and :meth:`update`, so that all
+        three agree about which posts have a reachable discussion. A comment thread cannot be more
+        visible than the article it is attached to: if the post is an unpublished draft belonging to
+        somebody else then for this caller the thread does not exist either, in every direction - it
+        cannot be read, it cannot be written to, and a comment already inside it can be neither
+        edited nor have its replies projected back.
 
         Args:
-            post_id: The post's identifier, from the URL path.
+            post_id: The post's identifier. It comes from the URL path on the two methods that name
+                a post, and from
+                :meth:`~app.repositories.comment_repository.CommentRepository.post_id_of` on
+                :meth:`update`, which names a comment instead.
             viewer: The resolved principal, or ``None`` for an anonymous caller.
 
         Returns:
-            The post. Its own columns are populated; its relationships are not, and nothing here
-            needs them - :func:`_visible_comment_statuses` reads ``author_id`` and
+            The post, with a shared lock held on its row until this transaction ends. Its own
+            columns are populated; its relationships are not, and nothing here needs them -
+            :func:`_visible_comment_statuses` reads ``author_id`` and
             :func:`~app.services.post_service.can_view_post` reads ``status`` and ``author_id``,
             all three of which are mapped columns.
 
@@ -641,8 +673,35 @@ class CommentService:
             :func:`~app.services.post_service.can_view_post` is its single declaration, and this
             method calls it: a rule repeated per call site drifts, which is exactly what the
             retired service demonstrated by writing its one identity predicate three times over.
+
+            **The row is taken under a shared lock, which is what makes this decision hold rather
+            than merely have been true.** Under ``READ COMMITTED`` every statement takes its own
+            snapshot, so an unlocked gate answers about the post as it was and the thread query or
+            the insert that follows runs against the post as it *becomes*. The window is small and
+            the consequences are not: a concurrent unpublish or archive would let a thread be
+            listed for an article the caller may no longer read, or let a comment be written onto
+            one, and a concurrent delete would surface as a foreign-key violation and a ``500``
+            describing a constraint rather than the ``404`` it is. ``FOR SHARE`` conflicts with the
+            ``FOR UPDATE`` every transition in ``app.services.post_service`` takes first, so those
+            transitions now queue behind this transaction, and a post already deleted and committed
+            comes back absent rather than out of a snapshot.
+
+            **Shared, not exclusive.** Two readers listing the same thread, or two readers
+            commenting on the same article, hold compatible locks and never wait for one another,
+            which is what keeps a public, high-frequency operation from serialising on one row.
+            Only a genuine post mutation waits, and only for the length of one request.
+
+            **``posts`` is locked FIRST, always.** The order is
+            ``posts`` -> ``comments`` -> ``post_likes``, and
+            :meth:`~app.repositories.post_repository.PostRepository.get_for_share` documents it in
+            full. It matters most in this module, because ``post_service.delete`` holds
+            ``FOR UPDATE`` on a post while its cascade locks that post's comments: a comment path
+            that locked its comment and then reached back for the post would close a cycle and
+            deadlock. That is why :meth:`update` resolves its lock target through
+            :meth:`~app.repositories.comment_repository.CommentRepository.post_id_of` before it
+            locks anything.
         """
-        post = await self._posts.get_by_id(post_id)
+        post = await self._posts.get_for_share(post_id)
         if post is None:
             raise NotFoundError(_POST_NOT_FOUND)
         if not can_view_post(post, viewer):
@@ -707,11 +766,12 @@ class CommentService:
 
         Args:
             parent_id: The identifier the client sent as ``parent_id``.
-            post: The post the reply is being written on, already confirmed visible to ``author``.
+            post: The post the reply is being written on, already confirmed visible to ``author``
+                and already held under a shared lock by :meth:`_load_visible_post`.
             author: The resolved principal writing the reply.
 
         Returns:
-            The parent comment.
+            The parent comment, with a shared lock held on its row until this transaction ends.
 
         Raises:
             AppValidationError: The parent does not exist, hangs off another post, is in a
@@ -736,6 +796,19 @@ class CommentService:
             for whether a given identifier names a comment awaiting moderation, which is a fact the
             public thread withholds - so the reply path must withhold it too.
 
+            **The parent is read under a shared lock, because its moderation state authorises a
+            write.** Reading it unlocked would decide from one ``READ COMMITTED`` snapshot and
+            insert in another, so an administrator rejecting the parent in between would leave a
+            reply beneath a comment no reader can reach, and a delete of an ancestor - which
+            cascades to the parent - would surface as a foreign-key violation rather than a clean
+            refusal. ``FOR SHARE`` conflicts with the ``FOR UPDATE`` that :meth:`set_status` and
+            :meth:`delete` take on that row and with the cascade that would remove it, while
+            staying compatible with every other reader replying to the same comment. The ancestors
+            walked by ``reply_depth_for_parent`` need no lock of their own: the chain above a
+            comment is immutable because ``parent_id`` is never reassigned, and the one way it
+            could change - an ancestor being deleted - is already blocked by the lock on the parent
+            it would have to cascade through.
+
             **A reply may only answer what its author can see**, and that is the same rule the
             listing applies, evaluated through the same :func:`_visible_comment_statuses` call
             rather than through a second predicate. It follows that an ordinary reader may reply
@@ -746,7 +819,16 @@ class CommentService:
             a subtree hanging off a hidden parent is pruned by the read path, so the reply would be
             written into a position no reader could ever reach.
         """
-        parent = await self._comments.get_parent(parent_id, post_id=post.id)
+        # Locked, because the row's `status` is about to authorise a write. `for_share` conflicts
+        # with the `FOR UPDATE` an administrator's moderation transition takes on this same comment,
+        # and with the cascade that would remove it if an ancestor were deleted - so the moderation
+        # state this check reads is the state that still holds when the reply is inserted, and the
+        # parent cannot vanish between the two statements. Shared rather than exclusive: two readers
+        # answering the same comment hold compatible locks and never queue behind each other.
+        #
+        # `comments` is locked SECOND. The owning post is already held under `FOR SHARE` by
+        # `_load_visible_post`, which is the global posts -> comments order this codebase follows.
+        parent = await self._comments.get_parent(parent_id, post_id=post.id, for_share=True)
         if parent is None or parent.status not in _visible_comment_statuses(post, author):
             raise AppValidationError(
                 _INVALID_PARENT,
@@ -919,14 +1001,29 @@ class CommentService:
             ``AUTHOR`` would make the comment form the client renders unusable for the account it
             renders it to.
 
-            **The integrity guard is not defensive noise.** Three foreign keys are checked at the
-            insert - ``post_id``, ``author_id`` and ``parent_id`` - and each names a row this method
-            read a moment earlier without locking it. A post deleted, or a parent comment deleted,
-            between the read and the insert would otherwise surface as a driver-level violation and
-            a ``500`` describing a constraint. Nothing is locked to prevent that on purpose: taking
-            a write lock on a whole post to add one comment would serialise a public, high-frequency
-            operation against every other comment on the same article, and a retry after a ``409``
-            resolves the race with a clean ``404``.
+            **The post and the parent are locked, and that is what makes the checks above
+            decisions rather than observations.** Both are read under ``SELECT ... FOR SHARE`` -
+            the post by :meth:`_load_visible_post`, the parent by :meth:`_resolve_parent` - and both
+            locks are held until this method's commit. So the article is still one this caller may
+            write to, and the parent is still in a moderation state they may answer, at the moment
+            the row is inserted rather than merely a statement earlier. A concurrent unpublish,
+            archive, delete or moderation transition queues behind this transaction; one that
+            committed *before* the checks ran was seen by them.
+
+            The locks are **shared**, which is what makes that affordable: a public,
+            high-frequency write must not serialise against every other comment on the same
+            article, and shared holders are compatible with one another, so two readers commenting
+            on one post - or answering one comment - never wait for each other. An exclusive lock
+            on the post would have had exactly the cost this note used to cite as the reason for
+            taking none.
+
+            **The integrity guard stays, and is now a backstop rather than the mechanism.** Three
+            foreign keys are checked at the insert - ``post_id``, ``author_id`` and ``parent_id`` -
+            and the locks above cover the first and the third. The second is not lockable here
+            without reading the account for no other reason: ``author`` is the resolved principal,
+            and an administrator deleting that account mid-request would otherwise surface as a
+            driver-level violation and a ``500`` describing a constraint. Translating it to a
+            ``409`` keeps that a retryable answer, and the retry resolves with a clean ``401``.
         """
         post = await self._load_visible_post(post_id, author)
 
@@ -969,8 +1066,6 @@ class CommentService:
             await self._session.rollback()
             raise ConflictError(_THREAD_CHANGED) from error
 
-        await self._session.commit()
-
         get_logger(__name__).info(
             "comment created",
             comment_id=str(persisted.id),
@@ -1011,13 +1106,41 @@ class CommentService:
             this actor may see - the shape ``CommentPublic.model_validate`` walks directly.
 
         Raises:
-            NotFoundError: No comment carries that identifier.
+            NotFoundError: No comment carries that identifier, **or** the article it hangs off is
+                not one this actor may see - an unpublished or archived post belonging to somebody
+                else. Both are reported identically and both are resolved before authority over the
+                comment is considered.
             ForbiddenError: The actor neither wrote the comment nor holds ``ADMIN``. Raised by
                 ``ensure_can_modify``, which is the one definition of that comparison; this module
                 does not restate it.
             AppValidationError: The replacement body sanitises to nothing.
 
         Note:
+            **Owning a comment is authority over that row, never over the thread around it.** This
+            method opens with the same visibility gate :meth:`list_for_post` and :meth:`create` open
+            with, evaluated through the same
+            :func:`~app.services.post_service.can_view_post` call, and only then asks who owns the
+            comment. It has to: the response below carries a reply subtree drawn from the
+            discussion, so an actor entitled to their own row but no longer entitled to the article
+            would otherwise receive its thread by editing. That was the defect this ordering
+            replaces - the post used to be fetched unguarded, on the reasoning that visibility of
+            the post was not this method's question, which is true of the *edit* and false of the
+            *projection* it returns.
+
+            Refusing the edit outright rather than narrowing the response is the coherent half of
+            that rule. A thread on a withdrawn article is unreachable in both directions already -
+            it cannot be listed and it cannot be added to - so an edit that could still succeed
+            would be the one operation on an invisible discussion that a stranger could perform,
+            and the row it changed would sit somewhere nobody, including its author, can read.
+
+            **The lock order is ``posts`` then ``comments``, and it is not negotiable.**
+            :meth:`~app.repositories.comment_repository.CommentRepository.post_id_of` resolves which
+            post to lock before anything is locked, precisely so this method never holds a comment
+            while waiting for a post: ``post_service.delete`` holds ``FOR UPDATE`` on a post while
+            its cascade locks that post's comments, so the reverse order would deadlock rather than
+            serialise. Both locks are held to the commit, so the article stays visible and the
+            comment stays this actor's for the whole of the edit and the projection.
+
             **The reply tree is returned, not defaulted away.** An edit changes one comment's text
             and never a thread's shape, but the comment being edited may already have replies under
             it - and a response reporting ``replies: []`` for a comment that has three of them is a
@@ -1030,12 +1153,15 @@ class CommentService:
             which is the same recursive descent and the same status filter the thread listing uses.
 
             **The subtree is narrowed to what this actor could read anyway**, by
-            :func:`_visible_comment_statuses` against the owning post - so an administrator or the
-            post's author sees pending and rejected replies here exactly as they would in the
-            listing, and a comment's own author editing their comment on somebody else's post sees
-            approved replies only. Following
+            :func:`_visible_comment_statuses` against the owning post the gate already resolved - so
+            an administrator or the post's author sees pending and rejected replies here exactly as
+            they would in the listing, and a comment's own author editing their comment on somebody
+            else's *published* post sees approved replies only. Following
             :attr:`~app.models.comment.Comment.replies` instead would have disclosed every state
-            and only one generation.
+            and only one generation. There is no fallback status set any more, and there is nothing
+            left for one to cover: the gate either produced the post or raised, so the narrowing is
+            always evaluated against a real row rather than degrading to the public set when the
+            article could not be fetched.
 
             **An accepted edit returns an ``APPROVED`` comment to ``PENDING``, whoever made it.**
             This is the second half of withholding ``status`` from the input model, and without it
@@ -1059,6 +1185,25 @@ class CommentService:
             **The replacement text is sanitised on write**, by the same policy and the same
             function creation uses, so an edit cannot be a way past a rule creation enforces.
         """
+        # The owning post is resolved and locked BEFORE the comment, which is the global
+        # posts -> comments order. Reversing it would deadlock: `post_service.delete` holds
+        # `FOR UPDATE` on a post while its cascade locks that post's comments, so a transaction
+        # holding a comment and waiting for its post closes a cycle. `post_id_of` is an unlocked
+        # single-column read used only to learn which post to lock, and it is sound because
+        # `comments.post_id` is immutable - a comment is never re-parented onto another article.
+        # A comment that does not exist is reported here rather than after a locked read, which is
+        # the same 404 the locked read would have produced.
+        post_id = await self._comments.post_id_of(comment_id)
+        if post_id is None:
+            raise NotFoundError(_COMMENT_NOT_FOUND)
+
+        # The same visibility gate every other path in this module opens with, and the reason it is
+        # here is a confidentiality one: this method returns a reply subtree drawn from the thread,
+        # so an actor who may no longer read the article must not receive its discussion by editing
+        # a comment they happen to own. Owning a comment is authority over that row, never over the
+        # thread around it. The gate holds its lock through the edit and the projection below.
+        post = await self._load_visible_post(post_id, actor)
+
         comment = await self._load_for_update(comment_id)
         ensure_can_modify(actor, comment.author_id)
 
@@ -1070,11 +1215,13 @@ class CommentService:
         provided = payload.model_dump(exclude_unset=True)
 
         if payload.body is not None:
-            # Off the event loop, for the reason `create` records. The comment is held under
-            # `FOR UPDATE` across the offload, which is the deliberate cost of sanitising after
-            # the ownership check rather than before it: an unauthorised caller must not be able
-            # to spend this worker's CPU. The lock is on one comment, so the only request it can
-            # delay is another edit of that same comment.
+            # Off the event loop, for the reason `create` records. Two locks are held across the
+            # offload - `FOR UPDATE` on this comment and `FOR SHARE` on its post - which is the
+            # deliberate cost of sanitising after the authority checks rather than before them: a
+            # caller who may not see the article, or may not touch the row, must not be able to
+            # spend this worker's CPU. Neither lock is broad: the exclusive one can delay only
+            # another edit of this same comment, and the shared one only a transition of this same
+            # post, since shared holders do not block one another.
             comment.body = await run_cpu_bound(_sanitize_body, payload.body)
             if comment.status is CommentStatus.APPROVED:
                 comment.status = CommentStatus.PENDING
@@ -1094,23 +1241,14 @@ class CommentService:
         # whose children were dropped takes its whole subtree out of the thread with nothing
         # failing.
         #
-        # The post is fetched UNGUARDED, and deliberately so: the visibility-guarded loader would
-        # raise a 404 for a post that is no longer published, and a caller who legitimately
-        # corrected a comment on an article that has since been withdrawn would be told their
-        # successful edit failed. Visibility of the *post* was never this method's question -
-        # authority over the *comment* was, and `ensure_can_modify` answered it above. The row is
-        # read only to decide which moderation states this actor may see beneath the comment.
-        #
-        # Loaded BEFORE the commit, like every other read on this path, so the commit remains the
-        # last database action of the request.
-        post = await self._posts.get_by_id(edited.post_id)
+        # The post it is narrowed against is the one the gate above resolved and locked, so there is
+        # no second fetch, no `None` to fall back from, and no possibility of projecting a thread
+        # whose article stopped being visible part-way through this request. The subtree is drawn
+        # BEFORE the commit, like every other read on this path, so the commit remains the last
+        # database action of the request.
         edited = await self._comments.load_visible_replies(
             edited,
-            statuses=(
-                _visible_comment_statuses(post, actor)
-                if post is not None
-                else PUBLIC_COMMENT_STATUSES
-            ),
+            statuses=_visible_comment_statuses(post, actor),
         )
         await self._session.commit()
 

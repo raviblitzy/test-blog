@@ -141,6 +141,7 @@ import rehypeSanitize from 'rehype-sanitize';
 import remarkGfm from 'remark-gfm';
 
 import { BadgeLink } from '@/components/ui/badge-link';
+import { Table } from '@/components/ui/table';
 import { categoryFeedPath } from '@/lib/seo';
 import type { CategorySummary } from '@/lib/types';
 import { cn, isAllowedImageUrl } from '@/lib/utils';
@@ -357,23 +358,6 @@ const WITHHELD_IMAGE_CLASSES = 'text-muted-foreground italic';
  * element itself instead of scrolling inside it.
  */
 const PRE_CLASSES = 'max-w-full overflow-x-auto';
-
-/**
- * The scroll container a GFM table is wrapped in.
- *
- * A table sizes itself to its content, and `overflow-wrap` cannot help it because the overflow is
- * the sum of its columns rather than one long word. Without this wrapper a five-column table is the
- * single most reliable way to break the "no horizontal overflow at any width" criterion at 375px,
- * so the table scrolls inside its own box and the page does not scroll at all.
- *
- * No `tabIndex` and no `role` are added, and that was verified rather than assumed. Driving the
- * rendered page from the keyboard, Chrome makes the `<pre>` scroll container a tab stop of its own
- * accord and it picks up the document-wide `:focus-visible` outline, so a keyboard user can reach and
- * scroll it with no help from us. A `tabIndex={0}` here would add a second, redundant stop, and the
- * `role="region"` that usually follows would then oblige us to name it - inventing ARIA the markup
- * does not need.
- */
-const TABLE_SCROLL_CLASSES = 'max-w-full overflow-x-auto';
 
 /**
  * The pill row itself. The engine's preflight already removes list markers, margin and padding from
@@ -671,20 +655,37 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 
   /*
-   * A GFM table, wrapped in its own scroll container. See {@link TABLE_SCROLL_CLASSES}.
+   * A GFM table, rendered through the shared `Table` primitive in its `prose` variant.
    *
-   * The wrapper takes no vertical margin of its own: `overflow-x: auto` establishes a new block
-   * formatting context, so the table's own `prose` margins stay inside it and contribute to its
-   * height rather than collapsing through it. The vertical rhythm the plugin intended therefore
-   * survives the wrapping unchanged, with nothing restated here that could drift from it.
+   * NOT a raw `<table>`, and that is a design-system rule rather than a preference: raw table
+   * elements are wrapped exactly once, in `@/components/ui/table`, and feature code composes that
+   * primitive instead of reaching past it. This module used to emit the element and its scroll
+   * wrapper itself, which put a second copy of both the markup and the horizontal-overflow
+   * guarantee in the codebase - and left the primitive able to change without this one following.
+   *
+   * `variant="prose"` is what makes the primitive usable here. It contributes no class to the
+   * `<table>`, so the typography plugin's own table rules keep sole possession of the presentation,
+   * and it swaps in a scrollport that exists at every width rather than the admin grid's sub-md
+   * card collapse - which would destroy an article table instead of adapting it, since its cells
+   * carry no column labels. The primitive's own documentation records both decisions.
+   *
+   * The header, rows and cells beneath are left to react-markdown and the plugin. Mapping them onto
+   * `TableHeader`/`TableRow`/`TableCell` would import exactly the card presentation the variant
+   * exists to avoid.
+   *
+   * No `scrollRegionLabel` is passed, and that was verified rather than assumed. Driving the
+   * rendered page from the keyboard, Chrome makes an `overflow-x: auto` container a tab stop of its
+   * own accord and it picks up the document-wide `:focus-visible` outline, so a keyboard reader can
+   * already reach and scroll it. Naming the region would add a second, redundant stop mid-article
+   * and oblige us to invent ARIA the markup does not need.
    */
   table: (props) => {
     const { children } = props;
 
     return (
-      <div className={TABLE_SCROLL_CLASSES}>
-        <table {...withoutHastNode(props)}>{children}</table>
-      </div>
+      <Table variant="prose" {...withoutHastNode(props)}>
+        {children}
+      </Table>
     );
   },
 };

@@ -93,13 +93,18 @@
  * | Layered separation of concerns   | Paths, query shaping and return types only; every request is delegated; no inward import      |
  * | Explicit API contracts           | Every return type is a declared shape from `@/lib/types`; the page envelope is passed through |
  * | API versioning                   | Namespace-relative paths; the version prefix is composed once, by the client module           |
- * | Secure-by-default authentication | The self-update cannot be requested anonymously; neither public read requires a credential    |
+ * | Secure-by-default authentication | The self-update cannot be requested anonymously; both public reads withhold a held credential |
  * | Blocking quality gates           | Compiles under `tsc --noEmit`, lints at `--max-warnings=0`, explicit return type on every export |
  *
  * @module
  */
 
-import { apiGet, apiPatch, type RequestOptions } from '@/lib/api/client';
+import {
+  apiGet,
+  apiPatch,
+  type ProtectedRequestOptions,
+  type PublicRequestOptions,
+} from '@/lib/api/client';
 import { encodePathSegment } from '@/lib/paths';
 
 import { pageOf, postSummarySchema, userMeSchema, userPublicSchema } from '@/lib/types';
@@ -196,13 +201,21 @@ const MAX_PAGE = Number.MAX_SAFE_INTEGER;
  * - `signal` to cancel a read whose result is no longer wanted.
  * - `cache` and `next` to let a Server Component choose how long a profile stays fresh, which is
  *   how the profile route and the sitemap avoid re-reading an unchanged author on every request.
- * - `anonymous` to *deliberately* withhold a credential that is held. Neither read requires one -
- *   the service resolves no principal on either, and the answer is identical for every caller - so
- *   this is never needed to make a read succeed. It is there for the case where a held credential
- *   should not travel: the sitemap, for instance, describes the public view of the site and has no
- *   business presenting a signed-in reader's token to do it.
+ *
+ * **There is deliberately no credential member of any kind.** Both reads are dispatched
+ * `anonymous`, always, by the functions themselves. The service resolves no principal on either -
+ * `GET /users/{username}` and `GET /users/{username}/posts` take neither a required nor an optional
+ * one - so a bearer sent with them cannot change a single byte of the answer, and sending one
+ * anyway is a disclosure that buys nothing: the token travels, is visible to anything logging the
+ * request, and is read by nobody. The sitemap is the clearest case - it describes the public view of
+ * the site and has no business presenting a signed-in reader's token to do it - but the same is true
+ * of every caller, which is why the choice is made here rather than left to each of them.
+ *
+ * That is what {@link PublicRequestOptions} encodes: `anonymous`, `bearer`, `allowRefresh` and
+ * `anonymousFallback` are all absent, because with anonymity forced not one of them could do
+ * anything.
  */
-export type ProfileReadOptions = Omit<RequestOptions, 'query'>;
+export type ProfileReadOptions = Omit<PublicRequestOptions, 'query'>;
 
 /**
  * Per-call controls for the authenticated self-update.
@@ -220,7 +233,7 @@ export type ProfileReadOptions = Omit<RequestOptions, 'query'>;
  *
  * `signal` remains, so a form that unmounts mid-flight can abandon its request.
  */
-export type SelfUpdateOptions = Pick<RequestOptions, 'signal'>;
+export type SelfUpdateOptions = Pick<ProtectedRequestOptions, 'signal'>;
 
 /**
  * The page window for {@link getUserPosts}: the complete set of parameters that operation accepts.
@@ -467,8 +480,9 @@ export function updateMe(changes: UserUpdate, options?: SelfUpdateOptions): Prom
  * this call answers the private view.
  *
  * A credential changes nothing about the response, because the service resolves no principal on
- * this route. One is sent anyway when one is held, which is harmless; pass `anonymous` to withhold
- * it deliberately, as the sitemap does.
+ * this route - so this call **withholds** one even when the reader holds one. Sending it would put a
+ * bearer on the wire, and into anything logging the request, to be read by nobody. See
+ * {@link ProfileReadOptions}.
  *
  * The handle matches case-insensitively, so `Alice` and `alice` address one account. An unclaimed
  * handle and a deactivated account are reported identically and cannot be told apart - whether a
@@ -491,9 +505,12 @@ export function updateMe(changes: UserUpdate, options?: SelfUpdateOptions): Prom
 export function getProfile(username: string, options?: ProfileReadOptions): Promise<UserPublic> {
   const segment = authorSegment(username, 'getProfile');
 
+  // `anonymous` last, so it cannot be overridden - and `ProfileReadOptions` gives a caller no
+  // member with which to try. No `anonymousFallback` is needed beside it: a request that never
+  // carried a credential has no expiry to fall back from.
   return apiGet(`${AUTHOR_PROFILE_PATH_PREFIX}${segment}`, userPublicSchema, {
     ...options,
-    anonymousFallback: true,
+    anonymous: true,
   });
 }
 
@@ -554,7 +571,9 @@ export function getUserPosts(
 
   return apiGet(path, pageOf(postSummarySchema), {
     ...options,
-    anonymousFallback: true,
+    // As in `getProfile`: this route resolves no principal, so the credential is withheld rather
+    // than transmitted to be ignored.
+    anonymous: true,
     // Both members are omitted from the URL when absent - the client module drops an undefined
     // query value - so the default call produces a bare path rather than one carrying blanks.
     query: {

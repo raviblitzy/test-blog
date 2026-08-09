@@ -35,22 +35,23 @@ and declares no category shape of its own.
 
 No collection wrapper is declared here, and that is deliberate
 --------------------------------------------------------------
-Two collections are served over this taxonomy and both answer with the **same** shape: the
-generic page envelope re-exported from ``app.schemas.common``, parameterised at the route with
-:class:`CategoryPublic` as its item type. ``GET /api/v1/categories`` is the public read the home
-page's filter control is built from, and ``GET /api/v1/admin/categories`` is the
-administrator-only management table, which additionally admits a ``q`` search term. Both reach
-one service method, ``CategoryService.list_paginated``, so a page of categories has one
-definition.
+Two collections are served over this taxonomy, and each is expressed with a shape it already has.
+``GET /api/v1/categories`` is the public read the home page's filter control is built from, and it
+answers with a **bare JSON array** of :class:`CategoryPublic` - ``list[CategoryPublic]`` declared
+at the route, which needs no wrapper model here because Python's own list type is the wrapper.
+``GET /api/v1/admin/categories`` is the administrator-only management table, which additionally
+admits a ``q`` search term and answers with the generic page envelope re-exported from
+``app.schemas.common``, parameterised at that route with :class:`CategoryPublic` as its item type.
 
-The public collection used to return a **bare JSON array** as a sanctioned exception, on the
-grounds that a curated taxonomy is bounded and a partially-offered filter would silently hide
-posts. That reasoning did not survive the requirement it was weighed against: every list
-endpoint in this API returns ``items``, ``total``, ``page``, ``page_size`` and ``pages``, and
-that uniformity is an acceptance criterion rather than a convention, so one exception makes the
-guarantee false for every client. The filter control gets its complete list from
-``listAllCategories`` in ``frontend/src/lib/api/categories.ts``, which walks the pages - and
-``total`` and ``pages`` are what let it know when it has them all, which an array never did.
+The bare array is the **one sanctioned exception** to the page envelope in this API, it is exactly
+one route wide, and it is specified rather than improvised. The list *is* the filter control: a
+window would offer some terms and silently hide every post filed exclusively under the rest, which
+is a wrong answer rather than a partial one. The taxonomy is bounded by editorial effort rather
+than by reader input, so there is nothing there for a window to protect against, and
+``listCategories`` in ``frontend/src/lib/api/categories.ts`` consequently returns the complete
+taxonomy in one round trip. Every *other* collection in the API returns ``items``, ``total``,
+``page``, ``page_size`` and ``pages``, and a client is entitled to assume that everywhere it is
+not told otherwise - which the published document says, per route, in the response schema itself.
 
 So there is no ``CategoryList``, no ``CategoriesResponse``, and above all no
 ``{"message": ..., "data": ...}`` wrapper: ``app.schemas.common`` permits exactly three
@@ -310,11 +311,12 @@ class CategoryPublic(CategorySummary):
     """A category as its own resource: the summary, plus the description, tally and age.
 
     The declared ``response_model`` of ``GET /api/v1/categories/{slug}`` and the item type of both
-    paged collections over this taxonomy - the public ``GET /api/v1/categories`` and the
-    administrator-only ``GET /api/v1/admin/categories``. Paths are relative in the public
-    decorators below because ``app.api.v1.router`` attaches the ``/categories`` prefix::
+    collections over this taxonomy - the public ``GET /api/v1/categories``, which returns a bare
+    array of them, and the administrator-only ``GET /api/v1/admin/categories``, which returns a page
+    of them. Paths are relative in the public decorators below because ``app.api.v1.router``
+    attaches the ``/categories`` prefix::
 
-        @router.get("", response_model=Page[CategoryPublic])
+        @router.get("", response_model=list[CategoryPublic])
         @router.get("/{slug}", response_model=CategoryPublic)
 
     It inherits :class:`CategorySummary` rather than restating ``id``, ``name`` and ``slug``, so

@@ -3,9 +3,22 @@
 This module owns everything that happens to a category between being named by an administrator
 and being removed by one: the slug derived from its name at creation, the deliberate refusal to
 re-derive that slug when the name later changes, the two conflict rules that keep names and
-slugs unique, the in-use guard that stops a delete from silently unfiling posts, and the read
-projections the home page's filter control and the administrative table render - which are one
-windowed method serving both, so the two screens cannot disagree about a page or a tally.
+slugs unique, the in-use guard that stops a delete from silently unfiling posts, and the two read
+projections the home page's filter control and the administrative table render - the whole
+taxonomy for the first, one window of it for the second, both projected through the same
+``_to_public`` mapping and both tallying the same thing, so the two screens cannot disagree about
+what a category looks like or about what ``post_count`` counts.
+
+The public read is the API's one un-paginated collection
+-------------------------------------------------------
+:meth:`CategoryService.list_with_post_counts` returns a plain ``list[CategoryPublic]`` and takes
+no window, and that is the specified contract rather than an oversight. The taxonomy is small and
+bounded by editorial effort, and the list *is* the home page's filter control: a windowed control
+would offer some terms and silently hide every post filed exclusively under the rest, which is a
+wrong answer rather than a partial one. It is the single documented exception to the page envelope
+across the whole API, one route wide, and ``GET /api/v1/admin/categories`` - the searchable
+management table, served by :meth:`CategoryService.list_paginated` - is what carries the envelope
+over the same relation.
 
 Why the entity exists at all
 ----------------------------
@@ -152,8 +165,12 @@ class CategoryService:
 
         service = CategoryService(session)
 
-        # GET /api/v1/categories - the filter control, counts included, one page envelope.
-        page = await service.list_paginated(q=None, page=1, page_size=100)
+        # GET /api/v1/categories - the filter control: the whole taxonomy, counts included,
+        # deliberately un-windowed. See `list_with_post_counts`.
+        categories = await service.list_with_post_counts()
+
+        # GET /api/v1/admin/categories - the management table, searchable and windowed.
+        page = await service.list_paginated(q="mach", page=1, page_size=20)
 
         # POST /api/v1/admin/categories - the slug is derived here, never sent by a client.
         # Both mutations return the projected `CategoryPublic` rather than the mapped row: the
@@ -283,6 +300,45 @@ class CategoryService:
     # Reads
     # -----------------------------------------------------------------------------------
 
+    async def list_with_post_counts(self) -> list[CategoryPublic]:
+        """Return the whole taxonomy, each term with its published-post tally.
+
+        The read behind ``GET /api/v1/categories``, whose declared ``response_model`` is a **bare**
+        ``list[CategoryPublic]`` rather than the page envelope. That is the API's one documented
+        collection exception and it is one route wide: the list *is* the home page's filter control,
+        and a windowed control would offer some terms while silently hiding every post filed
+        exclusively under the rest - a wrong answer rather than a partial one. A taxonomy is bounded
+        by editorial effort rather than by reader input, so there is nothing here for a window to
+        protect against. The searchable, windowed view over the same relation is
+        :meth:`list_paginated`, reached only through ``GET /api/v1/admin/categories``.
+
+        **One statement, never one per category.** The tally arrives from a single aggregate in
+        ``CategoryRepository.list_with_post_counts`` - a ``LEFT OUTER JOIN`` onto
+        ``post_categories`` and ``posts`` with a ``GROUP BY`` - and this method only names its two
+        columns. Counting per term instead would issue one statement per chip on the endpoint every
+        home-feed render calls, which is precisely the N+1 the outer join exists to avoid.
+
+        Returns:
+            Every category ascending by ``name``, each carrying ``post_count``. A category with no
+            published post is **present** with a tally of ``0``: the aggregate's outer join is what
+            keeps it in the result, and the filter control is expected to show an empty term rather
+            than omit it. An empty list when no category has been created.
+
+        Note:
+            The tally counts **published** posts only, which is draft confidentiality reaching the
+            category surface: a chip promising three posts that turn out to be drafts is worse than
+            no chip, and each tally therefore agrees exactly with the number of results
+            ``GET /api/v1/posts?category={slug}`` returns to an anonymous caller. The default lives
+            in the repository, so this method and :meth:`_targeted_count` cannot disagree about what
+            the number means.
+        """
+        # The repository hands back `(Category, count)` pairs, because a mapped category has no
+        # `post_count` attribute - the tally is an aggregate rather than a column. Naming the two
+        # halves is this layer's job; `_to_public` is the one place that naming happens, so the
+        # single read, this collection and the administrative table all project identically.
+        counted = await self.categories.list_with_post_counts(status=PostStatus.PUBLISHED)
+        return [self._to_public(category, post_count) for category, post_count in counted]
+
     async def get_by_slug(self, slug: str) -> Category:
         """Resolve one category by the slug in its URL, or report that there is none.
 
@@ -356,14 +412,15 @@ class CategoryService:
         page: int,
         page_size: int,
     ) -> Page[CategoryPublic]:
-        """Window the taxonomy. **The only listing surface, and both routes reach it.**
+        """Window the taxonomy. **The administrative listing surface.**
 
-        ``GET /api/v1/categories`` calls it with ``q=None`` for the reader-facing filter control,
-        and ``app.services.admin_service`` calls it with the administrator's search term for the
-        management table. One implementation, so the two screens cannot disagree about what a
-        category looks like, about what ``post_count`` counts, or about the shape of a page - a
-        distinction that used to exist here as an un-paginated variant returning a bare list, and
-        that produced the one collection in the API answering outside the page contract.
+        Reached only through ``app.services.admin_service`` for ``GET /api/v1/admin/categories``,
+        which is the searchable management table. The reader-facing filter control does **not**
+        come here: it calls :meth:`list_with_post_counts` and receives the whole taxonomy as a bare
+        list, for the reason recorded there. Both methods project through :meth:`_to_public` and
+        both tally published posts, so the two screens agree about what a category looks like and
+        about what ``post_count`` counts while differing - deliberately - in whether the result is
+        windowed.
 
         Args:
             q: Optional search text, matched case-insensitively against both the name and the
@@ -445,12 +502,6 @@ class CategoryService:
                 and a blank ``description`` has already been folded to ``None``, by the schema -
                 so nothing here re-validates input, and nothing here has to decide what an empty
                 string means.
-            commit: Whether this call owns the transaction boundary. ``True`` for the ordinary
-                case, where creating the category *is* the request. Pass ``False`` when this call
-                is one step of a larger unit of work that a caller will complete and commit
-                itself - which is what ``app.services.admin_service`` does, because the
-                administrative operation is not finished until the projection its response
-                declares has been assembled. See the note on the boundary.
 
         Returns:
             The persisted category **already projected into**
@@ -496,13 +547,22 @@ class CategoryService:
             compares its own candidates case-insensitively too, so no case folding is performed
             in this module at all.
 
-            **One request, one commit, and ``commit=False`` is how a composing caller keeps that
-            true.** Committing here unconditionally would mean an administrative create committed
-            the row and *then* read its projection, so a failure on that read would answer an
-            error over a category that already existed - and no rollback could undo it, because
-            the database had already accepted the work. Both unique constraints are still applied
-            here either way: ``add`` flushes, so the INSERT and its violations happen inside the
-            guard below regardless of who commits.
+            **One request, one commit, and the projection is what the commit comes after.** This
+            method owns its transaction boundary outright and takes no argument that would move it:
+            ``app.services.admin_service`` delegates here and adds only its audit line afterwards,
+            so there is nothing left for a caller to complete. Owning the projection is what makes
+            that boundary correct - ``post_count`` is read (as the constant ``0``) *before* the
+            commit, so the commit is the last database action of the request and a failure can never
+            answer an error over a category the database has already accepted. Both unique
+            constraints are applied inside the guard below rather than at the boundary: ``add``
+            flushes, and the commit is inside the same ``try``, so a violation raised by either is
+            translated the same way.
+
+            :meth:`delete` is the one method here that *does* expose a ``commit`` flag, and its
+            docstring states why on its own terms. Do not add one to this method or to
+            :meth:`update` speculatively: an unused flag reads as a supported composition pattern
+            that nothing exercises, which is how a docstring comes to describe an argument the
+            signature does not have.
         """
         # The clear-message path for the collision that actually happens. `categories.name` is
         # plain TEXT under a case-SENSITIVE unique constraint, so this lookup asks exactly the
@@ -555,9 +615,6 @@ class CategoryService:
             payload: The validated body. Every member is optional; an omitted member means
                 "leave this as it is". An empty body is a valid no-op rather than an error,
                 because a form that submits an unmodified record is a legitimate request.
-            commit: Whether this call owns the transaction boundary - see :meth:`create`. The
-                administrative caller passes ``False`` so that the rename and the projection its
-                response declares are one transaction.
 
         Returns:
             The category projected into :class:`~app.schemas.category.CategoryPublic`, reloaded from
@@ -595,6 +652,11 @@ class CategoryService:
             row could stop a concurrent rename of a different one from claiming the same name.
             ``uq_categories_name`` is the guarantee, so the pre-check buys a clear message and
             the handler below covers the race.
+
+            **This method owns its transaction boundary and takes no argument that would move it**,
+            exactly as :meth:`create` does and for the same reason - the projection it returns has
+            to be read before the commit. Only :meth:`delete`, which returns nothing, exposes a
+            ``commit`` flag.
         """
         category = await self.categories.get_by_id(category_id)
         if category is None:
@@ -654,9 +716,19 @@ class CategoryService:
 
         Args:
             category_id: The category's server-generated identifier, taken from the path.
-            commit: Whether this call owns the transaction boundary - see :meth:`create`. The
-                administrative caller passes ``False`` so that the whole operation, its audit line
-                included, is one transaction.
+            commit: Whether this call owns the transaction boundary. ``True``, the default, for a
+                caller for whom deleting the category *is* the request. ``False`` when this call is
+                one step of a larger unit of work the caller will finish and commit itself, which is
+                what ``app.services.admin_service`` passes so that the removal and the audit record
+                it writes around it are one transaction rather than two.
+
+                This is the only method on this class that takes the flag, and the asymmetry is
+                deliberate rather than an omission: :meth:`create` and :meth:`update` return a
+                projected :class:`~app.schemas.category.CategoryPublic`, so they must read their
+                tally before committing and there is nothing left for a caller to add afterwards.
+                A delete returns ``None``, so a composing caller genuinely does still have work to
+                do. Do not add the flag to the other two to make them look alike - an argument
+                nothing passes reads as a supported pattern that is not exercised.
 
         Raises:
             NotFoundError: If no category carries that identifier. Resolved **first**, before the

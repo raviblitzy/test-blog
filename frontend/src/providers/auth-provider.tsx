@@ -558,11 +558,19 @@ export interface AuthContextValue {
    * so a caller that ignores the rejection still ends up signed out rather than
    * stranded half-authenticated.
    *
-   * @returns When the session has ended.
-   * @throws `ApiError` when the revocation request itself failed. The local
-   * session is already gone by then, so a caller may safely ignore it; it is
-   * surfaced rather than swallowed because a caller that wants to report "signed
-   * out here, but the session may still be live elsewhere" needs to know.
+   * The session revoked is the one this tab holds. There is no parameter with
+   * which to name another, because the transport's own recovery path can only act
+   * on the held credential - see `@/lib/api/auth#logout`.
+   *
+   * @returns When the session has ended: the held refresh token was accepted by
+   * the service and the local session is gone.
+   * @throws `ApiError` when the revocation could not be carried out - a throttled
+   * window, an unreachable service, or a renewal the transport could not complete
+   * after the access token had expired. The local session is already gone by then,
+   * so a caller may safely ignore it; it is surfaced rather than swallowed
+   * precisely because a caller that wants to report "signed out here, but the
+   * session may still be live elsewhere" needs to know, and a sign-out that
+   * reported success either way could not tell it.
    */
   readonly logout: () => Promise<void>;
   /**
@@ -879,17 +887,27 @@ export function AuthProvider({ children }: AuthProviderProps): React.JSX.Element
 
   const logout = useCallback(async (): Promise<void> => {
     try {
-      // No argument: the refresh token currently held is the one revoked, which is
-      // the ordinary case - end the session this tab is signed in with.
+      // Takes no argument, and cannot: `@/lib/api/auth#logout` revokes the refresh
+      // token it is HOLDING, because that is the only credential its own recovery
+      // path can act on. Naming a different one used to be possible and could
+      // report success while leaving that token live.
       await requestLogout();
     } finally {
       // In a `finally`, and that is the whole point. If the revocation request
-      // fails - offline, throttled, a 5xx - the reader must still end up signed
-      // out locally rather than stranded with a credential they asked to give up.
+      // fails - offline, throttled, a 5xx, or a rotation it could not complete -
+      // the reader must still end up signed out locally rather than stranded with
+      // a credential they asked to give up.
       //
-      // This is now the ONLY local clear on the sign-out path. The wrapper used to
-      // clear as well, on its success path, which made one transition depend on
-      // which of two owners ran last; it no longer touches the credential store.
+      // WHO CLEARS WHAT. `@/lib/api/auth#logout` owns the transport-level clear and
+      // performs it on its success path: the in-memory pair and the presence cookie
+      // both go, which is the contract that module documents. `endSession` is this
+      // provider's single terminal path and owns what the transport cannot see -
+      // the React account state and the role marker - and it calls
+      // `clearCredentials` as well. That is deliberate belt-and-braces rather than
+      // a second owner: the call is idempotent and advances the auth generation, it
+      // is the same terminal path a refused renewal and the unauthorised
+      // notification take, and it is the only clear that runs when the wrapper
+      // rejects before reaching its own.
       endSession();
     }
   }, [endSession]);

@@ -212,6 +212,30 @@ So the worst case a thread page can produce is ``page_size`` roots plus
 :data:`MAX_THREAD_DESCENDANTS` descendants, whatever shape the discussion has - and the ordinary
 case is unaffected, because an ordinary thread has neither eight levels nor two hundred replies.
 
+Row locks over ``comments``, and where they sit in the global order
+-----------------------------------------------------------------
+Three methods here take a row lock, and the mode differs with what the lock is for.
+
+* :meth:`CommentRepository.get_with_author` under ``for_update=True`` - ``FOR UPDATE``, for an
+  operation that changes the comment itself: an owner's edit, a delete, an administrator's
+  moderation transition.
+* :meth:`CommentRepository.get_parent` under ``for_share=True`` - ``FOR SHARE``, for the parent a
+  reply claims to answer. The parent's moderation state decides whether the reply may be written at
+  all, so that state has to hold until the insert commits; a shared lock blocks the moderation
+  transition and the cascade that would remove it while still letting other readers reply to the
+  same comment.
+* :meth:`CommentRepository.post_id_of` takes **no** lock, and exists precisely so that a caller can
+  learn which post to lock *before* it locks anything.
+
+**The order is ``posts`` -> ``comments`` -> ``post_likes``, globally, and it is never reversed.**
+A caller reaching a locking method here is already holding
+:meth:`~app.repositories.post_repository.PostRepository.get_for_share`'s shared lock on the owning
+post, or is a path that never needs one. The hazard the order removes is concrete: deleting a post
+holds ``FOR UPDATE`` on that post while its cascade locks the post's comments, so a transaction
+that locked a comment and then reached back for its post would close a cycle and deadlock instead of
+serialising. ``get_for_share`` carries the full statement of the order; this module states its
+``comments`` half so neither can drift.
+
 Deliberately absent
 -------------------
 No reply-count aggregate: a count of a collection that is already loaded is ``len()`` at the layer
@@ -1110,7 +1134,9 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         _attach_replies((root,), descendants)
         return root
 
-    async def get_parent(self, parent_id: uuid.UUID, *, post_id: uuid.UUID) -> Comment | None:
+    async def get_parent(
+        self, parent_id: uuid.UUID, *, post_id: uuid.UUID, for_share: bool = False
+    ) -> Comment | None:
         """Fetch a candidate parent comment, but only if it belongs to the given post.
 
         The lookup behind reply creation. ``comments.parent_id`` is a foreign key, so the database
@@ -1123,6 +1149,24 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             post_id: The post the reply is being written on. Keyword-only, so a call site cannot
                 transpose the two identifiers - both are UUIDs, and a positional pair would
                 type-check either way round while silently asking a different question.
+            for_share: When ``True``, emit ``SELECT ... FOR SHARE`` so the parent row is locked
+                for the rest of this transaction and is re-read rather than served from the
+                identity map.
+
+                Ask for it whenever the parent's *moderation state* is about to decide whether the
+                reply may be written - which is every reply, because a reader may only answer a
+                comment they are entitled to see. Without the lock that decision comes from an
+                older ``READ COMMITTED`` snapshot than the insert it authorises, so a concurrent
+                ``PATCH /api/v1/admin/comments/{id}/status`` could reject the parent, or a
+                concurrent delete of an ancestor could cascade it away, between the check and the
+                write - placing a reply beneath a parent no reader can reach, or surfacing the
+                race as a driver-level foreign-key violation.
+
+                A **shared** lock rather than an exclusive one, deliberately: it conflicts with the
+                ``FOR UPDATE`` that ``comment_service``'s ``set_status`` and ``delete`` take on that
+                same row, and with the cascade that removes it, which is the whole requirement -
+                while remaining compatible with every other reader replying to the same popular
+                comment, so a busy thread is not serialised behind one lock.
 
         Returns:
             The parent comment, or ``None``.
@@ -1139,11 +1183,74 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             and its ``post_id``, both of which are columns. Attaching loaders would fetch an author
             and a post that no response will contain.
 
-            Built on :meth:`~app.repositories.base.BaseRepository.get_or_none`, so the statement -
-            ``WHERE id = ... AND post_id = ... LIMIT 1`` - is composed in one place. The primary
-            key resolves it, and the second term is a cheap filter on the row it finds.
+            Built on :meth:`~app.repositories.base.BaseRepository.get_or_none` in the unlocked
+            mode, so the statement - ``WHERE id = ... AND post_id = ... LIMIT 1`` - is composed in
+            one place. The primary key resolves it, and the second term is a cheap filter on the
+            row it finds.
+
+            **The locked mode is composed here rather than in the primitive**, because
+            ``get_or_none`` takes no lock argument and giving it one would offer every sibling
+            repository a lock with no policy attached. The predicate is the same either way; only
+            the locking clause and ``populate_existing`` differ.
+
+            **The lock order is global and this is its ``comments`` half.** Locks are taken
+            ``posts`` -> ``comments`` -> ``post_likes`` and never the reverse, so a caller reaching
+            this method under ``for_share=True`` is already holding
+            :meth:`~app.repositories.post_repository.PostRepository.get_for_share`'s shared lock on
+            the owning post. That ordering - documented in full on ``get_for_share`` - is what keeps
+            a reply from deadlocking against ``post_service.delete``, whose cascade locks comments
+            while it holds ``FOR UPDATE`` on the post.
         """
-        return await self.get_or_none(Comment.id == parent_id, Comment.post_id == post_id)
+        if not for_share:
+            return await self.get_or_none(Comment.id == parent_id, Comment.post_id == post_id)
+
+        result = await self.session.execute(
+            select(Comment)
+            .where(Comment.id == parent_id, Comment.post_id == post_id)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+        return result.scalars().first()
+
+    async def post_id_of(self, comment_id: uuid.UUID) -> uuid.UUID | None:
+        """Report which post a comment hangs off, reading that one column and nothing else.
+
+        A deliberately minimal read with one job: tell a caller *which* ``posts`` row it must lock
+        before it locks the comment. ``app.services.comment_service.update`` needs the owning post
+        to decide whether the actor may still see the thread it is about to edit and project, and
+        the global lock order - ``posts`` -> ``comments`` -> ``post_likes``, documented on
+        :meth:`~app.repositories.post_repository.PostRepository.get_for_share` - forbids it from
+        discovering that identifier by locking the comment first. Reversing the order would close a
+        cycle with ``post_service.delete``, which holds ``FOR UPDATE`` on a post while its cascade
+        locks that post's comments, and the two transactions would deadlock rather than serialise.
+
+        Args:
+            comment_id: The comment's identifier, from the URL path.
+
+        Returns:
+            The owning post's identifier, or ``None`` when no comment carries that key. ``None``
+            is not an error: the caller reports the missing comment the same way the locked read
+            that follows would, and it is deliberately indistinguishable from a comment that is
+            deleted a moment later.
+
+        Note:
+            **Unlocked, and safe precisely because ``comments.post_id`` never changes.** Nothing in
+            the codebase assigns it after construction and
+            ``app.schemas.comment.CommentUpdate`` exposes no ``post_id`` member, so a comment
+            cannot be re-parented onto another article - which is what makes an unlocked read a
+            sound way to choose a lock target. Everything else about the row *can* change, so
+            nothing else may be read from here: this is not a substitute for
+            :meth:`get_with_author`, and a caller still performs its authoritative, locked read
+            afterwards.
+
+            **One column, not an entity.** ``select(Comment.post_id)`` returns a scalar from the
+            primary-key index without constructing a ``Comment``, attaching it to the identity map
+            or loading a byline the caller has no use for yet. The authoritative read that follows
+            carries ``populate_existing``, so nothing this method put in the session could shadow
+            it in any case.
+        """
+        result = await self.session.execute(select(Comment.post_id).where(Comment.id == comment_id))
+        return result.scalars().first()
 
     async def list_moderation_queue(
         self,

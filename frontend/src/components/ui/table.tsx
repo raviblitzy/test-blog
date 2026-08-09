@@ -4,7 +4,8 @@
  *
  * Six exports, and they are the whole API:
  *
- *   Table         the scroll container plus the <table> itself
+ *   Table         the scroll container plus the <table> itself, in either of two
+ *                 presentations - a data grid, or a table inside rendered prose
  *   TableHeader   <thead>   - the column-header band, hidden below md
  *   TableBody     <tbody>   - the record region
  *   TableRow      <tr>      - a table row at md and above, a CARD below it
@@ -19,10 +20,16 @@
  *
  * THIS FILE IS THE ONLY PLACE IN src/ WHERE A RAW TABLE ELEMENT MAY APPEAR.
  * <table>, <thead>, <tbody>, <tr>, <th> and <td> are wrapped here exactly once;
- * feature code - the four admin management screens and anything else that grows
- * a grid - composes these six parts and never reaches past them. Adding a
- * seventh element type is a change to this file, not a licence to hand-roll one
- * at a call site.
+ * feature code - the four admin management screens, the Markdown renderer, and
+ * anything else that grows a grid - composes these six parts and never reaches
+ * past them. Adding a seventh element type is a change to this file, not a
+ * licence to hand-roll one at a call site.
+ *
+ * That rule is why `Table` carries a `variant`. A table inside an article is not
+ * a data grid and must not be dressed as one, but it is still a <table>, so it
+ * belongs here: `variant="prose"` keeps the element wrapped in this module while
+ * leaving its presentation to the typography plugin. See `TableProps.variant`.
+ * The three-tier contract below describes the DATA variant.
  *
  * ---------------------------------------------------------------------------
  * THE THREE-TIER RESPONSIVE CONTRACT
@@ -230,6 +237,49 @@ const TABLE_SCROLL_REGION_BASE = cn(
 );
 
 /*
+ * The `variant="prose"` container: the scrollport for a table inside rendered
+ * Markdown.
+ *
+ * A table sizes itself to its content, and `overflow-wrap` cannot help it,
+ * because the overflow is the sum of its columns rather than one long word. A
+ * five-column table in an article is the single most reliable way to break the
+ * "no horizontal overflow at any width" criterion at 375px, so it scrolls inside
+ * its own box and the document does not scroll at all.
+ *
+ * `max-w-full` rather than the data variant's `w-full min-w-0`, and NO
+ * `max-md:`/`md:` split. Both differences follow from where this one lives: it
+ * sits inside a prose measure that has already established the width, and the
+ * scrollport has to exist at EVERY width because an article table stays a table
+ * all the way down - there is no card presentation beneath it to hand the
+ * overflow to.
+ *
+ * The wrapper takes no vertical margin of its own. `overflow-x: auto`
+ * establishes a new block formatting context, so the table's own `prose` margins
+ * stay inside it and contribute to its height instead of collapsing through it;
+ * the vertical rhythm the typography plugin intended therefore survives the
+ * wrapping unchanged, with nothing restated here that could drift from it.
+ */
+const TABLE_PROSE_CONTAINER_BASE = 'max-w-full overflow-x-auto';
+
+/*
+ * The prose scrollport's focus ring, ungated by breakpoint.
+ *
+ * The data variant's ring is `md:`-prefixed because that scrollport only exists
+ * past md. This one exists at every width, so the ring must too.
+ *
+ * Applied only when `scrollRegionLabel` is supplied, which for a prose table is
+ * usually the wrong thing to do: driving the rendered page from the keyboard,
+ * Chrome makes an `overflow-x: auto` container a tab stop of its own accord and
+ * it picks up the document-wide `:focus-visible` outline from globals.css - so a
+ * reader can already reach and scroll it, and an explicit `tabIndex` would add a
+ * second, redundant stop in the middle of an article. That was verified in the
+ * browser rather than assumed, which is why `post-content.tsx` passes no label.
+ */
+const TABLE_PROSE_SCROLL_REGION_BASE = cn(
+  'focus-visible:outline-ring focus-visible:outline-2 focus-visible:outline-offset-2',
+);
+
+/*
  * `caption-bottom` places a <caption> after the grid rather than above it. It is
  * kept on the base so the element is styled correctly if a caption is ever
  * needed for the accessible name; until then, name a grid with `aria-label`,
@@ -278,6 +328,45 @@ interface TableProps extends ComponentProps<'table'> {
    * different moments.
    */
   scrollRegionLabel?: string;
+
+  /**
+   * Which presentation this table is: a DATA grid (the default) or a table inside
+   * rendered PROSE.
+   *
+   * `'data'` is the admin-screen presentation this module was written for - the
+   * three-tier responsive contract described at the top of the file, with the
+   * sub-md card, the ruled header band and the token type scale.
+   *
+   * `'prose'` is for a table that appears inside authored Markdown, rendered by
+   * `post-content.tsx`. It applies **no classes to the `<table>` at all** and
+   * swaps the container for a scrollport that exists at every width. Both
+   * differences are the point:
+   *
+   *   - The `@tailwindcss/typography` plugin already styles `table`, `thead`,
+   *     `th` and `td` inside a `prose` scope, and an author's table is part of
+   *     the article's typography rather than a grid of records. Adding this
+   *     module's own `text-sm` and rules on top would fight those 395 prose rules
+   *     and make one article element read differently from its neighbours.
+   *   - `max-md:block` - the first link in the data variant's display chain -
+   *     would be actively wrong here. There is no card presentation for a prose
+   *     table to collapse into (its cells carry no `label`, and its header is
+   *     meaningful at every width), so dropping table layout below md would
+   *     destroy the table instead of adapting it.
+   *
+   * What the variant still buys, and the reason a Markdown renderer routes
+   * through this primitive rather than emitting its own element, is that the raw
+   * `<table>` stays wrapped exactly once, in this file, where the design system
+   * says it belongs - and the horizontal-overflow guarantee that wrapping exists
+   * to provide is declared here rather than restated per consumer.
+   *
+   * A prose table needs none of the other five parts: react-markdown renders the
+   * header, rows and cells from the document's own syntax tree, and the plugin
+   * styles them. Do not map them onto `TableHeader`/`TableRow`/`TableCell` - that
+   * would import the card presentation the paragraph above rules out.
+   *
+   * @defaultValue `'data'`
+   */
+  variant?: 'data' | 'prose';
 }
 
 /**
@@ -324,25 +413,44 @@ interface TableProps extends ComponentProps<'table'> {
  * <Table aria-label="Category post counts" scrollRegionLabel="Category post counts">
  * ```
  */
-export function Table({ className, containerClassName, scrollRegionLabel, ...props }: TableProps) {
+export function Table({
+  className,
+  containerClassName,
+  scrollRegionLabel,
+  variant = 'data',
+  ...props
+}: TableProps) {
   // All three region attributes are applied together or not at all. A `tabIndex`
   // without a role and a name is an unexplained stop; a role and a name without a
   // `tabIndex` is a region a keyboard cannot enter. `undefined` omits each
   // attribute outright rather than rendering it empty.
   const isScrollRegion = scrollRegionLabel !== undefined && scrollRegionLabel.length > 0;
+  const isProse = variant === 'prose';
+
+  // The prose variant contributes nothing of its own, so a caller that also passes no `className`
+  // leaves this empty - and `class=""` in the published HTML is noise a reader of the source has to
+  // account for. Collapsed to `undefined` so the attribute is omitted outright rather than rendered
+  // blank. The data variant always carries `TABLE_BASE`, so this can never be empty there.
+  const tableClassName = cn(isProse ? undefined : TABLE_BASE, className);
 
   return (
     <div
       className={cn(
-        TABLE_CONTAINER_BASE,
-        isScrollRegion && TABLE_SCROLL_REGION_BASE,
+        isProse ? TABLE_PROSE_CONTAINER_BASE : TABLE_CONTAINER_BASE,
+        isScrollRegion && (isProse ? TABLE_PROSE_SCROLL_REGION_BASE : TABLE_SCROLL_REGION_BASE),
         containerClassName,
       )}
       role={isScrollRegion ? 'region' : undefined}
       aria-label={isScrollRegion ? scrollRegionLabel : undefined}
       tabIndex={isScrollRegion ? 0 : undefined}
     >
-      <table className={cn(TABLE_BASE, className)} {...props} />
+      {/*
+       * The prose variant contributes NO class of its own to the element - see
+       * `TableProps.variant`. What reaches the element is the caller's classes
+       * alone, or no class attribute at all, which is what leaves the typography
+       * plugin's own table rules in sole possession of the presentation.
+       */}
+      <table className={tableClassName === '' ? undefined : tableClassName} {...props} />
     </div>
   );
 }

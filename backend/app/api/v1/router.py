@@ -172,9 +172,9 @@ declaration holds only for as long as every future author remembers it.
 api_router = APIRouter(prefix=API_V1_PREFIX)
 """Every versioned operation in the service, behind one prefix, ready to mount.
 
-Thirty-seven operations, composed from eight includes over the seven domain modules in
+Thirty-eight operations, composed from eight includes over the seven domain modules in
 ``app.api.v1.routers``. ``app.api.v1.routers.health`` is not among them by design: its two
-probes are mounted unprefixed by ``app.main``, which brings the served total to thirty-nine.
+probes are mounted unprefixed by ``app.main``, which brings the served total to forty.
 
 Mounted as ``app.include_router(api_router)`` - bare, with no further ``prefix=``.
 """
@@ -220,8 +220,9 @@ api_router.include_router(comments.router, prefix="/comments", tags=["comments"]
 # 2 operations: list the taxonomy with post counts, and read one category by slug.
 api_router.include_router(categories.router, prefix="/categories", tags=["categories"])
 
-# 13 operations across four entities: aggregate counts, and listing, state mutation and
-# deletion for users, posts, comments and categories.
+# 14 operations: the aggregate counts for the overview screen, plus thirteen management
+# operations across four entities - listing, state mutation and deletion for users, posts,
+# comments and categories.
 #
 # THE ADMINISTRATOR GATE. This is the single router-level application of `require_admin` in
 # the service, and the only include on this router that carries `dependencies=`. It covers

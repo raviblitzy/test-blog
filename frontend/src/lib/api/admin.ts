@@ -87,7 +87,7 @@
  * | {@link updateAdminPostStatus}  | `posts.ts` `updatePost`         | Forces a lifecycle state vs. edits own content |
  * | {@link deleteAdminPost}        | `posts.ts` `deletePost`         | Any post vs. only the caller's own             |
  * | {@link listAdminPosts}         | `posts.ts` `listPosts`          | Every state vs. published only                 |
- * | {@link listAdminCategories}    | `categories.ts` `listCategories`| Accepts a search term vs. the window alone     |
+ * | {@link listAdminCategories}    | `categories.ts` `listCategories`| A searchable page vs. the whole bare array     |
  *
  * A bare `updatePost` is therefore **not** exported here, and neither is a bare `listPosts` or
  * `deletePost`. A screen that imports from both wrappers gets fourteen unambiguous names and needs
@@ -116,10 +116,11 @@ import {
   apiGet,
   apiPatch,
   apiPost,
+  type ProtectedRequestOptions,
   type QueryParams,
-  type RequestOptions,
 } from '@/lib/api/client';
 import { encodePathSegment } from '@/lib/paths';
+import { codePointLength } from '@/lib/text';
 import {
   adminCommentSchema,
   adminPostSchema,
@@ -335,10 +336,13 @@ export interface AdminCommentListParams extends AdminPageParams {
 /**
  * Query parameters of {@link listAdminCategories}.
  *
- * One filter beyond the window, and that single term is the whole difference between this listing and
- * the public one in `@/lib/api/categories.ts`: searching a controlled vocabulary is a management
- * affordance, so the term lives here rather than on the read every home-feed render performs. What
- * the two return is identical, down to the meaning of `post_count`.
+ * One filter beyond the window, and the two together are what separate this listing from the public
+ * one in `@/lib/api/categories.ts`: that read answers with the whole taxonomy as a bare array, because
+ * it *is* the home page's filter control and a window could hide the posts filed under a term that
+ * fell outside it, while this one is a management table and windows and searches like every other.
+ * Searching a controlled vocabulary is a management affordance, so the term lives here rather than on
+ * the read every home-feed render performs. The item projection is identical on both, down to the
+ * meaning of `post_count`.
  */
 export interface AdminCategoryListParams extends AdminPageParams {
   /**
@@ -347,6 +351,24 @@ export interface AdminCategoryListParams extends AdminPageParams {
    */
   q?: string;
 }
+
+/**
+ * The per-call transport controls **every** operation in this module accepts.
+ *
+ * All fourteen are administrator-only: the versioned router applies `require_admin` once, at the
+ * mount, so every route beneath `/admin` requires a credential and a privileged one. Anonymity is
+ * therefore not a mode any of them has, and {@link ProtectedRequestOptions} is what removes
+ * `anonymous` and `anonymousFallback` so it cannot be asked for - a request without a credential
+ * could only produce `401`, and one replayed without a credential could only produce it twice.
+ *
+ * `bearer` is retained, and on this namespace it is the member that matters most: an administrative
+ * screen rendered on the server passes the token it resolved from that request's own context, because
+ * the credential store is a module global and so browser-only by construction. `query` is retained on
+ * the type but is **superseded** on every listing - see {@link listRequestOptions} - because each
+ * listing's filters are a typed parameter object and two sources for one query string is a conflict
+ * with no correct resolution.
+ */
+export type AdminRequestOptions = ProtectedRequestOptions;
 
 /**
  * Merge a listing's typed filters into the caller's per-request options.
@@ -359,8 +381,8 @@ export interface AdminCategoryListParams extends AdminPageParams {
  */
 function listRequestOptions(
   query: QueryParams,
-  options: RequestOptions | undefined,
-): RequestOptions {
+  options: AdminRequestOptions | undefined,
+): ProtectedRequestOptions {
   return { ...options, query };
 }
 
@@ -393,7 +415,7 @@ function listRequestOptions(
  * @throws The client's normalised error - including the refusal an insufficiently privileged caller
  * receives, which surfaces rather than resolving to zeroed counts.
  */
-export function getAdminStats(options?: RequestOptions): Promise<AdminStats> {
+export function getAdminStats(options?: AdminRequestOptions): Promise<AdminStats> {
   return apiGet(ADMIN_STATS_PATH, adminStatsSchema, options);
 }
 
@@ -425,10 +447,20 @@ export function getAdminStats(options?: RequestOptions): Promise<AdminStats> {
  * @throws {RangeError} When the term is longer than {@link MAX_SEARCH_TERM_LENGTH} characters.
  */
 function assertSearchTermLength(term: string | null | undefined, caller: string): void {
-  if (term !== undefined && term !== null && term.length > MAX_SEARCH_TERM_LENGTH) {
+  if (term === undefined || term === null) {
+    return;
+  }
+  // Measured in CODE POINTS, through the tier's one length primitive, because that is the unit the
+  // service counts: Pydantic's `max_length` is applied to Python's `len()`. JavaScript's
+  // `String.length` counts UTF-16 code units, so a term containing any character above U+FFFF
+  // measures nearly double there - and this guard would reject, before issuing a request, a search an
+  // administrator is entitled to run. All-ASCII text cannot show the difference, which is exactly why
+  // the measurement is centralised rather than left to each of the four listings.
+  const length = codePointLength(term);
+  if (length > MAX_SEARCH_TERM_LENGTH) {
     throw new RangeError(
       `${caller}: q must be at most ${String(MAX_SEARCH_TERM_LENGTH)} characters, received ` +
-        `${String(term.length)}. The service refuses a longer term with 422 rather than ` +
+        `${String(length)}. The service refuses a longer term with 422 rather than ` +
         `truncating it, so cap the search input at that length instead of sending it.`,
     );
   }
@@ -448,7 +480,7 @@ function assertSearchTermLength(term: string | null | undefined, caller: string)
  */
 export function listAdminUsers(
   params: AdminUserListParams = {},
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<Page<AdminUser>> {
   assertSearchTermLength(params.q, 'listAdminUsers');
 
@@ -487,7 +519,7 @@ export function listAdminUsers(
 export function updateAdminUser(
   userId: string,
   payload: AdminUserUpdate,
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<AdminUser> {
   return apiPatch(adminUserPath(userId, 'updateAdminUser'), adminUserSchema, payload, options);
 }
@@ -506,7 +538,7 @@ export function updateAdminUser(
  * @returns Nothing, on success.
  * @throws The client's normalised error.
  */
-export function deleteAdminUser(userId: string, options?: RequestOptions): Promise<void> {
+export function deleteAdminUser(userId: string, options?: AdminRequestOptions): Promise<void> {
   return apiDeleteNoContent(adminUserPath(userId, 'deleteAdminUser'), options);
 }
 
@@ -539,7 +571,7 @@ export function deleteAdminUser(userId: string, options?: RequestOptions): Promi
  */
 export function listAdminPosts(
   params: AdminPostListParams = {},
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<Page<AdminPost>> {
   assertSearchTermLength(params.q, 'listAdminPosts');
 
@@ -583,7 +615,7 @@ export function listAdminPosts(
 export function updateAdminPostStatus(
   postId: string,
   payload: AdminPostStatusUpdate,
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<AdminPost> {
   return apiPatch(
     adminPostStatusPath(postId, 'updateAdminPostStatus'),
@@ -608,7 +640,7 @@ export function updateAdminPostStatus(
  * @returns Nothing, on success.
  * @throws The client's normalised error.
  */
-export function deleteAdminPost(postId: string, options?: RequestOptions): Promise<void> {
+export function deleteAdminPost(postId: string, options?: AdminRequestOptions): Promise<void> {
   return apiDeleteNoContent(adminPostPath(postId, 'deleteAdminPost'), options);
 }
 
@@ -637,7 +669,7 @@ export function deleteAdminPost(postId: string, options?: RequestOptions): Promi
  */
 export function listAdminComments(
   params: AdminCommentListParams = {},
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<Page<AdminComment>> {
   assertSearchTermLength(params.q, 'listAdminComments');
 
@@ -679,7 +711,7 @@ export function listAdminComments(
 export function updateAdminCommentStatus(
   commentId: string,
   payload: AdminCommentStatusUpdate,
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<AdminComment> {
   return apiPatch(
     adminCommentStatusPath(commentId, 'updateAdminCommentStatus'),
@@ -704,7 +736,10 @@ export function updateAdminCommentStatus(
  * @returns Nothing, on success.
  * @throws The client's normalised error.
  */
-export function deleteAdminComment(commentId: string, options?: RequestOptions): Promise<void> {
+export function deleteAdminComment(
+  commentId: string,
+  options?: AdminRequestOptions,
+): Promise<void> {
   return apiDeleteNoContent(adminCommentPath(commentId, 'deleteAdminComment'), options);
 }
 
@@ -746,9 +781,11 @@ export function deleteAdminComment(commentId: string, options?: RequestOptions):
  * see this section's header. A screen may therefore render a row from this listing with the same
  * component that renders the home page's filter option.
  *
- * `q` is the one thing this adds over `listCategories` in `@/lib/api/categories.ts`. Everything else
- * is the same: the same five envelope fields, the same item type, and a `post_count` that counts
- * PUBLISHED posts on both, so a moderator reads the figure a reader would see. A term with nothing
+ * Two things separate this from `listCategories` in `@/lib/api/categories.ts`: `q`, and the envelope
+ * itself - that read returns a bare `CategoryPublic[]` covering the whole taxonomy, because it is the
+ * home page's filter control and windowing it could hide posts, whereas this is a table and pages like
+ * every other. The item type is the same on both, and so is `post_count`, which counts PUBLISHED posts
+ * on either, so a moderator reads the figure a reader would see. A term with nothing
  * filed under it is present with a `post_count` of `0` rather than omitted, which is how the table
  * shows an unused category - and how {@link deleteAdminCategory} becomes available for it, since that
  * deletion is refused while any post is still filed.
@@ -761,7 +798,7 @@ export function deleteAdminComment(commentId: string, options?: RequestOptions):
  */
 export function listAdminCategories(
   params: AdminCategoryListParams = {},
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<Page<CategoryPublic>> {
   assertSearchTermLength(params.q, 'listAdminCategories');
 
@@ -798,7 +835,7 @@ export function listAdminCategories(
  */
 export function createAdminCategory(
   payload: CategoryCreate,
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<CategoryPublic> {
   return apiPost(ADMIN_CATEGORIES_PATH, categoryPublicSchema, payload, options);
 }
@@ -828,7 +865,7 @@ export function createAdminCategory(
 export function updateAdminCategory(
   categoryId: string,
   payload: CategoryUpdate,
-  options?: RequestOptions,
+  options?: AdminRequestOptions,
 ): Promise<CategoryPublic> {
   return apiPatch(
     adminCategoryPath(categoryId, 'updateAdminCategory'),
@@ -858,6 +895,9 @@ export function updateAdminCategory(
  * @returns Nothing, on success.
  * @throws The client's normalised error.
  */
-export function deleteAdminCategory(categoryId: string, options?: RequestOptions): Promise<void> {
+export function deleteAdminCategory(
+  categoryId: string,
+  options?: AdminRequestOptions,
+): Promise<void> {
   return apiDeleteNoContent(adminCategoryPath(categoryId, 'deleteAdminCategory'), options);
 }

@@ -93,10 +93,52 @@
  * @module
  */
 
-import { apiDelete, apiGet, apiPut, type RequestOptions } from '@/lib/api/client';
+import {
+  apiDelete,
+  apiGet,
+  apiPut,
+  type OptionalAuthRequestOptions,
+  type ProtectedRequestOptions,
+} from '@/lib/api/client';
 import { encodePathSegment } from '@/lib/paths';
 import { likeSummarySchema } from '@/lib/types';
 import type { LikeSummary } from '@/lib/types';
+
+/* -------------------------------------------------------------------------------------------------
+ * Per-call options
+ *
+ * Three routes, two credential modes, and the split is the routes' own rather than a convention: a
+ * like is an act performed BY somebody, and a tally is a fact ABOUT something.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The per-call transport controls the two **mutations** accept: like and unlike.
+ *
+ * Both require a credential - the account doing the liking is the resolved principal, which is why
+ * neither takes a body - so anonymity is not a mode they have, and neither `anonymous` nor
+ * `anonymousFallback` exists here to ask for it. Withholding the credential could not produce an
+ * anonymous like; it could only produce a `401`.
+ *
+ * `bearer` is retained for a server-side caller acting on behalf of one request. `signal` cancels a
+ * request whose control has since unmounted; `cache` and `next` are available for completeness and
+ * are of no real use on a mutation.
+ */
+export type LikeMutationOptions = ProtectedRequestOptions;
+
+/**
+ * The per-call transport controls the **read** accepts: the like summary.
+ *
+ * The route resolves an **optional** principal, and that is exactly why this mode is the caller-aware
+ * one: the count is the same for everybody, but `liked_by_caller` is not, so a held credential is
+ * attached by default and reports the caller's own state. `anonymous` remains available for a caller
+ * that deliberately wants the public view - and see the note in {@link getLikes} about what setting it
+ * costs, because pinning `liked_by_caller` to `false` for a signed-in reader is a silent defect rather
+ * than a visible one.
+ *
+ * `anonymousFallback` is the wrapper's to set: the tally renders for signed-out readers and crawlers,
+ * so a held credential that has expired must not turn a public page into a failure.
+ */
+export type LikeReadOptions = OptionalAuthRequestOptions;
 
 /* -------------------------------------------------------------------------------------------------
  * Path composition
@@ -172,8 +214,9 @@ function likesPath(postId: string, operation: string): string {
  * @param postId - The post to like, as the canonical text form of its UUID. Identity is always a
  * string on this API, never a number, and is never chosen by a client. The service parses it as a
  * UUID, so a malformed value is refused with a typed validation failure rather than silently missing.
- * @param options - Per-call transport controls, forwarded to the client module unchanged. `signal`
- * cancels a request whose control has since unmounted; `cache` and `next` are available for
+ * @param options - Per-call transport controls, forwarded to the client module unchanged - see
+ * {@link LikeMutationOptions}, which offers no way to withhold the credential this route requires.
+ * `signal` cancels a request whose control has since unmounted; `cache` and `next` are available for
  * completeness and are of no real use on a mutation.
  * @returns The settled state after the like: the post's identifier, its authoritative count, and
  * this caller's own state. An optimistic control reconciles against this and needs no follow-up read.
@@ -181,7 +224,10 @@ function likesPath(postId: string, operation: string): string {
  * unreachable service, or a cancelled request. Failures are already normalised by the client module;
  * nothing is re-mapped here.
  */
-export async function likePost(postId: string, options?: RequestOptions): Promise<LikeSummary> {
+export async function likePost(
+  postId: string,
+  options?: LikeMutationOptions,
+): Promise<LikeSummary> {
   // Bodyless on purpose: the post is addressed by the path and the account comes from the resolved
   // principal, so there is no third value for a client to send. The explicit `undefined` is the
   // client module's own signal for "no body and no content-type header" - `{}` would instead send an
@@ -207,12 +253,16 @@ export async function likePost(postId: string, options?: RequestOptions): Promis
  * pre-existence check either.
  *
  * @param postId - The post to un-like, as the canonical text form of its UUID.
- * @param options - Per-call transport controls, forwarded to the client module unchanged.
+ * @param options - Per-call transport controls, forwarded to the client module unchanged - see
+ * {@link LikeMutationOptions}, which offers no way to withhold the credential this route requires.
  * @returns The settled state after the like is removed, carrying the authoritative count.
  * @throws `ApiError` for every failure - no credential or an expired one, an unknown post, an
  * unreachable service, or a cancelled request.
  */
-export async function unlikePost(postId: string, options?: RequestOptions): Promise<LikeSummary> {
+export async function unlikePost(
+  postId: string,
+  options?: LikeMutationOptions,
+): Promise<LikeSummary> {
   // The recorded exception, restated at the call site so it survives future editing: this deletion
   // answers with the settled summary, so it uses the body-parsing deletion helper. Switching to the
   // no-content helper - or declaring this as returning nothing - would discard the count the caller
@@ -241,16 +291,16 @@ export async function unlikePost(postId: string, options?: RequestOptions): Prom
  * during a server render.
  *
  * @param postId - The post to report on, as the canonical text form of its UUID.
- * @param options - Per-call transport controls, forwarded to the client module unchanged. `cache` and
- * `next` are the useful members here: a Server Component reading a tally can choose its own
- * revalidation window rather than inheriting one. See the note in the body about `anonymous`, which
- * is the one member to leave alone.
+ * @param options - Per-call transport controls, forwarded to the client module unchanged - see
+ * {@link LikeReadOptions}. `cache` and `next` are the useful members here: a Server Component reading
+ * a tally can choose its own revalidation window rather than inheriting one. See the note in the body
+ * about `anonymous`, which is the one member to leave alone.
  * @returns The post's identifier, how many distinct accounts have liked it, and this caller's own
  * state - `false` when there is no caller.
  * @throws `ApiError` when no post carries that identifier, when it is an unpublished post this
  * viewer may not see, or when the service cannot be reached. Absence of a credential is not a failure.
  */
-export async function getLikes(postId: string, options?: RequestOptions): Promise<LikeSummary> {
+export async function getLikes(postId: string, options?: LikeReadOptions): Promise<LikeSummary> {
   // No credential check, no early throw, and no skipping the call for an anonymous reader. "No
   // bearer required" means this must succeed without one, not that one is refused when held.
   //

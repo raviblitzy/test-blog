@@ -4,10 +4,10 @@ Two routes, both anonymous, both reads, and between them the whole of what a rea
 the taxonomy:
 
 ``GET /api/v1/categories``
-    A page of categories, each carrying how many PUBLISHED posts are filed under it. This is
-    what the home page's filter renders as a row of chips reading ``Python (12)``. It answers
-    with the same five-field page envelope every other collection in this API answers with - see
-    the section below, which records why the bare array it used to return was wrong.
+    Every category, each carrying how many PUBLISHED posts are filed under it. This is what the
+    home page's filter renders as a row of chips reading ``Python (12)``. It answers with a bare
+    JSON array and takes no window - the one collection in this API that does, for the reason the
+    section below records.
 ``GET /api/v1/categories/{slug}``
     One category, resolved by the slug in its URL, as a bare representation.
 
@@ -24,36 +24,28 @@ unslashed path would then answer ``307`` with a ``Location`` header instead of a
 round trip on the endpoint every home-feed render calls, and a redirect a cross-origin caller
 may decline to replay at all.
 
-Why the collection answers with the page envelope
--------------------------------------------------
-``app.schemas.common`` permits exactly three response shapes: the page envelope for a
-collection, a bare representation for a single read, and a problem document for a failure. This
-route answers with the first of those, like every other collection in the service, and it does
-so through the same ``PageParams`` window and the same ``CategoryService.list_paginated`` call
-the administrative category table uses.
+Why the collection answers with a bare array - READ THIS TWICE
+-------------------------------------------------------------
+``GET /api/v1/categories`` declares ``response_model=list[CategoryPublic]``. It is the **only**
+endpoint in this API that does not answer with the five-field page envelope, that exception is
+specified rather than improvised, and it is exactly one route wide. Do not normalise it.
 
-It did not always. This collection previously returned a bare JSON array on the reasoning that a
-curated taxonomy is bounded, that a windowed filter control would silently hide the posts filed
-under a term that fell off the end, and that the home page wants the whole set in one request.
-Every one of those observations is true and none of them justifies the shape, because uniformity
-here is not a stylistic preference: the specification requires *every* list endpoint to return
-``items``, ``total``, ``page``, ``page_size`` and ``pages``, and asserts that uniformity as an
-acceptance criterion. One exception is enough to make the guarantee untrue, and an untrue
-guarantee costs more than the convenience it buys - a client that may not assume the envelope has
-to special-case a route, which is exactly the per-route guesswork the retired ``/items`` surface
-was replaced to remove.
+The list *is* the home page's filter control. A window would offer some terms and silently omit
+the rest, and every post filed exclusively under an omitted term would become unreachable through
+the filter - a wrong answer rather than a partial one, and one no status code reports. The
+taxonomy is also bounded by editorial effort rather than by reader input, so there is nothing here
+for a window to protect against: the whole set is a row of chips, and one request is what renders
+it. ``Page`` is therefore not imported by this module at all, no ``page`` or ``page_size``
+parameter is accepted, and ``PageParamsDep`` is deliberately absent from both handlers.
 
-What the envelope actually costs here is nothing, because the concern it raised is answered on
-the client rather than by weakening the contract. ``total`` and ``pages`` tell a caller whether
-it has the whole taxonomy, which a bare array never did:
-``frontend/src/lib/api/categories.ts`` exposes ``listAllCategories``, which walks the pages at
-the maximum page size and hands the filter control a complete list. The control is therefore
-complete *and* the collection contract holds - and a caller that only wants the first few terms
-can now ask for them, which the array shape made impossible.
-
-Both surfaces over the taxonomy now agree on the wire shape and differ only in what they admit:
-this one is public and takes the window alone, while ``GET /api/v1/admin/categories`` is
-administrator-only and additionally takes a search term. Neither is a special case.
+A client is still entitled to assume the envelope everywhere else, because everywhere else has it.
+The searchable, windowed view over this same relation exists and is where the envelope lives:
+``GET /api/v1/admin/categories`` is administrator-only, adds a ``q`` term and answers with the
+page envelope over the same item type, through ``CategoryService.list_paginated``. So the two
+surfaces over the taxonomy differ in shape because they differ in purpose - one renders a control,
+the other pages a management table - and neither has to compensate for the other. In particular no
+client needs to walk pages to obtain a complete taxonomy: ``listCategories`` in
+``frontend/src/lib/api/categories.ts`` returns ``CategoryPublic[]`` in one round trip.
 
 What deliberately does not live here
 ------------------------------------
@@ -93,7 +85,9 @@ Governing standards
 ``review_rules`` reports that this project specifies **no user rules**, so none governs this file;
 the self-imposed standards this repository holds itself to stand in their place, and five of them
 decide the shape of this module. *Explicit API contracts*: both routes declare a
-``response_model``, and every documented failure references the one problem document. *API
+``response_model`` - the collection a bare ``list[CategoryPublic]``, which is the one envelope
+exception that standard itself grants and specifies - and every documented failure references the
+one problem document. *API
 versioning*: the router is bare, so both operations reach the caller under ``/api/v1`` and cannot
 be mounted anywhere else. *Layered separation of concerns*: each handler is one call deep into the
 service layer and owns no query. *Server-owned identity*: no input here accepts an identifier, a
@@ -107,8 +101,7 @@ from typing import Final
 from fastapi import APIRouter, status
 
 from app.api.v1.responses import ProblemResponses, problem_response
-from app.core.dependencies import DbSession, PageParamsDep
-from app.core.pagination import Page
+from app.core.dependencies import DbSession
 from app.schemas import CategoryPublic
 from app.services import CategoryService
 
@@ -155,22 +148,13 @@ _SERVER_ERROR_RESPONSE: Final[ProblemResponses] = {
 Spread into each route's own ``responses`` map rather than used alone, so the 500 entry has one
 wording for the whole module and cannot drift into two descriptions of one behaviour."""
 
-_VALIDATION_FAILED_RESPONSE: Final[ProblemResponses] = {
-    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
-        "The window was not usable: `page` below 1, or `page_size` outside 1-100. The "
-        "problem document carries an `errors` list naming the offending parameter, and the "
-        "bound is not silently clamped - a client asking for 500 rows is told so rather "
-        "than being handed 100 and left to believe it received everything."
-    ),
-    **_SERVER_ERROR_RESPONSE,
-}
-"""The collection route's failures: the window it can reject, plus the shared backstop.
+_COLLECTION_RESPONSES: Final[ProblemResponses] = _SERVER_ERROR_RESPONSE
+"""The collection route's only declared failure: the shared server-side backstop.
 
-Declared because the route now takes ``page`` and ``page_size`` through
-:data:`~app.core.dependencies.PageParamsDep`, and FastAPI would otherwise document its own
-``HTTPValidationError`` shape for the 422 - a body this service never returns. It still requires
-no credential, so neither ``401`` nor ``403`` is reachable, and it looks nothing up, so ``404``
-is not a state it has: enumerating either would advertise a branch no client can take."""
+Minimal by construction, because the route has no other reachable failure to declare. It parses
+**no** parameter - there is no window here, so no ``422`` for one to fail - it requires no
+credential, so neither ``401`` nor ``403`` is reachable, and it looks nothing up, so ``404`` is
+not a state it has. Enumerating any of those would advertise a branch no client can take."""
 
 
 _NOT_FOUND_RESPONSE: Final[ProblemResponses] = {
@@ -205,47 +189,46 @@ slug is opaque text, so there is no shape for the framework to reject."""
 
 
 # ---------------------------------------------------------------------------------------
-# GET /api/v1/categories - a page of the taxonomy
+# GET /api/v1/categories - the whole taxonomy
 #
-# `response_model` is `Page[CategoryPublic]`, which is the shape EVERY collection in this API
-# returns. It used to be a bare `list[CategoryPublic]` on the argument that a curated taxonomy is
-# bounded and that a filter control needs all of it at once; the module docstring records why that
-# reasoning does not survive the specification's requirement that every list endpoint answer with
-# `items`, `total`, `page`, `page_size` and `pages`, and how the filter control gets a complete
-# list anyway - `listAllCategories` in `frontend/src/lib/api/categories.ts` walks the pages.
+# `response_model` is a BARE `list[CategoryPublic]`, never the page envelope, and that is the
+# one sanctioned exception to that envelope in this entire API. Do not normalise it: the list
+# is the home page's filter control, so a window would omit terms and make every post filed
+# exclusively under an omitted term unreachable through the filter - a wrong answer that no status
+# code reports. The module docstring records the reasoning in full, and `Page` is deliberately not
+# imported here at all so the shape cannot creep back in.
 #
-# The window arrives through `PageParamsDep`, so this route inherits the same parameter names,
-# defaults, bounds and documentation as the feed and the administrative tables, and validates
-# none of them itself.
+# No `PageParamsDep`, and no `page`/`page_size` query parameter. The searchable, windowed view over
+# this same relation is the administrator-only `GET /api/v1/admin/categories`.
 # ---------------------------------------------------------------------------------------
 
 
 @router.get(
     "",
-    response_model=Page[CategoryPublic],
+    response_model=list[CategoryPublic],
     status_code=status.HTTP_200_OK,
-    responses=_VALIDATION_FAILED_RESPONSE,
+    responses=_COLLECTION_RESPONSES,
     summary="List categories with post counts",
     description=(
-        "Returns one page of categories, ascending by name, each carrying how many PUBLISHED "
-        "posts are filed under it. This is the endpoint the home page's category filter is "
-        "built from.\n\n"
-        "**The response is the same page envelope every collection in this API returns** - "
-        "`items`, `total`, `page`, `page_size`, `pages` - and accepts `page` and `page_size` "
-        "like every other listing. A taxonomy is small, so the first page usually is the whole "
-        "of it: `pages` is what says so, and a client that needs the complete set for a filter "
-        "control asks for `page_size=100` and walks any further pages rather than assuming.\n\n"
+        "Returns **every** category, ascending by name, each carrying how many PUBLISHED posts "
+        "are filed under it. This is the endpoint the home page's category filter is built "
+        "from.\n\n"
+        "**The response is a bare JSON array, not the page envelope**, and this is the only "
+        "collection in this API that answers that way. The exception is deliberate: the array "
+        "*is* the filter control, and a windowed control would hide the posts filed under any "
+        "term that fell outside the window. The taxonomy is curated and bounded, so the whole "
+        "set is one small response and takes no `page` or `page_size` parameter.\n\n"
         "A category with no published posts is included with a `post_count` of `0` - the filter "
         "control is expected to show an empty term rather than omit it. Drafts and archived "
         "posts are never counted, so each tally agrees exactly with the number of results "
         "`GET /api/v1/posts?category={slug}` returns to an anonymous caller.\n\n"
-        "A page past the last one is not an error: it answers 200 with an empty `items` list "
-        "beside the real `total` and `pages`. The searchable view over the same taxonomy is "
-        "`GET /api/v1/admin/categories`, which is administrator-only and adds a `q` filter."
+        "An empty taxonomy answers 200 with an empty array. The searchable, paginated view over "
+        "the same taxonomy is `GET /api/v1/admin/categories`, which is administrator-only, adds "
+        "a `q` filter and returns the usual page envelope."
     ),
 )
-async def list_categories(db: DbSession, window: PageParamsDep) -> Page[CategoryPublic]:
-    """Return one page of the taxonomy, each term with its published-post tally.
+async def list_categories(db: DbSession) -> list[CategoryPublic]:
+    """Return the whole taxonomy, each term with its published-post tally.
 
     One call deep. The tally arrives from a single aggregate inside ``CategoryRepository`` - a
     ``LEFT OUTER JOIN`` with a ``GROUP BY``, scoped to published posts - which is why this
@@ -257,27 +240,20 @@ async def list_categories(db: DbSession, window: PageParamsDep) -> Page[Category
     Args:
         db: The request-scoped session, handed straight to the service. This handler issues
             nothing through it itself.
-        window: The validated page window. ``page`` and ``page_size`` are already normalised and
-            bounded by ``PageParams``, so no arithmetic and no clamping happens here; ``pages``,
-            the response half of the same contract, is computed by ``build_page`` inside the
-            service.
 
     Returns:
-        The page envelope every collection in this API returns, carrying ``items``, ``total``,
-        ``page``, ``page_size`` and ``pages``, with the categories on this page ascending by
-        name. An empty ``items`` list when the taxonomy is empty, and likewise for a page past
-        the last one - which is how a client detects it has run off the end.
+        Every category ascending by name, each carrying ``post_count``, as a bare JSON array -
+        **not** the page envelope. An empty array when no category has been created.
 
     Note:
-        ``q`` is deliberately **not** accepted here even though the service method behind this
-        route takes one. Searching a taxonomy is a management affordance rather than a reading
-        one, and it already has a home on the administrator-only
-        ``GET /api/v1/admin/categories``; admitting it on a public route would put a text
-        predicate on the busiest read in the service for no reader-facing benefit.
+        Neither a window nor a ``q`` is accepted here, and the two omissions have the same cause:
+        this route serves a control that needs the complete set, and searching or paging a
+        taxonomy is a management affordance that already has a home on the administrator-only
+        ``GET /api/v1/admin/categories``. Admitting either would put a parameter on the busiest
+        read in the service for no reader-facing benefit, and admitting the window would make the
+        control able to hide posts.
     """
-    return await CategoryService(db).list_paginated(
-        q=None, page=window.page, page_size=window.page_size
-    )
+    return await CategoryService(db).list_with_post_counts()
 
 
 # ---------------------------------------------------------------------------------------

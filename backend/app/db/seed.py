@@ -72,31 +72,47 @@ time this script runs those rows therefore usually exist already, including on t
 against a freshly upgraded database. That is the ordinary direction, and :func:`seed_categories`
 handles it by looking each specification up by slug and by folded name and reporting eight skips.
 
-The reverse direction - a database left at ``0002`` and seeded before it reached ``head`` - is
-**not** a supported state, and neither side absorbs it. Revision ``0003`` inserts its eight rows
-unconditionally, so the next ``alembic upgrade head`` against rows this script wrote aborts on
-``uq_categories_name`` with the database atomically still at ``0002``. That is deliberate: an
-unconditional insert is what entitles ``0003``'s downgrade to delete those eight slugs, because
-every row it leaves behind is a row it wrote itself. A guarded insert that adopted a pre-existing
-category instead would leave the downgrade deleting rows the upgrade never created - along with
-their ``post_categories`` associations, through ``ON DELETE CASCADE`` - and ``categories`` carries
-no provenance column that could tell the two apart. The revision's own docstring works through
-that trade in full.
+The reverse direction - a database left at ``0002`` and seeded before it reached ``head`` - **is
+supported, and ``0003`` is the side that absorbs it.** Revision ``0003`` does not insert
+unconditionally. Each of its eight rows is written by ``_guarded_insert``, which emits
+``INSERT INTO categories (...) SELECT <literals> WHERE NOT EXISTS (SELECT 1 FROM categories WHERE
+id = <id> OR slug = <slug> OR lower(name) = <folded name>) ON CONFLICT DO NOTHING`` - one round
+trip, no read-then-branch. So a category this script wrote first is **adopted**: the guard sees it
+by slug or by folded name and the revision skips that row rather than colliding on
+``uq_categories_name``.
+The trailing ``ON CONFLICT DO NOTHING`` covers the one case the guard cannot see, a writer that
+commits between the guard's snapshot and the insert - which is exactly an overlapping ``make seed``,
+since seeding is a separate process and nothing stops it running while an upgrade is in flight.
+Either order therefore ends at eight categories, and the revision's own docstring records the
+measurements behind both claims.
 
-So the ordering is a requirement rather than a convention: **migrate to ``head``, then seed.** The
-backend container's start command, ``make migrate`` before ``make seed``, and the
-continuous-integration job all establish it. Idempotency is this module's obligation alone - it is
-the writer expected to run repeatedly, and Alembic's ``alembic_version`` row already guarantees
-``0003`` runs at most once per database.
+**Adoption is safe on the way down because ``0003`` marks its own rows.** It supplies each row's
+``id`` itself - ``uuid5`` over a fixed namespace and the slug, so the identifier is derived rather
+than typed and is stable across environments - and its ``downgrade`` deletes only
+``id IN <those eight identifiers> AND NOT EXISTS (SELECT 1 FROM post_categories WHERE category_id =
+categories.id)``. Two guards, and the revision is reversible because of both: the first means a
+category written by anybody else - an administrator through ``POST /api/v1/admin/categories``, an
+early ``make seed``, a hand insert - is never removed by a downgrade, and the second means a
+reference category that posts are filed under is left in place rather than taking those filings with
+it through ``ON DELETE CASCADE``. Scoping the delete by *slug* instead would have destroyed adopted
+rows, which is what it used to do.
+
+So the ordering is a documented convention rather than a correctness requirement: **migrate to
+``head``, then seed.** The backend container's start command, ``make migrate`` before ``make seed``,
+and the continuous-integration job all establish it, and it is the order to write into a runbook
+because it is the one where this module reports eight clean skips and nothing has to reconcile
+anything. But an operator who seeds a database still at ``0002`` has not broken it: the next
+``alembic upgrade head`` adopts what they wrote and reaches ``head``. Idempotency remains this
+module's obligation - it is the writer expected to run repeatedly, whereas Alembic's
+``alembic_version`` row already guarantees ``0003`` runs at most once per database.
 
 **The rows this module writes keep server-generated identifiers, and that is load-bearing rather
-than incidental.** ``0003`` gives the rows *it* inserts a deterministic identifier derived from the
-slug, and its ``downgrade`` deletes by exactly those identifiers - which is how a downgrade removes
-only what the revision itself wrote. A category this script created is therefore adopted on the way
-up and left untouched on the way down. Deriving the same identifiers here would hand this module's
-rows the revision's provenance mark and put them back in the blast radius of a downgrade, so
+than incidental.** Deriving ``0003``'s ``uuid5`` identifiers here would hand this module's rows the
+revision's provenance mark and put them inside the blast radius of a downgrade - a category created
+by an operator would then be deleted by a schema rollback that never created it. So
 ``seed_categories`` constructs each :class:`~app.models.category.Category` without an ``id`` and
-lets the ``gen_random_uuid()`` default supply one, exactly as an administrative create does.
+lets the ``gen_random_uuid()`` default supply one, exactly as an administrative create does. The
+row is adopted on the way up, by slug or folded name, and left untouched on the way down.
 
 :data:`REFERENCE_CATEGORIES` is public for exactly that reason - it is the single canonical
 statement of the taxonomy, and revision ``0003`` must insert the same names, the same derived

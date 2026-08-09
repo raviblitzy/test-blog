@@ -83,9 +83,11 @@ import {
   apiGet,
   apiPatch,
   apiPost,
-  type RequestOptions,
+  type OptionalAuthRequestOptions,
+  type ProtectedRequestOptions,
 } from '@/lib/api/client';
 import { encodePathSegment } from '@/lib/paths';
+import { codePointLength } from '@/lib/text';
 import { pageOf, postDetailSchema, postSummarySchema } from '@/lib/types';
 import type { Page, PostCreate, PostDetail, PostSort, PostSummary, PostUpdate } from '@/lib/types';
 import { MAX_SEARCH_TERM_LENGTH } from '@/lib/types';
@@ -166,23 +168,41 @@ function postResourcePath(pathKey: string, operation: string): string {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The per-call transport controls every function in this module accepts.
+ * The per-call transport controls the two **reads** in this module accept: the feed and one post.
  *
- * Structurally the client module's own request options **minus `query`**, and the omission is the
- * point. This namespace has exactly one route that takes query parameters - the feed - and its six
- * parameters are declared individually on {@link ListPostsParams}. Withholding `query` here makes
- * "supplied the same filter twice, two different ways" unrepresentable instead of merely
- * discouraged, and it means no caller can smuggle a parameter the service does not declare past the
- * type system.
+ * Both routes resolve an **optional** principal, which is why this is the caller-aware mode. A held
+ * credential is attached by default and changes the answer - an author or an administrator
+ * additionally sees drafts - and `anonymous` remains available for the genuine case of wanting the
+ * public projection on purpose, such as previewing what a signed-out reader would see. `bearer`
+ * remains too, because that is how a Server Component reads on behalf of one request: the credential
+ * store is browser-only by construction, so a server render passes the token it resolved itself.
  *
- * What remains is genuinely useful and reachable no other way: a cancellation signal, the framework
- * cache mode and its revalidation controls - which a Server Component needs in order to say how
- * long a rendered feed or article may be reused - and the flag that forces an unauthenticated
- * request even while a credential is held. Because the client module is the only module in this
- * tier that performs HTTP, a control it exposes is available to a page only if the wrappers forward
- * it; forwarding an option object is parameter passing, not transport logic.
+ * `query` is removed, and the omission is the point. This namespace has exactly one route that takes
+ * query parameters - the feed - and its six parameters are declared individually on
+ * {@link ListPostsParams}. Withholding `query` makes "supplied the same filter twice, two different
+ * ways" unrepresentable instead of merely discouraged, and it means no caller can smuggle a parameter
+ * the service does not declare past the type system.
+ *
+ * `anonymousFallback` is absent because it is the wrapper's to set: a public read must not break for
+ * a reader whose held credential expired in a background tab, and a caller has no information with
+ * which to make that decision better.
  */
-export type PostRequestOptions = Omit<RequestOptions, 'query'>;
+export type PostReadOptions = Omit<OptionalAuthRequestOptions, 'query'>;
+
+/**
+ * The per-call transport controls the five **mutations** in this module accept: create, update,
+ * delete, publish and unpublish.
+ *
+ * Every one of them requires a credential and every one is ownership-scoped by the service, so
+ * anonymity is not a mode they have - `anonymous` and `anonymousFallback` are therefore absent
+ * rather than documented as mistakes. A request without a credential cannot succeed, and a request
+ * replayed without one certainly cannot.
+ *
+ * `bearer` is retained for a server-side caller acting on behalf of one request, `allowRefresh` for
+ * completeness, and `query` is removed for the reason given on {@link PostReadOptions} - none of
+ * these five routes accepts a query parameter at all.
+ */
+export type PostMutationOptions = Omit<ProtectedRequestOptions, 'query'>;
 
 /* -------------------------------------------------------------------------------------------------
  * Feed parameters
@@ -291,10 +311,20 @@ export interface ListPostsParams {
  * @throws {RangeError} When the term is longer than {@link MAX_SEARCH_TERM_LENGTH} characters.
  */
 function assertSearchTermLength(term: string | null | undefined, caller: string): void {
-  if (term !== undefined && term !== null && term.length > MAX_SEARCH_TERM_LENGTH) {
+  if (term === undefined || term === null) {
+    return;
+  }
+  // Measured in CODE POINTS, through the tier's one length primitive, because that is the unit the
+  // service counts: Pydantic's `max_length` is applied to Python's `len()`. JavaScript's
+  // `String.length` counts UTF-16 code units, so a term containing any character above U+FFFF
+  // measures nearly double there - and this guard would reject, before issuing a request, a query
+  // the API would have accepted. All-ASCII text cannot show the difference, which is exactly why
+  // the measurement is centralised rather than left to each call site.
+  const length = codePointLength(term);
+  if (length > MAX_SEARCH_TERM_LENGTH) {
     throw new RangeError(
       `${caller}: q must be at most ${String(MAX_SEARCH_TERM_LENGTH)} characters, received ` +
-        `${String(term.length)}. The service refuses a longer term with 422 rather than ` +
+        `${String(length)}. The service refuses a longer term with 422 rather than ` +
         `truncating it, so cap the search input at that length instead of sending it.`,
     );
   }
@@ -319,7 +349,7 @@ function assertSearchTermLength(term: string | null | undefined, caller: string)
  * cannot be turned into a detail without that request.
  *
  * @param params - The six feed parameters. Omit the argument entirely for the default feed.
- * @param options - Per-call transport controls. See {@link PostRequestOptions}.
+ * @param options - Per-call transport controls. See {@link PostReadOptions}.
  * @returns The page of summaries, unmodified.
  * @throws The client module's normalised error - notably `404` when `author` names no account, and
  * `422` when `page` or `page_size` is out of range.
@@ -342,7 +372,7 @@ function assertSearchTermLength(term: string | null | undefined, caller: string)
  */
 export function listPosts(
   params: ListPostsParams = {},
-  options?: PostRequestOptions,
+  options?: PostReadOptions,
 ): Promise<Page<PostSummary>> {
   assertSearchTermLength(params.q, 'listPosts');
 
@@ -378,7 +408,7 @@ export function listPosts(
  *
  * @param slug - The post's URL-safe slug - the key that appears in the canonical URL. **Not** its
  * identifier: passing one here answers `404`.
- * @param options - Per-call transport controls. See {@link PostRequestOptions}.
+ * @param options - Per-call transport controls. See {@link PostReadOptions}.
  * @returns The full post.
  * @throws The client module's normalised error - `404` when no published post has that slug and the
  * caller is not entitled to see an unpublished one.
@@ -389,7 +419,7 @@ export function listPosts(
  * return <PostContent markdown={post.content} />;
  * ```
  */
-export function getPost(slug: string, options?: PostRequestOptions): Promise<PostDetail> {
+export function getPost(slug: string, options?: PostReadOptions): Promise<PostDetail> {
   return apiGet(postResourcePath(slug, 'getPost'), postDetailSchema, {
     ...options,
     anonymousFallback: true,
@@ -429,7 +459,7 @@ export function getPost(slug: string, options?: PostRequestOptions): Promise<Pos
  * and sanitises the authored content on write.
  *
  * @param input - The new post. See the contract mirror's create shape for each field's meaning.
- * @param options - Per-call transport controls. See {@link PostRequestOptions}.
+ * @param options - Per-call transport controls. See {@link PostMutationOptions}.
  * @returns The created post in full, including the identifier and slug the service generated - which
  * are what every subsequent call about this post needs, so neither has to be looked up afterwards.
  * @throws The client module's normalised error - `401` without a credential, `422` with per-field
@@ -441,7 +471,7 @@ export function getPost(slug: string, options?: PostRequestOptions): Promise<Pos
  * const live = await publishPost(draft.id);
  * ```
  */
-export function createPost(input: PostCreate, options?: PostRequestOptions): Promise<PostDetail> {
+export function createPost(input: PostCreate, options?: PostMutationOptions): Promise<PostDetail> {
   return apiPost(POSTS_PATH, postDetailSchema, input, options);
 }
 
@@ -472,7 +502,7 @@ export function createPost(input: PostCreate, options?: PostRequestOptions): Pro
  *
  * @param id - The post's **server-generated identifier**, not its slug.
  * @param changes - Only the fields that change. Forwarded unmodified.
- * @param options - Per-call transport controls. See {@link PostRequestOptions}.
+ * @param options - Per-call transport controls. See {@link PostMutationOptions}.
  * @returns The updated post in full.
  * @throws The client module's normalised error - `401` without a credential, `403` when the caller
  * neither owns the post nor administers the site, `404` when no post has that identifier.
@@ -485,7 +515,7 @@ export function createPost(input: PostCreate, options?: PostRequestOptions): Pro
 export function updatePost(
   id: string,
   changes: PostUpdate,
-  options?: PostRequestOptions,
+  options?: PostMutationOptions,
 ): Promise<PostDetail> {
   // `changes` is handed over as it was received. Serialisation omits absent members, which is what
   // makes the update partial; rebuilding the object here is what would make it total.
@@ -507,7 +537,7 @@ export function updatePost(
  * afterwards, and invalidating it belongs to the layer that owns the cache.
  *
  * @param id - The post's **server-generated identifier**, not its slug.
- * @param options - Per-call transport controls. See {@link PostRequestOptions}.
+ * @param options - Per-call transport controls. See {@link PostMutationOptions}.
  * @returns Nothing. Resolution is the confirmation.
  * @throws The client module's normalised error - `401` without a credential, `403` when the caller
  * neither owns the post nor administers the site, `404` when no post has that identifier.
@@ -517,7 +547,7 @@ export function updatePost(
  * await deletePost(post.id);
  * ```
  */
-export function deletePost(id: string, options?: PostRequestOptions): Promise<void> {
+export function deletePost(id: string, options?: PostMutationOptions): Promise<void> {
   return apiDeleteNoContent(postResourcePath(id, 'deletePost'), options);
 }
 
@@ -540,7 +570,7 @@ export function deletePost(id: string, options?: PostRequestOptions): Promise<vo
  * public profile and in the sitemap.
  *
  * @param id - The post's **server-generated identifier**, not its slug.
- * @param options - Per-call transport controls. See {@link PostRequestOptions}.
+ * @param options - Per-call transport controls. See {@link PostMutationOptions}.
  * @returns The post in full, now published, with its publication instant set.
  * @throws The client module's normalised error - `401` without a credential, `403` when the caller
  * neither owns the post nor administers the site, `404` when no post has that identifier.
@@ -550,7 +580,7 @@ export function deletePost(id: string, options?: PostRequestOptions): Promise<vo
  * const live = await publishPost(post.id);
  * ```
  */
-export function publishPost(id: string, options?: PostRequestOptions): Promise<PostDetail> {
+export function publishPost(id: string, options?: PostMutationOptions): Promise<PostDetail> {
   // `undefined` for the body is the explicit no-body form; it is not a placeholder for one.
   return apiPost(
     `${postResourcePath(id, 'publishPost')}/publish`,
@@ -574,7 +604,7 @@ export function publishPost(id: string, options?: PostRequestOptions): Promise<P
  * broken by the round trip.
  *
  * @param id - The post's **server-generated identifier**, not its slug.
- * @param options - Per-call transport controls. See {@link PostRequestOptions}.
+ * @param options - Per-call transport controls. See {@link PostMutationOptions}.
  * @returns The post in full, now a draft.
  * @throws The client module's normalised error - `401` without a credential, `403` when the caller
  * neither owns the post nor administers the site, `404` when no post has that identifier.
@@ -584,7 +614,7 @@ export function publishPost(id: string, options?: PostRequestOptions): Promise<P
  * const draft = await unpublishPost(post.id);
  * ```
  */
-export function unpublishPost(id: string, options?: PostRequestOptions): Promise<PostDetail> {
+export function unpublishPost(id: string, options?: PostMutationOptions): Promise<PostDetail> {
   return apiPost(
     `${postResourcePath(id, 'unpublishPost')}/unpublish`,
     postDetailSchema,

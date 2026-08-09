@@ -48,10 +48,12 @@
  * `role`
  *     Neither schema declares it, and that is the privilege-escalation guard rather than an
  *     omission. Authority is an attribute of the stored account, granted by the service's own
- *     `'READER'` default and changed only through the administrative API. `z.object()` **strips**
- *     any key it does not declare, so a caller who puts `role` into a payload gets a parsed result
- *     with no `role` in it — the field cannot reach the wire through this module at all. The service
- *     independently answers `422` for the same key, so the guard holds on both sides.
+ *     `'READER'` default and changed only through the administrative API. Both schemas below are
+ *     **strict**, so a caller who puts `role` into a payload gets a validation failure naming the
+ *     key rather than a silently shortened payload — the field cannot reach the wire through this
+ *     module at all, and the attempt is reported rather than absorbed. The service answers `422`
+ *     for the same key through `extra='forbid'`, so the two ends agree on both the rule and the
+ *     consequence.
  * `id`, `is_active`, `created_at`, `updated_at`, and every other server-owned field
  *     Identity is a UUID the database generates; the timestamps and the active flag are the
  *     service's to set. No input shape accepts any of them.
@@ -474,18 +476,32 @@ type AssertAssignableTo<Target, Source extends Target> = Source;
 /**
  * Validates the sign-up form, mirroring the body of `POST /api/v1/auth/register`.
  *
- * Four fields, three required, matching the service exactly. Unknown keys are **stripped** rather
- * than reported, which is what makes this schema the client-side escalation guard: a `role` — or an
- * `id`, or an `is_active` — present in the input cannot survive into the parsed output, so it cannot
- * be sent. The service answers `422` for the same keys, so a caller who bypasses this module gains
- * nothing.
+ * Four fields, three required, matching the service exactly.
+ *
+ * **Strict: an unknown key is rejected, not stripped.** `z.strictObject` mirrors the
+ * `extra='forbid'` the service's own request models declare, so the two ends agree about what a
+ * payload may contain *and* about what happens when it contains something else. Stripping was the
+ * earlier behaviour and it was the wrong trade at this boundary: a misspelled member simply
+ * vanished, the request succeeded, and the value the author meant to send was silently absent -
+ * which is a defect that reaches production looking like success. Rejecting turns the same mistake
+ * into a field error naming the key.
+ *
+ * It is also what makes this schema the client-side escalation guard: a `role` - or an `id`, or an
+ * `is_active` - present in the input is now reported rather than quietly discarded, and either way
+ * cannot be sent.
+ *
+ * A form that carries state the wire does not have - a confirm-password box, a terms checkbox, a
+ * dirty marker - must **project it away before validating**, because strictness applies to whatever
+ * is handed in: `signupSchema.parse({ email, username, password, display_name })` rather than
+ * `signupSchema.parse(formState)`. That projection is the form's own job and belongs at its submit
+ * boundary, where the fields are named anyway.
  *
  * @example
  * ```ts
  * const form = useForm<SignupFormValues>({ resolver: zodResolver(signupSchema) });
  * ```
  */
-export const signupSchema = z.object({
+export const signupSchema = z.strictObject({
   email: emailField,
   username: usernameField,
   password: newPasswordField,
@@ -510,12 +526,16 @@ export type SignupFormValues = AssertAssignableTo<RegisterRequest, z.infer<typeo
  * form the *reader* fills in, whose identifier field is `email` and stays `email`; mapping it onto the
  * field the grant calls `username` belongs to `@/lib/api/auth` and happens in exactly one place.
  *
+ * **Strict, like every request schema here**: an unknown key is reported rather than removed, so a
+ * `remember_me` checkbox or a `next` redirect target has to be projected away at the submit boundary
+ * instead of riding along invisibly. See {@link signupSchema}.
+ *
  * @example
  * ```ts
  * const form = useForm<LoginFormValues>({ resolver: zodResolver(loginSchema) });
  * ```
  */
-export const loginSchema = z.object({
+export const loginSchema = z.strictObject({
   email: emailField,
   password: submittedPasswordField,
 });

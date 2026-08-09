@@ -48,10 +48,14 @@
 //     derived from data, so it can never be submitted.
 //   - `created_at` and `updated_at` come from the database clock.
 //
-// A Zod object strips unknown keys by default, so a form that carries any of them in its state
-// still posts a body containing only `name` and `description`. That matters because both service
-// models set `extra="forbid"`: an unrecognised member is answered with a 422 rather than ignored,
-// and stripping here is what guarantees one is never sent.
+// Both schemas below are STRICT, so a form that carries any of them in its state is told so at the
+// field level rather than having the member quietly removed. That matches the service exactly: both
+// request models set `extra="forbid"`, so an unrecognised member is answered with a 422 rather than
+// ignored, and a client that merely stripped would disagree with the service about what happens -
+// silently dropping a misspelled member (`postCount`, `Name`) and reporting success for a request
+// that did not carry what the author meant. Strictness applies to whatever is handed in, so a form
+// whose state carries UI-only members must project the wire fields out before validating:
+// `categoryCreateSchema.parse({ name, description })` rather than `.parse(formState)`.
 //
 // Uniqueness is NOT checked here. `categories.name` is UNIQUE and `categories.slug` is a unique
 // CITEXT index, so a duplicate is detected where the constraint lives and surfaces as a 409 that
@@ -117,8 +121,8 @@ const DESCRIPTION_MAX_LENGTH = 500;
  *
  * Note what it does not do: TypeScript applies excess-property checks to fresh object literals,
  * not to this kind of assignability, so an *extra* member would satisfy the constraint. Keeping
- * server-owned fields out is therefore enforced by not declaring them and by Zod stripping
- * unknown keys, not by this guard.
+ * server-owned fields out is therefore enforced by not declaring them and by the schemas being
+ * strict at run time, not by this guard.
  */
 type AssertAssignableTo<TActual extends TContract, TContract> = TActual;
 
@@ -225,9 +229,9 @@ const categoryDescriptionField = z
  * the module header on `id`, `slug`, `post_count` and the timestamps.
  *
  * Mirrors `CategoryCreate` in `backend/app/schemas/category.py`, the reconciliation point for both
- * fields. Unknown keys are stripped rather than rejected, which is what keeps a form carrying
- * incidental state in its values from posting a member that model's `extra="forbid"` would answer
- * with a 422.
+ * fields - including its `extra="forbid"`, which this schema mirrors by being strict: an unknown key
+ * is reported here rather than removed, so a form carrying incidental state has to project the two
+ * wire members out before validating instead of relying on them being dropped.
  *
  * A duplicate name is not detected here; it is a 409 from the API. See the module header.
  *
@@ -241,7 +245,7 @@ const categoryDescriptionField = z
  * The `''` default is deliberate and valid: `name` reports "Enter a category name." until it is
  * filled in, and a `description` left untouched folds to `null` on submit.
  */
-export const categoryCreateSchema = z.object({
+export const categoryCreateSchema = z.strictObject({
   name: categoryNameField,
   description: categoryDescriptionField,
 });

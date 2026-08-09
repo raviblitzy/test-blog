@@ -69,6 +69,17 @@ The dependency edge is strictly one-way. This module imports ``post_service``; `
 imports nothing from ``app.services`` and must never import this module. Reversing or completing
 that edge would be an import cycle at start-up, not a stylistic matter.
 
+Being *entitled* to see the post is not enough on its own, because entitlement can lapse while the
+request is still running. The post is therefore read under ``SELECT ... FOR SHARE``, so the decision
+holds until the transaction ends rather than only until the next statement takes a fresh
+``READ COMMITTED`` snapshot. That shared lock conflicts with the ``FOR UPDATE`` every post
+transition and delete takes first, so an unpublish, an archive or a delete cannot slip between the
+gate and the ``post_likes`` write or aggregate it authorises - and it stays compatible with other
+shared holders, so two readers liking the same popular post still never wait for each other.
+:meth:`~app.repositories.post_repository.PostRepository.get_for_share` documents the lock and the
+global ``posts`` -> ``comments`` -> ``post_likes`` order it belongs to; this module needs only its
+first step, because a like addresses no comment.
+
 Absence and inaccessibility are reported identically
 ---------------------------------------------------
 Every method resolves **not-found before forbidden**, and a post the caller may not see raises
@@ -85,6 +96,10 @@ The transaction boundary
 the boundary belongs to this layer. It is drawn once and simply: :meth:`LikeService.like` and
 :meth:`LikeService.unlike` commit exactly once, on success, after their write; and
 :meth:`LikeService.get_summary` commits nothing, because it is a read.
+
+That boundary is also what bounds the shared lock the gate takes. The commit releases it, and it is
+deliberately the *last* database action of each write - the gate, the write and the count the caller
+is told about are all inside it, so either the whole decision holds or none of it does.
 
 Nothing here *opens* a transaction either. The injected session already has one, and starting
 another explicitly would fight the outer transaction ``backend/tests/conftest.py`` wraps every test
@@ -228,8 +243,9 @@ class LikeService:
         """Resolve a post the caller is entitled to know exists, or report it as absent.
 
         The gate every public method opens with. It answers the only question this service needs
-        to ask about a post - may this caller see it at all - and answers it before any like
-        statement is issued, so an invisible draft's like count is never read and never written.
+        to ask about a post - may this caller see it at all - answers it before any like statement
+        is issued, so an invisible draft's like count is never read and never written, and holds the
+        answer for the rest of the transaction by taking the row under ``SELECT ... FOR SHARE``.
 
         Args:
             post_id: The identifier from the URL path, already validated as a UUID by the route.
@@ -239,13 +255,14 @@ class LikeService:
                 nothing can be transposed silently.
 
         Returns:
-            The post, with its own columns loaded and no relationship requested. That is
-            sufficient: :func:`~app.services.post_service.can_view_post` reads ``status`` and
-            ``author_id``, both mapped columns, and never ``post.author`` - touching an unloaded
-            relationship under an ``AsyncSession`` raises ``MissingGreenlet``. Callers currently
-            discard the entity and use only the fact that it resolved, but it is returned rather
-            than swallowed so this stays a loader a future caller can read a column from instead
-            of a guard that would have to be paired with a second fetch.
+            The post, with its own columns loaded, no relationship requested and a shared lock held
+            on its row until this transaction ends. The columns are sufficient:
+            :func:`~app.services.post_service.can_view_post` reads ``status`` and ``author_id``,
+            both mapped, and never ``post.author`` - touching an unloaded relationship under an
+            ``AsyncSession`` raises ``MissingGreenlet``. Callers currently discard the entity and
+            use only the fact that it resolved, but it is returned rather than swallowed so this
+            stays a loader a future caller can read a column from instead of a guard that would
+            have to be paired with a second fetch.
 
         Raises:
             NotFoundError: No post carries that identifier, **or** the post is not published and
@@ -264,12 +281,37 @@ class LikeService:
             call site drifts, which is what the three byte-identical 404 raises at ``app.py:L31``,
             ``app.py:L40`` and ``app.py:L49`` demonstrated.
 
-            No lock is taken. ``for_update`` is left at its default because nothing read from this
-            row decides what is written: the like statement addresses ``post_likes`` and its
-            outcome is settled by that table's primary key, not by the post's state. A lock here
-            would cost a round trip and serialise every reader liking the same popular post.
+            **The row is taken under a shared lock, and that is what makes this a gate rather than
+            a guess.** An unlocked read would answer from its own ``READ COMMITTED`` snapshot, and
+            every statement after it takes a new one - so the post could be unpublished, archived or
+            deleted in the window between this decision and the ``post_likes`` write or aggregate it
+            authorises. The three ways that ends are all wrong: a like persisted against a post the
+            caller may no longer see, a count returned for a post that has just been withdrawn, and
+            a foreign-key violation surfacing as a ``500`` when the post is gone outright.
+            ``SELECT ... FOR SHARE`` closes all three, because it conflicts with the ``FOR UPDATE``
+            every status transition and delete in ``app.services.post_service`` takes first: a
+            concurrent transition now waits for this transaction to end, and a post already deleted
+            and committed comes back absent rather than from a snapshot, so the ``404`` below is a
+            fact.
+
+            **Shared, not exclusive, and the distinction is the whole reason this is affordable.**
+            Shared locks are compatible with each other, so two readers liking or counting the same
+            popular post never wait for one another - only a genuine post mutation does. Nothing on
+            ``posts`` is written by any other path either:
+            ``app.repositories.post_repository`` deliberately exposes no view-count increment, so
+            this lock contends with nothing but the transitions it is meant to exclude.
+
+            **It is held to the transaction boundary, not merely for the statement.** Each caller's
+            commit releases it - or the rollback ``get_db`` performs if one raises - which is why
+            every public method below reads its summary *before* committing: the gate, the write and
+            the figure reported are then one atomic decision.
+
+            The lock is over ``posts`` and it is taken **first**, which is the global order this
+            codebase follows: ``posts`` -> ``comments`` -> ``post_likes``, never the reverse.
+            :meth:`~app.repositories.post_repository.PostRepository.get_for_share` documents it in
+            full. This module only ever needs the first step, because a like addresses no comment.
         """
-        post = await self._posts.get_by_id(post_id)
+        post = await self._posts.get_for_share(post_id)
         if post is None:
             raise NotFoundError(_POST_NOT_FOUND)
         # Reported as absence, not as a refusal - see the note above. `can_view_post` is imported
@@ -333,9 +375,15 @@ class LikeService:
     # after a visibility gate.
     #
     # Both follow the same four steps, in this order: gate the post, write, read the summary the
-    # response carries, commit. The commit is last on purpose - the write and the figure the caller
-    # is told about are then one atomic decision, and no failure can arrive after the row is
-    # durable. Each method's own Note records what reading after the commit cost.
+    # response carries, commit. The commit is last on purpose - the gate's shared lock, the write
+    # and the figure the caller is told about are then one atomic decision, and no failure can
+    # arrive after the row is durable. Each method's own Note records what reading after the commit
+    # cost.
+    #
+    # The gate is what makes the write conditional on a fact rather than on a stale snapshot: it
+    # holds `FOR SHARE` on the post until this transaction ends, so a concurrent unpublish, archive
+    # or delete either waits for the like or was already committed before the gate ran, in which
+    # case the gate reports the post absent.
     # -----------------------------------------------------------------------------------
 
     async def like(self, post_id: uuid.UUID, *, user: User) -> LikeSummary:
@@ -376,6 +424,16 @@ class LikeService:
             :class:`~app.core.exceptions.ConflictError`. The end state the client asked for is the
             end state it gets, so the request is safe to retry after a timeout, safe to duplicate
             through a proxy, and safe to double-click.
+
+            **The gate's lock is not a de-duplication check and does not become one.** It settles a
+            different question - whether this post is still one the caller may act on - and the two
+            must not be conflated: the composite primary key remains the only thing that decides
+            whether this statement creates a row. Because the lock is *shared*, two accounts liking
+            the same post still proceed together; it excludes the post's own transitions and nothing
+            else. What it does add is that the foreign key can no longer fail: a post being deleted
+            concurrently is either blocked behind this transaction or was already committed before
+            the gate ran, in which case the gate answered ``404`` and no insert was attempted. That
+            is why there is still no ``IntegrityError`` handler here.
 
             The boolean the repository returns is recorded rather than acted upon. It is the only
             place the information exists - after the statement the two outcomes are
@@ -513,7 +571,17 @@ class LikeService:
 
         Note:
             No commit. This is a read, and the transaction it participates in is ended by
-            ``get_db`` when the request finishes.
+            ``get_db`` when the request finishes - which is also what releases the shared lock the
+            gate took.
+
+            **The gate and the aggregate are one consistent answer, not two independent ones.**
+            Holding that lock across both statements is what makes the count reported here a count
+            of a post the caller was still entitled to see when the figure was read. Without it the
+            two statements would sit in different ``READ COMMITTED`` snapshots, and a post
+            unpublished, archived or deleted in between would be reported on anyway - a tally
+            published for an article the caller may no longer read. The lock is shared, so this read
+            still never waits for another reader; it waits only for a transition that would have
+            invalidated its answer.
 
             ``None`` is passed through as ``None``. No placeholder identifier is synthesised for an
             anonymous caller, and none could safely be: the repository skips the caller-state

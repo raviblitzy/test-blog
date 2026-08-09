@@ -109,19 +109,22 @@ import { z } from 'zod';
 /**
  * One window onto a larger collection, plus the counts needed to navigate it.
  *
- * **Every collection endpoint returns this envelope, without exception.** The home feed
- * (`GET /api/v1/posts`), an author's published posts (`GET /api/v1/users/{username}/posts`), a
- * post's comment thread (`GET /api/v1/posts/{id}/comments`), the category taxonomy
- * (`GET /api/v1/categories`) and each administrative table
+ * **Every collection endpoint returns this envelope, with exactly one documented exception.** The
+ * home feed (`GET /api/v1/posts`), an author's published posts
+ * (`GET /api/v1/users/{username}/posts`), a post's comment thread
+ * (`GET /api/v1/posts/{id}/comments`) and each administrative table
  * (`GET /api/v1/admin/{users,posts,comments,categories}`) all arrive as a page. That uniformity is
- * the reason one pagination component can drive all of them, and it is an acceptance criterion
- * rather than a convention - so a client may assume it, and a route that broke it would be the
- * defect rather than the exception.
+ * the reason one pagination component can drive all of them, and a route that broke it without being
+ * the exception below would be the defect rather than a second exception.
  *
- * The taxonomy was briefly an exception, answering with a bare JSON array on the grounds that a
- * curated set is bounded and a filter control needs all of it at once. It answers with a page now:
- * `@/lib/api/categories` exposes `listCategories` for one page and `listAllCategories`, which walks
- * `pages` and hands a filter control the complete set. See {@link CategoryPublic}.
+ * The exception is the public taxonomy. `GET /api/v1/categories` answers with a bare
+ * `CategoryPublic[]` and takes no window, because that list *is* the home page's filter control: a
+ * windowed control would offer some terms and silently hide every post filed exclusively under the
+ * rest, and a curated taxonomy is bounded by editorial effort rather than by reader input, so there
+ * is nothing there for a window to protect against. `@/lib/api/categories#listCategories` therefore
+ * returns the complete set in one request, and the searchable, paginated view over the same relation
+ * is the administrator-only `GET /api/v1/admin/categories`, which does return this envelope. See
+ * {@link CategoryPublic}.
  *
  * **Exactly five fields.** `has_next`, `has_prev`, `offset`, cursors and hypermedia links are all
  * absent and must stay absent: every one is computable from the five values here, and a sixth
@@ -649,21 +652,21 @@ export interface CategorySummary {
 }
 
 /**
- * A category in full: the item type of the page `GET /api/v1/categories` returns, and the response
- * of `GET /api/v1/categories/{slug}`.
+ * A category in full: the element type of the array `GET /api/v1/categories` returns, the item type
+ * of the page `GET /api/v1/admin/categories` returns, and the response of
+ * `GET /api/v1/categories/{slug}`.
  *
- * **The collection answers with `Page<CategoryPublic>`**, exactly as every other collection in this
- * API does, and the administrator-only `GET /api/v1/admin/categories` answers with the same shape
- * plus a `q` filter. It was briefly a bare array - the taxonomy is bounded, and a filter control
- * needs every term or it silently hides the posts filed under the ones it missed - but the envelope
- * is what a client is entitled to assume of a collection here, and the completeness that argument
- * was defending is provided by `listAllCategories` in `@/lib/api/categories`, which walks `pages`
- * and returns `CategoryPublic[]`.
+ * **The public collection answers with a bare `CategoryPublic[]`** - the one collection in this API
+ * that does not return {@link Page}, and a specified exception rather than an oversight. The array
+ * *is* the home page's filter control, so a window could hide the posts filed under whatever fell
+ * outside it, and the taxonomy is small and curated, so the whole set is one small response. There
+ * is consequently no page to walk and no window to pass: `listCategories` in `@/lib/api/categories`
+ * returns every term in one round trip.
  *
- * So there are two functions rather than one shape bent to serve both purposes: `listCategories`
- * for a page, `listAllCategories` for the whole taxonomy. A filter control uses the second; anything
- * showing a handful of terms uses the first. `@/hooks/use-pagination` and
- * `@/components/ui/pagination` drive this collection exactly as they drive the feed.
+ * The administrator-only `GET /api/v1/admin/categories` is the searchable, windowed view over the
+ * same relation and answers with the envelope plus a `q` filter, so `@/hooks/use-pagination` and
+ * `@/components/ui/pagination` drive **that** table exactly as they drive the feed. Both surfaces
+ * carry this same projection, so a term looks identical on either.
  *
  * Extends {@link CategorySummary}, so anything that renders a badge from the slim shape renders one
  * from this too.
@@ -1332,6 +1335,27 @@ export function pageOf<T>(row: z.ZodType<T>): z.ZodType<Page<T>> {
     page_size: z.number(),
     pages: z.number(),
   });
+}
+
+/**
+ * Wrap a row schema in a bare array, for the one collection that answers without the envelope.
+ *
+ * `GET /api/v1/categories` returns `CategoryPublic[]` at the top level rather than a page - the
+ * single documented exception across the API, because that list *is* the home page's filter control
+ * and a window would let the control hide posts. See {@link CategoryPublic}.
+ *
+ * A named factory rather than an inline `z.array(...)` at the one call site, for the same reason
+ * {@link pageOf} exists: the validated shape of a collection is declared in this module, beside the
+ * interface it checks, so a wrapper stays a path and a return type and imports no validator of its
+ * own. It is deliberately **not** a general-purpose helper to reach for on a second collection - if a
+ * new endpoint wants an array, the question to answer first is why it is not a page.
+ *
+ * @typeParam T - The row type, in practice {@link CategoryPublic}.
+ * @param row - The schema for one row.
+ * @returns A schema for a top-level JSON array of them, which may legitimately be empty.
+ */
+export function arrayOf<T>(row: z.ZodType<T>): z.ZodType<T[]> {
+  return z.array(row);
 }
 
 /** Decoder for {@link TokenPair} - the response of sign-in and of rotation. */

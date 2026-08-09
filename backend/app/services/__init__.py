@@ -73,18 +73,35 @@ rediscovered seven times below.
   work.** ``app.repositories`` flushes and never commits, and ``get_db`` commits nothing on the
   way out - deliberately, because an automatic commit there would persist a half-finished use
   case, exactly what a transaction exists to prevent. So the boundary has to be drawn somewhere
-  that knows when an operation is *complete*, and that is here: a read commits nothing, and a
-  write commits once, on success, after the last of its steps. There are twenty-five such commits
-  across the seven service modules - seven in ``post_service``; four each in ``admin_service``,
-  ``auth_service`` and ``comment_service``; three in ``category_service``; two in
-  ``like_service``; and one in ``profile_service.update_self`` - and every one of them is the last
-  statement of a completed unit of work rather than a flush in disguise.
+  that knows when an operation is *complete*, and that is here.
 
-  What a service never does is *undo*. It issues no ``rollback`` and closes no session:
-  ``get_db`` owns both, so a domain exception raised anywhere in this layer unwinds through it and
-  the whole unit of work is discarded together. That is why a service can raise from the middle of
-  a multi-step write - a slug derived, categories associated, and then a conflict - and leave
-  nothing behind.
+  The rule is one sentence: **a read commits nothing, and a successful write commits exactly once,
+  after the last of its steps.** "Exactly once" is the part worth stating, because the failure it
+  rules out looks harmless. A method that commits inside a guarded block and again after it has two
+  logical boundaries where the contract allows one, and the second is either a no-op - which invites
+  a reader to conclude the first was optional - or worse, a boundary drawn after a step the guard
+  no longer covers. "After the last of its steps" is the other half: every read the response needs -
+  a re-read with relations, an aggregate, a projected count - happens *before* the commit, so a
+  transient failure can never return an error for work the database has already accepted. Where a
+  method takes a row lock to make a decision hold, the same commit is what releases it. Counting the
+  commits per module is not a useful check and no count is quoted here; what is checkable is that
+  every one of them is the last statement of a completed unit of work rather than a flush in
+  disguise, and that no successful path reaches two.
+
+  A service does not *choose* to undo, and it never closes a session - ``get_db`` owns the session
+  and rolls back whenever an exception leaves the request, so a domain exception raised from the
+  middle of a multi-step write leaves nothing behind. But four of these modules do issue an explicit
+  ``rollback``, and it is a requirement rather than an exception to the rule above.
+  ``auth_service``, ``post_service``, ``comment_service`` and ``category_service`` each translate an
+  ``IntegrityError`` - a slug already claimed, a category filed concurrently, an account registered
+  a moment ago - into a ``ConflictError``. Once a flush or commit has aborted, SQLAlchemy refuses
+  every further statement on that session until it is rolled back, so without the rollback the
+  domain error would be followed by a second, unrelated failure: any caller that catches the
+  conflict and continues - the idempotent seeder, a test asserting on it, a composing
+  administrative operation - would find the session unusable, and ``get_db`` would have nothing left
+  to close cleanly. The rollback is therefore what makes the conflict *reportable*; it is issued
+  first, before the domain error is raised, and ``get_db``'s own rollback remains the safety net
+  behind it rather than the mechanism.
 * **Domain objects out, typed exceptions up.** A service returns a mapped instance, a page of
   them, or a schema, and it signals failure with the typed domain errors declared in
   ``app.core.exceptions`` rather than a framework exception. Turning ``NotFoundError`` into a 404

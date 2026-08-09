@@ -106,15 +106,26 @@ Deleting is inherited for a second reason too. ``post_categories.category_id`` c
 itself issues. There is no hand-written child delete anywhere in this module, and there must
 never be one: a rule with two definitions is a rule whose copies drift.
 
-The pagination contract
------------------------
-:meth:`~CategoryRepository.list_paginated` returns a plain ``(rows, total)`` tuple, exactly as
+The two collection methods, and which surface each one serves
+------------------------------------------------------------
+There are two ways to read the taxonomy here, and the difference is not stylistic.
+
+:meth:`~CategoryRepository.list_with_post_counts` returns **every** category in scope paired with
+its tally, un-windowed, and it is what the public ``GET /api/v1/categories`` is built from through
+``CategoryService.list_with_post_counts``. That route answers with a bare JSON array - the one
+documented exception to the page envelope in this API - because the list *is* the home page's
+filter control, and a control offering only some terms would silently hide every post filed
+exclusively under the rest.
+
+:meth:`~CategoryRepository.list_paginated` is the windowed, text-filterable counterpart, and it
+serves the administrator-only ``GET /api/v1/admin/categories`` through
+``CategoryService.list_paginated``. It returns a plain ``(rows, total)`` tuple, exactly as
 :meth:`~app.repositories.base.BaseRepository.paginate` does. It does **not** build the ``Page``
 envelope and this module does not import ``app/core/pagination.py`` at all. ``Page`` is a wire
 shape, and keeping wire shapes out of the data layer is what layered separation means in
 practice; the service projects the rows into response models and calls its ``build_page`` helper to
 produce the five-field envelope (``items``, ``total``, ``page``, ``page_size``, ``pages``) that
-every list endpoint serialises.
+every *paginated* list endpoint serialises.
 
 Index alignment
 ---------------
@@ -408,10 +419,11 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
         """Return categories paired with how many posts are filed under each.
 
         One statement, always - see "Aggregate, not N+1" in the module docstring. This is where
-        every ``post_count`` in the API comes from: ``category_service`` turns these pairs into a
-        tally map and attaches it to whichever categories it is projecting, which is how the single
-        read, the public page and the administrative page all report the same figure at the cost of
-        one aggregate rather than one count per row.
+        every ``post_count`` in the API comes from: ``category_service`` either projects these pairs
+        directly, which is what the public bare-array collection does, or turns them into a tally
+        map keyed by identifier and attaches it to the categories it is projecting, which is what
+        the single read and the administrative page do. Either way one aggregate serves the whole
+        result set rather than one count per row, and every surface reports the same figure.
 
         Args:
             status: Which lifecycle state to count. Defaults to
@@ -485,13 +497,14 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
     ) -> tuple[Sequence[Category], int]:
         """Window the taxonomy, optionally filtered by text.
 
-        Backs **both** category collections - the public ``GET /api/v1/categories`` and the
-        administrator-only ``GET /api/v1/admin/categories`` - which reach it through the one
-        service method ``CategoryService.list_paginated``. The two differ only in whether a ``q``
-        arrives: every collection in this API answers with the page envelope, so the reader-facing
-        control windows exactly as the management table does. Unlike :meth:`list_all`, which
-        returns the taxonomy as a lookup for a bulk membership check, this is the surface a client
-        pages through.
+        Backs the administrator-only ``GET /api/v1/admin/categories``, reached through
+        ``CategoryService.list_paginated``. It is the *only* category collection that is windowed:
+        the public ``GET /api/v1/categories`` is built from :meth:`list_with_post_counts` and
+        answers with a bare array, because that list is the home page's filter control and a
+        windowed control could hide posts. Unlike :meth:`list_all`, which returns the taxonomy as a
+        lookup for a bulk membership check, this is the surface a client pages through - and unlike
+        :meth:`list_with_post_counts`, it carries no tally, so the service attaches one for the
+        identifiers on the page it returned.
 
         Args:
             q: Optional search text, matched as a case-insensitive containment against both

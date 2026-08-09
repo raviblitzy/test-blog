@@ -1326,10 +1326,16 @@ class AdminService:
             check and the delete. Calling ``CategoryRepository.is_in_use`` from here instead would
             reproduce the check without the lock, which is a guard in appearance only.
 
-            **One transaction, committed here**, as on the other two administrative category
-            operations. There is no projection to read on a ``204``, so the delegate could have
-            committed safely - but the boundary is kept in the same place on all three so that
-            "who commits an administrative operation" has one answer rather than three.
+            **One transaction, and this is the one category operation that commits it here.** The
+            delegate is asked not to, through ``commit=False``, because a ``204`` carries no
+            projection and this method still has its audit line to write - so the removal and the
+            record of it belong to the same transaction. Its two siblings are the other way round:
+            ``CategoryService.create`` and ``CategoryService.update`` must read the tally their
+            response declares before committing, so they own their boundary outright and expose no
+            such flag, and this service issues no commit on top of theirs. Either way there is
+            exactly one commit per administrative category operation, which is the property that
+            matters; where it is issued follows from whether the delegate has a projection to
+            materialise first.
         """
         self._require_admin(actor)
 

@@ -69,6 +69,38 @@ configuration: :data:`_SEARCH_CONFIG` must be the same dictionary the generating
 ``app/models/post.py`` uses, because a ``tsquery`` built with a different configuration silently
 matches nothing rather than failing loudly.
 
+Row locks over ``posts``, and the one order every caller follows
+---------------------------------------------------------------
+``posts`` is the root of the blog domain: ``comments``, ``post_likes`` and ``post_categories`` all
+reference it with ``ON DELETE CASCADE``, and whether any of them may be read or written at all
+depends on one post's ``status`` and ``author_id``. That makes this relation the first lock in
+every multi-relation use case, and this module declares the two modes in which it is taken.
+
+* :meth:`PostRepository.get_for_update` - ``SELECT ... FOR UPDATE``, for an operation that changes
+  the post itself: update, delete, publish, unpublish, and the administrative forced status change.
+* :meth:`PostRepository.get_for_share` - ``SELECT ... FOR SHARE``, for an operation that hangs off
+  the post without changing it: liking, unliking, reading a like tally, listing a comment thread,
+  writing a comment, editing one. These callers need the visibility decision to *stay true* while
+  they read or write a different relation, and under ``READ COMMITTED`` an unlocked read cannot
+  offer that - every statement takes its own snapshot, so a decision made by one statement can
+  already be false by the next.
+
+The two modes conflict with each other and shared locks do not conflict among themselves, which is
+what makes the pairing correct rather than merely cautious: a concurrent unpublish or delete waits
+for the dependent operation to finish, while two readers, two likers or two commenters on the same
+post never wait for one another.
+
+**The order is ``posts`` -> ``comments`` -> ``post_likes``, globally, and it is never reversed.**
+A post's own transition locks the post and then reaches its dependents through the cascade; a
+dependent operation locks the post here first and only then locks the comment it is about. A caller
+that locked a comment and reached back for its post would close a cycle with a concurrent delete
+and deadlock rather than serialise, which is why ``app.services.comment_service`` resolves its lock
+target through
+:meth:`~app.repositories.comment_repository.CommentRepository.post_id_of` before it locks anything.
+The order is stated on both halves - here and on
+:meth:`~app.repositories.comment_repository.CommentRepository.get_parent` - so it reads as a design
+rather than as a coincidence at each call site.
+
 What this module deliberately does not do
 -----------------------------------------
 **No HTTP artefact.** Nothing here raises. A missing row is ``None``; a page past the end is
@@ -996,6 +1028,70 @@ class PostRepository(UUIDPrimaryKeyRepository[Post]):
             could return without touching the database at all - taking no lock.
         """
         stmt = select(Post).where(Post.id == post_id).with_for_update()
+        if with_relations:
+            stmt = _with_relations(stmt)
+        result = await self.session.execute(stmt.execution_options(populate_existing=True))
+        return result.scalars().first()
+
+    async def get_for_share(
+        self, post_id: uuid.UUID, *, with_relations: bool = False
+    ) -> Post | None:
+        """Fetch one post by primary key, holding a *shared* row lock until the transaction ends.
+
+        The read-side counterpart of :meth:`get_for_update`, and the first step of every operation
+        that hangs off a post without changing it: liking and unliking, reading a like tally,
+        listing a comment thread, and writing a comment. Those callers need one fact about the
+        ``posts`` row - the status and author that decide whether this caller may see it at all -
+        and they need it to *stay true* for the rest of their transaction, because what they do
+        next reads or writes a different relation entirely.
+
+        ``SELECT ... FOR SHARE`` is exactly that guarantee. It conflicts with ``FOR UPDATE`` and
+        with any ``UPDATE`` or ``DELETE`` of the row, so a concurrent unpublish, archive or delete
+        blocks until this transaction ends; and shared locks are mutually compatible, so two
+        readers, two likers or two commenters on the same post never wait for each other. An
+        unlocked read cannot offer either property: under ``READ COMMITTED`` every statement takes
+        its own snapshot, so a visibility decision made by statement *n* can already be false by
+        statement *n+1*.
+
+        Args:
+            post_id: The post's server-generated UUID.
+            with_relations: Whether to eager-load ``author`` and ``categories`` alongside the
+                locked row. ``False`` by default, and every current caller leaves it there -
+                they read ``status`` and ``author_id`` and render nothing from this entity.
+
+        Returns:
+            The post with a shared lock held on its row, or ``None`` when no row carries that
+            key. Absence is not an error here; the service turns it into a ``404``.
+
+        Note:
+            **This is the ``posts`` half of one lock order, and the order is global.** Locks are
+            always taken ``posts`` -> ``comments`` -> ``post_likes``, never the reverse: a post's
+            own transitions take ``FOR UPDATE`` here through :meth:`get_for_update` and then reach
+            the dependent rows through ``ON DELETE CASCADE``, while a dependent operation takes
+            ``FOR SHARE`` here and only then locks the comment it is about. A caller that locked a
+            comment first and reached back for its post would close a cycle with
+            ``post_service.delete``, whose cascade locks comments while it holds ``FOR UPDATE`` on
+            the post - so ``app.services.comment_service`` resolves its lock target before it locks
+            anything. Stating the order once, here and in
+            :meth:`~app.repositories.comment_repository.CommentRepository.get_parent`, is what
+            keeps it a design rather than a coincidence.
+
+            **The lock covers ``posts`` and nothing else**, in both modes, for the reason
+            :meth:`get_for_update` records: ``FOR SHARE`` applies to the rows the primary statement
+            returns, and the eager loaders are ``selectinload``, so they arrive through separate
+            unlocked statements.
+
+            **The row is re-read rather than served from the identity map**, through
+            ``populate_existing``. A lock over a stale in-session copy would be no lock at all -
+            the same hazard :meth:`get_for_update` documents - and it is why this is a ``select()``
+            rather than :meth:`~sqlalchemy.ext.asyncio.AsyncSession.get`, which could answer from
+            the identity map without touching the database and therefore without taking a lock.
+
+            Verified against SQLAlchemy 2.0.51 and PostgreSQL 18.4: ``with_for_update(read=True)``
+            renders ``FOR SHARE`` on this dialect, and a session holding it blocks a concurrent
+            ``FOR UPDATE`` on the same row until it commits.
+        """
+        stmt = select(Post).where(Post.id == post_id).with_for_update(read=True)
         if with_relations:
             stmt = _with_relations(stmt)
         result = await self.session.execute(stmt.execution_options(populate_existing=True))

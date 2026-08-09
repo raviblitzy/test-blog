@@ -456,16 +456,28 @@ const categoryIdList = z
  *   created_at,    Stamped from the database clock. An audit column a caller could set is not an
  *   updated_at     audit column.
  *
- * UNKNOWN MEMBERS ARE STRIPPED, NOT REJECTED
+ * UNKNOWN MEMBERS ARE REJECTED, NOT STRIPPED
  *
- * Both schemas use zod's default object behaviour, so a member neither of them declares is removed
- * from the parsed result rather than failing it. That is the right choice on a form boundary and it
- * is a deliberate divergence from the server, which forbids extras outright. Two reasons: the client
- * cannot forward a server-owned value even by accident, because the value never survives parsing;
- * and form state legitimately carries members that are not part of the request — a preview toggle,
- * an unsaved-changes marker — which `.strict()` would turn into a submission failure with no field
- * to attach the error to. The server keeps the strict reading, which is where it belongs: it is the
- * boundary that has to defend against callers other than this form.
+ * Both schemas are `z.strictObject`, so a member neither of them declares fails validation and is
+ * named in the failure. This matches the service exactly: `PostCreate` and `PostUpdate` both declare
+ * `extra='forbid'`, so the two ends agree about what a body may contain *and* about what happens when
+ * it contains something else.
+ *
+ * Stripping was the earlier behaviour, and the argument for it does not survive contact with the
+ * failure it permits. A misspelled member - `categoryIds` for `category_ids`, `coverImage` for
+ * `cover_image_url` - simply disappeared: the parse succeeded, the request succeeded, and the post
+ * saved without the categories or the cover image the author had chosen, with nothing reported
+ * anywhere. That is worse than a rejection, because it looks like success. Rejecting turns it into a
+ * message naming the key.
+ *
+ * The cost is real and is paid where it belongs. Editor state legitimately carries members the wire
+ * has none of - a preview toggle, an unsaved-changes marker, a slug preview - and strictness applies
+ * to whatever is handed in, so the editor must **project the wire fields out of its state before
+ * validating**: `postCreateSchema.parse({ title, excerpt, content, cover_image_url, category_ids })`
+ * rather than `postCreateSchema.parse(editorState)`. That projection belongs at the submit boundary,
+ * which is the one place that already knows which of its fields are the request. It also keeps the
+ * escalation guard intact: a server-owned value in the input is now reported rather than quietly
+ * discarded, and either way cannot be sent.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -534,7 +546,7 @@ type PostUpdateBody = z.ZodType<PostUpdate> & {
  * flatten the precise `ZodObject` type — `.shape` would stop being readable by a consumer, and the
  * `.partial()` call below would stop resolving.
  */
-export const postCreateSchema = z.object({
+export const postCreateSchema = z.strictObject({
   title: postTitle,
   excerpt: optionalPostExcerpt.optional(),
   content: postContent,
@@ -573,6 +585,11 @@ export type PostCreateFormValues = z.infer<typeof postCreateSchema>;
  * derivation is the guarantee: the two shapes cannot drift, and a member added to the create form
  * cannot be forgotten here. It is also the exact structure the server uses, where both models
  * reference one shared alias per field.
+ *
+ * The derivation **preserves strictness** - verified rather than assumed against the pinned zod
+ * version: an unknown member is rejected here exactly as it is on the create schema, while `{}`
+ * remains a valid no-op. So an edit form must project the wire members out of its state before
+ * validating, for the reason recorded in the section on unknown members above.
  *
  * `.partial()` produces precisely the right optionality because of how the fields above are built —
  * `title` and `content` become optional but stay non-nullable, while `excerpt` and

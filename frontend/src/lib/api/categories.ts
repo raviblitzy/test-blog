@@ -3,15 +3,27 @@
  *
  * Two reads, both public, and nothing else:
  *
- * | Function                  | Request                  | Answer                                |
- * | ------------------------- | ------------------------ | ------------------------------------- |
- * | {@link listCategories}    | `GET /categories`        | `Page<CategoryPublic>`                |
- * | {@link listAllCategories} | the same, page by page   | `CategoryPublic[]` - the whole set    |
- * | {@link getCategory}       | `GET /categories/{slug}` | one `CategoryPublic`                  |
+ * | Function               | Request                  | Answer                                    |
+ * | ---------------------- | ------------------------ | ----------------------------------------- |
+ * | {@link listCategories} | `GET /categories`        | `CategoryPublic[]` - the whole taxonomy    |
+ * | {@link getCategory}    | `GET /categories/{slug}` | one `CategoryPublic`                       |
  *
- * {@link listAllCategories} performs no transport of its own: it calls {@link listCategories} and
- * follows `pages`, which is what lets a filter control render the complete taxonomy while the
- * endpoint keeps the page envelope every collection in this API returns.
+ * ## The collection answers with a bare array, and it is the only one in this API that does
+ *
+ * `GET /api/v1/categories` returns `list[CategoryPublic]` and takes no window. Every other
+ * collection in this API returns the five-member page envelope; this one is the single documented
+ * exception, it is exactly one route wide, and it is specified rather than improvised.
+ *
+ * The reason is what the list is *for*. It **is** the home page's filter control, and a windowed
+ * control would offer some terms and silently hide every post filed exclusively under the rest - a
+ * wrong answer rather than a partial one, and one no status code reports. A curated taxonomy is also
+ * bounded by editorial effort rather than by reader input, so there is nothing here for a window to
+ * protect against: the whole set is a row of chips and one request renders it.
+ *
+ * So there is no page walk here and no second "give me all of them" function: {@link listCategories}
+ * returns the complete taxonomy in one round trip. The searchable, paginated view over the same
+ * relation exists and is administrator-only - `listAdminCategories` in `@/lib/api/admin`, which adds
+ * a `q` term and does answer with the envelope.
  *
  * The consumers are `src/app/page.tsx` (which resolves the term named by the feed's `category`
  * search parameter so `buildFeedMetadata` can title and describe the filtered view),
@@ -78,10 +90,10 @@
  * @module
  */
 
-import { apiGet, type RequestOptions } from '@/lib/api/client';
+import { apiGet, type PublicRequestOptions } from '@/lib/api/client';
 import { encodePathSegment } from '@/lib/paths';
-import { categoryPublicSchema, pageOf } from '@/lib/types';
-import type { CategoryPublic, Page } from '@/lib/types';
+import { arrayOf, categoryPublicSchema } from '@/lib/types';
+import type { CategoryPublic } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
  * Paths
@@ -111,56 +123,29 @@ const DOT_SEGMENT_PATTERN = /^\.{1,2}$/;
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Per-call controls available to every read here: `cache`, `next` (framework revalidation),
- * `signal` (cancellation) and `anonymous` (deliberately withhold a credential that is held).
+ * Per-call controls available to both reads here: `cache`, `next` (framework revalidation),
+ * `signal` (cancellation) and `timeoutMs`.
  *
- * **`query` is removed on purpose, and the removal is the contract rather than tidiness.** The
- * window is expressed through {@link CategoryPageParams} on the function that takes one, so a page
- * number has exactly one way in. Leaving `query` reachable would give it two, and the two would
- * silently disagree - the typed parameters win, and a `query` a caller believed in would be
- * discarded without a word. Omitting the member makes that mistake unrepresentable rather than
- * merely discouraged, exactly as `@/lib/api/admin` does for its listings.
+ * **There is deliberately no credential member and no `query` member**, and each absence is part of
+ * the contract rather than tidiness.
  *
- * The members that remain are what a Server Component needs. `src/app/sitemap.ts` and
- * `src/app/page.tsx` both render on the server and both want to say how long the taxonomy may be
- * held and which cache tag it participates in; that is `cache` and `next`, passed straight through
- * to the client untouched.
+ * No credential, because the service resolves no principal on either route: a bearer sent here
+ * cannot change a byte of the answer, so both calls are dispatched `anonymous` and a held token
+ * never travels to be ignored. {@link PublicRequestOptions} is what removes `anonymous`, `bearer`,
+ * `allowRefresh` and `anonymousFallback` together - with anonymity forced, not one of them could do
+ * anything.
+ *
+ * No `query`, because neither route accepts one. The collection takes no window at all (see the
+ * module header) and the single read is addressed entirely by its path segment, so an arbitrary
+ * query bag could only ever carry a parameter the service ignores - and a caller who believed in it
+ * would be silently wrong. The searchable listing over this taxonomy is administrator-only and
+ * lives in `@/lib/api/admin`.
+ *
+ * What remains is what a Server Component needs. `src/app/sitemap.ts` and `src/app/page.tsx` both
+ * render on the server and both want to say how long the taxonomy may be held and which cache tag it
+ * participates in; that is `cache` and `next`, passed straight through to the client untouched.
  */
-export type CategoryRequestOptions = Omit<RequestOptions, 'query'>;
-
-/**
- * The window {@link listCategories} accepts, and the whole of what the public collection admits.
- *
- * `GET /api/v1/categories` returns the same five-field page envelope every collection in this API
- * returns, and takes the same two parameters every listing takes. It deliberately takes **no**
- * search term: searching the taxonomy is a management affordance and lives on the administrator-only
- * `GET /api/v1/admin/categories`, wrapped as `listAdminCategories` in `@/lib/api/admin`, so no `q`
- * member exists here to send. That term is the *only* difference between the two listings - both
- * answer `Page<CategoryPublic>` from one service method, so neither can drift from the other.
- *
- * Both members are optional. Omitting them requests the service's own defaults - page one, twenty
- * rows - which is what a caller wanting "the first screenful of terms" should do.
- */
-export interface CategoryPageParams {
-  /** 1-based page number. Omit for the first page. */
-  page?: number;
-  /**
-   * Rows per page, 1 to 100 inclusive. Omit for the service's default of 20.
-   *
-   * An out-of-range value is answered with a `422` naming the parameter rather than being quietly
-   * clamped, so a control offering page sizes must keep its options inside that range.
-   * {@link MAX_CATEGORY_PAGE_SIZE} is the ceiling, and {@link listAllCategories} uses it.
-   */
-  page_size?: number;
-}
-
-/**
- * The largest page the service will serve: the ceiling `PageParams` enforces on every listing.
- *
- * Exported because {@link listAllCategories} walks the taxonomy with it and a caller may want to do
- * the same for its own reason. Asking for more is a `422`, not a clamp.
- */
-export const MAX_CATEGORY_PAGE_SIZE = 100;
+export type CategoryRequestOptions = Omit<PublicRequestOptions, 'query'>;
 
 /* -------------------------------------------------------------------------------------------------
  * Internal guards
@@ -201,81 +186,41 @@ function assertAddressableSlug(slug: string): string {
 }
 
 /* -------------------------------------------------------------------------------------------------
- * GET /categories - a page of the taxonomy
+ * GET /categories - the whole taxonomy
  *
- * `Page<CategoryPublic>`, which is the shape EVERY collection in this API returns: `items`, `total`,
- * `page`, `page_size`, `pages`. It used to be a bare `CategoryPublic[]` as a sanctioned exception,
- * on the argument that a curated taxonomy is bounded and a filter control needs all of it at once.
- * The endpoint keeps the envelope now because uniformity across collections is a stated acceptance
- * criterion rather than a convention - one exception makes it untrue for every client - and the
- * filter control still gets the complete set, from {@link listAllCategories}, which follows `pages`.
+ * A bare `CategoryPublic[]`, never the page envelope, and never a page walk to reconstruct one. This
+ * is the API's single sanctioned collection exception: the array IS the home page's filter control,
+ * so windowing it would let the control hide the posts filed under whatever fell outside the window.
+ * The module header records the reasoning in full; `@/lib/api/admin`'s `listAdminCategories` is where
+ * a searchable, paginated view of the same relation lives.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Fetch one page of the taxonomy, each term carrying its published-post tally.
+ * Fetch the **complete** taxonomy, each term carrying its published-post tally.
  *
  * Ascending by name, and a category with no published posts is present with a `post_count` of `0`
- * rather than omitted - the filter control is expected to show an empty term.
+ * rather than omitted - the filter control is expected to show an empty term rather than hide it.
  *
- * **A page, not the whole set.** Omitting `params` requests the service's default window of twenty
- * rows, which is the whole taxonomy in any ordinary deployment - but "ordinary" is not a guarantee a
- * caller can rely on, and `pages` is what says whether more exist. A surface that must be complete,
- * such as the home page's filter, calls {@link listAllCategories} instead of assuming.
+ * **The whole set, in one request, with no window to get wrong.** There is no `page` parameter to
+ * pass and no `pages` to follow: the service returns every category, so a filter control built from
+ * this is complete by construction rather than by a caller remembering to iterate. That is the whole
+ * point of the endpoint's shape - see the module header.
  *
- * @param params - The window. Both members optional; `page_size` is bounded to 1-100 by the service
- * and an out-of-range value is a `422` rather than a clamp.
+ * Dispatched without a credential even when one is held. The service resolves no principal on this
+ * route, so a bearer could not change the answer; withholding it keeps a token off the wire that
+ * nothing would have read.
+ *
  * @param options - Caching, revalidation and cancellation controls. Omit for the framework default.
- * A `query` cannot be passed: the window is the typed parameter above - see
- * {@link CategoryRequestOptions}.
- * @returns One page of categories with their published-post tallies. `items` is empty both when the
- * taxonomy is empty and when the requested page is past the last one, which `total` and `pages`
- * distinguish.
+ * Neither a `query` nor a credential member can be passed - see {@link CategoryRequestOptions}.
+ * @returns Every category, ascending by name, with its published-post tally. An empty array when no
+ * category has been created.
  * @throws `ApiError` from `@/lib/api/client` for every failure - a rejection from the service, an
- * unreachable service, a cancelled request, or a body that does not match the declared contract.
- *
- * @example The first screenful of terms
- * ```ts
- * const page = await listCategories({ page_size: 10 }, { next: { revalidate: 300 } });
- * console.log(`${String(page.items.length)} of ${String(page.total)} terms`);
- * ```
- */
-export function listCategories(
-  params: CategoryPageParams = {},
-  options?: CategoryRequestOptions,
-): Promise<Page<CategoryPublic>> {
-  return apiGet(CATEGORIES_PATH, pageOf(categoryPublicSchema), {
-    ...options,
-    anonymousFallback: true,
-    query: { page: params.page, page_size: params.page_size },
-  });
-}
-
-/**
- * Fetch the **complete** taxonomy by walking every page.
- *
- * What the home page's category filter renders from, and the reason the collection can keep the page
- * envelope without the control being wrong: a filter that offered only some of the terms would
- * silently hide every post filed exclusively under the rest, so this walks until it has them all.
- *
- * One request in every realistic deployment. The first call asks for {@link MAX_CATEGORY_PAGE_SIZE}
- * rows - the largest window the service will serve - and only fetches again if `pages` says there is
- * more, so a taxonomy of a hundred terms or fewer costs exactly one round trip. The loop is bounded
- * by the `pages` the service reported on the first answer rather than by "until an empty page
- * arrives", so a service that miscounted cannot make this iterate indefinitely.
- *
- * No transport of its own: every request goes through {@link listCategories} and therefore through
- * `@/lib/api/client`, which stays the only module in this tier that performs HTTP.
- *
- * @param options - Caching, revalidation and cancellation controls, applied to **every** request
- * this makes. A `signal` cancels the walk part-way, which surfaces as the client's normalised
- * cancellation error rather than as a partial list.
- * @returns Every category, ascending by name, as a flat array; empty when none has been created.
- * @throws `ApiError` from `@/lib/api/client` for every failure, including one on a later page - a
- * partial taxonomy is never returned, because a filter built from one is a filter that hides posts.
+ * unreachable service, a cancelled request, or a body that does not match the declared contract. A
+ * partial taxonomy is never returned: either the array is complete or the call rejects.
  *
  * @example Render the filter control from the full taxonomy
  * ```tsx
- * const categories = await listAllCategories({ next: { revalidate: 300, tags: ['categories'] } });
+ * const categories = await listCategories({ next: { revalidate: 300, tags: ['categories'] } });
  * return categories.map((category) => (
  *   <option key={category.id} value={category.slug}>
  *     {category.name} ({category.post_count})
@@ -283,19 +228,14 @@ export function listCategories(
  * ));
  * ```
  */
-export async function listAllCategories(
-  options?: CategoryRequestOptions,
-): Promise<CategoryPublic[]> {
-  const first = await listCategories({ page: 1, page_size: MAX_CATEGORY_PAGE_SIZE }, options);
-  const collected = [...first.items];
-
-  // `pages` is read once, from the first answer, so the bound cannot move under the loop.
-  for (let page = 2; page <= first.pages; page += 1) {
-    const next = await listCategories({ page, page_size: MAX_CATEGORY_PAGE_SIZE }, options);
-    collected.push(...next.items);
-  }
-
-  return collected;
+export function listCategories(options?: CategoryRequestOptions): Promise<CategoryPublic[]> {
+  // `anonymous` last, so it cannot be overridden - and `CategoryRequestOptions` gives a caller no
+  // member with which to try. No `anonymousFallback` beside it: a request that never carried a
+  // credential has no expiry to fall back from.
+  return apiGet(CATEGORIES_PATH, arrayOf(categoryPublicSchema), {
+    ...options,
+    anonymous: true,
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -351,8 +291,10 @@ export async function getCategory(
     parameterName: 'slug',
     hint: 'Read the slug from CategoryPublic.slug or from the feed\'s "category" search parameter.',
   });
+  // Withheld rather than transmitted: this route resolves no principal either, so a held bearer
+  // would travel and be ignored. See `listCategories`.
   return await apiGet(`${CATEGORIES_PATH}/${segment}`, categoryPublicSchema, {
     ...options,
-    anonymousFallback: true,
+    anonymous: true,
   });
 }
