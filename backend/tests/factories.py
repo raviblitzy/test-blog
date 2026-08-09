@@ -342,8 +342,15 @@ async def create_user(
 
     Args:
         session: The session under test.
-        email: Login address. Generated as ``user<n>@example.test`` when omitted; ``.test`` is
-            reserved by RFC 2606, so a generated address can never reach a real mailbox.
+        email: Login address. Generated as ``user<n>@example.com`` when omitted. RFC 2606 §3
+            reserves ``example.com`` for documentation, so a generated address can never reach
+            a real mailbox - and unlike the reserved ``.test`` TLD it is accepted by
+            ``email-validator``, which is what :class:`~pydantic.EmailStr` runs. That matters
+            because ``email`` is an ``EmailStr`` on every contract that carries it -
+            ``RegisterRequest`` inbound, ``UserMe`` and
+            :class:`~app.schemas.admin.AdminUser` outbound - so an address under a special-use
+            TLD is one the API could never have stored and one no response model can project.
+            A fabricated account has to be a *possible* account or it tests the wrong system.
             ``users.email`` is ``CITEXT``, so an explicit value that differs from an existing
             one only in case is a duplicate and will fail the flush.
         username: Public handle, the key ``GET /api/v1/users/{username}`` is addressed by.
@@ -378,7 +385,7 @@ async def create_user(
     """
     discriminator = _next_n()
     user = User(
-        email=email if email is not None else f"user{discriminator}@example.test",
+        email=email if email is not None else f"user{discriminator}@example.com",
         username=username if username is not None else f"user{discriminator}",
         # The only place this module holds a plaintext is the argument to this call. argon2id
         # is deliberately expensive, so it runs exactly once per created account.
