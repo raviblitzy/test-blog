@@ -25,8 +25,10 @@ Two properties are exercised that no single-environment test can establish:
 
 The suite writes to a capture buffer rather than to the process stdout, so it asserts on exactly
 the bytes a log collector would have received. ``configure_logging`` is called with the real
-settings object and restored afterwards, so nothing here depends on how the environment happens
-to be configured while the suite runs.
+settings object, with both the stage and the threshold pinned for the duration of a test and
+restored afterwards, so nothing here depends on how the environment happens to be configured
+while the suite runs - including the quiet ``LOG_LEVEL`` that ``backend/tests/conftest.py``
+sets to keep a failing assertion legible.
 """
 
 from __future__ import annotations
@@ -75,12 +77,27 @@ def captured_logs() -> Iterator[Any]:
     per stage without repeating the save/restore dance. The stage is set on the shared settings
     singleton - which the model is deliberately not ``frozen`` to allow - and put back in a
     ``finally``, so a failing assertion cannot leave the suite logging as ``production``.
+
+    The **threshold** is pinned as well as the stage, and for the same reason: this module
+    asserts on what redaction does to a record, not on which records clear a level, so a record
+    it emits has to reach the buffer whatever the ambient ``LOG_LEVEL`` happens to be.
+    ``backend/tests/conftest.py`` deliberately runs the suite at ``WARNING`` to keep a failing
+    assertion legible, and without this pin the one test that logs at ``info`` would find an
+    empty buffer and fail with an ``IndexError`` that says nothing about redaction. ``DEBUG`` is
+    the most permissive setting, so every level a test might use is admitted, and it is restored
+    in the same ``finally`` as the stage.
     """
     original_stage = settings.ENVIRONMENT
+    original_level = settings.LOG_LEVEL
     buffers: list[io.StringIO] = []
 
     def configure(stage: str) -> io.StringIO:
         settings.ENVIRONMENT = stage  # type: ignore[assignment]
+        # No `type: ignore` here, unlike the line above: `ENVIRONMENT` is assigned a plain `str`
+        # against a `Literal` annotation, whereas `"DEBUG"` is one of the members
+        # `Settings.LOG_LEVEL` declares, so the assignment type-checks as written and an ignore
+        # would be flagged as unused under the strict settings in backend/pyproject.toml.
+        settings.LOG_LEVEL = "DEBUG"
         buffer = io.StringIO()
         buffers.append(buffer)
         configure_logging(stream=buffer)
@@ -90,6 +107,7 @@ def captured_logs() -> Iterator[Any]:
         yield configure
     finally:
         settings.ENVIRONMENT = original_stage
+        settings.LOG_LEVEL = original_level
         configure_logging()
 
 

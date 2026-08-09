@@ -1,0 +1,255 @@
+# ==========================================================================================
+# Production container image for the FastAPI service tier.
+#
+# Two stages. The first builds the dependency tree and stages the application payload; the
+# second is the image that ships, and it receives only artifacts - never a compiler, never a
+# package index cache, never a test, never a development tool. Agent Action Plan section
+# 0.4.4.1 specifies a "Multi-stage image running the service under Gunicorn with Uvicorn
+# workers" and section 0.7.1.2 adds "as a non-root user"; both are literal here.
+#
+# BUILD CONTEXT IS `backend/`, not the repository root:
+#
+#     docker build -t blog-api-backend backend/
+#
+# so every COPY source below is relative to backend/. docker-compose.yml builds this same
+# service from this same file with that same context, and the port, the module path and the
+# probe path chosen here are the values it publishes and gates on.
+#
+# RUN IT with configuration supplied at run time and nothing baked in:
+#
+#     docker run --rm -p 8000:8000 --env-file .env blog-api-backend
+#
+# WHAT THIS IMAGE DELIBERATELY DOES NOT DO
+#
+#   * It does not apply migrations. `alembic upgrade head` is docker-compose.yml's job on
+#     service start, so putting it in CMD here would run it a second time and weld the image
+#     to one orchestration. The image's duty is to make the command POSSIBLE - which is why
+#     alembic.ini and migrations/ are copied in and the venv's `alembic` is on PATH - and to
+#     stop there. `docker run --rm --env-file .env blog-api-backend alembic upgrade head`
+#     works, as does compose overriding `command:`.
+#   * It does not carry configuration. Not one of the eleven backend environment variables
+#     has a default here, and no secret appears as ENV, as a build ARG, or in a comment: the
+#     only ENV entries are non-secret interpreter and pip behaviour flags. `.env` is never
+#     copied - the root `.gitignore` excludes it precisely so it cannot be committed, and
+#     backend/.env is a symlink to a path OUTSIDE this build context, so a blanket copy would
+#     not merely leak configuration, it would fail. `.env.example` is the documented contract.
+#   * It does not run as root. See the `blog` user below.
+#
+# WHY EVERY COPY IS NARROW AND EXPLICIT, AND WHY THERE IS NO `COPY . .`
+#
+# This plan contains no `.dockerignore`, by design, which moves the whole burden of exclusion
+# onto the COPY lines. Most of the context must never reach an image, and it is not a rounding
+# error: a developer's `.venv/` alone runs to hundreds of megabytes of host-built,
+# interpreter-specific artifacts, beside `.mypy_cache/`, `.ruff_cache/`, `tests/`,
+# `requirements-dev.txt`, the `.env` symlink, and `__pycache__/` directories inside `app/` and
+# `migrations/`. Four narrow COPY statements name exactly what ships. The `__pycache__` trees
+# are the one hazard a narrow COPY cannot dodge, because they live INSIDE the two directories
+# that do ship, so the builder stage strips them and then asserts they are gone - see the
+# payload staging step.
+# ==========================================================================================
+
+
+# ------------------------------------------------------------------------------------------
+# Stage 1 - builder: resolve dependencies, stage the payload
+# ------------------------------------------------------------------------------------------
+#
+# The tag is the EXACT patch version, matching backend/.python-version (3.14.7) and
+# backend/pyproject.toml's `requires-python = "==3.14.7"`. `python:3`, `python:3.14` and
+# `python:latest` are all forbidden, and the precision is load-bearing rather than tidy:
+# backend/app/main.py relies on PEP 758 (unparenthesized `except A, B:`), which is a syntax
+# error before 3.14, so a floating tag that drifted DOWN would not degrade this service - it
+# would refuse to import at all.
+FROM python:3.14.7-slim AS builder
+
+# Interpreter and pip behaviour only - no application configuration lives in ENV anywhere in
+# this file. PIP_NO_CACHE_DIR keeps the wheel cache out of the layer, and the version check is
+# silenced rather than acted on: pip is deliberately NOT upgraded, because an unpinned install
+# of anything - pip included - reintroduces exactly the drift the pinned requirement set exists
+# to remove.
+ENV PIP_NO_CACHE_DIR=1 \
+  PIP_DISABLE_PIP_VERSION_CHECK=1 \
+  PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /build
+
+# Dependency manifest first, alone, so this layer and the install below cache on the pin set
+# and are not invalidated by an edit to application code.
+COPY requirements.txt ./
+
+# A virtual environment rather than a --prefix install: /opt/venv is one self-contained
+# directory the runtime stage copies wholesale, and putting its bin/ on PATH there makes
+# `gunicorn`, `uvicorn` and `alembic` directly invocable without a wrapper or an activate step.
+#
+# `--require-hashes` is passed explicitly. requirements.txt already forces hash-checking mode
+# by carrying a --hash on every entry, but its own header asks for the flag "in any pipeline
+# that wants the check to be mandatory rather than merely available", and a production image
+# build is precisely that pipeline: with the flag, a requirement that ever loses its digests
+# fails the build instead of quietly installing unverified bytes.
+#
+# ONLY requirements.txt is installed. requirements-dev.txt is neither copied nor installed, so
+# pytest, ruff, mypy, httpx and Faker are absent from the shipped image by construction rather
+# than by pruning. No package is installed by name here: the 19 direct pins and their 29
+# pinned transitive dependencies are the complete, reproducible contents of this environment.
+#
+# No compiler is installed, and none is needed - verified, not assumed. The dependency set
+# chose `psycopg[binary]` and `pwdlib[argon2]` specifically because they publish wheels, and
+# this install resolves to wheels for all 48 distributions on linux/amd64, so build-essential
+# would add a toolchain to a stage that has nothing to compile.
+RUN python -m venv /opt/venv \
+  && /opt/venv/bin/pip install --require-hashes --requirement requirements.txt
+
+# ------------------------------------------------------------------------------------------
+# Payload staging
+#
+# Assembled here rather than copied straight into the runtime stage so that the byte-code
+# caches never exist in ANY layer of the shipped image. Deleting them in the runtime stage
+# would hide them from `find` while leaving their bytes in the layer beneath; stripping them
+# here means the runtime stage copies an already-clean tree.
+#
+# Four sources, each named on purpose:
+#   app/          the service itself, entered at app.main:app
+#   migrations/   Alembic's script_location, so `alembic upgrade head` is available
+#   alembic.ini   Alembic's entry point: script_location=migrations, prepend_sys_path=.
+#   pyproject.toml  DELIBERATE, and the one inclusion that looks wrong at first glance. It is
+#                 mostly tool configuration - ruff, mypy, pytest, coverage - which the
+#                 container never reads. But backend/app/main.py resolves the service version
+#                 from `[project] version` in this exact file whenever the distribution is not
+#                 installed, and this image installs dependencies only, never the distribution
+#                 itself. Verified both ways inside the built image: with the file present the
+#                 served /openapi.json reports `info.version` 1.0.0, and with it masked the
+#                 resolution falls through to the `0+unknown` marker and the API advertises no
+#                 real version. One small tracked secret-free TOML file is a cheap price for
+#                 correct OpenAPI metadata.
+# ------------------------------------------------------------------------------------------
+COPY app /payload/app
+COPY migrations /payload/migrations
+COPY alembic.ini /payload/alembic.ini
+COPY pyproject.toml /payload/pyproject.toml
+
+# Strip the host's byte-code caches, then ASSERT the strip worked. The test is not decoration:
+# it converts "someone changed a COPY and a stale .pyc rode along" from a defect discovered in
+# production into a failed build.
+RUN find /payload -type d -name '__pycache__' -prune -exec rm -rf {} + \
+  && find /payload -type f -name '*.py[co]' -delete \
+  && test -z "$(find /payload -name '__pycache__' -o -name '*.py[co]')"
+
+
+# ------------------------------------------------------------------------------------------
+# Stage 2 - runtime: the image that ships
+# ------------------------------------------------------------------------------------------
+FROM python:3.14.7-slim
+
+# Factual metadata only. Deliberately no version label: the version lives in exactly one place
+# (pyproject.toml, read at run time) and a second copy here is a copy that drifts the first
+# time only one of the two is bumped.
+LABEL org.opencontainers.image.title="blog-api-backend" \
+  org.opencontainers.image.description="FastAPI service tier of the blog platform, persisted in PostgreSQL" \
+  org.opencontainers.image.base.name="docker.io/library/python:3.14.7-slim"
+
+# PYTHONUNBUFFERED is an observability requirement, not a preference: the service logs through
+# structlog to stdout, and without it those lines sit in a block buffer instead of reaching
+# `docker logs` when they happen - which is the whole point of structured logging. Bytecode
+# writing stays off because the code tree is intentionally read-only to the runtime user, so
+# every attempted write would be a silently swallowed failure.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONUNBUFFERED=1 \
+  PATH="/opt/venv/bin:$PATH"
+
+# Least privilege: a dedicated system account with fixed numeric IDs, no login shell, and no
+# password. Fixed IDs rather than whatever the next `useradd` happens to allocate, so a mounted
+# volume's ownership means the same thing on every host. --system keeps the account out of the
+# human UID range; the home directory exists and is owned by the account so that anything
+# expecting a resolvable HOME finds one, though nothing on the boot path needs to write there.
+RUN groupadd --system --gid 10001 blog \
+  && useradd --system --uid 10001 --gid blog --create-home --home-dir /home/blog \
+    --shell /usr/sbin/nologin blog
+
+# The dependency tree, and nothing else, from the builder. Left root-owned: the runtime user
+# reads and executes these packages but must never be able to modify them.
+COPY --from=builder /opt/venv /opt/venv
+
+# NOT /app. With `COPY app ./app` that would produce the baffling /app/app and invite a
+# "corrective" `COPY app .` that flattens the package and breaks the app.main:app module path
+# outright. /srv/backend is neutral and mirrors the source layout: app/, migrations/ and
+# alembic.ini sit side by side in one directory, which is the cwd, which is what lets both
+# `gunicorn app.main:app` and `alembic upgrade head` resolve with no PYTHONPATH and no --chdir.
+WORKDIR /srv/backend
+
+# Owner root, group blog, modes carried over from the tracked sources (644 files, 755
+# directories). Chowning to root rather than to `blog` is the point of the --chown, read for
+# intent rather than for the letter: the runtime user reads and traverses the code tree through
+# its group and cannot write to it, so a compromised request handler cannot rewrite the code
+# that serves the next one. Owning the tree with the account that executes it would hand exactly
+# that ability away for nothing.
+COPY --from=builder --chown=root:blog /payload ./
+
+# One port, used consistently by EXPOSE, by the health probe and by the bind address below, and
+# it is the port the rest of the project already assumes: `.env.example` points the frontend at
+# http://localhost:8000/api/v1. Operators remap it with `-p` or compose's `ports:` rather than
+# by rebuilding.
+EXPOSE 8000
+
+# Liveness, and `/healthz` rather than `/readyz` on purpose. `/healthz` answers 200 from the
+# process alone and touches no database; `/readyz` answers only when a trivial query succeeds.
+# A container health check drives restart policy, so pointing it at readiness would have an
+# orchestrator kill a perfectly healthy service every time PostgreSQL blinked. Readiness gating
+# - deciding whether to send traffic - is the orchestrator's call against `/readyz`.
+#
+# Probed with the interpreter because this base image ships NEITHER curl NOR wget (verified),
+# and a HEALTHCHECK that shells out to a binary that does not exist reports `unhealthy` forever
+# while the service is fine. urlopen raises on any non-2xx or on a connection failure, so the
+# explicit 200 comparison is the only case that exits 0. Exec form, so no shell is involved -
+# which also means no variable expansion, hence the literal port.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status == 200 else 1)"]
+
+# Everything above this line runs as root because it must - installing packages, creating an
+# account, writing into /srv. Nothing below it does.
+USER blog
+
+# Gunicorn supervising Uvicorn workers, exec form so gunicorn is PID 1 and receives Docker's
+# SIGTERM directly instead of through a shell that would swallow it.
+#
+# `app.main:app`, never `main:app`. README.md documents `uvicorn main:app --reload` and no
+# `main` module has ever existed - the plan classifies that as the repository's one
+# non-functional feature. The repository-root app.py shim is equally unusable here: it resolves
+# the backend package only when the process working directory is the repository root, which is
+# never true inside this image.
+#
+# WORKER CLASS - checked against the pinned uvicorn rather than assumed. Uvicorn split its
+# Gunicorn worker out into the separate `uvicorn-worker` distribution during the 0.30 series,
+# so the conventional spelling is not automatically correct any more. Probed on the pinned
+# uvicorn[standard]==0.52.1: `import uvicorn.workers` SUCCEEDS and exposes UvicornWorker, so the
+# classic path is used and no dependency is added. It does emit a DeprecationWarning naming
+# `uvicorn-worker` as the successor (invisible under Python's default warning filters). If a
+# future uvicorn bump removes the module, the fix is to add that distribution as an exact `==`
+# pin to requirements.txt AND to pyproject.toml's dependencies array, keeping the two in
+# parity, and switch to `uvicorn_worker.UvicornWorker` - not to abandon Gunicorn.
+#
+# Two workers, a literal rather than a count derived from the host: a container sees the host's
+# CPUs regardless of the quota it is actually allowed, so deriving from them over-subscribes.
+# Multiple workers are correct here only because the system of record moved into PostgreSQL -
+# the retired in-memory design gave each worker a private list and answered identical requests
+# differently. Tune without rebuilding via gunicorn's own GUNICORN_CMD_ARGS, or by overriding
+# `command:` in compose.
+#
+# --no-control-socket because gunicorn 26 otherwise opens a control socket under $HOME on every
+# boot. The `blog` account below does have a writable home, so the default would work as
+# shipped - but the moment anyone runs this image with `--user 65534:65534` or under a read-only
+# root filesystem, both routine hardening moves, it logs `Control server error: [Errno 13]
+# Permission denied` at ERROR for a service that is in fact perfectly healthy. That was observed
+# in a probe and removed by this flag, and a permanent false ERROR is an observability defect,
+# not a cosmetic one. Declining a control channel nothing here uses costs the deployment
+# nothing; an operator who wants it passes `--control-socket <writable path>` through
+# GUNICORN_CMD_ARGS.
+#
+# Both logs go to `-`, which gunicorn maps to stdout for access lines and stderr for error
+# lines, so the container log stream is the only place logs live - no files, no rotation, no
+# writable volume required.
+CMD ["gunicorn", "app.main:app", \
+  "--worker-class", "uvicorn.workers.UvicornWorker", \
+  "--workers", "2", \
+  "--bind", "0.0.0.0:8000", \
+  "--no-control-socket", \
+  "--access-logfile", "-", \
+  "--error-logfile", "-"]
