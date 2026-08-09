@@ -107,13 +107,21 @@
 /**
  * One window onto a larger collection, plus the counts needed to navigate it.
  *
- * Every collection endpoint returns this envelope and no other: the home feed
- * (`GET /api/v1/posts`), an author's published posts (`GET /api/v1/users/{username}/posts`), a
- * post's comment thread (`GET /api/v1/posts/{id}/comments`), the category taxonomy
- * (`GET /api/v1/categories`) and each administrative table
- * (`GET /api/v1/admin/{users,posts,comments}`). That uniformity is the reason one pagination
- * component can drive all of them, and it holds without exception - a collection small enough to
- * render in full is still a collection, and still arrives as a page.
+ * Every collection endpoint returns this envelope, with exactly one documented exception: the home
+ * feed (`GET /api/v1/posts`), an author's published posts (`GET /api/v1/users/{username}/posts`), a
+ * post's comment thread (`GET /api/v1/posts/{id}/comments`) and each administrative table
+ * (`GET /api/v1/admin/{users,posts,comments}`) all arrive as a page. That uniformity is the reason
+ * one pagination component can drive all of them.
+ *
+ * **The one exception is the category taxonomy, and it is specified rather than accidental.**
+ * `GET /api/v1/categories` returns a **bare JSON array** of {@link CategoryPublic} at the top level
+ * - the service declares that route's response model as a plain list, and `app.schemas.category`
+ * records it as "the single sanctioned exception to the envelope rule in this API". The taxonomy is
+ * administrator-curated and bounded, and a filter offering only some of its terms would silently
+ * hide every post filed exclusively under the rest, so the whole set is returned in one request.
+ * `@/lib/api/categories` therefore returns `CategoryPublic[]`; reading an `items` member off that
+ * answer yields `undefined` while type-checking cleanly, because the mismatch is with the wire shape
+ * rather than with any signature. See {@link CategoryPublic}.
  *
  * **Exactly five fields.** `has_next`, `has_prev`, `offset`, cursors and hypermedia links are all
  * absent and must stay absent: every one is computable from the five values here, and a sixth
@@ -636,17 +644,24 @@ export interface CategorySummary {
 }
 
 /**
- * A category in full: the item type of `GET /api/v1/categories` and the response of
- * `GET /api/v1/categories/{slug}`.
+ * A category in full: the element type of the bare array `GET /api/v1/categories` returns, and the
+ * response of `GET /api/v1/categories/{slug}`.
  *
- * `GET /api/v1/categories` is a collection, so it returns {@link Page}`<CategoryPublic>` like every
- * other collection on this API - the taxonomy arrives as `items` inside the page envelope, not as a
- * bare array. The set being small and bounded is a reason the filter control can request a single
- * generous `page_size` and render the whole of it; it is not a reason for a second collection shape.
- * One envelope everywhere is what lets `@/hooks/use-pagination` and `@/components/ui/pagination`
- * drive any list without knowing which one they are looking at, so an API wrapper for this route
- * reads `page.items`, and a wrapper that returned `CategoryPublic[]` would be parsing a page object
- * as an array.
+ * **`GET /api/v1/categories` answers with a bare JSON array of this type, NOT with a
+ * {@link Page}.** It is the single sanctioned exception to the envelope rule across the whole API,
+ * and it is specified rather than accidental: the service declares that route's response model as a
+ * plain list, and the router carries a comment recording why it must not be normalised. Three
+ * reasons, and they compound - the taxonomy is administrator-curated and bounded, so nothing a
+ * reader does grows it; the home page needs all of it before it can render the filter control; and a
+ * filter offering only some of the terms is not an incomplete filter but a wrong one, silently
+ * hiding every post filed exclusively under a term left out.
+ *
+ * So `@/lib/api/categories` returns `CategoryPublic[]`. Do not "normalise" that to an envelope and
+ * do not reach for an `items` member on the answer: there is none, the read yields `undefined`, the
+ * filter control renders no options, and nothing reports an error - the mismatch is with the wire
+ * shape rather than with either signature, so both sides still type-check. The envelope, and with it
+ * `@/hooks/use-pagination` and `@/components/ui/pagination`, governs the feed, profile posts, comment
+ * threads and the administrative tables; this one route sits outside it by design.
  *
  * Extends {@link CategorySummary}, so anything that renders a badge from the slim shape renders one
  * from this too.

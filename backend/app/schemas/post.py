@@ -636,7 +636,7 @@ class PostUpdate(BaseModel):
 
         changes = payload.model_dump(exclude_unset=True)  # {} for an empty body
 
-    That is what replaces the whole-object replacement the retired ``PUT /items/{item_id}``
+    That is what replaces the whole-object replacement the retired unversioned item ``PUT``
     performed: it assigned the submitted object over the stored one, so a client holding a stale
     copy silently reverted every field it had not refreshed. Here, fixing a typo in a title touches
     the title and nothing else - not the body, not the excerpt, and not the categories.

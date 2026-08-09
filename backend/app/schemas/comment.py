@@ -432,7 +432,7 @@ class CommentUpdate(BaseModel):
 
         changes = payload.model_dump(exclude_unset=True)  # {} for an empty body
 
-    That is what replaces the whole-object replacement the retired ``PUT /items/{item_id}``
+    That is what replaces the whole-object replacement the retired unversioned item ``PUT``
     performed (``app.py:L34-L40``), which required the client to resend every field it was not
     changing and overwrote the stored record with whatever arrived. An empty body ``{}`` is
     therefore a valid no-op: it validates, dumps to ``{}`` and changes nothing. There is no "at

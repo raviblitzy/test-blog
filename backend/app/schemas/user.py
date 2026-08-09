@@ -548,7 +548,7 @@ class UserUpdate(BaseModel):
 
         changes = payload.model_dump(exclude_unset=True)  # {} for an empty body
 
-    That is what replaces the whole-object replacement the retired ``PUT /items/{item_id}``
+    That is what replaces the whole-object replacement the retired unversioned item ``PUT``
     performed. That route required the client to resend every field it was not changing and
     overwrote the stored record with whatever arrived, so a client holding a stale copy silently
     reverted whatever it had not refreshed. Here, writing a bio touches ``bio`` and nothing else.

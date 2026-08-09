@@ -504,7 +504,7 @@ class CategoryUpdate(BaseModel):
 
         changes = payload.model_dump(exclude_unset=True)  # {} for an empty body
 
-    That is what replaces the whole-object replacement the retired ``PUT /items/{item_id}``
+    That is what replaces the whole-object replacement the retired unversioned item ``PUT``
     performed: it required the client to resend every field it was not changing, so a client
     holding a stale copy of the record silently reverted whatever it had not refreshed. Here,
     renaming a category touches ``name`` and nothing else.
