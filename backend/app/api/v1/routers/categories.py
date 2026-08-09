@@ -96,13 +96,14 @@ slug or a body of any kind - both routes are reads. *Blocking quality gates*: ``
 have to pass on it.
 """
 
-from typing import Final
+from typing import Annotated, Final
 
 from fastapi import APIRouter, status
 
 from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import DbSession
 from app.schemas import CategoryPublic
+from app.schemas.common import StorableText
 from app.services import CategoryService
 
 __all__ = ["router"]
@@ -164,7 +165,8 @@ _NOT_FOUND_RESPONSE: Final[ProblemResponses] = {
         "`/categories/python` resolve to the same row, and both answer 404 only if no such "
         "category exists. The document's `type` is `/errors/not-found`."
     ),
-    # Declared even though no value of `slug` can currently reach it. FastAPI documents a 422 on
+    # Declared for the one value of `slug` that reaches it - a NUL character, refused by
+    # `StorableText` - and for accuracy on every other. FastAPI documents a 422 on
     # every operation that parses a parameter whether or not one is named here, and the entry it
     # generates unprompted points at its own validation-error shape - a body this service never
     # returns, because `register_exception_handlers` renders a request-validation failure as the
@@ -172,11 +174,11 @@ _NOT_FOUND_RESPONSE: Final[ProblemResponses] = {
     # entry, which is what keeps the framework's shape out of the published components entirely.
     status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
         "The request line did not satisfy the contract. `type` is "
-        "`/errors/validation-error` and `errors` names the offending parameter. **No value of "
-        "`slug` reaches this today**: the segment is opaque text to this tier, so an "
-        "unrecognisable slug answers 404, which is the honest report that no category carries "
-        "it. The entry documents the shape a parameter rejection would take, which is the same "
-        "problem document every other failure in this API returns."
+        "`/errors/validation-error` and `errors` names the offending parameter. **One value of "
+        "`slug` reaches this**: a segment containing a NUL character, which `CITEXT` cannot "
+        "represent and so cannot be compared against a stored slug. Every other segment is "
+        "opaque text to this tier, so an unrecognisable slug answers 404, which is the honest "
+        "report that no category carries it."
     ),
     **_SERVER_ERROR_RESPONSE,
 }
@@ -184,8 +186,9 @@ _NOT_FOUND_RESPONSE: Final[ProblemResponses] = {
 the server-side backstop every route shares.
 
 Spread from :data:`_SERVER_ERROR_RESPONSE` rather than restated, so the 500 entry has one
-wording for both routes and cannot drift into two descriptions of one behaviour. No ``422``: the
-slug is opaque text, so there is no shape for the framework to reject."""
+wording for both routes and cannot drift into two descriptions of one behaviour. The ``422`` is
+declared rather than assumed away: the slug is opaque text apart from one rule - it may not carry
+a character the column cannot store."""
 
 
 # ---------------------------------------------------------------------------------------
@@ -281,7 +284,7 @@ async def list_categories(db: DbSession) -> list[CategoryPublic]:
         "unknown slug answers `404` with a problem document."
     ),
 )
-async def get_category(slug: str, db: DbSession) -> CategoryPublic:
+async def get_category(slug: Annotated[str, StorableText], db: DbSession) -> CategoryPublic:
     """Resolve one category by its slug, or answer 404.
 
     ``slug`` is passed through **unchanged**. ``categories.slug`` is ``CITEXT``, so PostgreSQL
@@ -305,9 +308,10 @@ async def get_category(slug: str, db: DbSession) -> CategoryPublic:
     wrong layer.
 
     Args:
-        slug: The URL segment to resolve, in whatever case it arrived. Typed ``str`` because a
-            slug is opaque text to this tier; its shape was settled when it was derived at
-            creation.
+        slug: The URL segment to resolve, in whatever case it arrived. Opaque text to this
+            tier apart from :data:`~app.schemas.common.StorableText`, which refuses a NUL
+            character before the service is reached because ``CITEXT`` cannot represent one;
+            everything else about its shape was settled when it was derived at creation.
         db: The request-scoped session, handed straight to the service.
 
     Returns:

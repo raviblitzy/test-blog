@@ -70,11 +70,20 @@ load-bearing. Not ``app.models``, not ``app.core.config``, not the environment: 
 module performs no I/O, reaches no database and reads no setting, which is what lets a test
 import it with nothing running.
 
-Three names are exported beyond the two models, and the direction of each dependency is worth
-noting: the five partial-update schemas import :func:`omit_null_default` *from here*, and the two
-routers with a search parameter import :data:`SearchTerm` and
-:data:`MAX_SEARCH_TERM_LENGTH` *from here*. So this module gains no import of its own by being
-the place each shared rule is declared.
+Names are exported beyond the two models, and the direction of each dependency is worth
+noting: the five partial-update schemas import :func:`omit_null_default` *from here*, the two
+routers with a search parameter import :data:`SearchTerm` and :data:`MAX_SEARCH_TERM_LENGTH`
+*from here*, and every module declaring a stored-text member or an identifier parameter imports
+:data:`StorableText` or :data:`OptionalStorableText` *from here*. So this module gains no import
+of its own by being the place each shared rule is declared.
+
+One rule about the *characters* a value may carry lives here for that reason
+---------------------------------------------------------------------------
+:data:`StorableText` refuses ``U+0000``, the one character PostgreSQL's ``text`` and ``citext``
+cannot represent. It is declared once, beside the problem document it produces, because the
+alternative is the same three lines repeated in five schema modules and four routers - and a
+copy that one of them forgot is exactly how an unstorable value reached the driver and became a
+``500`` instead of a ``422``.
 """
 
 from typing import Annotated, Any, Final
@@ -90,7 +99,15 @@ from app.core.pagination import Page
 # `from app.schemas.common import Page`. A per-line lint suppression would have silenced only
 # the first of those, so this list is functional rather than decorative - keep it exactly in
 # step with what the module defines.
-__all__ = ["Page", "ProblemDetail", "ValidationErrorItem", "omit_null_default"]
+__all__ = [
+    "NUL_CHARACTER",
+    "OptionalStorableText",
+    "Page",
+    "ProblemDetail",
+    "StorableText",
+    "ValidationErrorItem",
+    "omit_null_default",
+]
 
 
 def omit_null_default(json_schema: dict[str, Any]) -> None:
@@ -132,10 +149,112 @@ def omit_null_default(json_schema: dict[str, Any]) -> None:
     json_schema.pop("default", None)
 
 
+NUL_CHARACTER: Final[str] = "\x00"
+"""The one character no text this API accepts may contain: ``U+0000``.
+
+Not a policy choice - a property of the storage engine. PostgreSQL's ``text`` and ``citext``
+cannot represent a NUL byte at all, so psycopg refuses to bind one and raises
+``psycopg.DataError`` before the statement is sent. A value carrying it therefore cannot be
+stored, cannot be compared against a stored value, and cannot name a row - which makes it
+invalid at the boundary rather than merely unlucky at the data layer.
+
+Every other control character is deliberately **not** listed here. A tab or a newline is
+storable and meaningful in a Markdown body, and rejecting the set "control characters" would
+refuse legitimate content in order to look thorough. This is the exact character that cannot
+work.
+"""
+
+_DETAIL_NUL_CHARACTER: Final[str] = (
+    "must not contain a NUL character (U+0000), which cannot be stored"
+)
+"""Message reported when a submitted value carries :data:`NUL_CHARACTER`.
+
+Phrased to complete a sentence about the field pydantic names, so the rendered entry reads as
+advice rather than as a diagnosis. It quotes nothing the caller submitted, matching the rule
+``app.core.exceptions`` holds every ``errors`` entry to.
+"""
+
+
+def _reject_nul_characters(value: str) -> str:
+    """Refuse a string carrying ``U+0000``, so the request fails at the boundary.
+
+    The first half of this service's answer to a NUL byte, and the half that produces the
+    *useful* answer: raising here makes the request a ``422`` whose ``errors`` entry names the
+    field pydantic was validating, so a form can attach the message to the control that produced
+    it. Reaching the data layer instead produced a ``500``, because the driver's refusal is a
+    ``DataError`` with no field attached and nothing a client could act on - and on four public
+    reads that made an unauthenticated caller able to manufacture server errors at will.
+
+    The second half is the ``DataError`` handler in ``app.core.exceptions``, which renders that
+    class of failure as a ``400`` however it arises. Neither replaces the other: this validator
+    covers what it is attached to and names the field; that handler covers everything and names
+    nothing.
+
+    Args:
+        value: The submitted string, already length-bounded and trimmed by whichever
+            ``StringConstraints`` precedes this validator.
+
+    Returns:
+        ``value`` unchanged. The check is a rejection, never a repair: silently stripping the
+        character would store a value the caller did not send, under a name they chose while
+        sending something else.
+
+    Raises:
+        ValueError: If the value contains :data:`NUL_CHARACTER`. Pydantic renders it as a
+            field-level entry in the ``422`` problem document.
+    """
+    if NUL_CHARACTER in value:
+        raise ValueError(_DETAIL_NUL_CHARACTER)
+    return value
+
+
+def _reject_nul_characters_optional(value: str | None) -> str | None:
+    """Apply :func:`_reject_nul_characters` to a value that may legitimately be absent.
+
+    Needed because ``None`` reaches an ``AfterValidator`` on a nullable annotation, and an
+    optional query parameter is absent far more often than it is present. Declared as a separate
+    function rather than a widened signature so that each of the two exported annotations carries
+    the type its own contract states, and neither has to advertise ``None`` where ``None`` is not
+    representable.
+
+    Args:
+        value: The submitted string, or ``None`` when the member or parameter was omitted.
+
+    Returns:
+        ``value`` unchanged, including ``None``.
+
+    Raises:
+        ValueError: If a present value contains :data:`NUL_CHARACTER`.
+    """
+    return value if value is None else _reject_nul_characters(value)
+
+
+StorableText: Final[AfterValidator] = AfterValidator(_reject_nul_characters)
+"""Metadata rejecting an unstorable character, for a required string.
+
+Composed into an annotation **after** its length rules, so a value that is both over-long and
+unstorable is reported by length - the failure a caller is most likely to have caused and most
+able to fix::
+
+    PostTitle = Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=120),
+        StorableText,
+    ]
+
+Attached to every member that reaches a ``text`` or ``citext`` column, and to every path and
+query parameter compared against one. It changes nothing in the generated schema - an
+``AfterValidator`` carries no JSON-schema keyword - so the published contract is unchanged and
+the behaviour is a ``422`` where a ``500`` used to be.
+"""
+
+OptionalStorableText: Final[AfterValidator] = AfterValidator(_reject_nul_characters_optional)
+"""The same rule for a string that may be ``None``: an optional member or query parameter."""
+
 MAX_SEARCH_TERM_LENGTH: Final[int] = 256
 """Longest free-text search term any listing in this service accepts.
 
-Every ``?q=`` parameter in the API is bounded by this one number - the public feed and the three
+Every ``?q=`` parameter in the API is bounded by this one number - the public feed and the four
 administrative listings - so a term that one surface refuses cannot be accepted by another.
 
 The bound exists because an unbounded term is not merely untidy. It is parsed by PostgreSQL's
@@ -186,6 +305,7 @@ def _normalise_search_term(value: str | None) -> str | None:
 SearchTerm = Annotated[
     str | None,
     StringConstraints(max_length=MAX_SEARCH_TERM_LENGTH),
+    OptionalStorableText,
     AfterValidator(_normalise_search_term),
 ]
 """The ``?q=`` query parameter, bounded and normalised, for every listing that accepts one.
@@ -195,13 +315,18 @@ description::
 
     q: Annotated[SearchTerm, Query(description="Free-text search term ...")] = None
 
-**The order of the two metadata entries is load-bearing.** The constraint is applied before the
-validator, so an over-long term is refused as a ``422`` naming ``q`` while it is still the string
+**The order of the three metadata entries is load-bearing.** The constraint is applied before the
+validators, so an over-long term is refused as a ``422`` naming ``q`` while it is still the string
 the caller sent - the length a client is told about is the length it submitted. Reversing them
-makes the framework apply ``max_length`` to the validator's *result*, which raises a
+makes the framework apply ``max_length`` to a validator's *result*, which raises a
 ``TypeError`` on a blank term the moment it normalises to ``None``. Verified by execution: in
 this order an absent, blank, padded, at-bound and over-bound term answer ``None``, ``None``, the
 collapsed term, the term, and ``422`` respectively.
+
+:data:`OptionalStorableText` sits between them, so an unstorable term is refused *before* it is
+normalised and the message a client receives is about the term it typed. It also has to run
+ahead of the normaliser for a mechanical reason: a NUL is not whitespace, so collapsing would
+carry it through untouched and into the query parser.
 
 Composing it with a route's ``Query(...)`` is safe because nested ``Annotated`` flattens
 left-to-right, which keeps the constraint ahead of the validator however the route annotates it.
@@ -264,8 +389,14 @@ class ValidationErrorItem(BaseModel):
             "that produced it. Pydantic's leading request-part marker is dropped whenever a "
             "field follows it, so ('body', 'email') reports as `email`, and integer indices "
             "are rendered decimally, so ('body', 'categories', 0, 'slug') reports as "
-            "`categories.0.slug`. Empty only when the location names no field at all, which "
-            "happens when a whole body is missing or could not be parsed."
+            "`categories.0.slug`. The internal case label pydantic inserts for a union member "
+            "is dropped too, so an optional member reports as `display_name` rather than as "
+            "`display_name.constrained-str`, and a bad element of an optional list reports as "
+            "`category_ids.0` - no framework or validator identifier ever appears here. When "
+            "the failure is the request itself rather than one of its members - a body that is "
+            "absent, or JSON that could not be parsed - there is no control to name, and this "
+            "carries what the validator located instead: the request part (`body`) or the "
+            "character offset the parser stopped at."
         ),
     )
     message: str = Field(

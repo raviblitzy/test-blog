@@ -60,6 +60,25 @@ One thing that must never be registered: slowapi ships a ready-made handler for 
 exception, and using it would emit slowapi's own response body, making the 429 the single
 error in the API that does not match the documented shape.
 
+What a limit is counted against
+-------------------------------
+The caller's address, taken from the transport - never from a header the caller sent. That
+distinction is load-bearing rather than pedantic, because Uvicorn rewrites the address the
+application sees: with ``proxy_headers`` on, which is its default, a peer inside
+``forwarded_allow_ips`` (default ``127.0.0.1``) has ``scope["client"]`` replaced by whatever
+its ``X-Forwarded-For`` header says. A limiter keyed on that value is a limiter the caller can
+reset, and it was: six sign-in attempts under a ``2/minute`` limit answered
+``401 401 429 429 429 429`` from one machine, and answered ``401`` six times when each
+carried a different forwarded address.
+
+:func:`_client_key` closes that from inside the application, so the guarantee does not depend
+on how the process was launched. A request carrying any forwarded-client header is counted
+against one fixed :data:`UNTRUSTED_CLIENT_KEY` bucket - rotating the header now spends a
+shared budget instead of resetting a private one - and a request making no such claim is
+counted against its transport address exactly as before. ``app.core.logging`` owns the
+predicate both this module and ``app.middleware.request_context`` apply, so the address this
+service *enforces* on and the address it *logs* are decided by one rule.
+
 Storage, and an honest limitation
 ---------------------------------
 Counters live in process memory. There is no Redis or Memcached backing store, because
@@ -94,10 +113,12 @@ from typing import Any, Final, Protocol
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from starlette.requests import Request
 
 from app.core.config import settings
+from app.core.logging import client_claim_is_forwarded
 
-__all__ = ["auth_rate_limit", "limiter"]
+__all__ = ["UNTRUSTED_CLIENT_KEY", "auth_rate_limit", "limiter"]
 
 
 _STORAGE_URI: Final = "memory://"
@@ -114,10 +135,72 @@ this file should ever be holding.
 """
 
 
+UNTRUSTED_CLIENT_KEY: Final[str] = "untrusted-forwarded-client"
+"""The single counter every request that volunteers a forwarded header is counted against.
+
+A fixed string, deliberately not derived from anything the caller sends, which is the whole
+property being bought: a bucket nobody can rotate out of. It is not an address and cannot
+collide with one, so it can never share a counter with a genuine peer.
+
+See :func:`_client_key` for why one shared bucket is the right answer here and what it costs.
+"""
+
+
+def _client_key(request: Request) -> str:
+    """Identify the caller a limit is counted against, ignoring anything the caller claims.
+
+    The default identity slowapi offers - and what this limiter used until it was measured -
+    is ``get_remote_address``, which reads ``request.client.host``. That value is not
+    reliably the socket peer. Uvicorn runs its ``ProxyHeadersMiddleware`` outside the
+    application by default, and for a peer inside ``forwarded_allow_ips`` (default
+    ``127.0.0.1``) it replaces ``scope["client"]`` with the address taken from
+    ``X-Forwarded-For``. Measured against this service before the change, with the limit set
+    to two per minute: six sign-in attempts from one machine answered
+    ``401 401 429 429 429 429``, and the same six attempts each carrying a *different*
+    ``X-Forwarded-For`` answered ``401`` six times over. The limit had not been raised - it
+    had been reset per request, by a header the attacker chose.
+
+    So this function asks the only question that can be answered from inside the application:
+    did the caller volunteer a claim about its own address? If it did, the reported address is
+    unusable as an identity and every such request is counted against the one fixed
+    :data:`UNTRUSTED_CLIENT_KEY` counter instead. The consequence is that rotating the header
+    no longer buys attempts - it now costs them from a shared budget - so the control holds
+    without depending on how the server happens to be launched, which is what makes it
+    reviewable. If it did not, the address is the transport's own and is used exactly as
+    before, through ``get_remote_address`` rather than a second reimplementation of it.
+
+    The cost is stated rather than hidden: callers that legitimately send one of these
+    headers would share a counter. No legitimate caller of this service does. The browser
+    tier calls the API directly, the container topology places a non-loopback peer in front
+    of it - so uvicorn ignores the header anyway there - and nothing in this project puts a
+    reverse proxy in the path. A deployment that introduces one must pin the server's trust
+    explicitly (``--forwarded-allow-ips`` with the proxy's address, or ``--no-proxy-headers``)
+    and revisit this function together with ``app.middleware.request_context``, which applies
+    the same rule to the address it logs. ``.env.example`` records that requirement beside
+    ``AUTH_RATE_LIMIT``.
+
+    Args:
+        request: The request being counted. slowapi passes the object it located the limiter
+            through, so this runs once per call to a decorated route.
+
+    Returns:
+        The transport's peer address for an unclaimed request - ``get_remote_address``'s own
+        ``"127.0.0.1"`` fallback still applies when the transport reports no peer, as it does
+        under the in-process ASGI transport the integration suite uses - or
+        :data:`UNTRUSTED_CLIENT_KEY` when the caller supplied a forwarded header.
+    """
+    if client_claim_is_forwarded(request.scope.get("headers", ())):
+        return UNTRUSTED_CLIENT_KEY
+    return get_remote_address(request)
+
+
 limiter: Final[Limiter] = Limiter(
-    # The client identity a limit is counted against. get_remote_address reads
-    # request.client.host and falls back to "127.0.0.1" when the transport reports no peer.
-    key_func=get_remote_address,
+    # The client identity a limit is counted against, and NOT slowapi's `get_remote_address`
+    # on its own: that reads request.client.host, which uvicorn rewrites from a caller's
+    # X-Forwarded-For for a loopback peer, so the limit could be reset per request by a header
+    # the caller chose. `_client_key` still uses it for an unclaimed request and buckets a
+    # claimed one under a fixed counter - see its docstring for the measurement.
+    key_func=_client_key,
     storage_uri=_STORAGE_URI,
     # Disabled for the test suite, and only for it.
     #

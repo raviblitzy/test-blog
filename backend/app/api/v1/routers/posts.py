@@ -140,7 +140,12 @@ from fastapi import APIRouter, Query, status
 from app.api.v1.responses import OPTIONAL_AUTHENTICATION, ProblemResponses, problem_response
 from app.core.dependencies import AuthorUser, DbSession, OptionalUser, PageParamsDep
 from app.schemas import Page, PostCreate, PostDetail, PostSortOption, PostSummary, PostUpdate
-from app.schemas.common import MAX_SEARCH_TERM_LENGTH, SearchTerm
+from app.schemas.common import (
+    MAX_SEARCH_TERM_LENGTH,
+    OptionalStorableText,
+    SearchTerm,
+    StorableText,
+)
 from app.services import PostService
 
 __all__ = ["router"]
@@ -456,9 +461,12 @@ async def list_posts(
                 "Category **slug** to filter by - the URL-safe identifier from "
                 "`GET /api/v1/categories`, not the display name and not the UUID. Matched "
                 "case-insensitively. A slug that matches no posts answers an empty page "
-                "rather than an error."
+                "rather than an error; one carrying a NUL character is refused as `422`, "
+                "because `citext` cannot represent that character and so cannot compare it "
+                "against a stored slug at all."
             ),
         ),
+        OptionalStorableText,
     ] = None,
     author: Annotated[
         str | None,
@@ -466,9 +474,12 @@ async def list_posts(
             description=(
                 "Author **username** to filter by, matched case-insensitively. A username "
                 "that names no account answers 404, so a mistyped filter is distinguishable "
-                "from an author who has published nothing."
+                "from an author who has published nothing; one carrying a NUL character is "
+                "refused as `422` instead, since `citext` cannot represent that character "
+                "and the comparison could not be performed."
             ),
         ),
+        OptionalStorableText,
     ] = None,
     sort: Annotated[
         PostSortOption | None,
@@ -559,7 +570,7 @@ async def list_posts(
 async def get_post(
     db: DbSession,
     viewer: OptionalUser,
-    slug: str,
+    slug: Annotated[str, StorableText],
 ) -> PostDetail:
     """Resolve one post by slug for ``GET /api/v1/posts/{slug}``.
 
@@ -572,7 +583,10 @@ async def get_post(
             column under a unique index, so the case-insensitive comparison happens in the
             database on an indexed predicate. Folding the case in Python would duplicate a
             rule the schema already owns and would silently diverge from it the moment the
-            column's collation changed.
+            column's collation changed. The one value refused before the service is reached is
+            a slug carrying a NUL character: ``citext`` cannot represent it, so it names no
+            post and cannot be compared against one - see
+            :data:`~app.schemas.common.StorableText`.
 
     Returns:
         The post projected into :class:`~app.schemas.post.PostDetail` - the bare

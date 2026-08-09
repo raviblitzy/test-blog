@@ -116,7 +116,7 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema
 
-from app.schemas.common import omit_null_default
+from app.schemas.common import StorableText, omit_null_default
 
 # The module's public contract is these four models and nothing else. The two length constants
 # and the three annotated aliases below are shared machinery, importable by a test or by a
@@ -194,6 +194,7 @@ CategoryName = Annotated[
         min_length=1,
         max_length=NAME_MAX_LENGTH,
     ),
+    StorableText,
 ]
 """A validated category name, as both input models accept it.
 
@@ -212,6 +213,7 @@ CategoryDescription = Annotated[
         min_length=1,
         max_length=DESCRIPTION_MAX_LENGTH,
     ),
+    StorableText,
 ]
 """A validated, non-empty category description."""
 
@@ -483,7 +485,9 @@ class CategoryCreate(BaseModel):
             "Display label for the category, 1 to "
             f"{NAME_MAX_LENGTH} characters after surrounding whitespace is trimmed. Must be "
             "unique across the taxonomy; a duplicate is rejected with 409. The URL slug is "
-            "derived from this value by the server and cannot be supplied."
+            "derived from this value by the server and cannot be supplied - and when that "
+            "derivation collides with an existing slug it is given a deterministic ascending "
+            "suffix rather than refusing the name, so read `slug` back from the response."
         ),
     )
     description: OptionalCategoryDescription = Field(

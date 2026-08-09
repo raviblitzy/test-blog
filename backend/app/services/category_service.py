@@ -518,7 +518,9 @@ class CategoryService:
 
         Raises:
             ConflictError: If the name is already taken, or if the insert violates either unique
-                constraint. Both spellings of the same outcome, deliberately - see the note.
+                constraint. Both spellings of the same outcome, deliberately - see the note. A
+                merely colliding *slug* is **not** among them: it is suffixed, per the note below,
+                and the request succeeds.
 
         Note:
             **Slug derivation is three steps, and splitting them is what keeps each testable.**
@@ -530,6 +532,17 @@ class CategoryService:
             same data yields the same slug. Nothing here consults the clock or a random source,
             and no digest or identifier fragment is spliced into a slug: an address a reader
             sees should read like the name it came from.
+
+            **A colliding slug is suffixed, not refused, and the route's published contract says
+            so.** The two are easy to conflate because both concern uniqueness, but only the name
+            is a conflict: ``uq_categories_name`` compares names, and two distinct names that
+            normalise to one slug - ``Machine Learning`` and ``machine learning`` - are both
+            legitimate labels that deserve distinct addresses rather than one being rejected on
+            the other's behalf. Do not "tighten" this into a 409: the derived slug is an address
+            this service assigns, and refusing a name because an address was taken would make the
+            taxonomy's vocabulary a function of its URL history. The consequence for a client is
+            stated in ``app.api.v1.routers.admin``: read ``slug`` from the response rather than
+            deriving it from the name that was sent.
 
             **The pre-check and the constraint are both needed, and neither replaces the
             other.** The ``get_by_name`` lookup exists so that the ordinary collision - an

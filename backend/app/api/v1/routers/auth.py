@@ -99,6 +99,28 @@ The 429 is rendered by the same code that renders every other failure.
 slowapi's own ready-made handler must never be registered: it would make the throttled response
 the single error in this API with a body of its own shape.
 
+What a rejected credential does NOT consume
+-------------------------------------------
+Dependencies resolve before the decorated body runs, and that ordering decides which failures
+the limiter ever sees. slowapi wraps the endpoint function; FastAPI resolves a route's
+dependencies and validates its request body *first*, and only then calls what it was handed. So
+on :func:`read_me` an absent, malformed, expired or wrong-type bearer token is rejected by
+``CurrentUser`` and answers 401 without reaching the counter - measured: five rapid
+unauthenticated calls under a ``2/second`` limit returned ``401`` five times, while the same
+five with a **valid** token returned ``200, 200, 429, 429, 429``. The same ordering means a
+request body that fails schema validation answers 422 without being counted either, on
+``/register`` and ``/login`` alike.
+
+That is stated here rather than left to be rediscovered, because it looks like a gap and is
+not one. Nothing guessable sits behind those rejections: an HS256 signature is not
+brute-forceable by repetition, ``app.core.dependencies`` performs no database work for a
+credential that fails to decode, and the response is the same 401 problem document either way,
+so repetition buys an attacker no information. What the limit exists to bound is *credential
+guessing*, and that happens on ``/login``, where the body IS reached and IS counted. Making the
+rejections countable would need the limit moved onto a dependency or a middleware, which would
+throttle a client whose token merely expired mid-session - a worse outcome than the one being
+prevented.
+
 One consequence of ``app.core.rate_limit`` disabling the limiter when ``ENVIRONMENT`` is
 ``test`` is worth knowing here. The integration suite drives register, sign in, rotate, sign out
 and revoked-token refusal repeatedly from one client address, which under a live limit would
@@ -660,6 +682,11 @@ async def read_me(
     No session parameter is declared, and that is not an oversight - ``CurrentUser`` resolves
     one internally for the lookup it performs. Declaring another here would advertise a
     datastore this handler never touches.
+
+    Because that dependency resolves *before* this function is called, the rate limit applies
+    only to calls that get past it: a rejected credential answers 401 and is never counted,
+    while a valid one is. See "What a rejected credential does NOT consume" in the module
+    docstring for the measurement and for why that is the right place for the boundary.
 
     Args:
         request: The incoming request, required by the rate limiter and otherwise unused.

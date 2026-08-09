@@ -140,7 +140,7 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 
 from app.models import UserRole
-from app.schemas.common import omit_null_default
+from app.schemas.common import StorableText, omit_null_default
 
 # The module's public contract is these three models, and the ordering is the one RUF022
 # enforces. The bounds and annotated aliases below are shared machinery - importable by a test
@@ -240,6 +240,7 @@ DisplayName = Annotated[
         min_length=DISPLAY_NAME_MIN_LENGTH,
         max_length=DISPLAY_NAME_MAX_LENGTH,
     ),
+    StorableText,
 ]
 """A validated display name, as :class:`UserUpdate` accepts it.
 
@@ -260,8 +261,9 @@ Bio = Annotated[
         min_length=1,
         max_length=BIO_MAX_LENGTH,
     ),
+    StorableText,
 ]
-"""A validated, non-empty biography."""
+"""A validated, non-empty biography, free of the one character the column cannot hold."""
 
 OptionalBio = Annotated[Bio | None, BeforeValidator(_blank_to_none)]
 """A biography that may legitimately be absent.

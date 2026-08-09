@@ -209,7 +209,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from app.models import PostStatus
 from app.schemas.category import CategorySummary
-from app.schemas.common import omit_null_default
+from app.schemas.common import StorableText, omit_null_default
 from app.schemas.user import UserPublic
 
 # The module's public contract is the four models plus `PostSortOption`, in the order RUF022
@@ -425,12 +425,16 @@ PostTitle = Annotated[
         min_length=TITLE_MIN_LENGTH,
         max_length=TITLE_MAX_LENGTH,
     ),
+    StorableText,
 ]
 """A validated post title, as both input models accept it.
 
 Declared once and referenced by :class:`PostCreate` and :class:`PostUpdate` so the two cannot
 drift: a bound tightened for a create and forgotten for a patch would let a value in through the
 second route that the first refuses.
+
+:data:`~app.schemas.common.StorableText` refuses a NUL character, which ``posts.title`` cannot
+hold - and which the slug derived from this value cannot either.
 """
 
 PostExcerpt = Annotated[
@@ -443,8 +447,9 @@ PostExcerpt = Annotated[
         min_length=1,
         max_length=EXCERPT_MAX_LENGTH,
     ),
+    StorableText,
 ]
-"""A validated, non-empty excerpt."""
+"""A validated, non-empty excerpt, free of the one character the column cannot hold."""
 
 OptionalPostExcerpt = Annotated[PostExcerpt | None, BeforeValidator(_blank_to_none)]
 """An excerpt that may legitimately be absent.
@@ -458,6 +463,7 @@ the wrapped type.
 PostContent = Annotated[
     str,
     StringConstraints(min_length=1, max_length=CONTENT_MAX_LENGTH),
+    StorableText,
     AfterValidator(_require_content),
 ]
 """A validated post body, as authored Markdown.

@@ -135,8 +135,58 @@ characters of one would silently read the wrong calendar day either side of midn
 
 Pinning it here also means no other layer has to normalise: no response serialiser
 converting on the way out, no ``astimezone`` in a schema validator, and no per-connection
-event listener - one connect argument, applied before the first statement, and the values
-are already UTC by the time anything reads them.
+event listener - one entry of :data:`CONNECT_ARGS`, applied before the first statement, and
+the values are already UTC by the time anything reads them.
+
+Reaching the database is bounded in time
+----------------------------------------
+Getting a connection can fail in two shapes, and only one of them is self-announcing. A *refused*
+connection - the server process gone, nothing listening - comes back immediately, so
+``/readyz`` answers 503 in about two milliseconds and the pool slot is free again at once.
+A *hung* server is the other shape: something accepts the TCP connection and then never
+completes the startup handshake, which is what a blocked network path, a saturated
+connection backlog or a wedged host looks like from here. Nothing about that state arrives
+as an error, so the only thing that ends the attempt is a timeout - and if no timeout is
+configured, the one that applies is libpq's own default of **130 seconds**, which psycopg
+carries as ``psycopg.conninfo._DEFAULT_CONNECT_TIMEOUT``.
+
+Measured against a listener that accepted connections and never answered, with no bound
+configured: ``/readyz`` returned the correct 503 problem document after **130.0 seconds**,
+and for the whole of that time all five connections this worker may hold
+(:data:`WORKER_CONNECTION_CEILING`) were consumed by stuck connect attempts, so every
+database-backed route queued behind them and then failed on SQLAlchemy's default 30-second
+checkout wait. A readiness probe that takes over two minutes to say "not ready" is not a
+probe: an orchestrator has long since given up, and a *hung* database has been converted
+into hung user requests instead of fast failures.
+
+:data:`CONNECT_TIMEOUT_SECONDS` and :data:`POOL_TIMEOUT_SECONDS` are therefore both set
+explicitly, and both are availability requirements rather than tuning knobs. Together they
+bound what any caller can observe at roughly ten seconds - one wait for a slot plus one
+connection attempt - so ``/readyz`` fails fast enough to be actionable and a slot is
+returned to the pool about twenty-six times sooner than before. ``/healthz`` is unaffected
+either way, because it touches no database at all; that separation is the whole reason the
+two probes exist.
+
+Measured after the change, against the same listener: a single ``/readyz`` on a fresh pool
+answered 503 in **5.01 seconds**, and a burst of six ``/readyz`` plus four feed requests -
+ten callers against five slots - cleared in **5.03 seconds** in total, every one of them
+answered, while ``/healthz`` kept replying in under a millisecond throughout. The *refused*
+path is unchanged at **1.3 to 2.3 milliseconds**, which is the property worth checking after
+any change here: a connect timeout must not turn a fast refusal into a full wait, and it
+does not, because a refused socket reports itself immediately and the deadline is only ever
+reached by a peer that stays silent.
+
+What these two values do **not** bound, stated so that the section title is not read wider
+than it is: a server that accepts a connection, answers normally, and only then goes silent
+*mid-session*. That is a statement stalling rather than a connection failing, and neither a
+connect timeout nor a checkout timeout applies to it. :data:`POOL_PRE_PING` covers the
+common form of it - a connection the server has actually closed is detected on checkout and
+replaced - but a silent network partition holding the socket open is bounded only by TCP
+keepalive or by a server-side statement timeout. No statement timeout is configured here on
+purpose: it would apply to every query this service runs, including the seeder's bulk
+inserts, and choosing one number for all of them is a decision this module has no basis to
+make. If that mode ever needs bounding, it belongs in ``CONNECT_ARGS`` as a documented
+libpq ``keepalives`` group or in the specific call that needs it, not as a blanket ceiling.
 
 Isolation level: PostgreSQL's default, and what that means for a reader
 ----------------------------------------------------------------------
@@ -228,6 +278,7 @@ from app.core.config import settings
 __all__ = [
     "ASSUMED_MAX_CONNECTIONS",
     "CONNECT_ARGS",
+    "CONNECT_TIMEOUT_SECONDS",
     "MAX_OVERFLOW",
     "MAX_REPLICAS",
     "MAX_WORKERS_PER_REPLICA",
@@ -235,6 +286,7 @@ __all__ = [
     "POOL_PRE_PING",
     "POOL_RECYCLE_SECONDS",
     "POOL_SIZE",
+    "POOL_TIMEOUT_SECONDS",
     "REQUIRED_MAX_CONNECTIONS",
     "RESERVED_CONNECTIONS",
     "SESSION_TIME_ZONE",
@@ -429,12 +481,50 @@ Part of the wire contract, not a preference - see "Every connection speaks UTC" 
 module docstring for the measurement and for what breaks without it.
 """
 
+CONNECT_TIMEOUT_SECONDS: Final[int] = 5
+"""How long one attempt to establish a connection may take before it is abandoned.
+
+An availability bound rather than tuning - see "Every failure mode is bounded in time" in
+the module docstring for the measurement this value comes from. Left unset, psycopg falls
+back to libpq's own default of 130 seconds
+(``psycopg.conninfo._DEFAULT_CONNECT_TIMEOUT``), which is what a *hung* server - one that
+completes the TCP handshake and then never answers - costs every attempt. Five seconds is
+comfortably above psycopg's two-second floor (values below it are raised to two), far above
+the sub-millisecond connect a healthy local database needs and the low milliseconds a
+same-network one needs, and low enough that ``/readyz`` answers inside any orchestrator's
+probe timeout.
+"""
+
+POOL_TIMEOUT_SECONDS: Final[float] = 5.0
+"""How long a caller may wait for a pooled connection before the checkout fails.
+
+The second half of the same bound. :data:`CONNECT_TIMEOUT_SECONDS` limits one connection
+attempt; this limits the wait for a *slot* in which to make one, which is the delay a
+caller sees once all :data:`WORKER_CONNECTION_CEILING` connections are already committed.
+SQLAlchemy's default is 30 seconds, so an outage that occupies every slot would queue
+callers for half a minute on top of whatever the attempt itself costs.
+
+Five seconds keeps the worst case a caller can observe at roughly ten - one full wait for a
+slot plus one full connection attempt - and that arithmetic is the reason both values are
+equal. It is also the right shape for this service rather than a compromise: a request here
+holds its connection for one short unit of work (the feed is two statements plus two
+batched loaders, every mutation is one transaction that commits and ends), so a caller that
+has been waiting five seconds for a slot is not queued behind normal traffic. Failing it
+fast applies back-pressure and frees the caller; queueing it for thirty seconds converts a
+database problem into a pile of stalled requests.
+"""
+
 CONNECT_ARGS: Final[dict[str, str]] = {
     # A libpq `options` string, passed through by psycopg to the server at connection time,
     # so the setting is established before the first statement and costs no extra round
     # trip. `-c timezone=UTC` is the same thing as `SET TIME ZONE 'UTC'` without needing a
     # statement, an event listener or a checkout hook to issue it.
     "options": f"-c timezone={SESSION_TIME_ZONE}",
+    # A libpq connection parameter, spelled as a string because that is how libpq receives
+    # every keyword; psycopg parses it back to an integer itself. Not tuning - the default
+    # it replaces is 130 seconds, and leaving it in place is what made a hung database an
+    # outage rather than a fast failure. See :data:`CONNECT_TIMEOUT_SECONDS`.
+    "connect_timeout": str(CONNECT_TIMEOUT_SECONDS),
 }
 """The connect arguments passed to psycopg for every connection. See :data:`engine`."""
 
@@ -477,11 +567,16 @@ engine: AsyncEngine = create_async_engine(
     pool_size=POOL_SIZE,
     max_overflow=MAX_OVERFLOW,
     pool_recycle=POOL_RECYCLE_SECONDS,
-    # Exactly one connect argument, and it is a correctness requirement rather than tuning -
-    # see "Every connection speaks UTC" in the module docstring. Nothing else is passed:
-    # there is no connection pooler in front of PostgreSQL in this deployment
-    # (docker-compose.yml defines db, backend and frontend and nothing else), so
-    # prepared-statement or statement-cache tuning would be speculative.
+    # Explicit rather than inherited, because the default is 30 seconds and the value
+    # decides how long a caller waits for a slot once the pool is fully committed - which is
+    # exactly the state a database outage produces. See :data:`POOL_TIMEOUT_SECONDS`.
+    pool_timeout=POOL_TIMEOUT_SECONDS,
+    # Two connect arguments, and both are requirements rather than tuning: the session time
+    # zone is part of the wire contract ("Every connection speaks UTC") and the connect
+    # timeout bounds a failure mode whose default is 130 seconds ("Every failure mode is
+    # bounded in time"). Nothing else is passed: there is no connection pooler in front of
+    # PostgreSQL in this deployment (docker-compose.yml defines db, backend and frontend and
+    # nothing else), so prepared-statement or statement-cache tuning would be speculative.
     connect_args=CONNECT_ARGS,
 )
 """The one engine this process owns, and the pool behind every session it hands out.

@@ -163,6 +163,14 @@ from app.core.password_policy import (
     password_character_groups,
 )
 
+# The one shared rule about the characters a stored string may carry. Declared beside the
+# problem document it produces rather than in each schema module - see that module's docstring -
+# and applied here to `display_name`, the only member of this module that reaches a text column
+# as the caller wrote it. `email` is validated by `email-validator`, and `username` by a
+# character-class pattern, so neither can carry the character in question; `password` and
+# `refresh_token` are hashed before anything is stored, so neither reaches a column at all.
+from app.schemas.common import StorableText
+
 # Exported in the order ruff's isort profile sorts identifiers - screaming-case constants,
 # then classes - so the list stays stable under `ruff check --select I`. The constants are
 # public deliberately: they are the numbers `frontend/src/lib/validation/auth.ts` has to agree
@@ -434,6 +442,11 @@ class RegisterRequest(BaseModel):
                 min_length=DISPLAY_NAME_MIN_LENGTH,
                 max_length=DISPLAY_NAME_MAX_LENGTH,
             ),
+            # The one character `users.display_name` cannot hold, refused here rather than at the
+            # driver - see `app.schemas.common.StorableText`. The two length bounds are restated
+            # from `app.schemas.user.DisplayName` rather than imported for the reason this
+            # module's docstring gives, and this rule is restated with them for the same one.
+            StorableText,
         ]
         | None
     ) = Field(

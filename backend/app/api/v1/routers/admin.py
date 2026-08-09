@@ -205,7 +205,9 @@ _NOT_FOUND_RESPONSE: Final[ProblemResponses] = {
 _CONFLICT_RESPONSE: Final[ProblemResponses] = {
     status.HTTP_409_CONFLICT: problem_response(
         "The request cannot be applied to the current state of the data. Either a "
-        "category name or its derived slug is already taken; or a category is still "
+        "category **name** is already taken - byte for byte, which is exactly what the "
+        "unique constraint on that column compares, and a name whose derived slug merely "
+        "collides is suffixed rather than refused; or a category is still "
         "referenced by at least one post and so may not be deleted yet; or the "
         "administrator is acting on their **own** account in a way that would remove "
         "their access - demoting it out of `ADMIN`, deactivating it, or deleting it. "
@@ -236,18 +238,23 @@ Every route in this namespace qualifies except ``GET /stats``, which takes no in
 
 
 # ---------------------------------------------------------------------------------------
-# The search-term contract, stated once for the three listings that accept one
+# The search-term contract, stated once for the four listings that accept one
 #
 # The bound itself is `app.schemas.common.MAX_SEARCH_TERM_LENGTH` and is enforced by
-# `SearchTerm`, the annotation the three `q` parameters carry. This sentence is only the
+# `SearchTerm`, the annotation all four `q` parameters carry. This sentence is only the
 # published half of it: the number is interpolated rather than written out, so the documentation
-# cannot claim a limit the annotation does not enforce, and the same wording reaches all three
-# listings rather than drifting into three descriptions of one rule.
+# cannot claim a limit the annotation does not enforce, and the same wording reaches all four
+# listings rather than drifting into four descriptions of one rule.
 #
-# Bounding these three matters as much as bounding the public feed. An administrative caller is
+# Bounding these four matters as much as bounding the public feed. An administrative caller is
 # authenticated but is not thereby trusted with unbounded work: `q` here is parsed by the
 # full-text parser, matched against a trigram index and written into a structured log line, and
-# the length of all three is the caller's to choose unless something says otherwise.
+# the length of all four is the caller's to choose unless something says otherwise.
+#
+# The taxonomy listing was the one that carried a bare `str | None` instead, which left it
+# unbounded and - because `SearchTerm` is also where the storable-text rule is attached - left a
+# NUL character to be refused by the driver rather than at the boundary. Both are the same
+# omission, and both are closed by carrying the same annotation as its three siblings.
 # ---------------------------------------------------------------------------------------
 
 _SEARCH_TERM_BOUND: Final[str] = (
@@ -895,11 +902,11 @@ async def list_categories(
     actor: AdminPrincipal,
     page: PageParamsDep,
     q: Annotated[
-        str | None,
+        SearchTerm,
         Query(
             description=(
                 "Free-text term matched case-insensitively against the category name and its "
-                "slug. An empty or whitespace-only value is treated as no filter."
+                "slug.\n\n" + _SEARCH_TERM_BOUND
             ),
         ),
     ] = None,
@@ -939,8 +946,12 @@ async def list_categories(
         "one - there is no self-service route, and an author files a post under existing terms "
         "rather than inventing them. The body carries a name and, optionally, a description. "
         "The identifier and the URL-safe slug are both generated server-side; supplying either "
-        "is a 422. A name or derived slug already in use is a 409. The new category's "
-        "`post_count` is `0`, since nothing has been filed under it yet."
+        "is a 422. A name already in use is a 409. A **name whose derived slug collides** with "
+        "an existing one is not: the slug is de-duplicated with a deterministic ascending "
+        "suffix - `python`, `python-2`, `python-3` - so the request succeeds and the response "
+        "carries the slug that was actually assigned. Read `slug` from the response rather than "
+        "deriving it client-side. The new category's `post_count` is `0`, since nothing has been "
+        "filed under it yet."
     ),
     response_description="The category was created, with its generated identifier and slug.",
 )
@@ -967,6 +978,13 @@ async def create_category(
         slug family already exist, and applies a deterministic collision suffix. A canonical
         address is precisely the thing that must have exactly one policy, so deriving a slug in
         this handler would be the second - and the two would disagree on the first collision.
+
+        That suffix is why a colliding slug is **not** a conflict here, and the distinction is
+        deliberate rather than incidental: the unique constraint on ``categories.name`` is what
+        this route reports as a 409, while two different names that happen to normalise to one
+        slug - ``Machine Learning`` and ``machine learning`` - are both legitimate labels and are
+        given distinct addresses instead of one being refused. A client must therefore read
+        ``slug`` from the response rather than deriving it from the name it sent.
     """
     return await AdminService(db).create_category(payload, actor=actor)
 

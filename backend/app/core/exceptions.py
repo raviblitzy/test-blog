@@ -102,8 +102,8 @@ escape with a different shape: Starlette raises ``HTTPException`` for an unmatch
 for a method mismatch, FastAPI raises ``RequestValidationError`` when a payload fails its
 model, and slowapi raises ``RateLimitExceeded`` when a login is throttled.
 
-The five handlers
------------------
+The six handlers
+----------------
 :func:`register_exception_handlers` installs all of them, and ``app.main`` calls it exactly
 once. Dispatch is not registration-ordered: Starlette walks ``type(exc).__mro__`` and takes
 the first registered class it finds, so the most-derived registration always wins. The order
@@ -120,7 +120,16 @@ Exception                   Status   Notes
 ``RateLimitExceeded``       429      Adds an integer ``Retry-After`` header.
 ``HTTPException``           its own  Starlette's and FastAPI's own failures, mapped
                                      to a stable type and title; ``exc.headers``
-                                     survive, which is how ``Allow`` stays on a 405.
+                                     survive, which is how ``WWW-Authenticate``
+                                     reaches a 401 - and on a 405 ``Allow`` is
+                                     recomputed across every route matching the
+                                     path, because the framework's own value names
+                                     only the one route that raised.
+``DataError``               400      A value the storage layer refuses - SQLSTATE
+                                     class 22 - is the caller's to fix, so it is
+                                     reported as a client error instead of becoming
+                                     a 500. The guarantee behind the boundary
+                                     validators, not a substitute for them.
 ``Exception``               500      Generic detail, nothing internal, logged in full.
 =========================== ======== =================================================
 
@@ -143,8 +152,11 @@ password. Neither is ever echoed. Only the field path, the message and the error
 Import purity
 -------------
 ``app.core`` is the root of the backend import graph, and this module keeps it that way. It
-imports the standard library, FastAPI, Starlette, slowapi and ``app.core.logging`` - nothing
-else, and in particular **not** ``app.schemas``. That asymmetry is deliberate rather than
+imports the standard library, FastAPI, Starlette, slowapi, ``sqlalchemy.exc`` and
+``app.core.logging`` - nothing else, and in particular **not** ``app.schemas``. The SQLAlchemy
+import is the exception class alone, for the ``DataError`` handler above, and it adds no edge to
+the graph that ``app.core.dependencies`` does not already have: no model, no session and no
+query is imported, and nothing here touches the database. That asymmetry is deliberate rather than
 tidy: ``app.schemas.common`` declares the Pydantic model of this document for the OpenAPI
 surface and therefore may import from ``app.core``, so an import back the other way would
 close a cycle. The handlers here build the body as a plain dict instead, which is also why
@@ -152,7 +164,7 @@ there is exactly one function in the codebase that assembles a problem document.
 """
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from http import HTTPStatus
 from types import MappingProxyType
 from typing import ClassVar, Final, TypedDict, cast
@@ -171,7 +183,9 @@ from fastapi.exceptions import RequestValidationError
 # unrelated deprecations for the whole process.
 from fastapi.responses import ORJSONResponse
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy.exc import DataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 from starlette.types import ExceptionHandler
 
 from app.core.logging import (
@@ -409,6 +423,13 @@ _DETAIL_SERVER_ERROR: Final[str] = "The server could not complete the request."
 # and never carries `None`. It quotes nothing the caller submitted.
 _DETAIL_INVALID_FIELD: Final[str] = "This value is invalid."
 
+# The 400 body for a value the storage layer refuses outright - see `_data_error_handler`. It
+# names no column, no type, no driver and no statement: the caller learns that a value they
+# sent could not be handled, and the classification goes to the structured log. Worded to be
+# actionable without being specific, because the boundary validators name the field for every
+# case that is expected to occur and this is the residue.
+_DETAIL_DATA_ERROR: Final[str] = "The request contained a value that could not be processed."
+
 
 # ---------------------------------------------------------------------------------------
 # Header and validation-mapping constants
@@ -425,6 +446,44 @@ exposes it have to be the same string, and it is declared here beside the handle
 """
 
 _BEARER_CHALLENGE: Final[str] = "Bearer"
+
+ALLOW_HEADER: Final[str] = "Allow"
+"""The RFC 9110 §10.2.1 header listing the methods a resource supports, sent with every 405.
+
+Public because the value this module writes has to be the whole truth about a path, and the
+truth is not knowable from the one route that raised. Starlette evaluates each ``Route``
+independently and builds ``Allow`` from that route's own methods, so ``/api/v1/posts`` -
+served by one route for ``GET`` and another for ``POST`` - answered ``Allow: GET`` to a
+``DELETE`` and told the caller that ``POST`` did not exist, contradicting the service's own
+published document. :func:`_allowed_methods` recomputes it across every route that matches the
+path; see that function for how.
+"""
+
+_METHOD_ORDER: Final[tuple[str, ...]] = (
+    "GET",
+    "HEAD",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+    "TRACE",
+    "CONNECT",
+)
+"""Canonical order for rendering an ``Allow`` list.
+
+RFC 9110 places no ordering requirement on the header - a client parses it as a set - so the
+order is chosen for the reader: safe methods first, then the mutations in the order this API's
+routers declare them. It is fixed rather than incidental because a set's iteration order is
+not stable between processes, and a header whose value varied between two identical requests
+would make the response impossible to assert on and pointless to cache.
+"""
+
+_ALLOW_HEADER_SEPARATOR: Final[str] = ", "
+"""Separator for the ``Allow`` list, per the RFC's comma-delimited list production."""
+
+_ALLOW_HEADER_KEY: Final[str] = ALLOW_HEADER.lower()
+"""Case-folded header name, for replacing an inbound ``Allow`` whatever case it arrived in."""
 
 RETRY_AFTER_HEADER: Final[str] = "Retry-After"
 """The delay header sent with a 429 from the rate-limited authentication routes.
@@ -480,6 +539,129 @@ _REQUEST_PART_MARKERS: Final[frozenset[str]] = frozenset(
 
 # Error type reported for a validation entry whose own type is missing or unusable.
 _FALLBACK_VALIDATION_TYPE: Final[str] = "invalid_request"
+
+# ---------------------------------------------------------------------------------------
+# Pydantic union case labels, which are NOT part of a field path
+#
+# When a value fails every member of a union, pydantic-core reports one entry per member and
+# inserts that member's CASE LABEL into `loc` immediately after the field name. The label is
+# the internal core-schema name of the member, so a caller submitting a bad `display_name`
+# against `DisplayName | SkipJsonSchema[None]` gets locations
+# `("body", "display_name", "constrained-str")` and `("body", "display_name", "none")` - and a
+# path rendered from those verbatim names nothing the client submitted. Worse, some labels
+# quote implementation identifiers outright: `function-after[_require_content(),
+# constrained-str]` is a private validator's name and `str-enum[UserRole]` is an enum class's,
+# neither of which belongs in a response body.
+#
+# `ValidationErrorItem.field` promises "the syntax the client's form library already consumes,
+# so a server-side rejection can be attached to the control that produced it", so these labels
+# are dropped by :func:`_field_path`. Recognition is by NAME rather than by shape, and that is
+# the whole reason this set is enumerated: `bool` and `none` are label-shaped *and*
+# identifier-shaped, while a legitimate nested member name like `slug` is identifier-shaped
+# too - so no pattern over the characters of a segment can separate them. Matching against the
+# core-schema vocabulary can, because that vocabulary is closed.
+#
+# The parameterised labels - `list[uuid]`, `str-enum[UserRole]`, `function-after[...]` - are
+# matched on the name before their bracket, so the set holds the stem only.
+# ---------------------------------------------------------------------------------------
+
+_CORE_SCHEMA_TAG_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        # Scalars and the null case, which is the one every optional-but-not-nullable member
+        # contributes.
+        "none",
+        "null",
+        "any",
+        "str",
+        "bytes",
+        "int",
+        "float",
+        "bool",
+        "complex",
+        "decimal",
+        "date",
+        "time",
+        "datetime",
+        "timedelta",
+        "uuid",
+        "url",
+        "multi-host-url",
+        "path",
+        "enum",
+        "literal",
+        # Containers.
+        "list",
+        "set",
+        "frozenset",
+        "tuple",
+        "dict",
+        "generator",
+        # Structures.
+        "model",
+        "model-fields",
+        "dataclass",
+        "dataclass-args",
+        "typed-dict",
+        "arguments",
+        "call",
+        "callable",
+        # Wrappers and combinators.
+        "nullable",
+        "union",
+        "tagged-union",
+        "chain",
+        "default",
+        "definitions",
+        "definition-ref",
+        "json",
+        "json-or-python",
+        "lax-or-strict",
+        "is-instance",
+        "is-subclass",
+        # Constrained scalars, which `StringConstraints` and its siblings produce.
+        "constrained-str",
+        "constrained-bytes",
+        "constrained-int",
+        "constrained-float",
+        "constrained-decimal",
+        "constrained-date",
+        "constrained-datetime",
+        "constrained-time",
+        "constrained-timedelta",
+        # Validator wrappers, whose parameters quote private function names.
+        "function-after",
+        "function-before",
+        "function-wrap",
+        "function-plain",
+        # Enum wrappers, whose parameters quote enum class names.
+        "str-enum",
+        "int-enum",
+        "float-enum",
+    }
+)
+
+_TAG_PARAMETER_OPEN: Final[str] = "["
+"""Character introducing a case label's parameter list, as in ``list[uuid]``."""
+
+_FIELD_PATH_SEPARATOR: Final[str] = "."
+"""Separator between the segments of a published field path.
+
+The dotted syntax form libraries already consume, so ``categories.0.slug`` addresses the
+``slug`` control of the first element. Named once because two places depend on it: the join in
+:func:`_field_path`, and the "is this path nested under that member" test in
+:func:`_field_errors`.
+"""
+
+_NONE_REQUIRED_VALIDATION_TYPE: Final[str] = "none_required"
+"""Pydantic's error type for "this member must be null", reported per union member.
+
+Every optional-but-not-nullable member in ``app.schemas`` is declared as ``T |
+SkipJsonSchema[None]``, so a value that fails ``T`` also fails the ``None`` member and pydantic
+reports both. The second entry reads ``Input should be None`` - which contradicts this API's
+own rule, since those members reject an explicit null with a validator of their own. Publishing
+it would tell a client to send a value the service refuses, so :func:`_field_errors` suppresses
+it whenever the same field already carries an actionable entry.
+"""
 
 
 # ---------------------------------------------------------------------------------------
@@ -936,6 +1118,24 @@ def _problem_for_status(status: int) -> tuple[str, str]:
     return (_ERROR_TYPE_HTTP_ERROR, _TITLE_HTTP_ERROR)
 
 
+def _is_core_schema_tag(part: str) -> bool:
+    """Report whether one ``loc`` segment is a pydantic union case label rather than a name.
+
+    The test is a membership check against :data:`_CORE_SCHEMA_TAG_NAMES`, performed on the
+    text before any parameter list, so ``list[uuid]`` is recognised by ``list`` and
+    ``function-after[_require_content(), constrained-str]`` by ``function-after``. See that
+    constant for why recognition cannot be done by shape.
+
+    Args:
+        part: One already-stringified segment of a ``loc`` tuple.
+
+    Returns:
+        Whether the segment names a core-schema case rather than a submitted member.
+    """
+    stem = part.split(_TAG_PARAMETER_OPEN, 1)[0]
+    return stem in _CORE_SCHEMA_TAG_NAMES
+
+
 def _field_path(loc: object) -> str:
     """Render a Pydantic ``loc`` tuple as the dotted field path the client can use.
 
@@ -950,6 +1150,29 @@ def _field_path(loc: object) -> str:
     the client's form library already understands, which is what allows a server-side
     rejection to be attached to the control that produced it.
 
+    Union case labels are dropped, and that is what keeps the promise above true
+    -----------------------------------------------------------------------------
+    Every optional member in ``app.schemas`` is a union - ``T | SkipJsonSchema[None]`` - so a
+    rejected value produces one entry per member with pydantic's internal case label inserted
+    after the field name. Rendered verbatim, ``("body", "display_name", "constrained-str")``
+    reports as ``display_name.constrained-str``, which is not a path any form control answers
+    to, and ``("body", "content", "function-after[_require_content(), constrained-str]")``
+    additionally publishes a private validator's name. Both are removed here, so those two
+    locations report as ``display_name`` and ``content``.
+
+    Two rules bound the removal, and each exists to protect a location that is already correct:
+
+    * **The first segment after the marker is never dropped.** It is the submitted member's own
+      name, and for an ``extra="forbid"`` rejection it is a name the *caller* chose - so a body
+      carrying ``{"my-field": 1}`` still reports ``my-field`` rather than an empty path.
+    * **Integer indices are never dropped**, because they address an element the caller sent.
+      ``("body", "category_ids", "list[uuid]", 0)`` therefore reports as ``category_ids.0``,
+      with the label removed from between them.
+
+    A location made up entirely of labels after its first segment is left as it arrived, which
+    cannot happen for any schema in this service and is handled rather than assumed: reporting
+    an empty path would be strictly worse than reporting an internal one.
+
     Args:
         loc: The ``loc`` value from a validation entry. Typed as ``object`` because
             ``RequestValidationError.errors()`` is declared as a sequence of ``Any``, so the
@@ -963,7 +1186,14 @@ def _field_path(loc: object) -> str:
     parts = [str(part) for part in loc]
     if len(parts) > 1 and parts[0] in _REQUEST_PART_MARKERS:
         del parts[0]
-    return ".".join(parts)
+    if len(parts) > 1:
+        # `parts[:1]` rather than `[parts[0]]` so the member name survives untested, and
+        # `isdigit()` so an index reads as an index even though it arrived as a string.
+        named = parts[:1] + [
+            part for part in parts[1:] if part.isdigit() or not _is_core_schema_tag(part)
+        ]
+        parts = named
+    return _FIELD_PATH_SEPARATOR.join(parts)
 
 
 def _fallback_field_error() -> FieldError:
@@ -1014,6 +1244,200 @@ def _field_error(raw: object) -> FieldError:
         message=text if isinstance(text, str) and text else _DETAIL_INVALID_FIELD,
         type=kind if isinstance(kind, str) and kind else _FALLBACK_VALIDATION_TYPE,
     )
+
+
+def _has_actionable_entry(field: str, actionable: AbstractSet[str]) -> bool:
+    """Report whether a field, or anything nested under it, already has a usable error.
+
+    The test :func:`_field_errors` needs in order to decide that a null companion is redundant,
+    and it is a prefix test rather than an equality test because the two entries a union
+    produces do not always name the same path. A bad element inside ``category_ids`` is reported
+    at ``category_ids.0`` - the index belongs to the caller and is kept - while the companion is
+    reported at ``category_ids``. Comparing only for equality would leave "Input should be None"
+    attached to the list whose element the caller has just been told to correct.
+
+    Args:
+        field: The path the null companion named.
+        actionable: The paths of every entry the caller can act on.
+
+    Returns:
+        Whether ``field`` itself, or a path nested beneath it, is among them.
+    """
+    prefix = field + _FIELD_PATH_SEPARATOR
+    return any(other == field or other.startswith(prefix) for other in actionable)
+
+
+def _field_errors(raw_errors: Sequence[object]) -> list[FieldError]:
+    """Reduce a whole validation failure to one actionable entry per problem.
+
+    :func:`_field_error` normalises entries one at a time; this function is where the *set* of
+    them is made coherent, which takes two passes that a per-entry function cannot perform.
+
+    **The null companion is suppressed.** Because every optional member in ``app.schemas`` is
+    declared ``T | SkipJsonSchema[None]``, pydantic reports the real failure *and* a
+    :data:`_NONE_REQUIRED_VALIDATION_TYPE` entry reading ``Input should be None``. That second
+    entry is not merely noise - it is wrong: those members reject an explicit null with a
+    validator of their own, so a client that followed the advice would be refused again. It is
+    dropped for any field that already carries an actionable entry, leaving one member to one
+    error. It is *kept* when it is the only thing reported for that field, which would mean the
+    API genuinely required null there, because publishing nothing would be worse than
+    publishing something surprising.
+
+    **Duplicates collapse.** Once case labels are stripped from the paths, two entries that
+    differed only by which union member produced them can render identically. The response
+    should not repeat itself, so an exact repeat of ``(field, message, type)`` is emitted once.
+    Order is otherwise preserved, so the first failure pydantic found is still the first one a
+    form shows.
+
+    Args:
+        raw_errors: ``exc.errors()`` from a ``RequestValidationError``. Typed as a sequence of
+            ``object`` because that method is declared as a sequence of ``Any``; each element is
+            validated by :func:`_field_error`.
+
+    Returns:
+        A non-empty list. Every guarantee the published schema makes about ``errors`` holds
+        unconditionally: at least one entry, and all three of its fields populated.
+    """
+    entries = [_field_error(raw) for raw in raw_errors]
+
+    # Which fields have something the caller can act on. Computed over the whole list first,
+    # because the actionable entry for a field can follow its null companion.
+    actionable = {
+        entry["field"] for entry in entries if entry["type"] != _NONE_REQUIRED_VALIDATION_TYPE
+    }
+
+    deduplicated: list[FieldError] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        if entry["type"] == _NONE_REQUIRED_VALIDATION_TYPE and _has_actionable_entry(
+            entry["field"], actionable
+        ):
+            continue
+        signature = (entry["field"], entry["message"], entry["type"])
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduplicated.append(entry)
+
+    # `or [...]` guarantees the criterion "a non-empty errors list" holds unconditionally.
+    # FastAPI always supplies at least one entry and the filtering above cannot remove every
+    # one of them, but a validation document whose `errors` was an empty list would be
+    # self-contradictory: a client would iterate it, find nothing, and have nothing to show.
+    return deduplicated or [_fallback_field_error()]
+
+
+def _route_leaves(routes: Iterable[object]) -> Iterator[object]:
+    """Flatten an application's route table down to the entries that can match a request.
+
+    ``app.routes`` is not flat. FastAPI 0.141.1 represents every ``include_router`` call as one
+    opaque entry that resolves its children - and their prefixes, tags and dependencies - only
+    when asked, so this application's six top-level entries stand for forty operations: the four
+    documentation routes are ordinary Starlette routes, while the versioned aggregate and the
+    health router are inclusions whose members are reachable only through them. A walk that read
+    ``methods`` off the top level would see the documentation routes and nothing else.
+
+    An inclusion is recognised by behaviour rather than by class - the presence of a callable
+    that yields its members with their effective paths already applied - so this survives the
+    layout changing back: were routes flattened into ``app.routes`` again, every entry would fail
+    that test, be yielded as a leaf, and match on its own.
+
+    A ``Mount`` is deliberately **not** descended into. It declares no methods, so it contributes
+    nothing here, and its children's paths are relative to the mount point: matching them against
+    a full request path would be meaningless, and a coincidental match would attribute a mounted
+    application's method to this one. A mounted application answers its own 405 with its own
+    ``Allow``, which is the correct owner of that answer.
+
+    Args:
+        routes: The route table to flatten, at any level.
+
+    Yields:
+        One entry per candidate, in declaration order. Each is expected to expose ``methods`` and
+        ``matches``; anything that does not is skipped by the caller rather than filtered here,
+        so this function stays a pure flattening.
+    """
+    for route in routes:
+        expand = getattr(route, "effective_route_contexts", None)
+        if callable(expand):
+            expanded = expand()
+            if isinstance(expanded, Iterable):
+                yield from expanded
+                continue
+        yield route
+
+
+def _allowed_methods(request: Request) -> str | None:
+    """Build the ``Allow`` value for a 405 from every route that matches the requested path.
+
+    Starlette cannot answer this question, and that is the reason this function exists.
+    ``Route.handle`` raises the 405 with ``Allow`` set from the methods of *that one route*, but
+    a path in this API is routinely served by two of them - ``GET`` and ``POST`` on
+    ``/api/v1/posts``, ``PUT`` and ``DELETE`` on ``/api/v1/posts/{post_id}/like``, ``PATCH`` and
+    ``DELETE`` on ``/api/v1/comments/{comment_id}`` - because a router registers one decorated
+    handler per method. Whichever route the matcher reached first supplied the header, so a
+    ``DELETE /api/v1/posts`` was answered ``Allow: GET`` and a client reading it concluded that
+    ``POST /api/v1/posts`` did not exist, contradicting the same service's ``/openapi.json``.
+    RFC 9110 §15.5.6 requires the header to carry the target resource's supported methods, so
+    the union across matching routes is the only correct value.
+
+    The route's own ``matches`` is the discriminator rather than a path comparison of this
+    module's own: it is the same predicate the router used, so a parameterised path, a converter
+    and a trailing-slash redirect route are all judged exactly as the routing layer judged them,
+    and ``Match.PARTIAL`` is precisely "this path, some other method". Both ``PARTIAL`` and
+    ``FULL`` are counted - a ``FULL`` match cannot occur alongside a 405 for the same method, and
+    excluding it would leave the value dependent on a coincidence.
+
+    Args:
+        request: The request being answered. Its ``scope`` supplies both the application, whose
+            routes are read, and the path and method the routes are matched against.
+
+    Returns:
+        The rendered header value in :data:`_METHOD_ORDER`, or ``None`` when no matching route
+        declares a method - in which case the caller keeps whatever the framework supplied,
+        because a recomputation that found nothing is not evidence that nothing is allowed.
+
+    Note:
+        ``HEAD`` appears only where a route declares it. FastAPI's ``APIRoute`` does not add it
+        alongside ``GET`` the way Starlette's plain ``Route`` does, so the value published here
+        matches ``/openapi.json`` rather than exceeding it - which is the property that makes
+        the two documents comparable.
+
+        The header describes the requested **URI**, not one path template, and the two differ
+        wherever templates overlap. ``PUT /api/v1/users/me`` answers ``Allow: GET, PATCH``
+        because ``/api/v1/users/{username}`` matches that concrete path as well - a ``GET`` there
+        is routed and answers ``404``, not ``405``, so a header omitting it would be the same
+        kind of untruth this function exists to remove. The same holds for
+        ``/api/v1/posts/{post_id}``, which ``/api/v1/posts/{slug}`` also matches. RFC 9110 asks
+        for the target resource's supported methods, and that is what the union of matching
+        routes reports.
+    """
+    # Read through `scope` rather than `request.app`, which raises `KeyError` when the key is
+    # absent. It cannot be absent in the assembled application, but this module runs on the
+    # failure path and must not fail while answering a failure.
+    routes = getattr(request.scope.get("app"), "routes", None)
+    if not isinstance(routes, Iterable):
+        return None
+
+    methods: set[str] = set()
+    for leaf in _route_leaves(routes):
+        # A `Mount`, a websocket route and an inclusion itself carry no methods; only an HTTP
+        # route or one of its effective contexts does, and only those can contribute.
+        declared = getattr(leaf, "methods", None)
+        matches = getattr(leaf, "matches", None)
+        if not isinstance(declared, set | frozenset | list | tuple) or not callable(matches):
+            continue
+        outcome = matches(request.scope)
+        if not isinstance(outcome, tuple) or not outcome or outcome[0] is Match.NONE:
+            continue
+        methods.update(str(method).upper() for method in declared)
+
+    if not methods:
+        return None
+
+    # Known methods in canonical order, then anything else alphabetically so a custom method
+    # registered by a future router is still reported deterministically rather than dropped.
+    ordered = [method for method in _METHOD_ORDER if method in methods]
+    ordered.extend(sorted(methods.difference(_METHOD_ORDER)))
+    return _ALLOW_HEADER_SEPARATOR.join(ordered)
 
 
 def _retry_after_seconds(exc: RateLimitExceeded) -> int:
@@ -1091,10 +1515,12 @@ async def _request_validation_error_handler(request: Request, exc: Exception) ->
     """Render FastAPI's request-validation failure as the same document, with ``errors``.
 
     Replaces FastAPI's default 422 body, which is shaped ``{"detail": [...]}`` and would be the
-    one response in the API that a client had to parse differently. Each entry is reduced by
-    :func:`_field_error` to the three publishable fields; ``exc.body`` - the raw submitted
-    payload, which on a registration request contains the caller's plaintext password - is
-    never read, and neither is any entry's ``input`` or ``ctx``.
+    one response in the API that a client had to parse differently. The entries are reduced by
+    :func:`_field_errors` to the three publishable fields, with union case labels stripped from
+    each path and the spurious null companion suppressed, so every entry names a control a form
+    can attach it to; ``exc.body`` - the raw submitted payload, which on a registration request
+    contains the caller's plaintext password - is never read, and neither is any entry's
+    ``input`` or ``ctx``.
 
     Args:
         request: The request being answered.
@@ -1105,21 +1531,13 @@ async def _request_validation_error_handler(request: Request, exc: Exception) ->
     """
     error = cast(RequestValidationError, exc)
 
-    # `or [...]` guarantees the criterion "a non-empty errors list" holds unconditionally.
-    # FastAPI always supplies at least one entry, but a validation document whose `errors` was
-    # an empty list would be self-contradictory, and a client iterating it would silently find
-    # nothing to show the user.
-    field_errors: list[FieldError] = [_field_error(raw) for raw in error.errors()] or [
-        _fallback_field_error()
-    ]
-
     return _problem_response(
         request=request,
         status=HTTPStatus.UNPROCESSABLE_CONTENT,
         error_type=_ERROR_TYPE_VALIDATION,
         title=_TITLE_VALIDATION,
         detail=_DETAIL_REQUEST_VALIDATION,
-        errors=field_errors,
+        errors=_field_errors(error.errors()),
     )
 
 
@@ -1220,8 +1638,114 @@ async def _http_exception_handler(request: Request, exc: Exception) -> ORJSONRes
         error_type=error_type,
         title=title,
         detail=detail,
-        headers=error.headers,
+        headers=_headers_for_http_exception(request, error),
     )
+
+
+async def _data_error_handler(request: Request, exc: Exception) -> ORJSONResponse:
+    """Render a driver-level *data* exception as a 400 rather than letting it become a 500.
+
+    ``sqlalchemy.exc.DataError`` wraps the driver's SQLSTATE class 22 conditions - "data
+    exception" - which are failures of a *value* rather than of the service: a string the column
+    cannot represent, a number outside its range, a malformed cast. Every value bound into a
+    statement in this API arrives from a request, so this class of failure is the caller's to
+    fix, and answering 500 misreported both whose fault it was and what a retry would achieve.
+
+    The concrete case this closes is a ``NUL`` character. PostgreSQL's ``text`` and ``citext``
+    cannot store ``U+0000``, so a username, slug, search term or body carrying one reached
+    psycopg and raised here, and an unauthenticated caller could turn any of several public
+    reads into a 500 - inflating the error rate, writing a traceback per attempt, and making
+    genuine 500 alerting untrustworthy. ``app.schemas.common``'s storable-text validators reject
+    that character at the boundary, with a ``422`` naming the field, and they are the *fix*; this
+    handler is the guarantee, covering every remaining path by which a value the storage layer
+    refuses could otherwise escape as a server error.
+
+    Both halves are needed and neither is redundant. A boundary validator produces the better
+    answer - it names the field, so a form can attach it - but it can only cover the members it
+    is attached to. This handler cannot name a field, because by the time the driver refuses a
+    value the request has been reduced to a statement and its parameters, but it covers
+    everything. So the 422 is what a client normally sees, and a 400 here means a value slipped
+    past the boundary: a signal worth logging.
+
+    The failure is logged at warning rather than error, because a rejected request is not an
+    incident. ``exception_type`` is recorded so the class is visible, alongside the message
+    redacted by ``app.core.logging.redact_sensitive_text`` and bounded by ``log_safe_text`` -
+    SQLAlchemy's message embeds the statement, and although ``hide_parameters=True`` keeps the
+    bound values out of it, the same treatment the 5xx path gives a framework detail is applied
+    here rather than trusting that. No frames: a value rejected at the boundary of storage has
+    no stack worth keeping, and the request identifier already on the line is what correlates it
+    with the access record.
+
+    Args:
+        request: The request being answered.
+        exc: The raised exception. Always a ``DataError``, by MRO dispatch.
+
+    Returns:
+        A 400 problem document with a fixed, safe ``detail``.
+    """
+    error = cast(DataError, exc)
+    get_logger(__name__).warning(
+        "data_error_response",
+        **{
+            # Neutralised before it is written, exactly as the 500 path does it, and for a
+            # sharper reason here: the offending value is frequently IN the path - a `NUL`
+            # arrives as `/api/v1/users/alice\x00` - and a control character written raw into a
+            # log line is how a record gets forged.
+            HTTP_LOG_FIELD_METHOD: log_safe_text(request.method),
+            HTTP_LOG_FIELD_PATH: log_safe_text(request.url.path),
+            HTTP_LOG_FIELD_STATUS: int(HTTPStatus.BAD_REQUEST),
+        },
+        exception_type=type(error).__name__,
+        exception_message=log_safe_text(
+            redact_sensitive_text(str(error)), limit=LOG_EXCEPTION_VALUE_MAX_LENGTH
+        ),
+    )
+    return _problem_response(
+        request=request,
+        status=HTTPStatus.BAD_REQUEST,
+        error_type=_ERROR_TYPE_BAD_REQUEST,
+        title=_TITLE_BAD_REQUEST,
+        detail=_DETAIL_DATA_ERROR,
+    )
+
+
+def _headers_for_http_exception(
+    request: Request, error: StarletteHTTPException
+) -> Mapping[str, str] | None:
+    """Forward a framework exception's headers, correcting ``Allow`` on a 405.
+
+    Everything the exception carries is forwarded unchanged - that is what puts a dependency's
+    ``WWW-Authenticate`` challenge on the wire - with exactly one substitution: on a
+    method-not-allowed the ``Allow`` value Starlette derived from a single route is replaced by
+    the union :func:`_allowed_methods` computes across every route matching the path. See that
+    function for why the framework's value is incomplete.
+
+    Args:
+        request: The request being answered, matched against the application's routes.
+        error: The framework exception, read for its status code and its headers.
+
+    Returns:
+        The headers to attach, or ``None`` when there are none - which is the common case, since
+        only a 401 and a 405 arrive carrying any.
+    """
+    if error.status_code != HTTPStatus.METHOD_NOT_ALLOWED:
+        return error.headers
+
+    allowed = _allowed_methods(request)
+    if allowed is None:
+        return error.headers
+
+    # Rebuilt rather than mutated: `exc.headers` belongs to the exception, and an exception
+    # object edited by a handler is one a caller may still be holding. The comparison is
+    # case-insensitive because a header name is, so the framework's own entry is replaced rather
+    # than duplicated alongside this one whatever case it used.
+    headers = {
+        name: value
+        for name, value in (error.headers or {}).items()
+        if name.lower() != _ALLOW_HEADER_KEY
+    }
+    headers[ALLOW_HEADER] = allowed
+    return headers
 
 
 async def _rate_limit_handler(request: Request, exc: Exception) -> ORJSONResponse:
@@ -1311,7 +1835,7 @@ def _validated_request_id(request: Request) -> str | None:
     return None
 
 
-def _cors_headers_for(request: Request) -> dict[str, str]:
+def _cors_headers_for(request: Request, *, traverses_cors_middleware: bool) -> dict[str, str]:
     """Build the CORS headers ``CORSMiddleware`` would have written, for a response it never sees.
 
     ``CORSMiddleware`` is registered with ``add_middleware`` and therefore runs **inside**
@@ -1347,8 +1871,34 @@ def _cors_headers_for(request: Request) -> dict[str, str]:
     configured entry into exactly that form, so ``https://Example.com:443`` in an env file matches
     a real request here as well as it does in the middleware.
 
+    The one header that must NOT simply be mirrored
+    -----------------------------------------------
+    ``Vary`` is the exception to "write the same headers for the same reasons", and it is the
+    reason this function has to be told which of the two render sites it is serving. Starlette
+    applies its own headers with two different mechanisms, and only one of them is idempotent:
+    ``simple_headers`` are assigned (``MutableHeaders.update``), so a value written here is
+    replaced rather than repeated, but ``Vary`` goes through ``add_vary_header``, which *appends*
+    to whatever is already present. For a response that passes back out through
+    ``CORSMiddleware`` with an **admitted** origin, writing ``Vary: Origin`` here therefore
+    produced ``vary: Origin, Origin`` - harmless under RFC 9110, which treats a repeated field
+    name as equivalent to one, but a header no other response in this API carries and one a
+    reader would reasonably read as a bug.
+
+    Suppressing it unconditionally would be the wrong fix. Starlette calls
+    ``add_vary_header`` only from ``allow_explicit_origin``, which it reaches only for an origin
+    it admits, so on the refusal path *nothing* would write ``Vary`` at all - and that is the
+    path where the header does the most work, keeping a shared cache from serving a refusal to an
+    origin the deployment does trust. So the rule is precisely: skip it only when the middleware
+    below will add it, which is the admitted-origin case on a response that still has
+    ``CORSMiddleware`` above it.
+
     Args:
         request: The request being answered. Only its ``Origin`` header is read.
+        traverses_cors_middleware: Whether the response being built will pass back out through
+            ``CORSMiddleware``. ``True`` for the inner render site, which is dispatched by the
+            ``ExceptionMiddleware`` ``app.main`` registers innermost; ``False`` for the outer
+            site on ``ServerErrorMiddleware``, which is outside every added wrapper and so is
+            the only writer of these headers.
 
     Returns:
         The CORS headers to attach, empty when the request is not cross-origin.
@@ -1379,10 +1929,18 @@ def _cors_headers_for(request: Request) -> dict[str, str]:
             _CORS_EXPOSE_HEADERS_HEADER: _CORS_EXPOSE_HEADERS_VALUE,
         }
 
-    # `Vary` is written for every named-allow-list answer, admitted or not, because both answers
-    # are origin-dependent and a cache must not reuse either across origins.
-    headers = {_VARY_HEADER: _ORIGIN_REQUEST_HEADER}
-    if origin not in settings.CORS_ALLOW_ORIGINS:
+    # `Vary` belongs on every named-allow-list answer, admitted or not, because both answers are
+    # origin-dependent and a cache must not reuse either across origins - but it is written HERE
+    # only when nothing below will write it. `CORSMiddleware.allow_explicit_origin` appends it
+    # through `add_vary_header` for an admitted origin, and appending to a value already present
+    # is what produced `vary: Origin, Origin`; on the refusal path that middleware writes no
+    # `Vary` at all, so this is the only writer and it must not be skipped. See "The one header
+    # that must NOT simply be mirrored" above.
+    admitted = origin in settings.CORS_ALLOW_ORIGINS
+    headers: dict[str, str] = {}
+    if not (admitted and traverses_cors_middleware):
+        headers[_VARY_HEADER] = _ORIGIN_REQUEST_HEADER
+    if not admitted:
         return headers
 
     headers[_CORS_ALLOW_ORIGIN_HEADER] = origin
@@ -1392,7 +1950,9 @@ def _cors_headers_for(request: Request) -> dict[str, str]:
     return headers
 
 
-def _outer_response_headers(request: Request, request_id: str | None) -> dict[str, str] | None:
+def _outer_response_headers(
+    request: Request, request_id: str | None, *, traverses_cors_middleware: bool
+) -> dict[str, str] | None:
     """Build the headers for a response rendered outside the middleware stack.
 
     ``ServerErrorMiddleware`` sits outside everything registered with ``add_middleware``, so the
@@ -1410,6 +1970,11 @@ def _outer_response_headers(request: Request, request_id: str | None) -> dict[st
     Args:
         request: The request being answered. Read only for its ``Origin`` header.
         request_id: The validated identifier, or ``None`` when the request has none.
+        traverses_cors_middleware: Passed straight through to :func:`_cors_headers_for`, which
+            needs it to avoid duplicating the one header Starlette appends rather than assigns.
+            The security headers and the correlation header are unaffected: the two middlewares
+            that also write them do so with ``setdefault`` semantics, so a value written here
+            survives as a single header either way.
 
     Returns:
         The header mapping to attach, or ``None`` when there is nothing to attach - which cannot
@@ -1430,14 +1995,14 @@ def _outer_response_headers(request: Request, request_id: str | None) -> dict[st
     from app.middleware.security_headers import resolved_security_headers
 
     headers = dict(resolved_security_headers())
-    headers.update(_cors_headers_for(request))
+    headers.update(_cors_headers_for(request, traverses_cors_middleware=traverses_cors_middleware))
     if request_id is not None:
         headers[REQUEST_ID_HEADER] = request_id
     return headers or None
 
 
 async def _render_unhandled(
-    request: Request, exc: Exception, *, log_frames: bool
+    request: Request, exc: Exception, *, log_frames: bool, traverses_cors_middleware: bool
 ) -> ORJSONResponse:
     """Render any unanticipated exception as a 500 that reveals nothing. One document, two sites.
 
@@ -1449,9 +2014,9 @@ async def _render_unhandled(
     ``app.middleware.request_context`` is already on the line. The response header set below is
     what lets a caller quote that identifier.
 
-    Two dispatch sites share this renderer, and ``log_frames`` is the only thing that differs
-    between them - see :func:`inner_exception_handlers` and :func:`register_exception_handlers`
-    for how each is installed:
+    Two dispatch sites share this renderer, and the two keyword arguments are the only things
+    that differ between them - see :func:`inner_exception_handlers` and
+    :func:`register_exception_handlers` for how each is installed:
 
     1. :func:`_inner_unhandled_exception_handler`, dispatched by the ``ExceptionMiddleware``
        ``app.main`` registers **innermost**, so its response passes back out through
@@ -1470,6 +2035,11 @@ async def _render_unhandled(
     the same header name, which is why the name is a shared constant rather than a literal in
     each.
 
+    ``CORSMiddleware`` is the exception to that symmetry, and ``traverses_cors_middleware`` is
+    how the difference is carried rather than guessed: it assigns its own headers but *appends*
+    ``Vary``, so site 1 must leave that one header to it while site 2 - which no CORS wrapper
+    will ever see - must write it. :func:`_cors_headers_for` documents the exact rule.
+
     ``ServerErrorMiddleware`` re-raises after site 2's response has been sent, so the ASGI
     server reports the failure as well. It also bypasses site 2 entirely when the application is
     constructed with ``debug=True``, in which case Starlette returns a traceback to the client -
@@ -1481,6 +2051,8 @@ async def _render_unhandled(
         log_frames: Whether to attach the traceback to this module's record. ``True`` at the
             inner site, where no other owner will serialise it; ``False`` at the outer one,
             where ``app.middleware.request_context`` already has.
+        traverses_cors_middleware: Whether this response will pass back out through
+            ``CORSMiddleware``. ``True`` at the inner site, ``False`` at the outer one.
 
     Returns:
         A 500 problem document with a generic detail, carrying the correlation header when the
@@ -1543,9 +2115,13 @@ async def _render_unhandled(
     # `Access-Control-Allow-Origin` is opaque to script no matter what its body says.
     #
     # The INNER site - the same renderer dispatched by the `ExceptionMiddleware` registered as
-    # the innermost user middleware - does pass through both middlewares and through CORS, and
-    # both of those apply their headers with `setdefault` semantics, so attaching them here as
-    # well produces the same single header rather than a duplicate.
+    # the innermost user middleware - does pass through both middlewares and through CORS. The
+    # two `app.middleware` wrappers apply their headers with `setdefault` semantics, so attaching
+    # them here as well produces the same single header rather than a duplicate. `CORSMiddleware`
+    # is NOT uniformly like that: it assigns its `simple_headers` but APPENDS `Vary` through
+    # `add_vary_header`, which is why `traverses_cors_middleware` is passed down instead of
+    # assuming symmetry. It is the one asymmetry in the whole "write it twice, get one header"
+    # argument, and it produced a real `vary: Origin, Origin` before it was accounted for.
     #
     # The correlation header is NOT a special case any more - `_problem_response` writes
     # `X-Request-ID` on every error path from the same value it puts in the document, so this
@@ -1553,7 +2129,9 @@ async def _render_unhandled(
     # the same reason, and both write the identical value, so the two cannot drift. What that
     # rule alone cannot do is make the header READABLE cross-origin, which is why
     # `Access-Control-Expose-Headers` is written beside it.
-    headers = _outer_response_headers(request, request_id)
+    headers = _outer_response_headers(
+        request, request_id, traverses_cors_middleware=traverses_cors_middleware
+    )
 
     return _problem_response(
         request=request,
@@ -1584,7 +2162,7 @@ async def _inner_unhandled_exception_handler(request: Request, exc: Exception) -
     Returns:
         The same 500 problem document the outer site renders - one shape, two dispatch sites.
     """
-    return await _render_unhandled(request, exc, log_frames=True)
+    return await _render_unhandled(request, exc, log_frames=True, traverses_cors_middleware=True)
 
 
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJSONResponse:
@@ -1602,10 +2180,11 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> ORJS
             has already logged this one with its frames on its way out.
 
     Returns:
-        The 500 problem document, with the baseline security headers and the correlation header
+        The 500 problem document, with the baseline security headers, the cross-origin permission
+        - ``Vary`` included, since no CORS wrapper will add it here - and the correlation header
         attached, because no middleware will reach this response.
     """
-    return await _render_unhandled(request, exc, log_frames=False)
+    return await _render_unhandled(request, exc, log_frames=False, traverses_cors_middleware=False)
 
 
 def inner_exception_handlers() -> dict[type[Exception], ExceptionHandler]:
@@ -1655,7 +2234,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     ``type(exc).__mro__`` and takes the first registered class, so the most-derived
     registration always wins - and the order is written most-specific-first purely to document
     that specificity. It is also why ``RateLimitExceeded`` reliably reaches its own handler
-    despite subclassing ``HTTPException``.
+    despite subclassing ``HTTPException``, and why ``DataError`` reaches its own rather than the
+    bare-``Exception`` handler it also derives from.
 
     Registration is by exception class throughout, never by status code. Starlette consults its
     integer status handlers *before* walking the MRO for an ``HTTPException``, so a status-keyed
@@ -1678,4 +2258,5 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RequestValidationError, _request_validation_error_handler)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
+    app.add_exception_handler(DataError, _data_error_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)

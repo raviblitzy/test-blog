@@ -286,7 +286,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 from pydantic.json_schema import SkipJsonSchema
 
 from app.models import CommentStatus
-from app.schemas.common import omit_null_default
+from app.schemas.common import StorableText, omit_null_default
 from app.schemas.user import UserPublic
 
 # The module's public contract is these three models, in the order RUF022 enforces. The two bounds
@@ -344,6 +344,7 @@ CommentBody = Annotated[
         min_length=BODY_MIN_LENGTH,
         max_length=BODY_MAX_LENGTH,
     ),
+    StorableText,
 ]
 """A validated comment body, as both input models accept it.
 

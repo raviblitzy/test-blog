@@ -106,6 +106,33 @@ This module still performs no configuration on import, for the reasons under *Im
 below - a settings read must not reconfigure the root logger of whatever process happens to be
 reading it.
 
+Under Gunicorn the window does not close, and closing it is the entry point's job
+--------------------------------------------------------------------------------
+The trick above works because uvicorn imports the application before it logs anything. Gunicorn
+does not: its **arbiter** binds the socket, forks workers and handles signals in a process that
+never imports ``app.main`` at all, so no call this module could make is reachable from it. Only
+the forked workers import the application, and only their lines can be reshaped.
+
+Measured under ``gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2`` at
+``ENVIRONMENT=production``: 10 of 34 lines were plain text, and all 10 came from the arbiter -
+six at boot (``Starting gunicorn``, ``Listening at:``, ``Using worker:``, two ``Booting worker
+with pid:``, ``Control socket listening at``) and four at shutdown (``Handling signal: term``,
+two ``Worker … was sent SIGTERM!``, ``Shutting down: Master``). **Every** worker-side line,
+including all request records, was JSON. The content is harmless - no secret, no request data -
+but a JSON-only collector treats each of them as unparsed, which is a real cost per container
+lifecycle rather than a cosmetic one, and the canonical documented launch
+(``uvicorn app.main:app``) has no such gap.
+
+The remedy belongs to whatever authors the production entry point - ``backend/Dockerfile`` and
+the Gunicorn invocation in it - because that is the only place with a hook that runs inside the
+arbiter. Either supply a ``gunicorn.conf.py`` whose ``on_starting`` (and ``post_fork``) calls
+:func:`configure_logging` and whose ``logconfig_dict`` routes the ``gunicorn.error`` logger
+through the structlog ``ProcessorFormatter``, or pass a ``--logger-class`` that does the same.
+Note that ``gunicorn`` and ``gunicorn.error`` are already in :data:`_DELEGATED_LOGGERS` and
+``gunicorn.access`` is already silenced, so once the arbiter's own handler is installed by such
+a hook, everything else here applies to it unchanged - no further work is needed in this module,
+and none should be attempted from it.
+
 Deliberate exclusions
 ---------------------
 A process stream is the only sink - stdout for the service, and stderr for the migration CLI
@@ -187,7 +214,7 @@ import logging
 import re
 import sys
 import unicodedata
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from functools import cache
 from typing import Any, Final, TextIO
 
@@ -196,6 +223,7 @@ from structlog.tracebacks import ExceptionDictTransformer
 from structlog.typing import FilteringBoundLogger, Processor
 
 __all__ = [
+    "FORWARDED_CLIENT_HEADERS",
     "HTTP_LOG_FIELD_CLIENT_NETWORK",
     "HTTP_LOG_FIELD_METHOD",
     "HTTP_LOG_FIELD_PATH",
@@ -204,6 +232,7 @@ __all__ = [
     "LOG_REDACTION_PLACEHOLDER",
     "LOG_TEXT_MAX_LENGTH",
     "anonymised_client_network",
+    "client_claim_is_forwarded",
     "configure_logging",
     "get_logger",
     "log_safe_text",
@@ -329,6 +358,70 @@ _IPV4_ANONYMISED_PREFIX: Final[int] = 24
 _IPV6_ANONYMISED_PREFIX: Final[int] = 64
 """Bits kept from an IPv6 peer address: the /64, the smallest block usually assigned to one
 subscriber."""
+
+
+FORWARDED_CLIENT_HEADERS: Final[frozenset[bytes]] = frozenset(
+    {
+        # The de-facto standard a reverse proxy prepends, and the one uvicorn itself reads.
+        b"x-forwarded-for",
+        # nginx's single-value spelling of the same claim.
+        b"x-real-ip",
+        # RFC 7239's standardised form, which carries `for=` among its parameters.
+        b"forwarded",
+    }
+)
+"""Request headers whose presence makes the reported peer address caller-supplied.
+
+Lowercase byte names, because an ASGI scope carries headers as lowercased byte pairs and
+comparing them there needs no decoding and no case folding.
+
+Why this list exists at all, and why it is here rather than in either module that uses it:
+Uvicorn installs its own ``ProxyHeadersMiddleware`` **outside** the application whenever
+``proxy_headers`` is on - which is its default - and for a peer inside ``forwarded_allow_ips``
+(default ``127.0.0.1``) that middleware **overwrites** ``scope["client"]`` with the address
+taken from ``X-Forwarded-For``. The original socket peer is not preserved anywhere the
+application can reach, so by the time any code here runs, ``scope["client"]`` is either the
+real peer or a value the caller chose, and nothing distinguishes them except the presence of
+the header that would have caused the substitution. Its port is no help: uvicorn honours an
+``address:port`` form, so a caller can supply a plausible non-zero port too.
+
+Two consumers need exactly that question answered, and they must answer it the same way or
+the service would enforce one rule and log another: ``app.core.rate_limit`` keys the
+authentication limit on the caller, and ``app.middleware.request_context`` writes the
+caller's network into the access record. Declaring the rule once, in the module both already
+depend on and beside :func:`anonymised_client_network` - the only other place this codebase
+decides what may be said about a peer - is what keeps them in agreement.
+"""
+
+
+def client_claim_is_forwarded(raw_headers: Iterable[tuple[bytes, bytes]]) -> bool:
+    """Report whether the request carries a caller-supplied claim about its own address.
+
+    ``True`` means the peer reported by the transport must be treated as untrusted: either
+    uvicorn already replaced it with the value of one of :data:`FORWARDED_CLIENT_HEADERS`, or
+    it did not and the caller was attempting to make it. Both cases are answered identically
+    on purpose - the distinction depends on the deployment's proxy configuration, and a
+    security control that changes shape with a server flag is one nobody can reason about.
+
+    There is no trusted-proxy allow-list here, and no configuration key for one, because this
+    deployment has no reverse proxy: the browser tier calls the API directly and the
+    container topology puts a non-loopback peer in front of it, so no legitimate caller of
+    this service sends any of these headers. Should a proxy ever be placed in front, the
+    correct change is to pin the server's own trust explicitly - ``--forwarded-allow-ips``
+    with the proxy's address, or ``--no-proxy-headers`` - and to revisit both consumers
+    together; it is not to widen this predicate.
+
+    The parameter is the raw ASGI header sequence rather than a framework ``Headers`` object,
+    so this module keeps its property of importing no web framework at all - it is imported
+    by ``backend/migrations/env.py`` as well as by the application.
+
+    Args:
+        raw_headers: ``scope["headers"]`` - lowercased name/value byte pairs, possibly empty.
+
+    Returns:
+        ``True`` when at least one forwarded-client header is present, ``False`` otherwise.
+    """
+    return any(name in FORWARDED_CLIENT_HEADERS for name, _ in raw_headers)
 
 
 def anonymised_client_network(host: str | None) -> str | None:

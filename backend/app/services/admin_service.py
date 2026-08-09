@@ -1187,9 +1187,11 @@ class AdminService:
 
         Raises:
             ForbiddenError: The principal does not hold ``ADMIN``.
-            ConflictError: The name, or the slug derived from it, is already taken. Raised by the
-                delegate, which reports the ordinary collision from a pre-check and the concurrent
-                one from the unique constraint as the same 409.
+            ConflictError: The name is already taken, or a concurrent transaction claimed the
+                name or the slug first. Raised by the delegate, which reports the ordinary
+                collision from a pre-check and the concurrent one from the unique constraint as
+                the same 409. A merely colliding derived slug is not a conflict - the delegate
+                suffixes it deterministically and the create succeeds.
 
         Note:
             **No slug is derived here.** ``CategoryService.create`` normalises the name, performs

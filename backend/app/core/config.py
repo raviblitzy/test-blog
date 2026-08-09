@@ -501,7 +501,20 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         # Absolute paths, in ascending precedence - see the module docstring.
         env_file=_ENV_FILES,
-        env_file_encoding="utf-8",
+        # `utf-8-sig`, not `utf-8`, and the difference is a diagnosis rather than a preference.
+        # Both decode an ordinary UTF-8 file identically; this one additionally discards a
+        # leading byte-order mark. Without it, an env file saved by an editor that writes a BOM
+        # - PowerShell's `Out-File`, several Windows editors' "UTF-8" default - hands the BOM to
+        # the parser as part of the FIRST key's name. The file then fails closed, which is
+        # correct, but it fails with a pair of errors that point away from the cause: the first
+        # variable is reported `Field required` because `\ufeffDATABASE_URL` is not
+        # `DATABASE_URL`, and simultaneously `Extra inputs are not permitted` because
+        # `extra="forbid"` below sees a key it does not know. Nobody reading that would suspect
+        # an invisible character, so the file is decoded correctly here instead of leaving a
+        # startup failure to be interpreted. Nothing else changes: no key, no default, no
+        # validator and no precedence rule is affected, and a BOM-free file is byte-identical
+        # in either encoding.
+        env_file_encoding="utf-8-sig",
         # The field names below are the environment variable names, spelled exactly as
         # .env.example spells them. No case folding, so `database_url` is not DATABASE_URL.
         case_sensitive=True,

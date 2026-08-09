@@ -82,7 +82,11 @@ reduces it to the ``/24`` or ``/64`` it sits in before it is written, and drops 
 does not parse as an address rather than logging it as text. An IP address identifies a person
 for practical and for regulatory purposes, while what an operator needs from this field is the
 ability to see that a burst of failures shares an origin - which a network prefix answers
-exactly as well.
+exactly as well. Nor is a network the *caller* nominated: a request carrying
+``X-Forwarded-For`` or one of its siblings has its peer rewritten by the server before this
+middleware sees it, so :func:`_client_network` writes nothing at all in that case rather than
+recording an origin the caller chose. ``app.core.rate_limit`` applies the same rule to the
+identity it enforces on, from the same predicate.
 
 The remaining two untrusted values, the method and the path, go through
 ``app.core.logging.log_safe_text``, which bounds their length and replaces every character in
@@ -140,6 +144,7 @@ from app.core.logging import (
     HTTP_LOG_FIELD_PATH,
     HTTP_LOG_FIELD_STATUS,
     anonymised_client_network,
+    client_claim_is_forwarded,
     get_logger,
     log_safe_text,
 )
@@ -268,7 +273,26 @@ def _client_network(scope: Scope) -> str | None:
     see that a burst of failures shares an origin, not enough to identify the person behind
     it - and anything that does not parse as an address is dropped rather than written out as
     text.
+
+    A caller-supplied address is not written at all, and that is the difference between a
+    field an operator can act on and one that merely looks authoritative. Uvicorn runs its
+    ``ProxyHeadersMiddleware`` outside this application by default, and for a peer inside
+    ``forwarded_allow_ips`` (default ``127.0.0.1``) it *replaces* ``scope["client"]`` with the
+    address from ``X-Forwarded-For`` - so a request carrying that header could put any network
+    it liked into this record. Measured before the change: a request from loopback carrying
+    ``X-Forwarded-For: 203.0.113.45`` was logged as ``client_network`` ``203.0.113.0/24``.
+    Nothing leaked - the full address still never appears anywhere - but an origin field that
+    an attacker chooses is worse than an absent one, because it will be believed.
+
+    So when ``app.core.logging.client_claim_is_forwarded`` reports a claim, the field is
+    written as ``None``: the same value already used for a transport with no peer, and already
+    part of this field's published contract. The key is always present, so the record still
+    carries exactly its six domain fields and nothing that reads it has to change. The
+    predicate lives in ``app.core.logging`` because ``app.core.rate_limit`` applies the same
+    rule to the identity it *enforces* on; one rule decides both.
     """
+    if client_claim_is_forwarded(scope.get("headers", ())):
+        return None
     client: Any = scope.get("client")
     if not client:
         return None

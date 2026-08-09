@@ -133,6 +133,7 @@ from fastapi import APIRouter, Path, status
 from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import CurrentUser, DbSession, PageParamsDep
 from app.schemas import Page, PostSummary, UserMe, UserPublic, UserUpdate
+from app.schemas.common import StorableText
 from app.services import ProfileService
 
 __all__ = ["router"]
@@ -154,12 +155,19 @@ router = APIRouter()
 # Declared once and referenced by both public reads, so the two halves of one profile
 # cannot end up documenting their own address differently.
 #
-# It carries a description and NOTHING else. A `min_length` or `max_length` here would look
+# It carries a description and ONE rule. A `min_length` or `max_length` here would look
 # harmless and would change the contract: an over-long handle would be answered 422 by the
 # framework before the route is entered, where both routes below document 404 - and 404 is
 # the honest answer, because an unclaimable handle is precisely a handle nobody holds.
 # Length is a property of what may be REGISTERED, enforced where registration happens; a
 # lookup only ever needs to report presence or absence.
+#
+# `StorableText` is the exception, and it is not a length rule in disguise. A NUL character is
+# not an unclaimable handle - it is a value the comparison itself cannot be performed on, since
+# `CITEXT` cannot represent it, so psycopg refused to bind it and the read became a 500 that any
+# anonymous caller could provoke at will. Refusing it here answers 422 naming `username`, which
+# is the framework's own report for a parameter it cannot accept, and it is the reason the 422
+# both routes declare is now reachable rather than theoretical.
 # ---------------------------------------------------------------------------------------
 
 _UsernamePath = Annotated[
@@ -169,10 +177,13 @@ _UsernamePath = Annotated[
             "The author's handle, exactly as it appears in the profile URL. Matched "
             "case-insensitively - `Alice` and `alice` address the same account - because "
             "`users.username` is a `CITEXT UNIQUE` column, so the index performs the fold "
-            "and no case is canonical."
+            "and no case is canonical. A handle nobody holds answers 404; the one value "
+            "refused as 422 instead is one carrying a NUL character, which no `CITEXT` "
+            "column can hold and which therefore cannot be compared against a stored one."
         ),
         examples=["example-reader"],
     ),
+    StorableText,
 ]
 
 
@@ -189,8 +200,8 @@ _UsernamePath = Annotated[
 # deliberately override the framework's own `HTTPValidationError`: this service registers a
 # `RequestValidationError` handler that renders a validation failure as the same problem
 # document, with per-field detail under `errors`, so the default schema would document a body
-# it never emits. That is why `GET /{username}` declares a 422 it cannot in practice reach -
-# see the entry's own note.
+# it never emits. `GET /{username}` declares one for a single reachable case - a handle carrying
+# a NUL character, which no `CITEXT` column can hold - see the entry's own note.
 #
 # 403 belongs to `PATCH /me` alone. It resolves `CurrentUser`, which refuses a DEACTIVATED
 # principal before the handler is entered; the two profile reads resolve no principal at all,
@@ -236,9 +247,11 @@ _PROFILE_RESPONSES: Final[ProblemResponses] = {
         "`/errors/validation-error` and `errors` names the offending parameter. Declared "
         "because the framework documents a validation rejection on every operation that "
         "parses a parameter, and this service renders every such rejection as the problem "
-        "document above rather than as the framework's own shape. **No value of `username` "
-        "reaches it today** - the handle is an unconstrained string here on purpose, so that "
-        "an unclaimable handle answers 404, which is the honest report that nobody holds it."
+        "document above rather than as the framework's own shape. **One value of `username` "
+        "reaches it**: a handle containing a NUL character, which `CITEXT` cannot represent and "
+        "so cannot be compared against a stored handle at all. Every other handle is an "
+        "unconstrained string here on purpose, so that an unclaimable one answers 404, which is "
+        "the honest report that nobody holds it."
     ),
 }
 

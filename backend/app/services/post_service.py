@@ -88,6 +88,7 @@ the event loop: :func:`_sanitize_content_off_loop` and :func:`_sanitize_excerpt_
 the write paths call.
 """
 
+import html
 import re
 import uuid
 from collections.abc import Mapping, Sequence
@@ -102,7 +103,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.concurrency import run_cpu_bound
 from app.core.dependencies import PageParams, ensure_can_author, ensure_can_modify, is_admin
-from app.core.exceptions import ConflictError, NotFoundError
+from app.core.exceptions import AppValidationError, ConflictError, FieldError, NotFoundError
 from app.core.logging import get_logger, log_safe_text
 from app.core.pagination import Page, build_page
 from app.core.slug import slugify_title, unique_slug
@@ -414,7 +415,45 @@ destinations would leave the whole indirect form untouched.
 """
 
 _NO_TAGS: Final[frozenset[str]] = frozenset()
-"""The empty tag allow-list used for the excerpt: strip every element, keep the text."""
+"""The empty tag allow-list used for the title and the excerpt: strip every element, keep the
+text."""
+
+_TITLE_SANITISE_PASSES: Final[int] = 3
+"""How many strip-and-decode passes :func:`_sanitize_title` performs before it stops.
+
+Three, and the number is measured rather than chosen for comfort. One pass handles plain markup.
+A second is needed for the entity-encoded form, ``&lt;script&gt;``, which the first pass sees as
+text and hands back unchanged before the decode turns it into real markup. A third settles a
+doubly encoded one, ``&amp;lt;script&amp;gt;``, which is the deepest form reachable through a
+120-character title. The loop exits as soon as a pass changes nothing, so the ordinary title costs
+one pass; the bound exists so that the function is total on input designed to keep it working.
+"""
+
+_FIELD_TITLE: Final[str] = "title"
+"""The member name reported in ``errors`` when a title cannot be accepted.
+
+The submitted member's own name, so a client's form attaches the message to the control the author
+typed into - the same contract ``ValidationErrorItem.field`` publishes for a schema rejection.
+"""
+
+_FIELD_ERROR_TYPE: Final[str] = "value_error"
+"""Validator identifier for a service-raised field error.
+
+Pydantic's own code for "a validator rejected this value", reused deliberately: a client
+switching on ``type`` cannot tell whether the rejection came from the schema or from this layer,
+and it should not have to - the two are the same kind of failure about the same member.
+"""
+
+_TITLE_EMPTY_AFTER_SANITISATION: Final[str] = (
+    "The title must contain text of its own. Everything submitted was markup, and removing it "
+    "left nothing to publish."
+)
+"""Detail for a title that sanitises away to nothing.
+
+Says what happened and what to do about it without quoting what was submitted, which is the rule
+every ``detail`` in this service is held to. The parallel message for a comment body lives in
+``app.services.comment_service`` and is worded the same way for the same reason.
+"""
 
 _NO_ATTRIBUTES: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType({})
 """The empty attribute allow-list that accompanies :data:`_NO_TAGS`.
@@ -938,6 +977,86 @@ def _sanitize_excerpt(raw: str) -> str | None:
         strip_comments=True,
     )
     return cleaned.strip() or None
+
+
+def _sanitize_title(raw: str) -> str:
+    """Reduce a submitted title to the plain text it claims to be, or refuse it.
+
+    The title had been the one authored member that reached its column exactly as it arrived,
+    while its plain-text sibling ``excerpt`` was stripped and the Markdown body was cleaned. That
+    asymmetry meant a title reading ``XSS <script>alert(1)</script> probe`` was stored, served and
+    slugified verbatim, so every consumer of this API inherited raw markup in the one field it is
+    told is a label - and the slug derived from it carried the tag names into a canonical URL.
+
+    Why this is not simply :func:`_sanitize_excerpt`
+    -----------------------------------------------
+    Because ``bleach.clean`` escapes as well as strips. It is the right answer for the excerpt,
+    which is emitted into a ``meta`` description and into structured data where the escaped form is
+    the safe one - and its docstring says so deliberately. Applied to a title it would be a new
+    defect rather than a fix: ``Tips & Tricks`` would be **stored** as ``Tips &amp; Tricks``,
+    rendered that way in every card heading and ``h1``, and slugified to ``tips-amp-tricks``. A
+    title is a label, so the stored value has to be the text a reader typed.
+
+    So each pass strips markup and then decodes the character references the strip introduced,
+    and the passes repeat until the value stops changing. Convergence is what closes the
+    entity-encoded form: ``&lt;script&gt;alert(1)&lt;/script&gt;`` survives one pass unchanged as
+    escaped text, decodes to real markup, and is stripped on the next - so a single pass would
+    have stored a title containing a live-looking ``<script>`` element. The loop is bounded by
+    :data:`_TITLE_SANITISE_PASSES` rather than run to a fixed point, because a bound is what makes
+    this function total on hostile input; each pass is monotone in the sense that matters - it can
+    only remove markup - and the bound was chosen against the worst case actually reachable, a
+    doubly escaped tag, which settles in three.
+
+    Verified by execution on the pinned bleach 6.4.0: markup is removed
+    (``<script>``/``<b>`` leave their text, ``<img>``/``<svg>``/``<iframe>`` leave nothing), while
+    ``&``, ``<`` and ``>`` used as prose, ``C++``, ``C#``, an em dash, CJK text, emoji, quotes and
+    apostrophes all survive byte for byte.
+
+    Args:
+        raw: The submitted title, already trimmed and length-bounded by
+            ``app.schemas.post.PostTitle``. Not offloaded to a worker thread as the body is: a
+            title is at most 120 characters, so the parse is bounded by the schema rather than by
+            the scheduler.
+
+    Returns:
+        The title as plain text, trimmed, with every element removed and no character reference
+        left behind.
+
+    Raises:
+        AppValidationError: If nothing survives - a title that was only markup, such as
+            ``<img src=x>``. ``posts.title`` is ``NOT NULL`` and the schema requires at least one
+            character, so there is no value left to store, and the honest answer is the same one
+            ``app.services.comment_service`` gives a body that sanitises to nothing: a ``422``
+            naming the member, rather than a title silently replaced by something the author did
+            not write.
+    """
+    current = raw
+    for _ in range(_TITLE_SANITISE_PASSES):
+        stripped: str = bleach.clean(
+            html.unescape(current),
+            tags=_NO_TAGS,
+            attributes=_bleach_attributes(_NO_ATTRIBUTES),
+            protocols=CONTENT_ALLOWED_PROTOCOLS,
+            strip=True,
+            strip_comments=True,
+        )
+        candidate = html.unescape(stripped).strip()
+        if candidate == current:
+            break
+        current = candidate
+
+    if not current:
+        raise AppValidationError(
+            _TITLE_EMPTY_AFTER_SANITISATION,
+            errors=[
+                FieldError(
+                    field=_FIELD_TITLE,
+                    message="Write the title as plain text; the markup submitted was removed.",
+                    type=_FIELD_ERROR_TYPE,
+                )
+            ],
+        )
+    return current
 
 
 async def _sanitize_content_off_loop(raw: str) -> str:
@@ -1508,6 +1627,8 @@ class PostService:
         Raises:
             ForbiddenError: The principal holds ``READER``. Raised by ``ensure_can_author``.
             NotFoundError: A supplied category identifier names no category.
+            AppValidationError: The title was nothing but markup, so sanitising it left no text to
+                store. Reported as a ``422`` naming ``title``.
             ConflictError: The derived slug was taken between the moment the taken set was read
                 and the moment the row was inserted. See the note.
 
@@ -1527,10 +1648,12 @@ class PostService:
             who writes their first post becomes an author" - would make the demotion revoke
             nothing at all, because the very next write would hand the role straight back.
 
-            **Both text members are sanitised before anything is stored.** The client sanitises
-            again where it renders, and this half is not skipped on the strength of that: the
-            row has to be safe for every consumer of the API, not only for the one client in
-            this repository.
+            **All three text members are sanitised before anything is stored** - the Markdown
+            body against the element allow-list, the excerpt and the title down to plain text.
+            The client sanitises again where it renders, and this half is not skipped on the
+            strength of that: the row has to be safe for every consumer of the API, not only for
+            the one client in this repository. The title is cleaned *before* the slug is derived
+            from it, so the canonical URL is built from the stored text rather than from markup.
 
             ``search_vector`` is never assigned. It is a generated column, so committing this
             insert is what derives it - there is no trigger to fire and no index to maintain.
@@ -1554,11 +1677,16 @@ class PostService:
             if payload.excerpt is None
             else await run_cpu_bound(_sanitize_excerpt, payload.excerpt)
         )
+        # Sanitised on this thread, unlike the two above: a title is bounded at 120 characters by
+        # the schema, so the parse cannot be made expensive by the caller and an offload would cost
+        # a thread hop for nothing. Cleaned BEFORE the slug is derived, so the canonical URL is
+        # built from the text that will actually be stored rather than from markup the author sent.
+        title = _sanitize_title(payload.title)
 
         post = Post(
             author_id=author.id,
-            title=payload.title,
-            slug=await self._derive_slug(payload.title),
+            title=title,
+            slug=await self._derive_slug(title),
             excerpt=excerpt,
             content=content,
             # `HttpUrl` validated the scheme and the host; the column is text, and the schema
@@ -1633,6 +1761,9 @@ class PostService:
                 names no category.
             ForbiddenError: The actor holds ``READER``, or holds ``AUTHOR`` and did not
                 write this post.
+            AppValidationError: A submitted title was nothing but markup, so sanitising it left no
+                text to store - the same rule creation applies, so a title this method accepts is
+                one ``create`` would have accepted too.
 
         Note:
             **The slug is not re-derived, and that is a guarantee rather than an omission.** A
@@ -1671,7 +1802,10 @@ class PostService:
         # "was sent" are the same condition for them - and this spelling is the one that narrows
         # the optional away for the type checker.
         if payload.title is not None:
-            post.title = payload.title
+            # Held to exactly the rule creation is held to, so a title refused by `create` cannot
+            # be introduced by patching one that was accepted. The slug is deliberately NOT
+            # re-derived from it - see this method's note on why a canonical URL does not move.
+            post.title = _sanitize_title(payload.title)
         if payload.content is not None:
             # Off the event loop, for the reason `create` records. The row is held under
             # `FOR UPDATE` while this runs, which is the narrow cost of sanitising after the
