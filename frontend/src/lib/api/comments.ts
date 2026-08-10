@@ -101,10 +101,10 @@
  */
 
 import { apiDeleteNoContent, apiGet, apiPatch, apiPost } from '@/lib/api/client';
-import { encodePathSegment } from '@/lib/paths';
 import type { OptionalAuthRequestOptions, ProtectedRequestOptions } from '@/lib/api/client';
 import { commentPublicSchema, pageOf } from '@/lib/types';
 import type { CommentCreate, CommentPublic, CommentUpdate, Page } from '@/lib/types';
+import { encodePathSegment } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Path composition
@@ -238,6 +238,18 @@ export interface ListCommentsParams {
   page?: number;
   /** Threads per page, 1 to 100. Omit for the service's default of 20. */
   page_size?: number;
+  /**
+   * Page the **replies** to this comment instead of the post's top-level comments.
+   *
+   * The continuation window for a wide discussion. A thread response bounds how many replies each
+   * top-level comment carries, so a comment reporting `has_more_replies` holds only a prefix of its
+   * replies; passing its `id` here makes its replies the page members, with their own `total`, so
+   * every reply stays reachable however many there are.
+   *
+   * The moderation filter is unchanged - only replies the caller may already see are returned - and
+   * an identifier naming no comment on this post yields an empty page rather than an error.
+   */
+  parent?: string;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -370,7 +382,7 @@ export async function listComments(
   return apiGet(threadPath(postId, 'listComments'), pageOf(commentPublicSchema), {
     ...options,
     anonymousFallback: true,
-    query: { page: params.page, page_size: params.page_size },
+    query: { parent: params.parent, page: params.page, page_size: params.page_size },
   });
 }
 

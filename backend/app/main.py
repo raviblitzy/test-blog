@@ -5,8 +5,9 @@ service. That sentence is the point of this module. The repository it replaces d
 ``uvicorn main:app --reload`` while shipping no ``main`` module at all, so the only published way
 to start the application could not succeed as written; the technical specification tracks that as
 the single feature in a non-functional state. There is now a real ``main``, the command resolves,
-and the repository-root ``app.py`` is a deprecated shim that re-exports the object built here -
-which is why the module-level name below is exactly ``app`` and must stay that way.
+and the repository-root ``app.py`` is a deprecated shim that rebinds ``sys.modules["app"]`` to the
+backend package in order to re-export the object built here - which is why the module-level name
+below is exactly ``app`` and must stay that way.
 
 An assembler, and nothing else
 ------------------------------
@@ -34,7 +35,7 @@ run to eight:
    none of the four, so the generated document described the API without ever naming it.
 2. **The documentation surface** - :data:`OPENAPI_URL` is always served; ``/docs`` and ``/redoc``
    are withdrawn in production. See *The documentation surface* below.
-3. **The middleware chain** - four wrappers in the one order that is correct. See *Middleware
+3. **The middleware chain** - five wrappers in the one order that is correct. See *Middleware
    order* below.
 4. **The rate limiter** - bound to ``app.state.limiter``, which is how *slowapi* reaches it from
    a decorated route.
@@ -44,7 +45,7 @@ run to eight:
    unprefixed.
 7. **The lifespan** - structured logging configured before the first request, the connection pool
    disposed on the way out.
-8. **The published document** - :func:`~app.api.v1.responses.customise_openapi`, which publishes
+8. **The published document** - :func:`_customise_openapi`, which publishes
    the error media type the handlers actually send and the optional-credential reads' true
    security alternatives. Both are properties of the finished document rather than of any route,
    so they are applied to the artifact once every route above is mounted - which is why this is
@@ -59,13 +60,15 @@ innermost**. The registration order below produces::
       RequestContextMiddleware       <- registered LAST: correlates, logs, sets X-Request-ID
         SecurityHeadersMiddleware    <- hardens every response, preflights included
           CORSMiddleware             <- built from settings.CORS_ALLOW_ORIGINS
-            ExceptionMiddleware      <- registered FIRST: catches what escapes the one below,
-                                        so an unhandled 500 is rendered INSIDE the CORS layer
-              ExceptionMiddleware    <- the framework's own; runs the registered handlers
-                Router -> endpoint
+            ExceptionMiddleware      <- catches what escapes the ones below, so an unhandled
+                                        500 is rendered INSIDE the CORS layer
+              BodyLimitMiddleware    <- registered FIRST: refuses an oversized body before
+                                        anything reads it
+                ExceptionMiddleware  <- the framework's own; runs the registered handlers
+                  Router -> endpoint
 
-which is exactly the order ``app.middleware`` and ``app.middleware.security_headers`` require, and
-each position is load-bearing:
+which is exactly the order ``app.middleware`` and its three sibling modules require, and each
+position is load-bearing:
 
 * ``RequestContextMiddleware`` is registered **last**, so it is outermost and every request gets
   an identifier and a bound log context - including one that fails inside another middleware.
@@ -77,8 +80,15 @@ each position is load-bearing:
 * ``CORSMiddleware`` sits above the added ``ExceptionMiddleware`` and below the other two, which
   is what lets the two wrappers above it act on the responses it generates itself *and* lets it
   act on the 500 the wrapper below it renders.
-* The added ``ExceptionMiddleware`` is registered **first**, therefore innermost of the four, and
-  that position is the entire reason it exists. Starlette hoists a handler registered for bare
+* ``BodyLimitMiddleware`` is registered **first**, therefore innermost, which puts every layer it
+  needs above it: inside ``CORSMiddleware`` so a browser can read its 413, inside
+  ``SecurityHeadersMiddleware`` so a refused request is hardened like a served one, inside
+  ``RequestContextMiddleware`` so the refusal carries the correlation identifier a burst of them
+  would be found by, and inside the added ``ExceptionMiddleware`` so the error it raises is
+  rendered as the problem document. It bounds a body before Starlette buffers it and long before a
+  schema or the rate limiter could object to its size - see ``app.middleware.body_limit``.
+* The added ``ExceptionMiddleware`` sits immediately outside it, and that position is the entire
+  reason it exists. Starlette hoists a handler registered for bare
   ``Exception`` onto ``ServerErrorMiddleware``, outside everything ``add_middleware`` adds, and
   offers no way to move it: a 500 rendered only there never passes through ``CORSMiddleware``, so
   a browser is handed a cross-origin failure with no readable body instead of the problem
@@ -145,8 +155,9 @@ reintroduce anything a worker could hold privately.
 """
 
 import tomllib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 from typing import Any, Final
@@ -154,23 +165,32 @@ from typing import Any, Final
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
+
+# The class FastAPI itself installs as the innermost exception boundary, imported here so the
+# inner handler table can be attached to that same class. FastAPI re-exports it nowhere, so it is
+# reached through the Starlette FastAPI pins and installs - which is not a reason to declare
+# starlette directly; see `backend/pyproject.toml`.
 from starlette.middleware.exceptions import ExceptionMiddleware
 
-from app.api.v1.responses import customise_openapi
 from app.api.v1.router import API_V1_PREFIX, api_router
 from app.api.v1.routers.health import router as health_router
 from app.core.config import settings
+from app.core.dependencies import OPTIONAL_AUTHENTICATION_EXTENSION
 from app.core.exceptions import (
     CORS_EXPOSE_HEADERS,
+    PROBLEM_JSON_MEDIA_TYPE,
     REQUEST_ID_HEADER,
     inner_exception_handlers,
     register_exception_handlers,
 )
 from app.core.logging import configure_logging, get_logger
 from app.core.rate_limit import limiter
+from app.core.security import warm_password_hashing
 from app.db.session import engine
+from app.middleware.body_limit import BodyLimitMiddleware
 from app.middleware.request_context import RequestContextMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.schemas import ProblemDetail
 
 __all__ = [
     "API_TITLE",
@@ -438,6 +458,297 @@ send.
 # pythonpath = ["."]` is what puts `app` on the path for the suite, rather than an install -
 # so the same table is read out of the file instead.
 # ---------------------------------------------------------------------------------------
+# The two corrections the finished document needs
+#
+# Everything from here to `_customise_openapi` operates on the GENERATED artifact rather than
+# on a route, because neither fact can be expressed on a route at all:
+#
+#   * `app.schemas.common.problem_response` cannot declare `application/problem+json`. The
+#     framework attaches a declared model under `route.response_class.media_type` and offers no
+#     per-response override, so a route can publish the right SCHEMA or the right MEDIA TYPE and
+#     not both. That helper's docstring records both failed alternatives, executed against
+#     FastAPI 0.141.1.
+#   * `app.core.dependencies.OPTIONAL_AUTHENTICATION` cannot be a `security` override, because
+#     FastAPI merges `openapi_extra` with `deep_dict_update`, which concatenates lists. That
+#     constant's docstring records the incoherent list the direct approach produces.
+#
+# So both are stated where they can be stated - at the route, as a schema and as a marker - and
+# reconciled here, once, on the document every consumer actually reads. Nothing below is a
+# route, a query, a session or a business rule, and nothing below reads the environment.
+# ---------------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------------------
+# Document constants
+#
+# All four describe the SERVED artifact rather than any framework object, which is what
+# keeps the transform below independent of FastAPI's internals.
+# ---------------------------------------------------------------------------------------
+
+_CONTENT_TOO_LARGE_STATUS: Final[str] = str(int(HTTPStatus.CONTENT_TOO_LARGE))
+"""The status key ``413`` under which the body-limit response is published.
+
+A string, because a generated document keys ``responses`` by string, and derived from
+:class:`~http.HTTPStatus` rather than written as a literal so the number and the name cannot part
+company.
+"""
+
+_REQUEST_BODY_LIMIT_DESCRIPTION: Final[str] = (
+    "The request body is larger than this API accepts. Refused before the body is parsed and "
+    "before any route is reached, so nothing was created or changed. The ceiling is a deployment "
+    "setting rather than a property of this operation - see `MAX_REQUEST_BODY_BYTES` in "
+    "`.env.example`, which defaults to 1 MiB - and it is comfortably above the largest body any "
+    "route accepts, so a request that reaches this is not a valid one made slightly too large."
+)
+"""What the published ``413`` says, and deliberately what it does not.
+
+The number is named as a *configuration* key rather than quoted as a value, because a ceiling
+returned in a response is a ceiling a caller can sit exactly underneath - and because it differs
+between deployments, so a figure baked into the document would be wrong wherever it was changed.
+"""
+
+_JSON_MEDIA_TYPE: Final[str] = "application/json"
+"""The media type the framework attaches a declared response model under.
+
+Taken from the JSON response classes' own ``media_type``, which is a hard-coded class attribute
+rather than anything a route can influence - the reason the remap exists.
+"""
+
+_PROBLEM_SCHEMA_REF: Final[str] = f"#/components/schemas/{ProblemDetail.__name__}"
+"""JSON-pointer reference the framework emits for a response whose model is the problem document.
+
+Derived from the class rather than written out, so renaming the model cannot leave the transform
+matching a component name that no longer exists.
+"""
+
+_OPERATION_KEYS: Final[frozenset[str]] = frozenset(
+    {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
+)
+"""The keys of a path-item object that are operations.
+
+Enumerated rather than assumed: a path item may also carry ``summary``, ``description``,
+``servers``, ``parameters`` or ``$ref``, none of which is an operation and one of which is a
+list. Iterating every value would either crash on those or, worse, silently treat one as an
+operation.
+"""
+
+_ANONYMOUS_SECURITY: Final[dict[str, list[str]]] = {}
+"""The security requirement object that permits an anonymous call.
+
+An empty requirement object is the specification's way of saying "no scheme has to be
+satisfied". Listed *first* among the alternatives so a reader and a code generator both meet
+"this may be called without a credential" before the bearer alternative.
+"""
+
+
+def _operations(document: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Yield every operation object in *document*, in document order.
+
+    Args:
+        document: A generated OpenAPI document, mutated in place by the callers of this
+            function - so the mappings yielded are the document's own, not copies.
+
+    Yields:
+        Each operation object under each path item, skipping the path-item members that are not
+        operations and skipping anything that is not a mapping, so a hand-written extension
+        cannot make the transform raise.
+    """
+    paths = document.get("paths")
+    if not isinstance(paths, dict):
+        return
+    for path_item in paths.values():
+        if not isinstance(path_item, dict):
+            continue
+        for method, operation in path_item.items():
+            if method in _OPERATION_KEYS and isinstance(operation, dict):
+                yield operation
+
+
+def _publish_request_body_limit(document: dict[str, Any]) -> None:
+    """Declare ``413`` on every operation that accepts a request body.
+
+    A property of the application rather than of any route, which is why it is applied to the
+    finished document instead of repeated in fourteen ``responses`` mappings.
+    ``app.middleware.body_limit`` refuses an oversized body before any route is reached, so every
+    operation that takes one can answer this status - and a route author cannot opt out of it,
+    cannot forget to declare it, and cannot declare it inconsistently.
+
+    Derived from ``requestBody`` rather than from a hand-kept list, so an operation added later is
+    covered the moment it accepts a body. Operations that take none are deliberately left alone: a
+    ``GET`` carrying an oversized body would be refused too, but declaring a status for a body the
+    contract does not accept describes a request no client should be making.
+
+    An operation that already declares ``413`` is not overwritten, so a route with something more
+    specific to say about its own limit keeps it.
+
+    Args:
+        document: The generated document, mutated in place.
+    """
+    for operation in _operations(document):
+        if "requestBody" not in operation:
+            continue
+        responses = operation.setdefault("responses", {})
+        if not isinstance(responses, dict) or _CONTENT_TOO_LARGE_STATUS in responses:
+            continue
+        # Written in the GENERATED shape, not the declared one. `problem_response` returns
+        # `{"model": ..., "description": ...}`, which is what a *route* passes to FastAPI for the
+        # generator to expand; injected straight into a finished document that `model` key means
+        # nothing and the response would publish a description with no body at all. Verified: doing
+        # it that way produced a 413 whose entry had no `content`. So the body is spelled out here,
+        # keyed on `application/json` exactly as a route-declared one is, and
+        # `_publish_problem_media_type` - which runs after this - re-keys every one of them to the
+        # problem media type together, keeping that job in one rule.
+        responses[_CONTENT_TOO_LARGE_STATUS] = {
+            "description": _REQUEST_BODY_LIMIT_DESCRIPTION,
+            "content": {_JSON_MEDIA_TYPE: {"schema": {"$ref": _PROBLEM_SCHEMA_REF}}},
+        }
+
+
+def _publish_problem_media_type(document: dict[str, Any]) -> None:
+    """Re-key every declared problem-document body from JSON to ``application/problem+json``.
+
+    Resolution of the drift between what the handlers send and what the document claimed: every
+    handler in ``app.core.exceptions`` returns its body with
+    :data:`~app.core.exceptions.PROBLEM_JSON_MEDIA_TYPE`, while the framework published the same
+    body as ``application/json`` because that is the media type of the response class. A
+    generated client therefore parsed - or refused - the wrong content type.
+
+    Only a response whose ``application/json`` schema is exactly a reference to the problem
+    document is touched. A success body is never a problem document, so no successful response
+    is reachable by this test, and a response that already declares the problem media type is
+    left alone.
+
+    Args:
+        document: The generated document, mutated in place.
+    """
+    for operation in _operations(document):
+        responses = operation.get("responses")
+        if not isinstance(responses, dict):
+            continue
+        for response in responses.values():
+            if not isinstance(response, dict):
+                continue
+            content = response.get("content")
+            if not isinstance(content, dict):
+                continue
+            body = content.get(_JSON_MEDIA_TYPE)
+            if not _is_problem_document(body):
+                continue
+            # Removed and re-added rather than copied to both keys: the service emits one media
+            # type, so the document must declare one. Declaring both would restate the very
+            # inaccuracy this transform exists to remove.
+            del content[_JSON_MEDIA_TYPE]
+            content[PROBLEM_JSON_MEDIA_TYPE] = body
+
+
+def _is_problem_document(body: object) -> bool:
+    """Report whether *body* is a media-type object whose schema is the problem document.
+
+    Args:
+        body: The candidate media-type object, read straight out of the document and therefore
+            of unverified shape.
+
+    Returns:
+        Whether it declares exactly ``{"$ref": "#/components/schemas/ProblemDetail"}`` as its
+        schema. A composed schema - an array of them, a ``oneOf``, an inline object - is
+        deliberately not matched: nothing in this service declares one, and a loose test here
+        could re-key a success body that merely mentions the component.
+    """
+    if not isinstance(body, dict):
+        return False
+    schema = body.get("schema")
+    return isinstance(schema, dict) and schema.get("$ref") == _PROBLEM_SCHEMA_REF
+
+
+def _publish_optional_authentication(document: dict[str, Any]) -> None:
+    """Turn each marked operation's mandatory security into anonymous-or-bearer alternatives.
+
+    An operation carrying :data:`~app.core.dependencies.OPTIONAL_AUTHENTICATION` accepts a bearer
+    credential and serves
+    a caller who presents none. The framework cannot know that - it sees the security scheme in
+    the dependency tree and publishes a single mandatory requirement - so the marker is what
+    tells this function to prepend :data:`_ANONYMOUS_SECURITY`.
+
+    The marker is removed from every operation it appears on, whether or not the rewrite
+    applies, so the served document carries no vendor extension.
+
+    Args:
+        document: The generated document, mutated in place.
+    """
+    for operation in _operations(document):
+        if not operation.pop(OPTIONAL_AUTHENTICATION_EXTENSION, False):
+            continue
+        declared = operation.get("security")
+        if not isinstance(declared, list) or not declared:
+            # Nothing to relax: the operation already requires no scheme. Reached only if the
+            # marker is attached to a route with no security dependency, which is a
+            # mis-annotation rather than a document defect - and writing `[{}]` here would
+            # publish a security block that says nothing.
+            continue
+        if _ANONYMOUS_SECURITY in declared:
+            continue
+        # A COPY of the constant, not the constant itself. `_openapi_tags` above states the
+        # same rule for the same reason: two applications built by the factory would otherwise
+        # hold one shared mutable object, and a consumer editing the document it was handed
+        # would edit it for every other application in the process.
+        operation["security"] = [dict(_ANONYMOUS_SECURITY), *declared]
+
+
+def _customise_openapi(application: FastAPI) -> None:
+    """Install the three document corrections on *application*, replacing its ``openapi`` callable.
+
+    The last statement of assembly, made by :func:`create_app` after the routers are mounted.
+    Everything it corrects is a property of the finished document, so it runs on the generated
+    artifact rather than on the routes:
+
+    1. Every operation that accepts a request body declares ``413``, which
+       ``app.middleware.body_limit`` can answer for any of them before a route is reached.
+    2. Every declared problem-document body is published as ``application/problem+json``, which
+       is what the handlers actually send.
+    3. Every operation marked :data:`~app.core.dependencies.OPTIONAL_AUTHENTICATION` publishes
+       anonymous *and* bearer
+       as alternatives instead of bearer as a requirement.
+
+    The framework's own generator is called first and its cache is honoured afterwards, so the
+    document is still built once per application and every subsequent request to
+    ``/openapi.json`` serves the same object. The cache is cleared on installation so that a
+    document generated before this call - which nothing does today, but which a future
+    assertion in the factory easily could - cannot be served uncorrected.
+
+    Args:
+        application: The application to correct. Its ``openapi`` attribute is replaced, and its
+            cached document discarded.
+    """
+    # Bound before the replacement, so the closure calls the framework's generator rather than
+    # itself. Rebinding `application.openapi` to a function that reached for `application.openapi`
+    # would recurse until the stack ended.
+    generate_document = application.openapi
+
+    def openapi() -> dict[str, Any]:
+        """Return the corrected document, generating and caching it on first call."""
+        if application.openapi_schema is not None:
+            return application.openapi_schema
+        # `generate_document` stores its result on `application.openapi_schema` itself; the
+        # corrections below therefore mutate the cached object in place, and the assignment
+        # after them is what makes that explicit rather than incidental.
+        document = generate_document()
+        # Ordered deliberately: the body-limit publisher writes its entry keyed on
+        # `application/json`, and `_publish_problem_media_type` then re-keys every declared
+        # problem body - the injected 413s included - to `application/problem+json` in one pass.
+        _publish_request_body_limit(document)
+        _publish_problem_media_type(document)
+        _publish_optional_authentication(document)
+        application.openapi_schema = document
+        return document
+
+    application.openapi_schema = None
+    # Assigning over a method is how the framework's own documentation prescribes customising
+    # the generated document; the code is named because a bare ignore is banned by
+    # `[tool.mypy] enable_error_code = ["ignore-without-code"]`.
+    application.openapi = openapi  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------------------
 
 _DISTRIBUTION_NAME: Final[str] = "blog-api-backend"
 """``[project] name`` in ``backend/pyproject.toml``, the key the installed metadata is under."""
@@ -545,7 +856,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     may escape: it would replace the exception that caused the shutdown in the first place.
 
     **Startup performs no I/O.** No connection is opened, no query is issued, no migration is
-    applied and nothing is seeded. That is a requirement rather than an economy: schema evolution
+    applied and nothing is seeded. It does perform one bounded piece of CPU work -
+    :func:`~app.core.security.warm_password_hashing` - for the reason recorded at that function
+    and below. That is a requirement rather than an economy: schema evolution
     belongs to ``alembic upgrade head`` - run by the container start command and by the
     ``migrate`` target - and reference data to ``app.db.seed``, invoked by the ``seed`` target. A
     process that migrated on boot would race every other replica starting beside it, and one that
@@ -586,6 +899,16 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         api_prefix=API_V1_PREFIX,
         docs_enabled=application.docs_url is not None,
     )
+
+    # Before the first request, never in response to one. `app.services.auth_service` verifies an
+    # unknown email against a stand-in argon2id hash so that a login for an unregistered address
+    # costs what a login for a registered one costs. That hash is cached, so only its FIRST
+    # computation is expensive - and left to happen lazily, that first computation lands inside the
+    # first unknown-email login the process serves, which then pays a full argon2 hash on top of
+    # its verify while a known-email attempt pays only the verify. One request is enough to read
+    # that difference. Paying it here puts it where nobody is waiting on it and nothing is being
+    # timed. CPU only: no connection, no query, so the "startup performs no I/O" rule above holds.
+    warm_password_hashing()
 
     try:
         yield
@@ -701,17 +1024,32 @@ def create_app() -> FastAPI:
     )
 
     # ---------------------------------------------------------------------------------------
-    # 2-5. The middleware chain
+    # 2-6. The middleware chain
     #
     # ORDER IS LOAD-BEARING. `add_middleware` inserts at the front, so first registered ends up
-    # INNERMOST. Read the four calls below as the stack upside down, and see "Middleware order"
+    # INNERMOST. Read the five calls below as the stack upside down, and see "Middleware order"
     # in the module docstring for why each position is the only correct one. Reordering them
     # does not fail - it silently stops hardening preflight responses, silently drops the
     # correlation identifier from requests that fail inside another wrapper, or silently turns
     # an unhandled 500 back into an unreadable cross-origin failure.
     # ---------------------------------------------------------------------------------------
 
-    # 2. INNERMOST, and it has to be inside CORS rather than outside it.
+    # 2. INNERMOST of the five, which is what puts every layer its refusal needs above it: CORS,
+    #    so a browser can read the 413; the security headers, so a refused request is hardened like
+    #    a served one; the request context, so the refusal carries a correlation identifier; and
+    #    the exception wrapper registered next, which is what renders the error it raises. It
+    #    bounds a request body before Starlette buffers it - and therefore before a Pydantic field
+    #    bound or the route's rate limiter could object to its size, both of which run too late to
+    #    be a limit on size at all. `app.middleware.body_limit` records the reasoning in full.
+    application.add_middleware(
+        BodyLimitMiddleware,
+        # From settings, never a literal here: `Settings.MAX_REQUEST_BODY_BYTES` validates the
+        # floor and carries the reasoning behind the default, so this is the only place the value
+        # is read and the only place it can be configured.
+        max_body_bytes=settings.MAX_REQUEST_BODY_BYTES,
+    )
+
+    # 3. Immediately outside the body limit, and it has to be inside CORS rather than outside it.
     #
     #    Starlette hoists a handler registered for bare `Exception` onto
     #    `ServerErrorMiddleware`, which `build_middleware_stack` places outside every wrapper
@@ -735,7 +1073,7 @@ def create_app() -> FastAPI:
         debug=False,
     )
 
-    # 3. Configured entirely from settings: no origin literal appears here, and
+    # 4. Configured entirely from settings: no origin literal appears here, and
     #    `app.core.config` has already split the comma-separated value and rejected anything
     #    that is not a bare http/https origin.
     application.add_middleware(
@@ -768,14 +1106,14 @@ def create_app() -> FastAPI:
         expose_headers=CORS_EXPOSE_HEADERS,
     )
 
-    # 4. Outside CORS, so an OPTIONS preflight - which CORSMiddleware answers itself, without
+    # 5. Outside CORS, so an OPTIONS preflight - which CORSMiddleware answers itself, without
     #    calling anything beneath it - is hardened like every other response. `enable_hsts` is
     #    required by that class rather than defaulted, so the question cannot be skipped at the
     #    one point that can answer it; `settings.is_production` is the answer wherever the
     #    deployment stage and TLS termination coincide.
     application.add_middleware(SecurityHeadersMiddleware, enable_hsts=settings.is_production)
 
-    # 5. LAST, therefore OUTERMOST. Every request gets an identifier and a bound log context
+    # 6. LAST, therefore OUTERMOST. Every request gets an identifier and a bound log context
     #    before any other wrapper can fail, and every response carries it back out. Both
     #    keyword arguments are left at their defaults deliberately: the header name is the
     #    constant `expose_headers` above and the 500 handler both agree on, and the quiet-path
@@ -783,7 +1121,7 @@ def create_app() -> FastAPI:
     application.add_middleware(RequestContextMiddleware)
 
     # ---------------------------------------------------------------------------------------
-    # 6. The rate limiter
+    # 7. The rate limiter
     #
     # `slowapi` reaches the limiter back through `request.app.state.limiter` when a decorated
     # route is called, so this binding is not bookkeeping: without it every rate-limited
@@ -799,7 +1137,7 @@ def create_app() -> FastAPI:
     application.state.limiter = limiter
 
     # ---------------------------------------------------------------------------------------
-    # 7. The error contract - one call, one rendering site
+    # 8. The error contract - one call, one rendering site
     #
     # This is the direct remedy for the three duplicated `HTTPException(status_code=404,
     # detail="Item not found")` raises the retired module carried at three separate call
@@ -816,7 +1154,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(application)
 
     # ---------------------------------------------------------------------------------------
-    # 8. Routes - mounted here, declared nowhere in this file
+    # 9. Routes - mounted here, declared nowhere in this file
     #
     # Two includes, and the asymmetry between them is deliberate.
     # ---------------------------------------------------------------------------------------
@@ -835,7 +1173,7 @@ def create_app() -> FastAPI:
     application.include_router(health_router)
 
     # ---------------------------------------------------------------------------------------
-    # 8. The published document - LAST, and after every route is mounted
+    # 10. The published document - LAST, and after every route is mounted
     #
     # Two facts about this API cannot be expressed on a route and are therefore applied to the
     # finished document, both of them corrections to what the framework would otherwise
@@ -856,7 +1194,7 @@ def create_app() -> FastAPI:
     # document here - generation stays lazy and cached, on the first request to
     # `OPENAPI_URL` - so this call costs nothing at startup.
     # ---------------------------------------------------------------------------------------
-    customise_openapi(application)
+    _customise_openapi(application)
 
     return application
 
@@ -884,8 +1222,23 @@ Four things import or address this object by that name: ``uvicorn app.main:app``
 ``backend/``, which is the canonical launch and the correction of the ``uvicorn main:app`` command
 the old README documented against a module that never existed; the container's Gunicorn command,
 which supervises Uvicorn workers over ``app.main:app``; the Compose service built from it; and the
-repository-root ``app.py``, retained as a deprecated shim whose entire body is
-``from app.main import app`` so that the historical ``uvicorn app:app`` invocation still resolves.
+repository-root ``app.py``, retained as a deprecated shim so that the historical
+``uvicorn app:app`` invocation still resolves.
+
+That last one is not a one-line re-export, and the difference matters to anyone reading it.
+``app.py`` is itself imported *as* ``app``, so ``sys.modules["app"]`` already holds a plain module
+and ``from app.main import app`` fails there with "'app' is not a package" - while resolving ``app``
+by name would find and re-execute the shim itself, recursing. It therefore locates
+``backend/app/__init__.py`` from its own ``__file__``, loads it through
+``importlib.util.spec_from_file_location`` with explicit ``submodule_search_locations``, rebinds
+``sys.modules["app"]`` to that package, imports ``app.main`` and takes this object from it - then
+re-attaches the name ``app`` to the package, because ``backend/app/__init__.py`` declares no such
+attribute and Uvicorn's final ``getattr(import_module("app"), "app")`` step would otherwise fail
+after every import had succeeded. It also emits a ``DeprecationWarning`` and converts an import
+failure into a ``RuntimeError`` naming the canonical command. None of that machinery is reachable
+from here and none of it is required by this module; it is described because "a shim that
+re-exports it" understates what has to happen for that invocation to work, and because the one
+thing it cannot do is put the repository root on ``sys.path`` in the first place.
 
 A plain module-level instance, not a factory reference and not lazily built, because that is what
 those four resolutions require. Constructing it opens no connection - see *Import-time effects* in

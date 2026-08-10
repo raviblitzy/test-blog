@@ -146,7 +146,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE, MIN_PAGE_SIZE
 from app.models import Comment, CommentStatus, Post, PostStatus, User
-from app.repositories.comment_repository import MAX_THREAD_DEPTH
+from app.repositories.comment_repository import (
+    MAX_THREAD_DEPTH,
+    MAX_THREAD_DESCENDANTS,
+    replies_per_root,
+)
 from app.schemas.comment import BODY_MAX_LENGTH
 from app.services.comment_service import MAX_REPLY_DEPTH
 from tests import factories
@@ -198,6 +202,8 @@ COMMENT_MEMBERS: Final[frozenset[str]] = frozenset(
         "status",
         "created_at",
         "updated_at",
+        "reply_count",
+        "has_more_replies",
         "replies",
     }
 )
@@ -239,6 +245,50 @@ ABSENT_UUID: Final[str] = "00000000-0000-0000-0000-000000000000"
 
 #: A path segment that is not a UUID at all.
 MALFORMED_UUID: Final[str] = "not-a-uuid"
+
+
+# ---------------------------------------------------------------------------------------
+# The shape of the oversized thread
+#
+# `app.repositories.comment_repository` bounds a thread read TWICE: `MAX_THREAD_DEPTH` prunes the
+# recursive term, and the descendant budget bounds how many rows the page may carry. That budget is
+# `MAX_THREAD_DESCENDANTS` for the page as a whole, but it is not spent first-come: it is divided
+# by `replies_per_root(page_size)`, so each root on the page receives an equal share and a busy
+# thread cannot consume a quiet neighbour's rows. Depth was already exercised by
+# `TestReplyThreading`; the row budget was not, and it cannot be exercised by a thread that fits
+# inside it. So `wide_thread` builds one that does not.
+#
+# Every number below is DERIVED from the published allowance rather than written as a literal,
+# which is what stops this becoming a test that used to be meaningful. Raise
+# `MAX_THREAD_DESCENDANTS` and the fixture grows with it and still overshoots; write `20` here
+# instead and the same change would leave a thread comfortably inside the allowance, asserting
+# nothing while staying green.
+# ---------------------------------------------------------------------------------------
+
+#: The per-root share of the page budget at the default page size - what one thread may carry.
+CAP_ALLOWANCE: Final[int] = replies_per_root(DEFAULT_PAGE_SIZE)
+
+#: How far past :data:`CAP_ALLOWANCE` the fixture reaches. Chosen so the overshoot is at least as
+#: large as the allowance itself, because the cut has to be observed and the rows discarded are as
+#: much of the assertion as the rows kept.
+CAP_OVERSHOOT: Final[int] = CAP_ALLOWANCE
+
+#: Replies in the first generation, i.e. direct children of the root. Deliberately well inside the
+#: allowance: the depth-major ordering must retain this whole generation before any of the next,
+#: and that property is only observable if the generation could have fit.
+CAP_FIRST_GENERATION: Final[int] = max(1, CAP_ALLOWANCE // 2)
+
+#: Replies in the second generation, chosen so that the two generations together exceed one root's
+#: allowance by exactly :data:`CAP_OVERSHOOT`.
+CAP_SECOND_GENERATION: Final[int] = CAP_ALLOWANCE + CAP_OVERSHOOT - CAP_FIRST_GENERATION
+
+#: How many of the first-generation replies carry the second generation, so the thread is a genuine
+#: forest with several branches rather than one chain or one flat fan.
+CAP_BRANCHING: Final[int] = CAP_FIRST_GENERATION
+
+#: Replies beneath the second, smaller root, used to show one thread's share is its own and a
+#: shallow neighbour is not starved by a busy sibling.
+CAP_NEIGHBOUR_REPLIES: Final[int] = 3
 
 
 # ---------------------------------------------------------------------------------------
@@ -364,6 +414,20 @@ def assert_comment_public(node: Json) -> None:
     assert isinstance(node["body"], str), node["body"]
     assert node["body"], "a stored comment body is never empty"
     assert isinstance(node["replies"], list), node["replies"]
+
+    # The continuation contract, asserted at every level. `reply_count` is the number of replies
+    # VISIBLE to this caller, which a bounded response may carry only a prefix of, so it can never
+    # be smaller than what was returned - and `has_more_replies` must be exactly the statement that
+    # the two differ. Deriving the flag in the assertion rather than trusting it is what would catch
+    # a projection that set one member and forgot the other.
+    assert isinstance(node["reply_count"], int), node["reply_count"]
+    assert node["reply_count"] >= len(node["replies"]), (
+        f"reply_count {node['reply_count']} is below the {len(node['replies'])} replies returned"
+    )
+    assert node["has_more_replies"] is (node["reply_count"] > len(node["replies"])), (
+        f"has_more_replies {node['has_more_replies']} disagrees with reply_count "
+        f"{node['reply_count']} against {len(node['replies'])} returned replies"
+    )
 
     # `replies` is never null and never a placeholder, so the same contract holds at every level
     # of a thread and a client can walk it without a null check.
@@ -493,6 +557,128 @@ async def descendant_chain(
         )
         chain.append(parent)
     return chain
+
+
+async def wide_thread(
+    session: AsyncSession,
+    *,
+    post: Post,
+    author: User,
+    first_generation: int = CAP_FIRST_GENERATION,
+    second_generation: int = CAP_SECOND_GENERATION,
+    branching: int = CAP_BRANCHING,
+) -> tuple[Comment, list[Comment], list[Comment]]:
+    """Create one ``APPROVED`` root carrying two generations of replies, and return all three parts.
+
+    The fixture the row budget needs. ``descendant_chain`` builds depth and no breadth, which is
+    the wrong shape here: a chain can never exceed :data:`CAP_ALLOWANCE` because
+    :data:`MAX_THREAD_DEPTH` stops it at eight, so the LIMIT would never be reached. Breadth is
+    unbounded by design - a popular comment may have any number of replies - so breadth is what
+    the row budget actually defends against and breadth is what this builds.
+
+    The second generation is distributed round-robin over the first *branching* replies, so the
+    result is a forest of several branches at two depths rather than one fan. That matters for the
+    ordering assertion: a flat fan has a single depth and could not distinguish depth-major
+    ordering from plain ``created_at`` ordering.
+
+    Built through ``factories.create_comment`` rather than by constructing rows here, so every node
+    goes through the same parent/post validation the request path applies, and every node is
+    ``APPROVED`` and therefore visible to an anonymous reader.
+
+    Args:
+        session: The session under test.
+        post: The post whose thread this is.
+        author: The account writing every comment. One author throughout - authorship is not what
+            is under test here, and a byline per node would add rows without adding coverage.
+        first_generation: How many direct children the root gets.
+        second_generation: How many grandchildren, spread over the first *branching* children.
+        branching: How many of the first generation carry children.
+
+    Returns:
+        ``(root, firsts, seconds)`` - the top-level comment, its direct children in creation
+        order, and its grandchildren in creation order. ``firsts + seconds`` is the complete
+        descendant set the allowance has to truncate.
+
+    Note:
+        Every comment created in one test shares a single ``created_at``. ``created_at`` defaults
+        to ``func.now()``, which is the *transaction* clock, and the whole build happens inside the
+        test's one transaction - measured directly on this fixture: every row, one distinct
+        ``created_at``. So the ordering the cut follows reduces to ``(depth, id)`` here, and ``id``
+        is a server-generated UUID. That is why no test below hard-codes which replies survive: the
+        expectation is computed from the same key the statement orders by.
+    """
+    if first_generation >= CAP_ALLOWANCE:
+        raise ValueError(
+            "the first generation must fit inside one root's allowance, or the depth-major "
+            f"assertion below cannot distinguish anything (first_generation={first_generation}, "
+            f"CAP_ALLOWANCE={CAP_ALLOWANCE})."
+        )
+    if first_generation + second_generation <= CAP_ALLOWANCE:
+        raise ValueError(
+            "the thread must exceed one root's allowance, or nothing is truncated and every "
+            f"assertion below passes vacuously (total={first_generation + second_generation}, "
+            f"CAP_ALLOWANCE={CAP_ALLOWANCE})."
+        )
+    if not 0 < branching <= first_generation:
+        raise ValueError(
+            "branching must name a non-empty prefix of the first generation "
+            f"(branching={branching}, first_generation={first_generation})."
+        )
+
+    root = await factories.create_comment(
+        session, post=post, author=author, status=CommentStatus.APPROVED, body="the root"
+    )
+    firsts = [
+        await factories.create_comment(
+            session,
+            post=post,
+            author=author,
+            parent=root,
+            status=CommentStatus.APPROVED,
+            body=f"first-{index:03d}",
+        )
+        for index in range(first_generation)
+    ]
+    seconds = [
+        await factories.create_comment(
+            session,
+            post=post,
+            author=author,
+            parent=firsts[index % branching],
+            status=CommentStatus.APPROVED,
+            body=f"second-{index:03d}",
+        )
+        for index in range(second_generation)
+    ]
+    return root, firsts, seconds
+
+
+def retained_by_the_documented_order(
+    generations: Sequence[Sequence[Comment]],
+    *,
+    limit: int,
+) -> set[str]:
+    """Return the identifiers the repository's own ordering keeps, as wire strings.
+
+    An independent re-derivation of the cut, from the persisted rows and from the key the
+    statement declares - ``ORDER BY depth, created_at, id`` with ``LIMIT`` - rather than from what
+    the response happened to contain. *generations* is shallowest-first, which is where ``depth``
+    comes from: it is not a stored column, so the only honest source for it is the shape the
+    fixture built.
+
+    Args:
+        generations: The descendant generations, shallowest first.
+        limit: How many rows the statement may return.
+
+    Returns:
+        The ``str(uuid)`` of each retained comment.
+    """
+    # Visiting the generations shallowest-first IS the leading `depth` key, so only the two
+    # tiebreakers need sorting - within a generation, and never across one.
+    ordered: list[Comment] = []
+    for generation in generations:
+        ordered.extend(sorted(generation, key=lambda row: (row.created_at, row.id)))
+    return {str(comment.id) for comment in ordered[:limit]}
 
 
 async def comment_ids_present(session: AsyncSession, ids: Sequence[uuid.UUID]) -> set[uuid.UUID]:
@@ -847,6 +1033,57 @@ class TestCreateComment:
         assert 'rel="nofollow"' in stored
         assert "target=" not in stored
 
+    async def test_an_unrecognised_integrity_failure_is_a_server_error_not_a_conflict(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+        auth_headers_for: HeaderFactory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An integrity failure naming no thread foreign key answers 500, not a thread conflict.
+
+        ``CommentService.create`` translates exactly two constraints - the foreign key to the post
+        and the one to the parent comment - because those are the only integrity failures a
+        concurrent request can cause: the post or the parent was deleted between the visibility
+        check and the insert. That is a real race, and "the thread changed, retry" is the right
+        answer to it.
+
+        Every other integrity failure on this relation is a defect in the service rather than
+        contention: a column it failed to populate, a check it violated, a generated key it
+        somehow collided. Reporting one of those as a 409 was actively harmful, because 409 is the
+        status a client is meant to retry - so a reader would resubmit forever against a fault
+        that cannot clear, while no 500 was ever raised to say what was actually broken.
+
+        The injected failure carries no driver diagnostics, so no constraint can be named. That is
+        the fail-closed path through ``integrity_constraint_name``, and re-raising is the only
+        correct response to "I cannot tell what went wrong".
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        from app.repositories import CommentRepository
+
+        post = await visible_post(db_session, author_user)
+
+        async def raise_unknown_integrity_error(self: CommentRepository, comment: Any) -> Any:
+            raise IntegrityError("INSERT INTO comments", {}, Exception("some other invariant"))
+
+        monkeypatch.setattr(CommentRepository, "add_with_author", raise_unknown_integrity_error)
+
+        response = await client.post(
+            _thread_path(post.id),
+            json={"body": "A comment whose insert fails for a reason nobody allow-listed."},
+            headers=auth_headers_for(reader_user),
+        )
+
+        assert response.status_code == 500, response.text
+        payload = response.json()
+        assert payload["status"] == 500
+        assert "removed while this comment was being written" not in payload["detail"], (
+            "a defect must not be reported as a thread race the reader should retry"
+        )
+
 
 class TestReplyThreading:
     """``parent_id`` and the shape of the thread it produces - the threading half of AAP R4."""
@@ -1146,6 +1383,242 @@ class TestReplyThreading:
         assert past_ceiling.status_code == 422, past_ceiling.text
         assert_problem(past_ceiling.json(), status=422, problem_type=PROBLEM_TYPE_VALIDATION)
         assert_field_error(past_ceiling.json(), "parent_id")
+
+
+class TestReplyBreadth:
+    """A thread can be wide as well as deep, and width must not silently lose replies.
+
+    Depth is bounded by ``MAX_THREAD_DEPTH`` and breadth by a row budget, and the two failed
+    differently. The depth bound was always visible in its effect - a chain simply stopped - while
+    the breadth bound was a single ``LIMIT`` spent across every root on the page, first-come. One
+    discussion with a few hundred replies consumed the whole budget, and every other thread on that
+    page came back looking as though nobody had answered it, with nothing in the response saying
+    otherwise.
+
+    Three properties are asserted here: the budget is shared fairly, a truncated collection says it
+    is truncated, and everything beyond the bound is still reachable.
+    """
+
+    @staticmethod
+    async def _wide_thread(
+        session: AsyncSession,
+        *,
+        post: Post,
+        author: User,
+        replies: int,
+        body_prefix: str,
+    ) -> tuple[Comment, list[Comment]]:
+        """Create one approved root with *replies* approved direct replies beneath it."""
+        root = await factories.create_comment(
+            session,
+            post=post,
+            author=author,
+            status=CommentStatus.APPROVED,
+            body=f"{body_prefix} root",
+        )
+        children = [
+            await factories.create_comment(
+                session,
+                post=post,
+                author=author,
+                parent=root,
+                status=CommentStatus.APPROVED,
+                body=f"{body_prefix} reply {index}",
+            )
+            for index in range(replies)
+        ]
+        return root, children
+
+    async def test_a_busy_thread_cannot_starve_the_others_on_its_page(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """A quiet thread keeps its replies even when a louder one shares the page.
+
+        The regression this closes, in the shape that produced it. The busy root's replies are
+        created *first*, and the descent is ordered depth-major by ``created_at`` - so under a
+        single global ``LIMIT`` of ``MAX_THREAD_DESCENDANTS`` every one of the budget's rows went to
+        that root, and the quiet root that follows received **none**. Its two replies existed, were
+        approved, were visible, and simply did not appear.
+
+        The allowance is now per root, so the busy thread takes its share and no more. Both halves
+        are asserted, because either alone would pass for the wrong reason: the quiet thread must
+        carry *all* of its replies, and the busy one must both be capped and admit that it is.
+        """
+        post = await visible_post(db_session, author_user)
+        busy_root, busy_replies = await self._wide_thread(
+            db_session,
+            post=post,
+            author=reader_user,
+            replies=MAX_THREAD_DESCENDANTS + 5,
+            body_prefix="busy",
+        )
+        quiet_root, quiet_replies = await self._wide_thread(
+            db_session, post=post, author=reader_user, replies=2, body_prefix="quiet"
+        )
+
+        response = await client.get(_thread_path(post.id))
+
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        threads = {item["id"]: item for item in payload["items"]}
+        assert str(busy_root.id) in threads
+        assert str(quiet_root.id) in threads
+
+        quiet = threads[str(quiet_root.id)]
+        assert len(quiet["replies"]) == len(quiet_replies), (
+            "the quiet thread lost replies to the busy one sharing its page"
+        )
+        assert quiet["reply_count"] == len(quiet_replies)
+        assert quiet["has_more_replies"] is False
+
+        busy = threads[str(busy_root.id)]
+        allowance = replies_per_root(DEFAULT_PAGE_SIZE)
+        assert len(busy["replies"]) == allowance, (
+            f"the busy thread carried {len(busy['replies'])} replies rather than its allowance "
+            f"of {allowance}"
+        )
+        assert busy["reply_count"] == len(busy_replies)
+        assert busy["has_more_replies"] is True, (
+            "a truncated thread reported itself as complete, which is indistinguishable from a "
+            "thread nobody answered"
+        )
+
+    async def test_every_reply_beyond_the_bound_stays_addressable(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """The replies a bounded thread omits are all reachable through the ``parent`` window.
+
+        Bounding a response is only acceptable if nothing becomes unreachable, so this pages the
+        continuation window to exhaustion and requires the union to be exactly the set that was
+        created - not a subset, and with no row served twice. That is the difference between a
+        response that is *bounded* and one that is *lossy*.
+        """
+        post = await visible_post(db_session, author_user)
+        allowance = replies_per_root(DEFAULT_PAGE_SIZE)
+        root, replies = await self._wide_thread(
+            db_session,
+            post=post,
+            author=reader_user,
+            replies=allowance * 2 + 3,
+            body_prefix="wide",
+        )
+
+        thread = await client.get(_thread_path(post.id))
+        assert thread.status_code == 200, thread.text
+        node = next(item for item in thread.json()["items"] if item["id"] == str(root.id))
+        assert node["has_more_replies"] is True
+        assert node["reply_count"] == len(replies)
+
+        collected: list[str] = []
+        page = 1
+        while True:
+            window = await client.get(
+                _thread_path(post.id), params={"parent": str(root.id), "page": page, "page_size": 5}
+            )
+            assert window.status_code == 200, window.text
+            body = window.json()
+            assert body["total"] == len(replies), (
+                "the continuation window counts the replies of that comment, so its total is the "
+                "number of replies rather than the number of threads"
+            )
+            if not body["items"]:
+                break
+            for item in body["items"]:
+                assert_comment_public(item)
+                assert item["parent_id"] == str(root.id), (
+                    "the parent window returned a comment that does not answer the given parent"
+                )
+            collected.extend(item["id"] for item in body["items"])
+            page += 1
+
+        assert len(collected) == len(set(collected)), "a reply was served on two pages"
+        assert set(collected) == {str(reply.id) for reply in replies}, (
+            "paging the continuation window did not recover exactly the replies that exist"
+        )
+
+    async def test_the_parent_window_applies_the_same_moderation_filter(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """The continuation window is not a way around moderation.
+
+        A new addressing mode is a new chance to leak, and this is the one that would matter: the
+        replies reached through ``parent`` are filtered exactly as the nested ones are, so a
+        ``PENDING`` reply is absent from both. Asserted for an anonymous caller, who is entitled to
+        approved comments and nothing else.
+        """
+        post = await visible_post(db_session, author_user)
+        root = await factories.create_comment(
+            db_session, post=post, author=reader_user, status=CommentStatus.APPROVED
+        )
+        approved = await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            parent=root,
+            status=CommentStatus.APPROVED,
+            body="Visible to everyone.",
+        )
+        pending = await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            parent=root,
+            status=CommentStatus.PENDING,
+            body="Still awaiting review.",
+        )
+
+        response = await client.get(_thread_path(post.id), params={"parent": str(root.id)})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        returned = {item["id"] for item in body["items"]}
+        assert str(approved.id) in returned
+        assert str(pending.id) not in returned, "an unapproved reply reached a public caller"
+        assert body["total"] == 1, (
+            "the continuation window's total counts only the replies the caller may see, or it "
+            "reports the existence of comments they cannot read"
+        )
+
+    async def test_an_unknown_parent_answers_an_empty_page_rather_than_an_error(
+        self, client: AsyncClient, db_session: AsyncSession, author_user: User
+    ) -> None:
+        """A parent that names no comment on this post is an empty page, disclosing nothing.
+
+        Refusing would answer "does this identifier exist, and is it on this post?" for any
+        identifier a caller cared to try. An empty page is indistinguishable from a comment nobody
+        answered, which is the same reasoning the sign-out route follows.
+        """
+        post = await visible_post(db_session, author_user)
+
+        response = await client.get(_thread_path(post.id), params={"parent": str(uuid.uuid4())})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["items"] == []
+        assert body["total"] == 0
+
+    async def test_a_malformed_parent_is_refused_as_validation(
+        self, client: AsyncClient, db_session: AsyncSession, author_user: User
+    ) -> None:
+        """``parent`` is a UUID, so a value that is not one is a 422 naming the parameter."""
+        post = await visible_post(db_session, author_user)
+
+        response = await client.get(_thread_path(post.id), params={"parent": "not-a-uuid"})
+
+        assert response.status_code == 422, response.text
+        assert_field_error(response.json(), "parent")
 
 
 class TestModerationVisibility:
@@ -1642,6 +2115,321 @@ class TestCommentListingPagination:
 
         assert response.status_code == 404, response.text
         assert_problem(response.json(), status=404, problem_type=PROBLEM_TYPE_NOT_FOUND)
+
+
+class TestThreadDescendantCap:
+    """The descendant budget truncating an oversized thread, and truncating it *coherently*.
+
+    The second bound on a thread read, and the one no other test in this module can reach.
+    ``TestReplyThreading`` exercises ``MAX_THREAD_DEPTH`` by building a chain, but a chain cannot
+    exercise the row budget: depth stops at eight, so eight rows is the most a chain can ever
+    produce. Breadth is what the budget defends against - nothing bounds how many replies one
+    comment may attract - so every test here reads a thread built by :func:`wide_thread`, whose
+    descendants exceed one root's :data:`CAP_ALLOWANCE` by :data:`CAP_OVERSHOOT`.
+
+    The budget is :data:`MAX_THREAD_DESCENDANTS` for the whole page, spent **per root** through
+    ``replies_per_root`` rather than first-come. That distinction is what
+    :class:`TestReplyBreadth` covers from the fairness direction; this class covers what the
+    truncation does to the *shape* of one oversized thread, which is a different property and
+    fails independently.
+
+    Truncating is the easy half. The reason the allowance is a windowed ``LIMIT`` under
+    ``ORDER BY depth, created_at, id`` rather than a plain ``LIMIT`` is that an arbitrary handful
+    of a thread's rows is not a thread: drop a reply and keep its child, and
+    ``comment_repository._attach_replies`` groups that child under a parent that is not in the
+    result, so the child is silently discarded - present in the row set, attached to nothing, and
+    invisible in the response. Depth-major ordering is what makes that impossible, and the tests
+    below assert the consequence rather than the mechanism.
+
+    Each test builds its own thread. They cannot share one: the session is per-test and rolled back
+    afterwards, which is what keeps the suite order-independent.
+    """
+
+    async def test_the_thread_is_truncated_to_the_published_cap(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """A thread with more descendants than its allowance returns exactly the allowance.
+
+        The fixture's own size is asserted first, and that assertion is not ceremony: without it
+        this test would pass trivially the moment the budget were raised above the number of rows
+        built, and it would look like the bound working rather than like the test no longer
+        reaching it.
+
+        ``reply_count`` and ``has_more_replies`` are asserted alongside the truncation, because a
+        bounded response is only honest if it says so. Both are *per node* and count **direct**
+        visible replies, so the root - whose whole first generation fits inside the allowance -
+        reports its true child count and reports itself complete. The nodes the cut actually
+        truncates are the first-generation replies that carry a second generation, and at least one
+        of them must announce itself as a prefix; otherwise a client cannot tell a truncated thread
+        from a thread nobody answered.
+        """
+        post = await visible_post(db_session, author_user)
+        root, firsts, seconds = await wide_thread(db_session, post=post, author=reader_user)
+        built = len(firsts) + len(seconds)
+        assert built > CAP_ALLOWANCE, (
+            f"the fixture must exceed one root's allowance to test it: built {built}, "
+            f"allowance {CAP_ALLOWANCE}"
+        )
+
+        response = await client.get(_thread_path(post.id))
+
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        # One thread, so one page member: `total` counts roots, not replies.
+        assert_page(payload, total=1, page=MIN_PAGE, page_size=DEFAULT_PAGE_SIZE)
+        returned = flatten(payload["items"])
+        assert ids_of(payload["items"]) == [str(root.id)]
+        # The root itself is a page member rather than a descendant, hence the plus one.
+        assert len(returned) == CAP_ALLOWANCE + 1, len(returned)
+        (item,) = payload["items"]
+        assert item["reply_count"] == len(firsts), item["reply_count"]
+        assert item["has_more_replies"] is False, (
+            "the root's own children all fit inside the allowance, so it is not a prefix"
+        )
+        truncated = [
+            node
+            for node in flatten(item["replies"])
+            if node["has_more_replies"] and len(node["replies"]) < node["reply_count"]
+        ]
+        assert truncated, (
+            "the allowance cut a generation and no node said so, which is indistinguishable "
+            "from a thread nobody answered"
+        )
+
+    async def test_the_shallower_generation_survives_the_cut_whole(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """Every first-generation reply is kept, and only second-generation replies are dropped.
+
+        The observable consequence of ``depth`` leading the sort. The alternative ordering -
+        ``created_at`` first, which is what the ordinary listing uses - would cut somewhere inside
+        a single instant shared by every row, taking replies from both generations arbitrarily.
+        Here the count of survivors per generation is exact: the whole of the first, and the
+        remainder of the allowance from the second.
+        """
+        post = await visible_post(db_session, author_user)
+        _, firsts, seconds = await wide_thread(db_session, post=post, author=reader_user)
+
+        response = await client.get(_thread_path(post.id))
+
+        assert response.status_code == 200, response.text
+        returned = {node["id"] for node in flatten(response.json()["items"])}
+        kept_first = {str(comment.id) for comment in firsts} & returned
+        kept_second = {str(comment.id) for comment in seconds} & returned
+
+        assert len(kept_first) == len(firsts), (
+            "a shallower reply was dropped while a deeper one was kept: "
+            f"kept {len(kept_first)} of {len(firsts)} first-generation replies"
+        )
+        assert len(kept_second) == CAP_ALLOWANCE - len(firsts), len(kept_second)
+        assert len(seconds) - len(kept_second) == CAP_OVERSHOOT, len(kept_second)
+
+    async def test_the_cut_falls_exactly_where_the_ordering_puts_it(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """The retained set is the one ``ORDER BY depth, created_at, id`` selects - not merely N.
+
+        The strongest form of the assertion, and the reason
+        :func:`retained_by_the_documented_order` exists: the expectation is re-derived from the
+        persisted rows and the declared key, in this module, so a statement that returned the right
+        *number* of the wrong rows fails here. A ``LIMIT`` without the ``ORDER BY`` would satisfy
+        every count assertion above and fail this one, because PostgreSQL is then free to return
+        any subset of the size the allowance permits.
+        """
+        post = await visible_post(db_session, author_user)
+        _, firsts, seconds = await wide_thread(db_session, post=post, author=reader_user)
+        expected = retained_by_the_documented_order((firsts, seconds), limit=CAP_ALLOWANCE)
+
+        response = await client.get(_thread_path(post.id))
+
+        assert response.status_code == 200, response.text
+        returned = {node["id"] for node in flatten(response.json()["items"])}
+        # The root is a page member, not a descendant, so it is excluded from the comparison.
+        descendants = returned - {ids_of(response.json()["items"])[0]}
+        assert descendants == expected, (
+            f"{len(descendants - expected)} unexpected and "
+            f"{len(expected - descendants)} missing descendants"
+        )
+
+    async def test_every_retained_reply_is_still_attached_to_its_own_parent(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """The truncated set is a valid forest: no orphan, and nothing re-parented onto the root.
+
+        The defect depth-major ordering exists to prevent, asserted from two directions. Every
+        returned node's ``parent_id`` names something the response also carries, so nothing hangs
+        off a comment that was cut; and the root's own child count is still exactly the first
+        generation, so a grandchild whose parent was dropped was not quietly promoted to sit
+        beside its former parent.
+        """
+        post = await visible_post(db_session, author_user)
+        root, firsts, _ = await wide_thread(db_session, post=post, author=reader_user)
+
+        response = await client.get(_thread_path(post.id))
+
+        assert response.status_code == 200, response.text
+        items = response.json()["items"]
+        returned = flatten(items)
+        present = {node["id"] for node in returned}
+        orphans = [
+            node["id"]
+            for node in returned
+            if node["parent_id"] is not None and node["parent_id"] not in present
+        ]
+        assert not orphans, f"{len(orphans)} replies name a parent the response does not carry"
+        assert len(items[0]["replies"]) == len(firsts), (
+            "the root's direct children changed under truncation: "
+            f"{len(items[0]['replies'])} nested, {len(firsts)} created"
+        )
+        # And the nesting is genuinely two deep, so the fixture's shape reached the response
+        # rather than being flattened by the cut.
+        assert depth_of(items[0]) == 3, depth_of(items[0])
+        assert str(root.id) == items[0]["id"]
+
+    async def test_the_truncation_is_the_same_on_every_read(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """Two identical requests return the identical rows in the identical order.
+
+        Why ``id`` is the final tiebreaker. Every row here shares one ``created_at`` - the
+        transaction clock - so ``ORDER BY depth, created_at`` alone leaves 210 rows tied inside two
+        groups and PostgreSQL free to break the tie differently per execution. The cut would then
+        fall in a different place on each read, and a client paging or re-reading a busy thread
+        would see replies appear and disappear without anything having changed.
+        """
+        post = await visible_post(db_session, author_user)
+        await wide_thread(db_session, post=post, author=reader_user)
+
+        first_read = await client.get(_thread_path(post.id))
+        second_read = await client.get(_thread_path(post.id))
+
+        assert first_read.status_code == 200, first_read.text
+        assert second_read.status_code == 200, second_read.text
+        first_ids = ids_of(flatten(first_read.json()["items"]))
+        second_ids = ids_of(flatten(second_read.json()["items"]))
+        assert first_ids == second_ids, "the truncation moved between two identical reads"
+
+    async def test_the_budget_is_shared_per_root_and_a_shallow_thread_is_not_starved(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """Two threads on one page each get their own share, and the small one keeps every reply.
+
+        Both halves are published behaviour and both matter. The page budget is
+        :data:`MAX_THREAD_DESCENDANTS` across one statement covering every root on the page, which
+        is what makes the cost of a listing predictable however the discussion is shaped - but it
+        is divided by ``replies_per_root`` rather than spent first-come, so a huge sibling cannot
+        starve a shallow neighbour of rows it would otherwise have had. The neighbour keeps every
+        reply because it is well inside its own share; the busy thread is held to exactly its own.
+        """
+        post = await visible_post(db_session, author_user)
+        _, firsts, _ = await wide_thread(db_session, post=post, author=reader_user)
+        (neighbour,) = await approved_thread(
+            db_session, post=post, author=reader_user, bodies=["the quiet thread"]
+        )
+        neighbour_replies = [
+            await factories.create_comment(
+                db_session,
+                post=post,
+                author=reader_user,
+                parent=neighbour,
+                status=CommentStatus.APPROVED,
+                body=f"neighbour-{index:02d}",
+            )
+            for index in range(CAP_NEIGHBOUR_REPLIES)
+        ]
+
+        response = await client.get(_thread_path(post.id))
+
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert_page(payload, total=2, page=MIN_PAGE, page_size=DEFAULT_PAGE_SIZE)
+        returned = flatten(payload["items"])
+        # Two roots are page members; everything else is a descendant. The busy thread spends its
+        # whole share, the quiet one spends only what it has, and the two together are what the
+        # page carries - which is the per-root division rather than a first-come budget.
+        assert len(returned) - 2 == CAP_ALLOWANCE + CAP_NEIGHBOUR_REPLIES, len(returned)
+
+        present = {node["id"] for node in returned}
+        assert {str(reply.id) for reply in neighbour_replies} <= present, (
+            "the shallow thread lost replies to its sibling's share"
+        )
+        # And the first generation of the large thread is untouched too, for the same reason.
+        assert {str(comment.id) for comment in firsts} <= present
+
+    async def test_a_page_of_one_root_carries_only_that_root_s_replies(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """Narrowing the page to one thread narrows the descendants to that thread's own.
+
+        The anchor of the recursive term is ``parent_id IN (the roots on this page)``, so a page is
+        self-contained: no reply from a thread the page does not carry may appear on it, in either
+        direction. Asserted over both pages rather than over a chosen one, because every row here
+        shares a ``created_at`` and the page order therefore falls out of the ``id`` tiebreaker -
+        which thread lands on page one is not knowable in advance and must not need to be.
+        """
+        post = await visible_post(db_session, author_user)
+        _, firsts, seconds = await wide_thread(db_session, post=post, author=reader_user)
+        (neighbour,) = await approved_thread(
+            db_session, post=post, author=reader_user, bodies=["the quiet thread"]
+        )
+        neighbour_reply = await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            parent=neighbour,
+            status=CommentStatus.APPROVED,
+            body="neighbour-00",
+        )
+        subtrees = {
+            str(neighbour.id): {str(neighbour_reply.id)},
+            # The large thread's own subtree, before truncation - membership is asserted as a
+            # subset, so the rows the cap discarded simply do not appear.
+            None: {str(comment.id) for comment in (*firsts, *seconds)},
+        }
+
+        for page in (MIN_PAGE, MIN_PAGE + 1):
+            response = await client.get(
+                _thread_path(post.id), params={"page": page, "page_size": MIN_PAGE_SIZE}
+            )
+
+            assert response.status_code == 200, response.text
+            payload = response.json()
+            assert_page(payload, total=2, page=page, page_size=MIN_PAGE_SIZE)
+            (item,) = payload["items"]
+            own = subtrees.get(item["id"], subtrees[None])
+            descendants = {node["id"] for node in flatten(item["replies"])}
+            assert descendants <= own, (
+                f"page {page} carried {len(descendants - own)} replies from another thread"
+            )
+            assert descendants, "a root with replies returned none"
 
 
 class TestEditComment:

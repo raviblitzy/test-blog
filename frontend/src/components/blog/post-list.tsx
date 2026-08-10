@@ -143,9 +143,8 @@ import type { JSX } from 'react';
 import { PostCard, PostCardSkeleton } from '@/components/blog/post-card';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Pagination } from '@/components/ui/pagination';
-import { derivePagination, FIRST_PAGE, formatResultRange } from '@/lib/pagination';
 import type { Page, PostSummary } from '@/lib/types';
-import { cn } from '@/lib/utils';
+import { cn, derivePagination, FIRST_PAGE, formatResultRange } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Heading level
@@ -327,9 +326,11 @@ const RANGE_CLASSES = 'text-sm text-muted-foreground';
  * lived in `@/hooks/use-pagination`, and this component is a SERVER component - no `'use client'`, so the
  * rows reach the initial HTML for the SEO requirement - which cannot call a hook at all.
  *
- * `@/lib/pagination` is that arithmetic with the hook removed, so this file now calls exactly what the
- * client-side control and the administrative grid call. One range calculation, one sentence, three
- * consumers.
+ * The page-arithmetic section of `@/lib/utils` is that arithmetic with the hook removed, so this file
+ * now calls exactly what the client-side control and the administrative grid call. One range
+ * calculation, one sentence, three consumers. It lives there rather than in a module of its own because
+ * AAP §0.4.5.3 names four modules under `src/lib/`, and `utils` is the one of them that is shared,
+ * pure and - critically for this file - free of a `'use client'` directive.
  * ---------------------------------------------------------------------------------------------- */
 
 /* -------------------------------------------------------------------------------------------------

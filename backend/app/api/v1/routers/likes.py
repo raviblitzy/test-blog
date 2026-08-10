@@ -107,7 +107,7 @@ It declares routes, wires dependencies, and returns what a service handed back. 
   that a draft's presence is never disclosed.
 * **No request model, and no model declared here at all.** ``LikeSummary`` comes from the
   ``app.schemas`` barrel, and the failure shape comes from
-  :func:`~app.api.v1.responses.problem_response` rather than being named here; this file declares
+  :func:`~app.schemas.common.problem_response` rather than being named here; this file declares
   no wire shape of its own.
 * **No sharing endpoint.** Social sharing is the third element of R4 and needs no route: the
   client builds every share target from the post's canonical URL. There is nothing to add for it
@@ -143,9 +143,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, status
 
-from app.api.v1.responses import OPTIONAL_AUTHENTICATION, ProblemResponses, problem_response
-from app.core.dependencies import CurrentUser, DbSession, OptionalUser
-from app.schemas import LikeSummary
+from app.core.dependencies import OPTIONAL_AUTHENTICATION, CurrentUser, DbSession, OptionalUser
+from app.schemas import LikeSummary, ProblemResponses, problem_response
 from app.services import LikeService
 
 __all__ = ["router"]
@@ -157,7 +156,7 @@ __all__ = ["router"]
 # The wording lives in a named constant rather than inline in a decorator argument, because
 # the 404 description is used by all three operations and three copies of a sentence is how
 # two of them stop matching. Every entry is built by
-# `app.api.v1.responses.problem_response`, which is the one place in this package that names
+# `app.schemas.common.problem_response`, which is the one place in this package that names
 # the problem document and the one place its published media type is decided: without a model
 # the failure mode is undocumented and a generated client emits no type for it, which is
 # precisely the gap the "every route declares its shapes" standard closes.
@@ -416,7 +415,8 @@ async def unlike_post(post_id: UUID, db: DbSession, user: CurrentUser) -> LikeSu
     # Anonymous OR bearer, in that order. `OptionalUser` puts the bearer scheme in this
     # operation's dependency tree, and without this marker the framework would publish it as
     # REQUIRED - turning a public like count into a signed-in-only figure as far as a generated
-    # client or the interactive documentation is concerned. See `app.api.v1.responses`.
+    # client or the interactive documentation is concerned. See
+    # `app.core.dependencies.OPTIONAL_AUTHENTICATION`.
     openapi_extra=OPTIONAL_AUTHENTICATION,
     summary="Read a post's like count",
     description=(

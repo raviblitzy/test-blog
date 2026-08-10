@@ -164,6 +164,15 @@ FEED_PATH: Final[str] = "/api/v1/posts"
 """The feed. ``app.api.v1.router`` mounts the posts router at ``/api/v1/posts`` and the handler
 registers on ``""``, so this is the whole path and it carries no trailing slash."""
 
+type QueryValue = str | int | float | bool | None
+"""A value that may appear in a query string, as httpx's own ``params`` signature defines it.
+
+Named because the four helpers below take ``**params`` and forward it verbatim to
+``AsyncClient.get``. Annotating those as ``object`` typed nothing and hid a real narrowing: httpx
+accepts a scalar or a sequence of scalars per key, so ``object`` admits a value the request layer
+would reject at runtime. Every call in this module passes a scalar, so the alias stops at those.
+"""
+
 PAGE_MEMBERS: Final[frozenset[str]] = frozenset(Page.model_fields)
 """The envelope's five member names, taken from the model rather than restated.
 
@@ -294,7 +303,10 @@ def _compile_explain_json(element: ExplainJson, compiler: Any, **kw: Any) -> str
     Returns:
         The complete ``EXPLAIN`` statement, ready to execute.
     """
-    return "EXPLAIN (FORMAT JSON) " + compiler.process(element.statement, **kw)
+    # `SQLCompiler.process` is annotated as returning `Any`, so the concatenation would be `Any`
+    # too and this function's declared `str` would be a claim nothing checked. `str(...)` makes the
+    # assumption explicit at the one point it is made.
+    return "EXPLAIN (FORMAT JSON) " + str(compiler.process(element.statement, **kw))
 
 
 def _flatten_plan(node: dict[str, Any]) -> list[dict[str, Any]]:
@@ -361,6 +373,78 @@ def _scans_sequentially(nodes: list[dict[str, Any]], relation: str) -> bool:
     )
 
 
+def _bitmap_or_branches(nodes: list[dict[str, Any]]) -> dict[str, str]:
+    """Return the index each ``BitmapOr`` branch reads, mapped to the condition it serves.
+
+    Asserting on the *set* of indexes a plan touches says the two indexes were read somewhere;
+    it does not say the disjunction was served by them. This says the second thing. PostgreSQL
+    combines an ``OR`` of two indexable predicates under a ``BitmapOr`` whose children are the
+    per-branch ``Bitmap Index Scan`` nodes, so reading those children names exactly which index
+    answered which half - and would notice one index answering both halves, or one half falling
+    out of the bitmap and into a recheck filter.
+
+    ``_flatten_plan`` keeps the original node dictionaries rather than copies, so a ``BitmapOr``
+    found in the flattened list still exposes its own ``"Plans"`` and the parent-child edge is
+    recoverable without walking the tree a second time.
+
+    Args:
+        nodes: Flattened plan nodes.
+
+    Returns:
+        Index name to the ``Index Cond`` that index was given, across every ``BitmapOr`` in the
+        plan. Empty when the plan contains no ``BitmapOr`` at all, which is itself a meaningful
+        answer for a caller asserting that a disjunction was combined from two index scans.
+    """
+    branches: dict[str, str] = {}
+    for node in nodes:
+        if node.get("Node Type") != "BitmapOr":
+            continue
+        for child in node.get("Plans") or ():
+            name = child.get("Index Name")
+            if child.get("Node Type") == "Bitmap Index Scan" and name:
+                branches[name] = str(child.get("Index Cond") or "")
+    return branches
+
+
+def _relation_estimate(nodes: list[dict[str, Any]], relation: str) -> int:
+    """Return the row count the planner expects from the node that actually reads ``relation``.
+
+    The node to ask, and the reason it is not the root, is the whole point of this helper. The
+    statements planned here are the feed's **first page**, so their root is a ``Limit`` and its
+    ``Plan Rows`` is capped at the page size - eight. Reading the estimate there makes a
+    selectivity assertion unfalsifiable: ``8 < rows / 10`` holds for any corpus above eighty
+    rows whether the planner expects the predicate to match seven rows or every one of them, so
+    the gate would pass on precisely the statistics it exists to reject.
+
+    The scan over ``posts`` carries the estimate that was actually derived from the predicate -
+    ``Bitmap Heap Scan`` for the search paths, ``Index Scan`` or ``Seq Scan`` for the others -
+    and that is the number a claim about ``ANALYZE`` and selectivity is a claim about.
+
+    Args:
+        nodes: Flattened plan nodes.
+        relation: The relation whose scan estimate is wanted, for example ``"posts"``.
+
+    Returns:
+        The largest ``Plan Rows`` across every node that reads ``relation``. The maximum rather
+        than the first, so a plan that reads the relation twice cannot hide an unselective
+        branch behind a selective one.
+
+    Raises:
+        AssertionError: If no node in the plan reads that relation. A selectivity assertion
+            about a relation the plan never touches would otherwise pass silently.
+    """
+    estimates = [
+        int(node["Plan Rows"])
+        for node in nodes
+        if node.get("Relation Name") == relation and node.get("Plan Rows") is not None
+    ]
+    assert estimates, (
+        f"no node in the plan reads {relation!r}, so there is no scan estimate to assert on; "
+        f"plan was:\n{_describe_plan(nodes)}"
+    )
+    return max(estimates)
+
+
 def _describe_plan(nodes: list[dict[str, Any]]) -> str:
     """Render a plan compactly, for use as an assertion message.
 
@@ -409,7 +493,11 @@ async def _relation_sizes(session: AsyncSession) -> dict[str, int]:
             " WHERE relname IN ('posts', 'ix_posts_search_vector', 'ix_posts_title_trgm')"
         )
     )
-    return dict(result.all())
+    # `Result.all()` types its rows as `Row[Any]`, which `dict()` cannot accept as a pair
+    # source. `.tuples()` is SQLAlchemy 2.0's own narrowing for exactly this: it re-types the
+    # result as tuples so the two selected columns are visible to the checker, and it emits no
+    # additional SQL.
+    return dict(result.tuples().all())
 
 
 # ---------------------------------------------------------------------------------------
@@ -880,7 +968,7 @@ async def corpus(db_session: AsyncSession) -> FeedCorpus:
 # ---------------------------------------------------------------------------------------
 
 
-async def _feed(client: AsyncClient, **params: object) -> dict[str, Any]:
+async def _feed(client: AsyncClient, **params: QueryValue) -> dict[str, Any]:
     """Request the feed, assert the envelope's shape, and return the parsed body.
 
     Every successful assertion in this module goes through here, which is how AAP §0.10.1 #4's
@@ -927,7 +1015,7 @@ async def _all_pages(
     client: AsyncClient,
     *,
     page_size: int,
-    **params: object,
+    **params: QueryValue,
 ) -> list[list[str]]:
     """Walk every page of a filtered feed and return the identifiers page by page.
 
@@ -947,7 +1035,7 @@ async def _all_pages(
     return pages
 
 
-async def _validation_failure(client: AsyncClient, **params: object) -> dict[str, Any]:
+async def _validation_failure(client: AsyncClient, **params: QueryValue) -> dict[str, Any]:
     """Request the feed expecting ``422``, and return the problem document.
 
     ``PageParams`` states its bounds as FastAPI query metadata, so an out-of-range ``page`` or
@@ -1830,11 +1918,15 @@ class TestSortOrdering:
 class TestStatusScoping:
     """AAP §0.9.4.4 "Draft confidentiality": no filter path may surface an unpublished post.
 
-    Which lifecycle states are in scope is decided once, in ``PostService``'s
-    ``visible_statuses_for``, and passed into the repository as an argument - the repository
-    "never decides who may see a draft". So a leak would be a service defect, and testing every
-    filter path is what localises it there: search, category, author and all three together each
-    reach the rows by a different access path, and each is checked separately.
+    Which lifecycle states are in scope is decided once, in ``PostService.list_feed``, and passed
+    into the repository as an argument - the repository "never decides who may see a draft". So a
+    leak would be a service defect, and testing every filter path is what localises it there:
+    search, category, author and all three together each reach the rows by a different access
+    path, and each is checked separately.
+
+    The public feed's scope is a **constant**: ``PUBLIC_POST_STATUSES``, for every caller. The
+    author-scoped widening lives on the private ``?mine=true`` mode, which is a different mode of
+    the same operation and is the subject of ``test_posts_api.py``'s ``TestAuthorWorkspace``.
     """
 
     @pytest.mark.parametrize(
@@ -1859,7 +1951,7 @@ class TestStatusScoping:
         both filed under the alpha category, so each narrowing below would surface one of them if
         the status scope were being lost at that point rather than applied once.
         """
-        queries: dict[str, dict[str, object]] = {
+        queries: dict[str, dict[str, QueryValue]] = {
             "unfiltered": {"page_size": MAX_PAGE_SIZE},
             "search": {"q": SEARCH_TERM, "page_size": MAX_PAGE_SIZE},
             "category": {"category": corpus.alpha_slug, "page_size": MAX_PAGE_SIZE},
@@ -1876,22 +1968,26 @@ class TestStatusScoping:
         assert not corpus.hidden & set(_ids(body))
         assert all(element["status"] == PostStatus.PUBLISHED for element in body["items"])
 
-    async def test_a_caller_supplied_status_parameter_changes_nothing(
+    async def test_a_caller_supplied_scope_parameter_changes_nothing(
         self,
         client: AsyncClient,
         corpus: FeedCorpus,
     ) -> None:
-        """AAP §0.9.4.4: the status scope is the service's decision, not part of the wire contract.
+        """AAP §0.9.4.4: the public feed's status scope is a constant, not a wire parameter.
 
-        ``?status=`` is not a parameter of this route, so a caller who invents one is simply
-        ignored - the value cannot reach ``visible_statuses_for`` and cannot widen what it
-        returns. Asserted because "undeclared parameters are ignored" is the behaviour that keeps
-        privilege escalation off the query string.
+        None of the spellings below is a parameter of this route, so a caller who invents one is
+        simply ignored and cannot widen the scope. Asserted because "undeclared parameters are
+        ignored" is the behaviour that keeps privilege escalation off the query string.
+
+        ``?status=`` is deliberately absent from this list. It *is* declared - it narrows the
+        private ``?mine=true`` workspace - and on the public feed it is **refused** with a 422
+        rather than ignored, so its behaviour is pinned by
+        ``test_posts_api.py::TestAuthorWorkspace::test_status_is_refused_on_the_public_feed``.
         """
         for attempt in (
-            {"status": PostStatus.DRAFT.value},
-            {"status": PostStatus.ARCHIVED.value},
             {"statuses": "DRAFT,PUBLISHED,ARCHIVED"},
+            {"include_drafts": "true"},
+            {"visibility": "all"},
         ):
             body = await _feed(
                 client,
@@ -1902,24 +1998,25 @@ class TestStatusScoping:
             assert body["total"] == len(corpus.published_primary)
             assert not corpus.hidden & set(_ids(body))
 
-    async def test_an_author_reading_their_own_scoped_feed_does_see_their_drafts(
+    async def test_an_author_reads_their_drafts_only_through_the_workspace_mode(
         self,
         author_client: AsyncClient,
         client: AsyncClient,
         db_session: AsyncSession,
     ) -> None:
-        """AAP §0.9.4.4: the complement - an author scoped to themselves sees every state they own.
+        """AAP §0.9.4.4: the complement - the widening is requested, and it is the only way in.
 
-        This is deliberately **not** a leak, and stating it here is what stops a later reader from
-        "fixing" it. ``visible_statuses_for`` widens the scope in exactly two cases - the viewer is
-        an administrator, or the listing is scoped to the very author doing the viewing - and this
-        is the second. It is how an author's workspace lists its own drafts: the same feed
-        endpoint, authenticated, with ``author=`` set to one's own username.
+        Three questions, one corpus, and the contrast between them is the whole rule. Asking the
+        *public* feed for one's own posts (``?author=<me>``, authenticated) returns published posts
+        only, exactly as it does for an anonymous caller: a shared surface answers the same rows to
+        everybody, so its ``total`` and its page boundaries do not depend on the credential.
+        Asking the *workspace* (``?mine=true``) returns every state the caller owns. And the
+        anonymous caller sees the published post either way.
 
-        The same author's drafts remain invisible to an anonymous caller asking the identical
-        question, which is the half that makes the widening safe. A fresh author is built here
-        rather than reusing :func:`corpus` because the widening is a property of the *viewer*, and
-        ``author_client`` authenticates as ``conftest``'s ``author_user``.
+        Stating all three here is what stops a later reader from "restoring" the identity-based
+        widening this test used to assert. A fresh author is built rather than reusing
+        :func:`corpus` because the mode is a property of the *viewer*, and ``author_client``
+        authenticates as ``conftest``'s ``author_user``.
         """
         response = await author_client.get("/api/v1/auth/me")
         assert response.status_code == 200, response.text
@@ -1945,14 +2042,21 @@ class TestStatusScoping:
             published_at=_at(60),
         )
 
-        own = await _feed(author_client, author=viewer["username"], page_size=MAX_PAGE_SIZE)
+        public_self = await _feed(author_client, author=viewer["username"], page_size=MAX_PAGE_SIZE)
+        workspace = await _feed(author_client, mine="true", page_size=MAX_PAGE_SIZE)
         anonymous = await _feed(client, author=viewer["username"], page_size=MAX_PAGE_SIZE)
 
-        assert str(draft.id) in set(_ids(own))
-        assert str(published.id) in set(_ids(own))
+        # The public feed: identical for the author and for a stranger.
+        assert str(draft.id) not in set(_ids(public_self))
+        assert str(published.id) in set(_ids(public_self))
+        assert public_self["total"] == anonymous["total"]
         assert str(draft.id) not in set(_ids(anonymous))
         assert str(published.id) in set(_ids(anonymous))
-        assert anonymous["total"] < own["total"]
+
+        # The workspace: every state the caller owns, and strictly more than the public feed.
+        assert str(draft.id) in set(_ids(workspace))
+        assert str(published.id) in set(_ids(workspace))
+        assert workspace["total"] > public_self["total"]
 
     async def test_an_authenticated_reader_sees_no_more_of_the_unscoped_feed_than_anyone_else(
         self,
@@ -2075,6 +2179,14 @@ def _repository_statement(
     more than it might appear: the same measurement performed against the ``@@`` half in isolation
     would credit the wrong plan to the wrong index, and a rewritten predicate could easily be one
     an index cannot serve while looking identical on the page.
+
+    The window is part of that fidelity and is kept deliberately: the feed's first page really is
+    ``LIMIT PAGINATION_PAGE_SIZE OFFSET 0``, and a ``LIMIT`` changes what the planner costs, so
+    explaining the statement without one would be explaining a statement the application never
+    issues. The consequence is that the **root** node of every plan built here is a ``Limit``
+    whose ``Plan Rows`` is capped at the page size and therefore says nothing about how selective
+    the predicate is. Any assertion about selectivity must read the scan over ``posts`` instead -
+    which is what :func:`_relation_estimate` is for, and why no caller reads ``nodes[0]``.
 
     Args:
         term: The search term, or ``None`` to build the browse statement.
@@ -2228,14 +2340,28 @@ class TestSearchIndexUsageAtVolume:
         scans: measured on this schema the disjunction scans at six hundred rows and takes both
         indexes from about twelve hundred upward, which is what :data:`VOLUME_POSTS` clears.
 
-        Three things are asserted, all at volume:
+        Four things are asserted, all at volume, and each states what it tolerates as carefully
+        as what it requires - a plan gate that rejects valid plans is as useless as one that
+        accepts invalid statistics:
 
-        1. **The statistics are usable.** The planner estimates a handful of matching rows out of
-           thousands. A selective estimate is the precondition for preferring an index at all, and
-           its absence is precisely the failure AAP §0.9.5 warns about - "without fresh statistics
-           the planner has no basis to prefer the index".
-        2. **Both halves are served by their index**, and ``posts`` is not scanned sequentially.
-        3. **Both access paths exist over the columns the predicate names**, read from the
+        1. **The statistics are usable.** The scan over ``posts`` is estimated to match a handful
+           of rows out of thousands. The estimate is read from that scan node and deliberately
+           **not** from the root: the statement is the feed's first page, so its root ``Limit``
+           reports at most :data:`PAGINATION_PAGE_SIZE` rows however unselective the predicate
+           turns out to be, and an assertion there would hold for any corpus above eighty rows
+           even if the planner expected the predicate to match the whole table. A selective
+           estimate is the precondition for preferring an index at all, and its absence is
+           precisely the failure AAP §0.9.5 warns about - "without fresh statistics the planner
+           has no basis to prefer the index".
+        2. **Both GIN indexes are read.** As a subset, not as the plan's complete index set: an
+           additional index the planner also finds worth reading is a *better* plan, not a
+           broken one, and costs shift with statistics and with releases. What would be a defect
+           is one of the two being absent.
+        3. **They serve the two OR branches.** Read from the ``BitmapOr``'s own children, so the
+           claim is that ``search_vector`` answered the ranked half and ``title`` answered the
+           trigram half - not merely that both names appeared somewhere in the plan. And
+           ``posts`` is not scanned sequentially, asserted independently of all of the above.
+        4. **Both access paths exist over the columns the predicate names**, read from the
            catalogue: ``@@`` reaches a GIN index on ``search_vector`` and ``%`` reaches a GIN index
            on ``title`` with ``gin_trgm_ops``. That is the defect the measurement above rules out
            and this assertion keeps ruled out.
@@ -2250,17 +2376,49 @@ class TestSearchIndexUsageAtVolume:
             db_session,
             _repository_statement(term=SEARCH_TERM, sort="relevance"),
         )
-        estimated = nodes[0]["Plan Rows"]
+        # The estimate is read from the node that reads `posts`, NOT from the root. The root is a
+        # `Limit` over the feed's first page, so its estimate is capped at PAGINATION_PAGE_SIZE
+        # and would satisfy this assertion for any corpus above eighty rows even if the planner
+        # expected the predicate to match every one of them. See :func:`_relation_estimate`.
+        estimated = _relation_estimate(nodes, "posts")
+        used = _indexes_used(nodes)
+        branches = _bitmap_or_branches(nodes)
         sizes = await _relation_sizes(db_session)
 
         assert estimated < rows / 10, (
             "ANALYZE must leave the planner a selective estimate for the composed search "
-            f"predicate: it expects {estimated} of {rows} rows; plan was:\n{_describe_plan(nodes)}"
+            f"predicate: the scan over posts expects {estimated} of {rows} rows; plan was:\n"
+            f"{_describe_plan(nodes)}"
         )
-        assert _indexes_used(nodes) == {SEARCH_VECTOR_INDEX, TITLE_TRIGRAM_INDEX}, (
+        # A SUBSET, not set equality. Both GIN indexes are required, and an additional index the
+        # planner also finds worth reading is a valid plan - a `posts_pkey` lookup for the
+        # bitmap recheck, or a join path added when statistics or a release changes the costing.
+        # Demanding exact equality would fail a correct plan for being better than expected,
+        # which is a gate that reports the wrong thing.
+        assert {SEARCH_VECTOR_INDEX, TITLE_TRIGRAM_INDEX} <= used, (
             "both halves of the search disjunction must be served by their GIN index at "
-            f"{rows} rows; pages were {sizes}; plan was:\n{_describe_plan(nodes)}"
+            f"{rows} rows; indexes read were {sorted(used)}; pages were {sizes}; plan was:\n"
+            f"{_describe_plan(nodes)}"
         )
+        # And they must serve the two OR branches rather than merely appear somewhere in the
+        # plan: the disjunction is combined under a `BitmapOr`, and its children name which index
+        # answered which half. This is what would notice one index answering both halves, or one
+        # half dropping out of the bitmap into a recheck filter.
+        assert {SEARCH_VECTOR_INDEX, TITLE_TRIGRAM_INDEX} <= set(branches), (
+            "the two GIN indexes must be the children of the BitmapOr that combines the search "
+            f"disjunction; branches found were {branches}; plan was:\n{_describe_plan(nodes)}"
+        )
+        assert "search_vector" in branches[SEARCH_VECTOR_INDEX], (
+            f"{SEARCH_VECTOR_INDEX} must serve the ranked full-text half, but its branch "
+            f"condition was {branches[SEARCH_VECTOR_INDEX]!r}"
+        )
+        assert "title" in branches[TITLE_TRIGRAM_INDEX], (
+            f"{TITLE_TRIGRAM_INDEX} must serve the trigram half over the title, but its branch "
+            f"condition was {branches[TITLE_TRIGRAM_INDEX]!r}"
+        )
+        # Retained independently of everything above: whatever the planner combines and however
+        # it costs it, reading the whole relation is the outcome AAP §0.9.5 asks this module to
+        # rule out.
         assert not _scans_sequentially(nodes, "posts"), (
             f"the composed search must not scan posts sequentially at {rows} rows; "
             f"pages were {sizes}; plan was:\n{_describe_plan(nodes)}"
@@ -2273,7 +2431,9 @@ class TestSearchIndexUsageAtVolume:
             ),
             {"names": [SEARCH_VECTOR_INDEX, TITLE_TRIGRAM_INDEX]},
         )
-        definitions = dict(access_paths.all())
+        # `.tuples()` for the same reason as in `_relation_sizes`: two selected columns, made
+        # visible to the checker without a second query or a cast.
+        definitions: dict[str, str] = dict(access_paths.tuples().all())
 
         assert set(definitions) == {SEARCH_VECTOR_INDEX, TITLE_TRIGRAM_INDEX}
         assert "USING gin" in definitions[SEARCH_VECTOR_INDEX]

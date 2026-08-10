@@ -128,6 +128,15 @@ from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.base import metadata
 
+# Imported for two values and nothing else: the connect arguments and the parameter-hiding
+# invariant every engine in this project opens with. `app.db.session` builds the application's
+# pooled engine at import time, and that costs nothing here - construction is pure bookkeeping
+# and the first connection is only established when a session needs one, which is exactly why
+# that module documents itself as importable by `alembic check` with no database reachable. The
+# engine this file builds below is its own, separate, NullPool engine; nothing here draws a
+# connection from the application's pool.
+from app.db.session import HIDE_PARAMETERS, safe_connect_args
+
 if TYPE_CHECKING:
     # Imported for annotations only, and therefore never at run time. Both of these are
     # Alembic's own aliases for the arguments it passes to the two filters below, and taking
@@ -512,6 +521,16 @@ def run_migrations_online() -> None:
     a revision raises, which matters most in CI, where a lingering backend can hold a lock that
     the next step then waits on.
 
+    The engine is built with ``app.db.session.safe_connect_args()`` and that module's
+    ``HIDE_PARAMETERS``, so a migration reaches the database under the **same** connection
+    contract the service does: the session time zone is UTC before the first statement, one
+    connection attempt is bounded at five seconds instead of libpq's 130, and no bound value is
+    rendered into a logged statement or into the message on a wrapped ``DBAPIError``. Only the
+    *pool* settings are left behind, because ``NullPool`` retains nothing for them to describe.
+    Both properties are properties of a connection, and a migration is the connection most
+    likely to meet a cold or wedged database first: this run happens on the container's
+    start-up path, before the service answers anything.
+
     Transaction handling is left at Alembic's default - one transaction spanning the whole run,
     so a failed revision rolls the entire attempt back rather than stranding the schema
     half-migrated. ``transaction_per_migration`` is not set. The one thing that would force it
@@ -543,7 +562,20 @@ def run_migrations_online() -> None:
     url = _get_url()
     logger.info("Running migrations against %s", _redacted(url))
 
-    connectable = create_engine(url, poolclass=pool.NullPool, future=True)
+    connectable = create_engine(
+        url,
+        poolclass=pool.NullPool,
+        future=True,
+        # The two invariants a *connection* carries, shared with the application and the test
+        # engine rather than restated - see "Three processes open connections to this database"
+        # in `app.db.session`. `connect_timeout` matters more here than anywhere: this run sits
+        # on the container's start-up path, so without it a hung server holds the whole start
+        # for libpq's 130-second default while the service beside it fails in five.
+        # `hide_parameters` matters because `--sql` output and CI logs are redirected to files,
+        # and revision `0003` binds the reference category rows as parameters.
+        connect_args=safe_connect_args(),
+        hide_parameters=HIDE_PARAMETERS,
+    )
     try:
         # A SEPARATE, short-lived connection, opened and closed before the migration connection
         # exists - see the warning above for the silent rollback that sharing one would cause.

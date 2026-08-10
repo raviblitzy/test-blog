@@ -55,6 +55,13 @@ from app.core.slug import (
     unique_slug,
 )
 
+# Every test here is fast, isolated, and touches neither the database nor the network, which is
+# the marker `backend/pyproject.toml` registers for exactly this. Applied at module scope so
+# `-m unit` selects the whole file - and that selection is only truthful because
+# `tests/conftest.py`'s schema fixture is not autouse, so nothing here creates or migrates a
+# database on the way to a pure derivation test.
+pytestmark = pytest.mark.unit
+
 # ---------------------------------------------------------------------------------------
 # The one expression of a well-formed slug
 # ---------------------------------------------------------------------------------------
@@ -522,7 +529,10 @@ class TestSlugifyTitle:
         positionally would otherwise be silently supplying it as the title.
         """
         with pytest.raises(TypeError, match="positional"):
-            slugify_title("Hello World", 10)  # type: ignore[misc]
+            # `call-arg`, not `misc`: mypy reports the extra positional argument against the
+            # call, and the narrower code is what keeps this suppression honest - it hides the
+            # one error the line is written to provoke and nothing else.
+            slugify_title("Hello World", 10)  # type: ignore[call-arg]
 
 
 class TestUniqueSlug:
@@ -733,7 +743,7 @@ class TestUniqueSlug:
     def test_the_bound_cannot_be_passed_positionally(self) -> None:
         """``max_length`` is keyword-only here too, so the signature cannot drift apart."""
         with pytest.raises(TypeError, match="positional"):
-            unique_slug("hello", set(), 10)  # type: ignore[misc]
+            unique_slug("hello", set(), 10)  # type: ignore[call-arg]
 
 
 class TestDeriveUniqueSlug:
@@ -822,4 +832,4 @@ class TestDeriveUniqueSlug:
     def test_the_bound_cannot_be_passed_positionally(self) -> None:
         """Keyword-only across all three public functions, with no exception."""
         with pytest.raises(TypeError, match="positional"):
-            derive_unique_slug("Hello World", set(), 10)  # type: ignore[misc]
+            derive_unique_slug("Hello World", set(), 10)  # type: ignore[call-arg]

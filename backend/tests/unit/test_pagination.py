@@ -302,7 +302,9 @@ class TestEnvelopeShape:
         assert set(page.model_dump()) == {"items", "total", "page", "page_size", "pages"}
 
     def test_serialises_the_keys_in_declaration_order(self) -> None:
-        page = build_page([], total=0, page=MIN_PAGE, page_size=DEFAULT_PAGE_SIZE)
+        # Annotated because an empty list leaves `ItemT` unsolved; `str` is arbitrary and
+        # unused - this test is about the envelope, not about what it carries.
+        page: Page[str] = build_page([], total=0, page=MIN_PAGE, page_size=DEFAULT_PAGE_SIZE)
 
         assert tuple(page.model_dump()) == _ENVELOPE_FIELD_ORDER
 
@@ -328,14 +330,25 @@ class TestEnvelopeShape:
         # where a count belongs. The exact type is what a JSON serialiser reads.
         assert type(value) is int, f"{field} is {type(value).__name__}, not int"
 
-    def test_items_is_a_list(self) -> None:
-        # A tuple in, a list out. Callers hand `build_page` whatever sequence their query
-        # produced, and the envelope normalises it, because a tuple would serialise
-        # identically in JSON but differ under any Python-side equality assertion.
-        page = build_page(("a", "b"), total=2, page=MIN_PAGE, page_size=DEFAULT_PAGE_SIZE)
+    def test_items_is_a_list_the_envelope_owns(self) -> None:
+        # `build_page` declares `items: list[ItemT]`, and every caller conforms: the services
+        # build a list of response models, and the repositories are documented as materialising
+        # their rows with `list(rows)` first. So this asserts what the envelope guarantees about
+        # a list it was handed, and claims nothing about a sequence the signature does not
+        # accept - the previous "any sequence in, a list out" wording described a tolerance
+        # pydantic happens to have at runtime rather than the contract callers are held to.
+        #
+        # The property that matters is ownership: validation copies, so the envelope does not
+        # alias the caller's list, and a caller mutating its own list afterwards cannot change
+        # what an already-built response serialises.
+        rows = ["a", "b"]
+        page = build_page(rows, total=2, page=MIN_PAGE, page_size=DEFAULT_PAGE_SIZE)
+
+        rows.append("c")
 
         assert type(page.items) is list
         assert page.items == ["a", "b"]
+        assert page.items is not rows
 
     def test_carries_no_derived_or_hypermedia_fields(self) -> None:
         # Each of these is computable from the five above, and each would be a sixth thing the
@@ -414,7 +427,10 @@ class TestEnvelopeGenericity:
         # parameter load-bearing instead of decorative.
         with pytest.raises(ValidationError) as raised:
             Page[int](
-                items=["not-a-number"],
+                # Deliberately the wrong static type: the assertion IS that the concrete
+                # parameterisation refuses it. Suppressed by code so the line hides exactly the
+                # one error it exists to provoke.
+                items=["not-a-number"],  # type: ignore[list-item]
                 total=1,
                 page=MIN_PAGE,
                 page_size=DEFAULT_PAGE_SIZE,
@@ -429,7 +445,9 @@ class TestEnvelopeGenericity:
         # and a numeric string becomes an int. Asserted rather than left uncovered, so that
         # enabling strict mode later is a deliberate change with a failing test to notice it.
         page = Page[int](
-            items=["5"],
+            # Wrong static type on purpose again, and this time the assertion is that lax mode
+            # converts it rather than refusing it.
+            items=["5"],  # type: ignore[list-item]
             total=1,
             page=MIN_PAGE,
             page_size=DEFAULT_PAGE_SIZE,
@@ -459,7 +477,7 @@ class TestPageCountArithmetic:
         page_size: int,
         expected_pages: int,
     ) -> None:
-        page = build_page([], total=total, page=MIN_PAGE, page_size=page_size)
+        page: Page[str] = build_page([], total=total, page=MIN_PAGE, page_size=page_size)
 
         assert page.pages == expected_pages, (
             f"{total} rows at {page_size} per page should occupy {expected_pages} pages, "
@@ -483,7 +501,7 @@ class TestPageCountArithmetic:
         # whose answer surprises readers. It is 0 rather than 1 because `ceil(0 / n) == 0`, and
         # the frontend is written to render no page control at all on that value. Asserted here
         # with the two things that hold regardless of the count: no exception, and no items.
-        page = build_page([], total=0, page=MIN_PAGE, page_size=DEFAULT_PAGE_SIZE)
+        page: Page[str] = build_page([], total=0, page=MIN_PAGE, page_size=DEFAULT_PAGE_SIZE)
 
         assert page.pages == 0
         assert page.items == []
@@ -502,7 +520,7 @@ class TestPageCountArithmetic:
     ) -> None:
         # `total` arrives from a `COUNT(*)` and Python integers are unbounded, so nothing in the
         # formula can overflow - but a float intermediate would silently lose the low bits.
-        page = build_page([], total=total, page=MIN_PAGE, page_size=page_size)
+        page: Page[str] = build_page([], total=total, page=MIN_PAGE, page_size=page_size)
 
         assert page.pages == expected_pages
 
@@ -574,7 +592,7 @@ class TestPageCountArithmetic:
         # collection, so a short last page must not change the count.
         full = build_page(["a"] * 10, total=95, page=1, page_size=10)
         short = build_page(["a"] * 5, total=95, page=10, page_size=10)
-        empty = build_page([], total=95, page=99, page_size=10)
+        empty: Page[str] = build_page([], total=95, page=99, page_size=10)
 
         assert full.pages == short.pages == empty.pages == 10
 
@@ -590,14 +608,14 @@ class TestBuildPageEcho:
         expected_pages: int,
     ) -> None:
         del expected_pages  # Covered by TestPageCountArithmetic; this row is reused for echo.
-        page = build_page([], total=total, page=MIN_PAGE, page_size=page_size)
+        page: Page[str] = build_page([], total=total, page=MIN_PAGE, page_size=page_size)
 
         assert page.total == total
         assert page.page_size == page_size
 
     @pytest.mark.parametrize("requested_page", [MIN_PAGE, 2, 7, 99, 1_000_000])
     def test_echoes_the_requested_page_verbatim(self, requested_page: int) -> None:
-        page = build_page([], total=95, page=requested_page, page_size=10)
+        page: Page[str] = build_page([], total=95, page=requested_page, page_size=10)
 
         assert page.page == requested_page
 
@@ -632,7 +650,7 @@ class TestBuildPageEcho:
         # wrapped in `pytest.raises`, deliberately: the call must succeed. The requested page is
         # echoed back beside the real count, which is precisely how a client detects it has run
         # off the end rather than being redirected to a page it never asked for.
-        page = build_page([], total=5, page=99, page_size=10)
+        page: Page[str] = build_page([], total=5, page=99, page_size=10)
 
         assert page.items == []
         assert page.total == 5
@@ -642,7 +660,7 @@ class TestBuildPageEcho:
     def test_a_page_beyond_the_last_one_is_never_clamped(self) -> None:
         # The failure this guards against is a plausible "helpful" edit: clamping `page` down to
         # `pages` would answer a different question from the one asked, and silently.
-        page = build_page([], total=0, page=42, page_size=DEFAULT_PAGE_SIZE)
+        page: Page[str] = build_page([], total=0, page=42, page_size=DEFAULT_PAGE_SIZE)
 
         assert page.page == 42
         assert page.pages == 0
@@ -878,7 +896,7 @@ class TestTheTwoHalvesAgree:
         for page_size in range(MIN_PAGE_SIZE, MAX_PAGE_SIZE + 1):
             params = PageParams(page_size=page_size)
 
-            page = build_page([], total=0, page=params.page, page_size=params.limit)
+            page: Page[str] = build_page([], total=0, page=params.page, page_size=params.limit)
 
             assert page.page_size == page_size
             assert page.pages == 0

@@ -3,11 +3,10 @@
 This module owns everything that happens to a category between being named by an administrator
 and being removed by one: the slug derived from its name at creation, the deliberate refusal to
 re-derive that slug when the name later changes, the two conflict rules that keep names and
-slugs unique, the in-use guard that stops a delete from silently unfiling posts, and the two read
-projections the home page's filter control and the administrative table render - the whole
-taxonomy for the first, one window of it for the second, both projected through the same
-``_to_public`` mapping and both tallying the same thing, so the two screens cannot disagree about
-what a category looks like or about what ``post_count`` counts.
+slugs unique, the in-use guard that stops a delete from silently unfiling posts, and the one read
+projection both the home page's filter control and the administrative table render - the whole
+taxonomy, tallied, projected through ``_to_public``, so the two screens cannot disagree about what
+a category looks like or about what ``post_count`` counts.
 
 The public read is the API's one un-paginated collection
 -------------------------------------------------------
@@ -16,9 +15,10 @@ no window, and that is the specified contract rather than an oversight. The taxo
 bounded by editorial effort, and the list *is* the home page's filter control: a windowed control
 would offer some terms and silently hide every post filed exclusively under the rest, which is a
 wrong answer rather than a partial one. It is the single documented exception to the page envelope
-across the whole API, one route wide, and ``GET /api/v1/admin/categories`` - the searchable
-management table, served by :meth:`CategoryService.list_paginated` - is what carries the envelope
-over the same relation.
+across the whole API, and it is one route wide because it is the only read this relation has:
+the administrative categories screen reads the same bare array rather than a privileged, windowed
+duplicate of it, which is why the AAP's administrative surface (§0.6.2) declares create, rename and
+delete for a category and no listing.
 
 Why the entity exists at all
 ----------------------------
@@ -101,14 +101,12 @@ model, and the one page envelope every collection in the API shares.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
 from typing import Final
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ConflictError, NotFoundError
-from app.core.pagination import Page, build_page
+from app.core.exceptions import ConflictError, NotFoundError, integrity_constraint_name
 from app.core.slug import slugify_title, unique_slug
 from app.models import Category, PostStatus
 from app.repositories import CategoryRepository
@@ -134,15 +132,45 @@ _DETAIL_NOT_FOUND: Final[str] = "Category not found."
 _DETAIL_NAME_TAKEN: Final[str] = "A category with that name already exists."
 """Detail for the ordinary, pre-checked collision on the unique ``categories.name``."""
 
-_DETAIL_NAME_OR_SLUG_TAKEN: Final[str] = (
-    "That category name, or the URL slug derived from it, is already in use."
+_DETAIL_SLUG_EXHAUSTED: Final[str] = (
+    "The URL slug derived from that name is being claimed concurrently. Try again."
 )
-"""Detail for a collision the database reported rather than the pre-check.
+"""Detail for a slug race that outlasted :data:`SLUG_ALLOCATION_ATTEMPTS` retries.
 
-Names both columns because the constraint that fired is not distinguished here: reading the
-violated constraint's name out of the driver's error would couple this module to a message
-format the driver is free to change, and the caller's remedy - choose another name - is the
-same for either. ``app.core.exceptions`` renders it at ``409``.
+Distinct from :data:`_DETAIL_NAME_TAKEN` because the remedy is different: the name is *not* taken,
+so choosing another one is the wrong advice - the request was valid and lost a race repeatedly, and
+retrying is what resolves it. Reached only under sustained contention on one slug family.
+"""
+
+_NAME_UNIQUE_CONSTRAINT: Final[str] = "uq_categories_name"
+"""The unique constraint on ``categories.name``, created under that name by revision ``0001``."""
+
+_SLUG_UNIQUE_INDEX: Final[str] = "ix_categories_slug"
+"""The unique index on ``categories.slug``, created under that name by revision ``0001``.
+
+``Category.slug`` declares ``unique=True, index=True``, which SQLAlchemy renders as a single unique
+index under the ``"ix": "ix_%(column_0_label)s"`` convention in ``app.db.base``.
+"""
+
+_TRANSLATABLE_SQLSTATES: Final[frozenset[str]] = frozenset({"23505"})
+"""``unique_violation`` - the only class a concurrent category write can cause.
+
+``23503`` (``foreign_key_violation``) is absent because a category references nothing, and
+``23514``/``23502`` are absent because a check or ``NOT NULL`` violation means this service
+assembled a row it should not have. Anything outside this set is re-raised, so a defect surfaces as
+a ``500`` with frames rather than as a plausible-looking conflict.
+"""
+
+SLUG_ALLOCATION_ATTEMPTS: Final[int] = 4
+"""How many times :meth:`CategoryService.create` re-derives a slug and re-inserts after a race.
+
+Slug allocation is read-then-insert - ``CategoryRepository.slugs_starting_with`` reads the family
+and :func:`~app.core.slug.unique_slug` picks the first free suffix - so a
+concurrent create whose *different* name derives the *same* slug stem can take that suffix in
+between. ``Machine Learning`` and ``machine learning`` are both legitimate names, and the route
+publishes de-duplication as a promise, so the loser retries rather than being refused. Four
+attempts, for the reason recorded on the identically-named constant in
+``app.services.post_service``: it is a bound on contention, and it guarantees termination.
 """
 
 _DETAIL_IN_USE: Final[str] = (
@@ -168,9 +196,6 @@ class CategoryService:
         # GET /api/v1/categories - the filter control: the whole taxonomy, counts included,
         # deliberately un-windowed. See `list_with_post_counts`.
         categories = await service.list_with_post_counts()
-
-        # GET /api/v1/admin/categories - the management table, searchable and windowed.
-        page = await service.list_paginated(q="mach", page=1, page_size=20)
 
         # POST /api/v1/admin/categories - the slug is derived here, never sent by a client.
         # Both mutations return the projected `CategoryPublic` rather than the mapped row: the
@@ -244,46 +269,14 @@ class CategoryService:
             created_at=category.created_at,
         )
 
-    async def _published_post_counts(
-        self, category_ids: Sequence[uuid.UUID] | None = None
-    ) -> dict[uuid.UUID, int]:
-        """Return published-post tallies keyed by category identifier.
-
-        One statement for the requested scope, so a caller holding a set of categories can attach a
-        real tally to each of them without asking a question per category.
-
-        Keyed by ``id`` rather than by ``slug`` or ``name``: the identifier is a UUID, so
-        lookups need no case handling at all, while a slug key would tempt a caller into folding
-        case in Python and duplicating - or contradicting - what the ``citext`` column already
-        does.
-
-        Args:
-            category_ids: The categories to tally, or ``None`` for the whole taxonomy. **A paginated
-                caller must pass its page's identifiers.** The unbounded form is correct for
-                :meth:`list_with_post_counts`, whose result set *is* the taxonomy, and wrong
-                everywhere else: aggregating every category and every filing in order to enrich
-                twenty rows defeats the page boundary the window just established, and the cost then
-                grows with the taxonomy rather than with the page. A caller that needs exactly one
-                tally should not come here at all - :meth:`_targeted_count` answers that with a
-                single targeted count, and every one-category projection in this module uses it.
-
-        Returns:
-            ``{category_id: published_post_count}`` covering every category in scope. A category
-            with no published post is present with a value of ``0``; the aggregate's outer join is
-            what keeps it in the result.
-        """
-        counted = await self.categories.list_with_post_counts(
-            status=PostStatus.PUBLISHED, category_ids=category_ids
-        )
-        return {category.id: post_count for category, post_count in counted}
-
     async def _targeted_count(self, category_id: uuid.UUID) -> int:
         """Return one category's published-post tally with a single targeted count.
 
-        The one-row counterpart to :meth:`_published_post_counts`. Every method here that projects
-        exactly one category routes through this, so ``published`` means the same thing on the
-        single-category read as it does in the aggregate - one call site, one default, no second
-        definition of the number to drift.
+        The single-category counterpart to the outer-join aggregate
+        ``CategoryRepository.list_with_post_counts`` performs for the whole taxonomy. Every method
+        here that projects exactly one category routes through this, so ``published`` means the same
+        thing on the single-category read as it does in the aggregate - one call site, one default,
+        no second definition of the number to drift.
 
         Args:
             category_id: The category to tally. An identifier that matches nothing counts ``0``
@@ -309,8 +302,8 @@ class CategoryService:
         and a windowed control would offer some terms while silently hiding every post filed
         exclusively under the rest - a wrong answer rather than a partial one. A taxonomy is bounded
         by editorial effort rather than by reader input, so there is nothing here for a window to
-        protect against. The searchable, windowed view over the same relation is
-        :meth:`list_paginated`, reached only through ``GET /api/v1/admin/categories``.
+        protect against. This is the relation's only read: the administrative categories screen
+        consumes this same array, which is why no privileged listing exists to disagree with it.
 
         **One statement, never one per category.** The tally arrives from a single aggregate in
         ``CategoryRepository.list_with_post_counts`` - a ``LEFT OUTER JOIN`` onto
@@ -405,86 +398,6 @@ class CategoryService:
         # honest tally rather than a placeholder.
         return self._to_public(category, await self._targeted_count(category.id))
 
-    async def list_paginated(
-        self,
-        *,
-        q: str | None,
-        page: int,
-        page_size: int,
-    ) -> Page[CategoryPublic]:
-        """Window the taxonomy. **The administrative listing surface.**
-
-        Reached only through ``app.services.admin_service`` for ``GET /api/v1/admin/categories``,
-        which is the searchable management table. The reader-facing filter control does **not**
-        come here: it calls :meth:`list_with_post_counts` and receives the whole taxonomy as a bare
-        list, for the reason recorded there. Both methods project through :meth:`_to_public` and
-        both tally published posts, so the two screens agree about what a category looks like and
-        about what ``post_count`` counts while differing - deliberately - in whether the result is
-        windowed.
-
-        Args:
-            q: Optional search text, matched case-insensitively against both the name and the
-                slug so a term is findable by either spelling. ``None``, an empty string and
-                whitespace alone all mean "no filter" - the repository normalises that - because
-                a blank search box is not a search for nothing.
-            page: The 1-based page requested. A page past the last one is **not** an error: it
-                comes back with an empty ``items`` list beside the real ``pages``, which is how
-                a client recognises that it has run off the end rather than being silently
-                redirected to a page it never asked for.
-            page_size: Rows per page.
-
-        Returns:
-            The one page envelope every collection endpoint in this API returns, carrying
-            ``items``, ``total``, ``page``, ``page_size`` and ``pages``.
-
-        Raises:
-            ValueError: If ``page_size`` is zero or negative, raised by ``build_page``. That can
-                only arrive from a defect in a caller: request-supplied values are bounded to
-                ``page >= 1`` and ``1 <= page_size <= 100`` by ``PageParams`` in
-                ``app.core.dependencies`` long before they reach here, so failing loudly beats
-                dividing by zero or substituting a default that would make ``pages`` a fiction.
-
-        Note:
-            **``post_count`` is a real number on this surface too, and the aggregate behind it is
-            bounded to the page.** The repository's windowed query returns entities without tallies,
-            and ``CategoryPublic.post_count`` is a required member, so a tally has to come from
-            somewhere; emitting ``0`` because none was to hand would put a fabricated figure in a
-            documented field. It comes from one further aggregate - three statements in total,
-            constant in the page size, and never one per row - narrowed to the identifiers this page
-            actually returned. Aggregating the whole taxonomy here would have undone the window: the
-            page bounds what is rendered, and the enrichment behind it has to respect the same
-            bound, or the endpoint's cost grows with the taxonomy however small the page is.
-
-            **The tally counts published posts here as well, not posts in every state.**
-            ``CategoryPublic.post_count`` is published in ``/openapi.json`` as the number of
-            *published* posts, and this method returns that same model, so counting archived
-            posts and drafts into it would make the document describe something the API does not
-            return. An all-states tally is a different number and would need a model of its own
-            rather than a differently-meaning field under a name a client has already been told
-            the meaning of.
-        """
-        # The window arithmetic `PageParams.offset` performs, restated for a caller that passes
-        # the page and its size rather than the dependency object - which is what keeps this
-        # method callable from `admin_service` and from a test with no request in sight.
-        offset = (page - 1) * page_size
-        rows, total = await self.categories.list_paginated(q=q, limit=page_size, offset=offset)
-
-        # Ordered after the window on purpose, and scoped BY it. The identifiers come from the rows
-        # the window returned, so the aggregate covers exactly this page rather than the relation.
-        # Sequencing it second is also what makes it complete: both statements take their own
-        # snapshot under READ COMMITTED, so an aggregate that runs after the window sees every row
-        # the window returned unless one was deleted in between, whereas an earlier one could miss a
-        # category the window then included.
-        #
-        # `.get(..., 0)` therefore cannot invent a tally. The only way a row on this page is absent
-        # from the aggregate is a concurrent transaction having deleted it in between, in which case
-        # the response is about to describe a category that no longer exists and 0 is as truthful a
-        # figure as any. Every other row takes its real counted value.
-        counts = await self._published_post_counts([category.id for category in rows])
-
-        items = [self._to_public(category, counts.get(category.id, 0)) for category in rows]
-        return build_page(items, total, page, page_size)
-
     # -----------------------------------------------------------------------------------
     # Writes
     # -----------------------------------------------------------------------------------
@@ -517,10 +430,13 @@ class CategoryService:
             the note on why the count is a constant here.
 
         Raises:
-            ConflictError: If the name is already taken, or if the insert violates either unique
-                constraint. Both spellings of the same outcome, deliberately - see the note. A
-                merely colliding *slug* is **not** among them: it is suffixed, per the note below,
-                and the request succeeds.
+            ConflictError: If the name is already taken - on the pre-check below, or on
+                ``uq_categories_name`` when a concurrent writer claims it in between. Two
+                spellings of one outcome, deliberately, because the remedy is the same. A merely
+                colliding *slug* is **not** among them: it is suffixed, per the note below, and
+                the request succeeds. The one slug-shaped conflict is exhaustion - a family so
+                contended that all :data:`SLUG_ALLOCATION_ATTEMPTS` re-derivations lost the race -
+                and it carries a different detail because it asks for a retry, not a rename.
 
         Note:
             **Slug derivation is three steps, and splitting them is what keeps each testable.**
@@ -540,9 +456,11 @@ class CategoryService:
             legitimate labels that deserve distinct addresses rather than one being rejected on
             the other's behalf. Do not "tighten" this into a 409: the derived slug is an address
             this service assigns, and refusing a name because an address was taken would make the
-            taxonomy's vocabulary a function of its URL history. The consequence for a client is
-            stated in ``app.api.v1.routers.admin``: read ``slug`` from the response rather than
-            deriving it from the name that was sent.
+            taxonomy's vocabulary a function of its URL history. The promise survives concurrency
+            because the loop below re-derives rather than reports - the only slug that reaches a
+            caller as a conflict is one whose family stayed contended for every bounded attempt.
+            The consequence for a client is stated in ``app.api.v1.routers.admin``: read ``slug``
+            from the response rather than deriving it from the name that was sent.
 
             **The pre-check and the constraint are both needed, and neither replaces the
             other.** The ``get_by_name`` lookup exists so that the ordinary collision - an
@@ -584,34 +502,63 @@ class CategoryService:
             raise ConflictError(_DETAIL_NAME_TAKEN)
 
         base = slugify_title(payload.name)
-        taken = await self.categories.slugs_starting_with(base)
-        slug = unique_slug(base, taken)
 
-        category = Category(name=payload.name, slug=slug, description=payload.description)
+        # The slug family is re-read on every attempt, because that is what a retry is FOR: the
+        # attempt that lost the race has to see the row that won before it can pick the next free
+        # suffix. The name pre-check above is deliberately outside the loop - it is a question about
+        # a value the caller supplied, and its answer cannot change in this request's favour.
+        for attempt in range(SLUG_ALLOCATION_ATTEMPTS):
+            taken = await self.categories.slugs_starting_with(base)
+            slug = unique_slug(base, taken)
+            category = Category(name=payload.name, slug=slug, description=payload.description)
 
-        try:
-            # `add` flushes, so the INSERT - and therefore both unique constraints - is applied
-            # inside this block rather than at some later commit. The commit is inside it too:
-            # a commit issues a flush of its own, and a translation that covered only one of the
-            # two would leave the other able to surface as a 500.
-            persisted = await self.categories.add(category)
-            # Projected BEFORE the commit, and with a constant rather than a query: a category
-            # created a moment ago has no post filed under it, because `post_categories` rows are
-            # written by the post lifecycle and nothing in this method writes one. Counting would
-            # ask the database a question whose answer is already known - which is what the
-            # administrative readback used to do, and it did it with a whole-taxonomy aggregate.
-            projected = self._to_public(persisted, 0)
-            await self.session.commit()
-        except IntegrityError as error:
-            # Rolled back before the domain error is raised. After an IntegrityError the session
-            # is unusable until it is rolled back, so a caller that catches this conflict - the
-            # idempotent seed, a test asserting on it - would otherwise find every subsequent
-            # statement failing with a pending-rollback error instead. `get_db` also rolls back
-            # on the way out, which is the safety net rather than the mechanism.
-            await self.session.rollback()
-            raise ConflictError(_DETAIL_NAME_OR_SLUG_TAKEN) from error
+            try:
+                # `add` flushes, so the INSERT - and therefore both unique constraints - is applied
+                # inside this block rather than at some later commit. The commit is inside it too:
+                # a commit issues a flush of its own, and a translation that covered only one of
+                # the two would leave the other able to surface as a 500.
+                persisted = await self.categories.add(category)
+                # Projected BEFORE the commit, and with a constant rather than a query: a category
+                # created a moment ago has no post filed under it, because `post_categories` rows
+                # are written by the post lifecycle and nothing in this method writes one. Counting
+                # would ask the database a question whose answer is already known.
+                projected = self._to_public(persisted, 0)
+                await self.session.commit()
+            except IntegrityError as error:
+                # Rolled back before anything else happens. After an IntegrityError the session is
+                # unusable until it is rolled back, so a caller that catches this conflict - the
+                # idempotent seed, a test asserting on it - would otherwise find every subsequent
+                # statement failing with a pending-rollback error instead. `get_db` also rolls back
+                # on the way out, which is the safety net rather than the mechanism.
+                await self.session.rollback()
 
-        return projected
+                # WHICH constraint fired decides what happens next, and the two answers are
+                # opposite. This used to report one 409 for both, which was wrong in the slug case
+                # twice over: it refused a request whose name was free, and it advised the caller
+                # to choose a different name when the name was never the problem.
+                constraint = integrity_constraint_name(error, sqlstates=_TRANSLATABLE_SQLSTATES)
+                if constraint == _SLUG_UNIQUE_INDEX:
+                    # A slug race. The next attempt re-reads the family and takes the next suffix,
+                    # which is the promise the route publishes; only sustained contention exhausts
+                    # the bound, and that answers a 409 saying so rather than blaming the name.
+                    if attempt + 1 < SLUG_ALLOCATION_ATTEMPTS:
+                        continue
+                    raise ConflictError(_DETAIL_SLUG_EXHAUSTED) from error
+                if constraint == _NAME_UNIQUE_CONSTRAINT:
+                    # The name was taken between the pre-check and the insert. A retry cannot help
+                    # - the name is the caller's - so this is the 409 the pre-check would have
+                    # raised had it run a moment later.
+                    raise ConflictError(_DETAIL_NAME_TAKEN) from error
+                # Anything else is a defect here rather than contention, and is re-raised untouched
+                # so it surfaces as a 500 with frames instead of as somebody else's category name.
+                raise
+            else:
+                return projected
+
+        # Unreachable: every iteration either returns, continues, or raises, and the last iteration
+        # cannot continue. Stated rather than left to fall off the end so the function has one exit
+        # contract and a type checker sees it.
+        raise ConflictError(_DETAIL_SLUG_EXHAUSTED)
 
     async def update(self, category_id: uuid.UUID, payload: CategoryUpdate) -> CategoryPublic:
         """Apply a partial update to a category, leaving its slug alone.
@@ -716,6 +663,15 @@ class CategoryService:
             await self.session.commit()
         except IntegrityError as error:
             await self.session.rollback()
+            # Only the name constraint. A rename never touches the slug, so a slug violation here
+            # would mean this service wrote a column it does not write, and a check or NOT NULL
+            # violation would mean it assembled an invalid row - each is a defect that must surface
+            # as a 500 with frames rather than as "that name is taken".
+            if (
+                integrity_constraint_name(error, sqlstates=_TRANSLATABLE_SQLSTATES)
+                != _NAME_UNIQUE_CONSTRAINT
+            ):
+                raise
             raise ConflictError(_DETAIL_NAME_TAKEN) from error
 
         return projected

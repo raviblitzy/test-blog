@@ -1,4 +1,4 @@
-"""The administrative namespace: fourteen gated operations over four entity families.
+"""The administrative namespace: thirteen gated operations over four entity families.
 
 What the user asked for was "an admin dashboard for managing users, posts, comments, and
 categories". Because the framework question was resolved to FastAPI there is no
@@ -21,12 +21,14 @@ The whole namespace, in declaration order::
     GET    /api/v1/admin/comments                  ->  Page[AdminComment]
     PATCH  /api/v1/admin/comments/{id}/status      ->  AdminComment
     DELETE /api/v1/admin/comments/{comment_id}     ->  204, no body
-    GET    /api/v1/admin/categories                ->  Page[CategoryPublic]
     POST   /api/v1/admin/categories                ->  201, CategoryPublic
     PATCH  /api/v1/admin/categories/{category_id}  ->  CategoryPublic
     DELETE /api/v1/admin/categories/{category_id}  ->  204, no body
 
-Fourteen, and exactly fourteen. There is no bulk endpoint, no password reset for another
+Thirteen, and exactly thirteen - the namespace the AAP's REST surface declares (§0.6.2),
+neither more nor fewer. There is no administrative listing of categories, because the public
+`GET /api/v1/categories` already returns the whole taxonomy, ascending by name, with the same
+`post_count` this screen would show; there is no bulk endpoint, no password reset for another
 account, no impersonation and no query console. Each of those is a privileged operation
 whose blast radius is far wider than anything the dashboard needs, and an administrative
 namespace is the one place where "it might be handy" is the most expensive argument in the
@@ -49,7 +51,7 @@ path segment, the ``admin`` documentation tag, and the administrator gate.
 
 That single placement is what makes the gate impossible to omit. It covers every operation
 beneath it, including one added long after this file was written by someone who never read
-this paragraph, so the guarantee is a property of the mount rather than of fourteen separate
+this paragraph, so the guarantee is a property of the mount rather than of thirteen separate
 acts of remembering. Restating it here would document the same security requirement twice in
 ``/openapi.json`` for no additional protection, and would put the version prefix and the tag
 in two files that then have to agree forever.
@@ -88,7 +90,7 @@ is aliased to ``AdminPrincipal`` and the **schema** keeps its documented name. N
 negotiable in isolation - the alias is the vocabulary the handler signatures read in, and the
 class is the name the response model is documented and tested under.
 
-Fourteen handlers, fourteen one-line service calls
+Thirteen handlers, thirteen one-line service calls
 --------------------------------------------------
 Every handler here constructs ``AdminService(db)`` and calls exactly one method on it. That
 is the whole body. The file's job is shape and routing - path, method, status code, response
@@ -136,7 +138,6 @@ from fastapi import APIRouter, Path, Query, status
 # The dependency is aliased and the schema keeps its name - see "Two names spelled AdminUser"
 # in the module docstring. `AdminPrincipal` is the injected administrator; `AdminUser`, from
 # the schema barrel below, is the serialised administrative user row.
-from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import AdminUser as AdminPrincipal, DbSession, PageParamsDep
 from app.models import CommentStatus, PostStatus, UserRole
 from app.schemas import (
@@ -151,6 +152,8 @@ from app.schemas import (
     CategoryPublic,
     CategoryUpdate,
     Page,
+    ProblemResponses,
+    problem_response,
 )
 from app.schemas.common import MAX_SEARCH_TERM_LENGTH, SearchTerm
 from app.services import AdminService
@@ -165,9 +168,9 @@ __all__ = ["router"]
 # `/openapi.json` rather than an undocumented body a client generator has to guess at. The
 # entries are composed per route with `|` from the four constants below, which keeps each
 # decorator's declaration an explicit statement of what that operation can actually return
-# and keeps the descriptions from drifting apart between fourteen copies.
+# and keeps the descriptions from drifting apart between thirteen copies.
 #
-# Every entry is built by `app.api.v1.responses.problem_response`, which names the one error
+# Every entry is built by `app.schemas.common.problem_response`, which names the one error
 # shape this API has - `type`, `title`, `status`, `detail`, `instance`, `request_id`, in place
 # of the three ad-hoc 404 raises and the two different success envelopes the retired surface
 # used - and which is the single place its published media type is decided.
@@ -186,7 +189,7 @@ _GATE_RESPONSES: Final[ProblemResponses] = {
         "does not disclose which role would have sufficed."
     ),
 }
-"""401 and 403, declared on all fourteen routes because the gate covers all fourteen.
+"""401 and 403, declared on all thirteen routes because the gate covers all thirteen.
 
 Every operation in this namespace is reachable only by an authenticated, active principal
 holding ``ADMIN``, so both failure modes apply uniformly. ``app.api.v1.router`` documents the
@@ -238,23 +241,18 @@ Every route in this namespace qualifies except ``GET /stats``, which takes no in
 
 
 # ---------------------------------------------------------------------------------------
-# The search-term contract, stated once for the four listings that accept one
+# The search-term contract, stated once for the three listings that accept one
 #
 # The bound itself is `app.schemas.common.MAX_SEARCH_TERM_LENGTH` and is enforced by
-# `SearchTerm`, the annotation all four `q` parameters carry. This sentence is only the
+# `SearchTerm`, the annotation all three `q` parameters carry. This sentence is only the
 # published half of it: the number is interpolated rather than written out, so the documentation
-# cannot claim a limit the annotation does not enforce, and the same wording reaches all four
-# listings rather than drifting into four descriptions of one rule.
+# cannot claim a limit the annotation does not enforce, and the same wording reaches all three
+# listings rather than drifting into three descriptions of one rule.
 #
-# Bounding these four matters as much as bounding the public feed. An administrative caller is
+# Bounding these three matters as much as bounding the public feed. An administrative caller is
 # authenticated but is not thereby trusted with unbounded work: `q` here is parsed by the
 # full-text parser, matched against a trigram index and written into a structured log line, and
-# the length of all four is the caller's to choose unless something says otherwise.
-#
-# The taxonomy listing was the one that carried a bare `str | None` instead, which left it
-# unbounded and - because `SearchTerm` is also where the storable-text rule is attached - left a
-# NUL character to be refused by the driver rather than at the boundary. Both are the same
-# omission, and both are closed by carrying the same annotation as its three siblings.
+# the length of all three is the caller's to choose unless something says otherwise.
 # ---------------------------------------------------------------------------------------
 
 _SEARCH_TERM_BOUND: Final[str] = (
@@ -601,11 +599,14 @@ async def list_posts(
         The one page envelope, with :class:`~app.schemas.admin.AdminPost` items.
 
     Note:
-        The breadth is the service's decision, not this function's: it passes the full
-        lifecycle tuple when no state was named, so a fourth state added to the enumeration
-        appears here without an edit to this file - and cannot fail to. Bypassing the public
-        status scope is safe only because the surface is gated, which is why the reach lives
-        behind an authority check rather than behind a query parameter.
+        The breadth is the service's decision, not this function's, and it is expressed as the
+        *absence* of a predicate rather than as an enumeration: when no state was named
+        ``AdminService.list_posts`` passes ``statuses=None``, which is the repository's spelling
+        for "do not filter on status at all". So a fourth state added to the enumeration appears
+        here without an edit to this file or to the service - and cannot fail to, because there
+        is no list for it to be missing from. Bypassing the public status scope is safe only
+        because the surface is gated, which is why the reach lives behind an authority check
+        rather than behind a query parameter.
     """
     return await AdminService(db).list_posts(
         actor=actor,
@@ -856,18 +857,18 @@ async def delete_comment(comment_id: _CommentIdPath, db: DbSession, actor: Admin
 # ---------------------------------------------------------------------------------------
 # Categories
 #
-# Four routes: a searchable listing and the three lifecycle operations. The listing is what the
-# administrative categories screen renders its management table from, and it is a separate
-# operation from the public `GET /api/v1/categories` for one reason - it accepts a `q` term.
-# Searching a taxonomy is a management affordance; putting a text predicate on the public read
-# every home-feed render calls would serve no reader. Both answer the identical page envelope
-# and both reach `CategoryService.list_paginated`, so the two screens cannot disagree about what
-# a category looks like or about what `post_count` counts.
+# Three routes, and exactly the three the AAP's REST surface declares (§0.6.2): create, rename
+# and delete. There is deliberately no administrative LISTING of categories, and that omission is
+# the design rather than a gap. The taxonomy is small, bounded reference data, and the public
+# `GET /api/v1/categories` already returns it whole - every term, ascending by name, each with the
+# `post_count` a reader sees - so the management screen reads the same array the home page filter
+# reads and no privileged listing has to exist. Adding one would put a thirty-eighth operation on
+# a thirty-seven-operation surface, and a second definition of "a page of categories" behind it.
 #
-# There is deliberately no administrative PROJECTION of a category, and none is needed: a
+# There is deliberately no administrative PROJECTION of a category either, and none is needed: a
 # category has no private member - no owner, no address, no credential, no moderation state - so
 # `CategoryPublic` already carries everything this screen shows. That is why `app.schemas.admin`
-# declares no category output type and this route names the public model.
+# declares no category output type and these routes name the public model.
 #
 # The two inputs are `CategoryCreate` and `CategoryUpdate` from `app.schemas.category`, reached
 # through the barrel and deliberately not re-declared as administrative variants: one wire
@@ -875,64 +876,6 @@ async def delete_comment(comment_id: _CommentIdPath, db: DbSession, actor: Admin
 # restating them for exactly that reason. Neither accepts an identifier or a slug, because both
 # are the server's to generate.
 # ---------------------------------------------------------------------------------------
-
-
-@router.get(
-    "/categories",
-    response_model=Page[CategoryPublic],
-    status_code=status.HTTP_200_OK,
-    responses=_GATE_RESPONSES | _UNPROCESSABLE_RESPONSE,
-    summary="List categories with post counts",
-    description=(
-        "The management table behind the administrative categories screen: one page of the "
-        "taxonomy, ascending by name, each term carrying how many PUBLISHED posts are filed "
-        "under it.\n\n"
-        "`q` is what this route adds over the public `GET /api/v1/categories`, and it is matched "
-        "case-insensitively against **both** the name and the slug, so a term is findable by "
-        "either spelling. A blank or whitespace-only value is treated as no filter rather than "
-        "as a search for nothing.\n\n"
-        "`post_count` counts published posts here exactly as it does on the public control, "
-        "because it is the same documented model - a moderator reads the figure a reader would "
-        "see. A term with nothing filed under it is included with a `post_count` of `0`, which "
-        "is how the screen shows an unused category rather than hiding it."
-    ),
-)
-async def list_categories(
-    db: DbSession,
-    actor: AdminPrincipal,
-    page: PageParamsDep,
-    q: Annotated[
-        SearchTerm,
-        Query(
-            description=(
-                "Free-text term matched case-insensitively against the category name and its "
-                "slug.\n\n" + _SEARCH_TERM_BOUND
-            ),
-        ),
-    ] = None,
-) -> Page[CategoryPublic]:
-    """Return one page of the taxonomy, optionally narrowed by a search term.
-
-    Args:
-        db: The request-scoped session.
-        actor: The administrator principal.
-        page: The validated window.
-        q: Optional free-text term over the name and the slug, or ``None`` for no filter.
-
-    Returns:
-        The one page envelope, with :class:`~app.schemas.category.CategoryPublic` items - the
-        same model the public taxonomy endpoints return, so the administrative screen and the
-        home page filter agree on what a category looks like down to the meaning of
-        ``post_count``.
-
-    Note:
-        ``AdminService`` delegates to ``CategoryService.list_paginated``, which is the single
-        windowing implementation over this relation and is what the public collection calls too.
-        Composing a second query here would be a second definition of a page of categories.
-    """
-    return await AdminService(db).list_categories(
-        actor=actor, q=q, page=page.page, page_size=page.page_size
-    )
 
 
 @router.post(
@@ -949,9 +892,12 @@ async def list_categories(
         "is a 422. A name already in use is a 409. A **name whose derived slug collides** with "
         "an existing one is not: the slug is de-duplicated with a deterministic ascending "
         "suffix - `python`, `python-2`, `python-3` - so the request succeeds and the response "
-        "carries the slug that was actually assigned. Read `slug` from the response rather than "
-        "deriving it client-side. The new category's `post_count` is `0`, since nothing has been "
-        "filed under it yet."
+        "carries the slug that was actually assigned. That holds under concurrency too: a slug "
+        "claimed by another writer between derivation and insert is re-derived and retried, so "
+        "the only slug-shaped 409 is sustained contention on one family - and its detail says to "
+        "retry, not to rename. Read `slug` from the response rather than deriving it "
+        "client-side. The new category's `post_count` is `0`, since nothing has been filed under "
+        "it yet."
     ),
     response_description="The category was created, with its generated identifier and slug.",
 )

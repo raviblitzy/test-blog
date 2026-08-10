@@ -35,10 +35,11 @@ Requests:
 
 There is deliberately no ``AdminCategory``, and its absence is not an oversight: a category has no
 private member. No owner, no address, no credential, no moderation state - nothing for a
-privileged projection to reveal that ``CategoryPublic`` withholds. So
-``GET /api/v1/admin/categories`` names the public item type, which is why the three privileged
-projections above number three rather than four. The administrative listing differs from the public
-one in what it *accepts* (a ``q`` search term), not in what it *returns*.
+privileged projection to reveal that ``CategoryPublic`` withholds. So the two category mutations
+answer with the public model, which is why the privileged projections above number three rather
+than four. Nor is there an administrative *listing* of categories: the AAP's surface (§0.6.2) gives
+this relation one read, the bare array behind the public ``GET /api/v1/categories``, and the
+management screen consumes that array rather than a windowed duplicate of it.
 
 The whole namespace, and the payload each operation carries::
 
@@ -52,7 +53,6 @@ The whole namespace, and the payload each operation carries::
     GET    /api/v1/admin/comments               ->  Page[AdminComment]
     PATCH  /api/v1/admin/comments/{id}/status   AdminCommentStatusUpdate ->  AdminComment
     DELETE /api/v1/admin/comments/{id}                                   ->  204, no body
-    GET    /api/v1/admin/categories             ->  Page[CategoryPublic]
     POST   /api/v1/admin/categories             CategoryCreate           ->  CategoryPublic
     PATCH  /api/v1/admin/categories/{id}        CategoryUpdate           ->  CategoryPublic
     DELETE /api/v1/admin/categories/{id}                                 ->  204, no body
@@ -427,9 +427,12 @@ class AdminUserUpdate(BaseModel):
             "New authority for the account - READER, AUTHOR or ADMIN. Omit to leave it unchanged. "
             "Takes effect on the account's next request, because every authorisation decision "
             "re-reads this column rather than trusting a token claim, so a demotion does not wait "
-            "for an already-issued access token to expire. An administrator may change their own "
-            "role, including demoting themselves; the service, not this model, decides whether "
-            "the last remaining administrator may do so."
+            "for an already-issued access token to expire. An administrator may **not** demote "
+            "themselves: sending any role other than ADMIN for your own account is refused with "
+            "`409`, unconditionally and regardless of how many other administrators exist, "
+            "because an account that revokes its own authority cannot restore it. Re-sending "
+            "ADMIN for your own account is a permitted no-op. Ask another administrator to make "
+            "the change."
         ),
     )
     """New authority, or omitted to leave it unchanged. Optional but not nullable.

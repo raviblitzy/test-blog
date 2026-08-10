@@ -134,7 +134,15 @@ from http import HTTPStatus
 from typing import Any, Final
 
 import structlog
-from starlette.datastructures import Headers, MutableHeaders
+from fastapi.datastructures import Headers
+
+# ASGI-protocol surface, reached through the Starlette that FastAPI pins and installs. FastAPI
+# re-exports `Headers` above but not `MutableHeaders`, and re-exports none of the five protocol
+# aliases below, so there is no FastAPI-surface spelling of them to prefer - which is also why
+# `backend/pyproject.toml` does NOT declare starlette as a direct dependency: nothing here pins
+# a version FastAPI has not already resolved, and every alias used is part of the ASGI spec this
+# middleware implements rather than of a library API that could move underneath it.
+from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.exceptions import REQUEST_ID_CONTEXT_KEY, REQUEST_ID_HEADER, is_usable_request_id

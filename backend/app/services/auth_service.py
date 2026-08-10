@@ -105,13 +105,19 @@ second one would collide with the outer transaction the suite rolls back.
 
 from __future__ import annotations
 
+import uuid
 from typing import Final, NoReturn
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.exceptions import ConflictError, ForbiddenError, UnauthorizedError
+from app.core.exceptions import (
+    ConflictError,
+    ForbiddenError,
+    UnauthorizedError,
+    integrity_constraint_name,
+)
 from app.core.logging import get_logger
 from app.core.security import (
     create_access_token,
@@ -144,6 +150,26 @@ __all__ = ["AuthService"]
 # ---------------------------------------------------------------------------------------
 
 _IDENTIFIER_TAKEN: Final[str] = "That email address or username is already registered."
+
+_REGISTRATION_UNIQUE_CONSTRAINTS: Final[frozenset[str]] = frozenset(
+    {"ix_users_email", "ix_users_username"}
+)
+"""The only two constraints a concurrent registration can legitimately violate.
+
+Both are unique ``citext`` indexes created under these names by revision ``0001``, and both mean
+exactly what :data:`_IDENTIFIER_TAKEN` says. Every other constraint on ``users`` describes an
+invariant this service is supposed to satisfy on its own - a ``NOT NULL`` column it failed to
+populate, a check it failed to respect - so a violation of one is a defect here, not a race, and is
+re-raised untouched so it surfaces as a ``500`` with frames.
+"""
+
+_REGISTRATION_SQLSTATES: Final[frozenset[str]] = frozenset({"23505"})
+"""``unique_violation`` - the only class a concurrent registration can produce.
+
+``23503`` is absent because a new account references nothing. ``23502`` and ``23514`` are absent
+because a ``NOT NULL`` or check violation means the row assembled above was wrong.
+"""
+
 """Registration conflict, for a taken email **and** for a taken username alike.
 
 Deliberately ambiguous. Reporting which of the two collided would answer "is this address
@@ -232,8 +258,39 @@ class AuthService:
     :meth:`login`                   :meth:`authenticate` then :meth:`issue_token_pair`, which
                                     is what the login route calls.
     :meth:`rotate_refresh_token`    Spend a refresh token and mint its replacement.
-    :meth:`logout`                  Withdraw a refresh token, idempotently.
+    :meth:`logout`                  Withdraw the caller's own refresh token, idempotently.
+                                    Requires the principal: a token belonging to another
+                                    account is inert.
     ==============================  ========================================================
+
+    One lock, one order: every token write serialises on the owning ``users`` row
+    -----------------------------------------------------------------------------
+    Issuing, rotating, withdrawing and sweeping refresh tokens are four writes to the *same*
+    logical thing - the set of credentials one account currently holds - performed by four
+    different requests that can arrive at once. Each was individually correct and the set was
+    not, because none of them serialised against the others.
+
+    The interleaving that lost a revocation: a rotation spends token ``T1`` and is about to
+    insert its successor ``T2``; a concurrent sign-out, reuse sweep or administrative
+    deactivation runs ``revoke_all_for_user`` and revokes everything it can *see*, which is
+    ``T1`` and not ``T2`` because ``T2`` does not exist yet; then the rotation commits ``T2``.
+    Both transactions succeed, and the account is left holding a live credential after a request
+    whose whole purpose was to leave it holding none. After an administrative suspension that
+    token stays usable, and it is usable again if the account is later reactivated.
+
+    A bulk ``UPDATE`` cannot fix this on its own: it locks the rows that exist when it runs, and
+    the row that defeats it is the one inserted afterwards. So every writer here takes an
+    exclusive lock on the owning ``users`` row **before** touching any token row, through
+    :meth:`_lock_account`. Whichever writer arrives second blocks, and because the session runs at
+    ``READ COMMITTED`` it then re-evaluates against the state the first one committed - the sweep
+    sees the successor and revokes it, or the rotation finds its token already revoked and refuses.
+
+    **The order is not negotiable: the account row first, always.** ``app.services.admin_service``
+    already locks it before its deactivation sweep and before deleting an account, so the two
+    services share one protocol rather than two. Reversing the order anywhere - taking a token-row
+    lock and then asking for the account - introduces a deadlock cycle against every writer that
+    does it the documented way, which is why :meth:`rotate_refresh_token` performs an unlocked read
+    purely to discover the owner and locks the account before it claims anything.
 
     Which errors leave here, and what each means
     --------------------------------------------
@@ -251,9 +308,11 @@ class AuthService:
       deactivated account.
 
     A :class:`~sqlalchemy.exc.IntegrityError` is caught where one can legitimately occur - the
-    registration race - and translated. Nothing else is swallowed: a driver or programming error
-    must surface as a ``500`` that gets logged and investigated rather than as a plausible-looking
-    domain refusal.
+    registration race - and translated only when the constraint it names is one of the two unique
+    indexes on identity, checked through
+    :func:`~app.core.exceptions.integrity_constraint_name`. Nothing else is swallowed: a driver or
+    programming error must surface as a ``500`` that gets logged and investigated rather than as a
+    plausible-looking domain refusal.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -315,8 +374,12 @@ class AuthService:
             password field to leak the credential back through.
 
         Raises:
-            ConflictError: The email or the username is already registered. The message does not
-                say which - see :data:`_IDENTIFIER_TAKEN`.
+            ConflictError: The email or the username is already registered, whether the pre-check
+                below or one of the two unique indexes caught it. The message does not say which
+                identifier collided - see :data:`_IDENTIFIER_TAKEN`. An integrity failure on any
+                *other* constraint is deliberately **not** translated: it means this method
+                assembled a row it should not have, so it propagates and is answered as a ``500``
+                with frames. See :data:`_REGISTRATION_UNIQUE_CONSTRAINTS`.
         """
         # One statement with LIMIT 1 rather than two lookups, and the row is returned whole -
         # but nothing here reads it. Which identifier collided is deliberately not inspected,
@@ -369,12 +432,22 @@ class AuthService:
             # to `get_db`. The transaction held nothing but this insert, so nothing else is
             # discarded.
             await self.session.rollback()
+
+            # WHICH constraint failed decides whether this is a race or a defect, and the two get
+            # opposite answers. This used to report every integrity failure as "that email or
+            # username is taken", which meant a `NOT NULL` column this method forgot to populate,
+            # or a check constraint it violated, was announced to the caller as somebody else's
+            # account - a 409 they would retry forever, with no traceback and no 500 to alert on.
+            constraint = integrity_constraint_name(violation, sqlstates=_REGISTRATION_SQLSTATES)
+            if constraint not in _REGISTRATION_UNIQUE_CONSTRAINTS:
+                # Not a race on identity. Re-raised untouched so it surfaces as a 500 with frames,
+                # which is the only answer that gets a defect here looked at.
+                raise
             # Chained rather than suppressed with `from None`: the caller sees only the `409`,
             # while a traceback keeps the constraint name, which is what separates a genuine
-            # race on `ix_users_email` from a constraint nobody expected to be able to fail
-            # here. Attaching it discloses nothing, because the engine is built with
-            # `hide_parameters=True` - the bound email, username and password hash are never
-            # rendered into the exception SQLAlchemy raises.
+            # race on `ix_users_email` from one on `ix_users_username`. Attaching it discloses
+            # nothing, because the engine is built with `hide_parameters=True` - the bound email,
+            # username and password hash are never rendered into the exception SQLAlchemy raises.
             raise ConflictError(_IDENTIFIER_TAKEN) from violation
 
         return persisted
@@ -402,14 +475,16 @@ class AuthService:
         So the verification always runs. When no account matches, it runs against
         :func:`~app.core.security.dummy_password_hash_async` - a real argon2id hash of a value
         drawn from the CSPRNG, which no submitted password can match - and both paths therefore
-        pay the same cost before refusing. The dummy hash is cached, so the cost is paid once per
-        process rather than per attempt, which is what keeps two consecutive unknown-email
-        attempts identical to each other as well.
+        pay the same cost before refusing. The dummy hash is cached *and* computed during startup
+        by :func:`~app.core.security.warm_password_hashing`, which is what makes the very FIRST
+        unknown-email attempt cost the same as the thousandth: left to be computed lazily, that
+        first attempt would have paid a whole argon2 hash on top of its verify, and one request is
+        enough to read a difference that large.
 
         Note the ordering below: ``verify_password_async`` is awaited *before* the branch that
         raises, because a branch that skips the call is the timing oracle this exists to close.
         Both refusal paths reach it through the same bounded offload in
-        ``app.core.concurrency``, so moving the argon2 cost off the event loop does not
+        ``app.core.security``, so moving the argon2 cost off the event loop does not
         reintroduce a difference between them - it makes both of them cheaper for every *other*
         request in flight, and neither of them cheaper than the other.
 
@@ -448,9 +523,10 @@ class AuthService:
         # The stand-in costs one extra offload on the unknown-account path. That asymmetry is
         # deliberate and it is in the safe direction: an unknown email pays *more* than a known
         # one, never less, so it cannot become the fast answer that reveals an address is
-        # unregistered. The difference is one token acquisition - tens of microseconds against
-        # argon2's tens of milliseconds - and the hash itself is cached, so no second argon2 run
-        # is involved after the first unknown-email attempt this process sees.
+        # unregistered. What remains is one token acquisition - tens of microseconds against
+        # argon2's tens of milliseconds - because the argon2 run itself is gone from this path
+        # entirely: `app.main.lifespan` calls `warm_password_hashing` before the first request, so
+        # this await is a cache read even on the first unknown-email attempt the process serves.
         if user is not None:
             stored_hash = user.password_hash
         else:
@@ -506,6 +582,32 @@ class AuthService:
     # Token issuance
     # -----------------------------------------------------------------------------------
 
+    async def _lock_account(self, user_id: uuid.UUID) -> User | None:
+        """Take the one per-user lock every token write in this service serialises on.
+
+        ``SELECT ... FOR UPDATE`` on the ``users`` row, held until this transaction commits or
+        rolls back. The account record is used as the mutex for its *token set* rather than a
+        lock being taken over the token rows themselves, and that is the point: the token set's
+        membership is what changes, so no row-level lock over the current members can exclude an
+        insert that adds a new one. A single, stable row that every writer must hold can.
+
+        Re-entrant within a transaction, so a caller that already holds it may ask again and pay
+        only a round trip - which is why :meth:`issue_token_pair` can take it unconditionally even
+        when :meth:`rotate_refresh_token` has already done so. That is deliberate: it means no
+        future caller of :meth:`issue_token_pair` can insert a token outside the protocol by
+        forgetting to lock first.
+
+        Args:
+            user_id: The account whose credentials are about to change.
+
+        Returns:
+            The locked :class:`~app.models.user.User`, or ``None`` if no such row exists - which
+            under ``FOR UPDATE`` is a stronger statement than an ordinary miss: the account was
+            not merely absent from a snapshot, it is absent from the committed state, so an
+            administrator's delete has already landed.
+        """
+        return await self.users.get_by_id(user_id, for_update=True)
+
     async def issue_token_pair(self, user: User) -> TokenPair:
         """Mint an access token and a refresh token for an account already established.
 
@@ -538,6 +640,21 @@ class AuthService:
             token's configured lifetime in seconds so a client can schedule its refresh without
             decoding anything.
         """
+        # THE lock, taken before any token row is written - see the protocol on this class. Held
+        # unconditionally rather than left to the caller: this is the only method that INSERTS a
+        # refresh token, so locking here is what makes "no token is ever issued outside the
+        # protocol" true by construction rather than by convention. When rotation is the caller it
+        # already holds this lock and the re-acquisition costs one round trip.
+        locked = await self._lock_account(user.id)
+        if locked is None:
+            # The account was deleted, and committed, between the caller establishing it and this
+            # lock. Refused with the generic 401 - deliberately not one of this module's specific
+            # messages, because both callers reach here for different reasons and neither should
+            # describe the other's: a sign-in would be wrong to blame the password, and a rotation
+            # would be wrong to blame the token. The insert below would otherwise fail on the
+            # foreign key and answer 500 for an ordinary, if rare, sequence of events.
+            raise UnauthorizedError
+
         access_token = create_access_token(subject=user.id, role=user.role)
 
         # The plaintext exists in this frame and in the response, and nowhere else.
@@ -632,7 +749,24 @@ class AuthService:
         """
         token_hash = hash_refresh_token(raw_token)
 
-        # The decision, in one statement. A row comes back only to the transaction that spent it.
+        # An UNLOCKED read, for one purpose: to learn which account to lock. It takes no lock, so
+        # it cannot participate in a deadlock cycle, and it needs no accuracy beyond the owner -
+        # `user_id` never changes on a token row, and every decision below is re-made under the
+        # lock. A digest that matches nothing leaves nothing to lock, and `claim` will refuse it
+        # on its own terms.
+        presented = await self.refresh_tokens.get_by_hash(token_hash)
+        if presented is not None:
+            # The account row first, BEFORE the claim - see the protocol on this class. Claiming
+            # first and locking afterwards would take a token-row lock and then ask for the
+            # account, which is the reverse of the order every sweep uses and would deadlock
+            # against them. The return value is deliberately unused: whether the account exists and
+            # is active is decided below, from the row `claim` hands back, so that a token whose
+            # owner vanished is refused by one path rather than two.
+            await self._lock_account(presented.user_id)
+
+        # The decision, in one statement, and now made while the account is locked: a sweep that
+        # committed while this transaction waited is visible to it, so a token that sweep revoked
+        # cannot be claimed here. A row comes back only to the transaction that spent it.
         claimed = await self.refresh_tokens.claim(token_hash)
         if claimed is None:
             # Nothing has been written yet - `claim` matched no row - so there is no write to
@@ -685,6 +819,14 @@ class AuthService:
             # reading is the hostile one. Revoking the family ends every session the account has
             # open, so an attacker holding a stolen token loses it and the legitimate holder
             # simply signs in again.
+            #
+            # Locked first, and this sweep is the reason the protocol exists. Without the lock a
+            # rotation running beside it inserts a successor the bulk UPDATE cannot see - it locks
+            # the rows that exist, and the row that defeats it is the one added afterwards - so the
+            # sweep would report success while leaving the compromised family holding a live
+            # credential. `rotate_refresh_token` may already hold this lock when it calls here;
+            # re-acquiring is a round trip and keeps this method correct when called on its own.
+            await self._lock_account(existing.user_id)
             revoked_count = await self.refresh_tokens.revoke_all_for_user(existing.user_id)
 
             # Committed before raising, so the revocation survives. `get_db` rolls back on an
@@ -717,7 +859,7 @@ class AuthService:
     # Revocation
     # -----------------------------------------------------------------------------------
 
-    async def logout(self, raw_token: str) -> None:
+    async def logout(self, raw_token: str, *, actor: User) -> None:
         """End a session by withdrawing the refresh token it was carried by.
 
         Idempotent, and that is a security decision rather than a convenience. An unknown or
@@ -744,19 +886,70 @@ class AuthService:
         family sweep is reached only by a token that was already withdrawn, and in that state the
         caller has in any case asked for the session to end.
 
+        **The effect is bound to the presenting principal, and that is what makes the family
+        sweep safe to have.** *actor* is required, and a token belonging to any other account is
+        treated as if it did not exist: nothing is revoked and nothing is committed. Without that
+        check the sweep above was a weapon rather than a protection - anyone with an account of
+        their own could present a *stale, already-revoked* token belonging to someone else and end
+        every session that victim had open, repeatedly, without ever holding a live credential of
+        theirs. The row was located by digest alone, so the account the digest belonged to was in
+        effect a caller-supplied parameter naming whose sessions to destroy.
+
+        The refusal is silent, which is the same reasoning as for an unknown token: answering
+        differently would turn this route into "does this digest exist, and whose is it?". So a
+        foreign token and an unknown token are indistinguishable to the caller - ``204`` either
+        way, nothing revoked either way - and only the log records that the two are different
+        events.
+
         Args:
             raw_token: The plaintext refresh token to withdraw. Hashed to locate the row, and
                 neither stored nor logged.
+            actor: The authenticated account presenting the token, resolved by the route from the
+                access token. Keyword-only so a call site cannot pass it positionally where
+                *raw_token* belongs, and required so that adding a new caller cannot silently
+                reintroduce an unbound revocation.
 
         Returns:
-            ``None``. There is nothing meaningful to report: success and "already ended" are the
-            same state, and distinguishing them is the oracle this deliberately does not build.
+            ``None``. There is nothing meaningful to report: success, "already ended" and "that
+            token is not yours" are one answer, and distinguishing them is the oracle this
+            deliberately does not build.
         """
         existing = await self.refresh_tokens.get_by_hash(hash_refresh_token(raw_token))
         if existing is None:
             # Nothing to withdraw and nothing to commit - the session holds no writes, so
             # returning here leaves the transaction exactly as it was found.
             return
+
+        if existing.user_id != actor.id:
+            # Someone else's token. Checked BEFORE the replay branch below, and the order is the
+            # whole fix: reaching that branch with a foreign token is what let a caller revoke a
+            # stranger's entire token family. Nothing is revoked and nothing is committed, so the
+            # transaction is left exactly as it was found.
+            get_logger(__name__).warning(
+                "foreign_refresh_token_presented_at_logout",
+                # Both identifiers, because an operator investigating this needs to know who
+                # presented the token as well as whose it was - a caller holding a token that is
+                # not theirs means it leaked or was captured. Never the token and never its
+                # digest: one is a credential and the other is the value the UNIQUE index is
+                # keyed on.
+                actor_id=str(actor.id),
+                token_user_id=str(existing.user_id),
+            )
+            return
+
+        # THE lock, before either revocation below - see the protocol on this class. A sign-out
+        # that did not hold it could run its UPDATE beside a rotation and miss the successor the
+        # rotation was about to insert, so the session the caller asked to end would still be
+        # alive when the request returned 204. Taken after the ownership check above, because a
+        # foreign token must not even cause a lock to be taken on a stranger's account.
+        await self._lock_account(actor.id)
+
+        # Re-read under the lock. The state this branch turns on - whether the token is already
+        # revoked - was read before the lock was held, and a sweep or a rotation committing in
+        # between is exactly what this protocol exists to order. Deciding on the pre-lock snapshot
+        # would mean choosing between "revoke this row" and "sweep the family" from a state that
+        # is no longer true.
+        await self.session.refresh(existing)
 
         if existing.revoked_at is not None:
             # Already withdrawn, so this is a replay - see the docstring. Ending the family is what

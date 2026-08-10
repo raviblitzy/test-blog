@@ -4,8 +4,16 @@ It holds no application code. It only re-exports the object the factory in
 ``backend/app/main.py`` builds, so addressing the application as ``app:app`` from the
 repository root - the invocation this project used to document - still resolves rather
 than breaking. Prefer the canonical entry point, which does not involve this file at
-all: ``uvicorn app.main:app --reload`` from inside ``backend/``, as ``README.md``, the
-``Makefile``, ``docker-compose.yml`` and ``backend/Dockerfile`` all do.
+all: ``uvicorn app.main:app --reload`` from inside ``backend/``.
+
+Which artifacts agree with that today, stated as it actually stands rather than as it
+will: ``backend/Dockerfile`` is the only other file in the repository that names an entry
+point, and it serves ``app.main:app``, so the module path above is the one the image
+already runs. ``README.md`` has not been rewritten yet and still documents
+``uvicorn main:app --reload`` against a ``main`` module that has never existed - the one
+defect the plan classifies as leaving a feature non-functional. A ``Makefile`` and a
+``docker-compose.yml`` are scheduled for a later stage of the plan and do not exist; when
+they land they are to name this same canonical path, which is why it is stated here once.
 
 Known limitation: ``import app`` reaches this shim only while the repository root is on
 ``sys.path`` - in practice only when the process working directory is the repository

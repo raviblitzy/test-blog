@@ -150,7 +150,7 @@ Responses are bare representations
 Each route declares a ``response_model``, sign-out declares ``204 No Content`` and returns an
 empty body, and every *reachable* failure status is declared in ``responses`` - not merely the
 likely ones - each against the single problem document by way of
-:func:`~app.api.v1.responses.problem_response`, so a generated client has a type for it and a
+:func:`~app.schemas.common.problem_response`, so a generated client has a type for it and a
 branch for it. No route wraps its result in a ``message``/``data`` envelope or answers a mutation
 with a bare ``message``, which is what the retired application did on three of its five routes.
 
@@ -176,15 +176,23 @@ than a relationship, so serialising one emits no query.
 
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import ValidationError
 
-from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import CurrentUser, DbSession
 from app.core.exceptions import UnauthorizedError
 from app.core.rate_limit import auth_rate_limit
-from app.schemas import LoginRequest, RefreshRequest, RegisterRequest, TokenPair, UserMe, UserPublic
+from app.schemas import (
+    LoginRequest,
+    ProblemResponses,
+    RefreshRequest,
+    RegisterRequest,
+    TokenPair,
+    UserMe,
+    UserPublic,
+    problem_response,
+)
 from app.services import AuthService
 
 __all__ = ["router"]
@@ -193,7 +201,7 @@ __all__ = ["router"]
 # ---------------------------------------------------------------------------------------
 # The documented failure contract
 #
-# Every entry below is built by `app.api.v1.responses.problem_response`, which names
+# Every entry below is built by `app.schemas.common.problem_response`, which names
 # `ProblemDetail` as the model - what puts the failure body into the generated document, since
 # without it a client generator emits no type for the error case and "every route declares its
 # shapes" would hold only for success - and which is the single place the published error media
@@ -269,12 +277,60 @@ _UNPROCESSABLE: Final[ProblemResponses] = {
 _THROTTLED: Final[ProblemResponses] = {
     status.HTTP_429_TOO_MANY_REQUESTS: problem_response(
         "Too many requests from this client address. Applies to all five credential "
-        "routes, which are the only throttled routes in the service, and it counts "
-        "failed attempts as well as successful ones - a limit that only counted "
-        "successes would not bound guessing. The response carries `Retry-After` with "
-        "the remaining window in seconds."
+        "routes, which are the only throttled routes in the service.\n\n"
+        "What counts against the limit is every attempt that **reaches the handler**, "
+        "whether it then succeeds or is refused on its merits - so a wrong password counts, "
+        "and a limit that counted only successes would not bound guessing. What does not "
+        "count is a request rejected *before* the handler: the limiter is applied as a "
+        "decorator on the handler, so a body that fails schema validation (422), an absent "
+        "or malformed access token (401) and a deactivated account (403) are all raised by "
+        "dependency resolution or validation upstream of it. Those are refusals that cost no "
+        "credential work, which is why they are not rate-limited - and it means the count a "
+        "client can observe tracks credential attempts rather than malformed requests.\n\n"
+        "The response carries `Retry-After` with the remaining window in seconds."
     )
 }
+
+#: Applied to every response that carries a token, by :func:`_deny_token_caching`.
+#:
+#: ``no-store`` is the directive that matters: it forbids *any* cache - the browser's, a corporate
+#: proxy's, a CDN's - from writing the response to storage at all, which is the only guarantee that
+#: keeps a refresh token out of a disk cache that outlives the session. ``no-cache`` and
+#: ``must-revalidate`` are included because ``no-store`` alone has historically been honoured
+#: inconsistently, and ``private`` because a shared cache storing a token response would hand one
+#: user's credential to the next.
+_NO_STORE_CACHE_CONTROL: Final[str] = "no-store, no-cache, must-revalidate, private"
+
+#: The HTTP/1.0 spelling, sent alongside the header above.
+#:
+#: Obsolete as a request directive and formally not a response header at all, but still consulted
+#: by intermediaries old enough to ignore ``Cache-Control``. A token is a credential, so the cost
+#: of one redundant header is not worth weighing against the chance that one such intermediary sits
+#: between this service and a client.
+_PRAGMA_NO_CACHE: Final[str] = "no-cache"
+
+
+def _deny_token_caching(response: Response) -> None:
+    """Mark a response as never storable, because it carries a credential.
+
+    Both token-minting routes call this. Written once rather than twice so the two cannot come to
+    disagree about what "do not store this" means - and so a third token-bearing route, if one is
+    ever added, has an obvious thing to call.
+
+    The routes that need it are exactly the two that return tokens to a request carrying **no**
+    ``Authorization`` header. That distinction is the reason this is not applied service-wide:
+    HTTP already forbids a shared cache from storing a response to an authenticated request, so
+    ``GET /auth/me`` and every other protected read are covered by that rule, while ``POST
+    /auth/login`` and ``POST /auth/refresh`` are not - their requests are unauthenticated in the
+    HTTP sense, and their responses are the most sensitive bodies this service produces.
+
+    Args:
+        response: The response FastAPI will send. Mutated in place; the handler's returned model
+            is untouched, so the body remains exactly the declared ``TokenPair``.
+    """
+    response.headers["Cache-Control"] = _NO_STORE_CACHE_CONTROL
+    response.headers["Pragma"] = _PRAGMA_NO_CACHE
+
 
 _REGISTER_RESPONSES: Final[ProblemResponses] = _CONFLICT | _UNPROCESSABLE | _THROTTLED
 """Registration: no 401 and no 403 - it authenticates nothing and there is no prior account to
@@ -414,6 +470,7 @@ async def login(
     request: Request,  # noqa: ARG001
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: DbSession,
+    response: Response,
 ) -> TokenPair:
     """Verify a submitted credential and mint the pair it earns.
 
@@ -482,6 +539,10 @@ async def login(
     except ValidationError:
         raise UnauthorizedError from None
 
+    # Marked before the pair is minted, not after, so the headers are set even if serialising the
+    # body were to fail - a response that carried tokens without them is the one outcome worth
+    # ordering the two statements to prevent.
+    _deny_token_caching(response)
     return await AuthService(db).login(credentials)
 
 
@@ -518,6 +579,7 @@ async def refresh(
     request: Request,  # noqa: ARG001
     payload: RefreshRequest,
     db: DbSession,
+    response: Response,
 ) -> TokenPair:
     """Exchange a refresh token for a new pair.
 
@@ -557,6 +619,10 @@ async def refresh(
             password and answering differently would make the route an oracle for which accounts
             are suspended. ``responses`` on this operation declares no 403 for the same reason.
     """
+    # See `_deny_token_caching`: this response carries both a new access token and a new refresh
+    # token, and its request carried no `Authorization` header, so nothing in HTTP's own rules
+    # stops a shared cache from storing it.
+    _deny_token_caching(response)
     return await AuthService(db).rotate_refresh_token(payload.refresh_token)
 
 
@@ -579,10 +645,15 @@ async def refresh(
         "answering otherwise would report whether a given token exists and would fail the "
         "honest cases - a retried request, a second browser tab, a client signing out twice - "
         "for no benefit.\n\n"
-        "Accepted, however, is not the same as inert. Presenting a refresh token that has "
-        "**already been revoked** is read the same way `POST /auth/refresh` reads it - as a "
+        "**The token must belong to the authenticated account.** One presented by any other "
+        "account is treated exactly as an unknown one - nothing is revoked, and the answer is "
+        "still `204`, so the route never reports whose a token is. The two credentials do "
+        "different jobs: the refresh token says which session to end, the access token says who "
+        "is asking, and the effect is bounded by the second.\n\n"
+        "Accepted, however, is not the same as inert. Presenting **your own** refresh token that "
+        "has **already been revoked** is read the same way `POST /auth/refresh` reads it - as a "
         "replay, whether from a leak or from a client that spent the token and re-sent it - and "
-        "it revokes every refresh token the account holds. That is what makes the request mean "
+        "it revokes every refresh token that account holds. That is what makes the request mean "
         "what it says: whatever token succeeded the presented one is what is still keeping the "
         "session alive. The answer is `204` either way, so nothing about the token's state is "
         "disclosed.\n\n"
@@ -600,12 +671,10 @@ async def logout(
     request: Request,  # noqa: ARG001
     payload: RefreshRequest,
     db: DbSession,
-    # Declared to enforce the credential requirement and deliberately unread: the token to
-    # revoke is located by its own hash, so the resolved principal is not needed to do the
-    # work. Naming it with a leading underscore is how this module says "required, not used",
-    # matching `app.core.dependencies._bearer_token`'s treatment of the security scheme it
-    # depends on purely so the scheme reaches the generated document.
-    _principal: CurrentUser,
+    # Read, and passed to the service. The token names its own row, but WHOSE row it is decides
+    # whether this request may act on it: without the principal, a caller holding any account
+    # could revoke a stranger's whole token family with a stale digest.
+    principal: CurrentUser,
 ) -> None:
     """End the session the presented refresh token belongs to.
 
@@ -615,28 +684,30 @@ async def logout(
     representation nor something a client can act on.
 
     Requiring an access token *as well as* the refresh token is the documented contract for
-    this route and is the source of its 401. It is a narrower rule than the service enforces
-    on its own, which is the point: :meth:`~app.services.auth_service.AuthService.logout` is
-    idempotent and refuses nothing, so without a credential requirement here this route would
-    let an unauthenticated caller revoke any refresh token they could guess or had captured.
-    The principal is not consulted when choosing what to revoke - the token names its own row
-    - so holding a credential is a condition of calling, not a filter on the effect.
+    this route and is the source of its 401. Both credentials do work here, and they do
+    different work: the refresh token says *which* session to end, and the access token says
+    *who is asking*. The principal is forwarded to
+    :meth:`~app.services.auth_service.AuthService.logout`, which refuses to act on a token
+    belonging to anyone else - so holding a credential is not merely a condition of calling, it
+    bounds the effect. Forwarding it is what stops any account holder from ending a stranger's
+    sessions with a digest they had captured.
 
     Args:
         request: The incoming request, required by the rate limiter and otherwise unused.
         payload: The body carrying the refresh token to withdraw.
         db: The request-scoped session, handed straight to the service.
-        _principal: The authenticated, active account. Resolved so that an absent, malformed or
+        principal: The authenticated, active account. Resolved so that an absent, malformed or
             expired access token is refused with 401 - and a deactivated account with 403 -
-            before the body is acted on; unused thereafter.
+            before the body is acted on, and then passed to the service as the owner the
+            presented token must belong to.
 
     Returns:
-        ``None``. Success and "already signed out" are the same state, and reporting which one
-        occurred is the validity oracle the service deliberately does not build - which is also
-        why the family revocation the service performs on an already-revoked token changes the
-        effect and not the answer.
+        ``None``. Success, "already signed out" and "that token is not yours" are one answer,
+        and reporting which one occurred is the validity oracle the service deliberately does
+        not build - which is also why the family revocation the service performs on an
+        already-revoked token of the caller's own changes the effect and not the answer.
     """
-    await AuthService(db).logout(payload.refresh_token)
+    await AuthService(db).logout(payload.refresh_token, actor=principal)
 
 
 # ---------------------------------------------------------------------------------------

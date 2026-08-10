@@ -323,10 +323,12 @@ type ButtonProps = ComponentProps<'button'> &
  * <Button type="submit">Publish</Button>
  * ```
  *
- * @example A link that looks like a button
+ * @example A link that looks like a button. The address comes from `@/lib/routes`, never written as a
+ * literal: `(dashboard)` is a route GROUP, so its name is erased from the URL and the authoring
+ * screens live at `/posts/*` rather than under `/dashboard`
  * ```tsx
  * <Button asChild variant="secondary">
- *   <Link href="/dashboard/posts/new">New post</Link>
+ *   <Link href={NEW_POST_ROUTE}>New post</Link>
  * </Button>
  * ```
  *

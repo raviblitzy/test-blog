@@ -1,10 +1,24 @@
-// Badge - the design system's category and status pill.
+// Badge - the design system's category and status pill, in both of its forms.
 //
 // One of the fifteen primitives under src/components/ui/ that together ARE this
 // project's design system: feature code consumes this layer and never reaches
 // past it. Radix publishes no badge, so this is one of the nine primitives
-// authored directly over a plain element - here a `<span>`, because a pill is a
-// run of text with a shape, not a control.
+// authored directly over a plain element.
+//
+// The module publishes TWO components over ONE appearance table:
+//
+//   Badge      a `<span>`. A pill that LABELS - a category name beside a title,
+//              a lifecycle state on a dashboard row. A run of text with a shape
+//              rather than a control: it is not interactive and must not become
+//              so.
+//   BadgeLink  the anchor `next/link` renders. A pill that NAVIGATES - a
+//              category chip reaching the category-filtered feed. It IS a
+//              control, so it carries the hover step, the focus ring, the
+//              long-label wrapping and the minimum target size that a span has
+//              no business carrying.
+//
+// Section 3 records why the two share a module, and why sharing one is not the
+// same thing as making the span interactive.
 //
 // ---------------------------------------------------------------------------
 // 1. WHAT THE VARIANTS ARE KEYED ON, AND WHY THEY ARE NOT KEYED ON TONE
@@ -47,9 +61,14 @@
 //
 // Every text/ground pair below was computed against the token layer rather than
 // eyeballed, and each clears the WCAG AA 4.5:1 body-text floor in BOTH themes at
-// this 12px size - the tightest is `published`/`approved` at 4.51:1 in light. So
-// there is no BLITZY [A11Y] deferral in this file: nothing here is implemented
-// below a threshold.
+// this 12px size - the tightest is `published`/`approved` at 4.51:1 in light. No
+// tone in the table is therefore implemented below a threshold.
+//
+// The file's one BLITZY [A11Y] deferral is not about contrast and does not belong
+// to the table: it sits on BADGE_LINK_CLASSES, where the navigating chip clears
+// WCAG 2.5.8's 24x24 AA target minimum and stops deliberately short of 2.5.5's
+// 44x44 AAA size. The reasoning, the mitigations and the browser measurements are
+// recorded there.
 //
 // The per-variant figures quoted below are the token layer's own published
 // measurements, taken from the A11Y table in src/app/globals.css so that they
@@ -60,25 +79,88 @@
 // floor, and the difference is quantisation rather than disagreement; it is
 // recorded here so nobody re-derives it and concludes the table is wrong.
 //
-// The pill is NOT interactive and must not become so. No `role`, no `tabIndex`,
-// no `onClick`, no focus ring, no hover step - a badge that responds to a click
-// while announcing itself as a span is a control a keyboard cannot reach. A
-// clickable category chip is a `Button` with `asChild` wrapping a `Link`, or a
-// bare `Link`; both of those already exist and both are focusable.
+// The SPAN is NOT interactive and must not become so. No `role`, no `tabIndex`,
+// no `onClick`, no focus ring and no hover step on `Badge` - a badge that
+// responds to a click while announcing itself as a span is a control a keyboard
+// cannot reach. A category chip that NAVIGATES is `BadgeLink` at the foot of this
+// file, a real anchor that is focusable by construction; a chip that performs an
+// action rather than navigating is a `Button` with `asChild`. Both of those
+// exist, so `Badge` never has to grow a handler.
+//
+// `BadgeLink` does carry a hover step, a focus ring and a 24px minimum target,
+// and that is not an exception to the paragraph above. Those states are declared
+// on the anchor, in a class list `Badge` never reads, and a span cannot inherit
+// them from a sibling export.
 //
 // ---------------------------------------------------------------------------
-// 3. FOUR THINGS THIS FILE DELIBERATELY OMITS
+// 3. TWO COMPONENTS, ONE MODULE - AND WHY THE SPAN STAYS INERT
+//
+// `BadgeLink` exists because two feature components - the post page's category
+// row and the feed card's category footer - had each grown their own pill-shaped
+// link out of `badgeVariants`, and the two copies had drifted apart in the three
+// ways a duplicated affordance always does: they disagreed on the hover
+// treatment, they disagreed on what a long label should do, and only one of them
+// had a note about the target size. A chip that navigates is one element with one
+// behaviour, so it is declared exactly once.
+//
+// It is declared HERE, beside `Badge`, rather than in a module of its own,
+// because the design system is a fixed inventory of fifteen primitives and the
+// pill is ONE of them. An element that is the pill's appearance carried on a
+// focusable tag is still the pill; it is not a sixteenth primitive, and giving it
+// its own file would say otherwise. Keeping both halves against the single
+// appearance table they share has a second, practical payoff: a re-tone or a
+// shape change stays one edit that reaches the labelling pill and the navigating
+// one together, which is what a duplicated class list could never guarantee.
+//
+// Sharing a module is NOT the same as making the span interactive, and three
+// structural facts keep them apart rather than a convention anyone has to
+// remember:
+//
+//   * They are different ELEMENTS. `Badge` renders `<span>`; `BadgeLink` renders
+//     the anchor `next/link` emits. Neither can acquire the other's semantics,
+//     and no prop on either reaches the other.
+//   * They are different CLASS LISTS. `badgeVariants` is the appearance both
+//     wear. The hover step, the focus ring, the long-label wrapping and the
+//     minimum target are composed into BADGE_LINK_CLASSES alone, which `Badge`
+//     never reads.
+//   * The shared base is not WIDENED for the anchor. Growing it to clear WCAG
+//     2.5.8's 24px interactive minimum would inflate every static status pill in
+//     every admin table to satisfy a rule that governs interactive targets only,
+//     so the two missing pixels are added by the anchor's own `min-h-6`/`min-w-6`
+//     instead. That is the same reason the two disagree about `whitespace`: the
+//     base holds a two-word lifecycle state on one line, and the anchor displaces
+//     that for the free-text category name it alone carries.
+//
+// `BadgeLink` takes no `variant` prop, and that is a constraint rather than an
+// omission waiting to be filled in. Its hover step moves `primary` to `accent`,
+// which src/app/globals.css defines as the emphasis step `primary` hovers to.
+// That relationship holds for the `category` tone and for no other - hovering a
+// `draft` pill to `accent` would change its HUE and say something the state does
+// not mean, and hovering a `danger` pill toward emphasis would say the opposite
+// of what it means. A navigating chip in another tone needs a hover step chosen
+// for that tone, so it earns its own export here rather than a parameter on this
+// one.
+//
+// ---------------------------------------------------------------------------
+// 4. WHAT THIS FILE DELIBERATELY OMITS
 //
 //   1. `'use client'`. There is no hook, no state, no browser API and no event
-//      handler here, so the module stays shared - and that is load-bearing. The
-//      surfaces that render the most badges are Server Components: the
-//      server-rendered feed cards, the post detail page's category row and the
-//      author profile. The directive would pull this module and its callers into
-//      the client bundle to paint a static span, and it would take the initial
-//      HTML those pages need for SEO with it.
-//   2. `forwardRef`. React 19 hands `ref` to a function component as an ordinary
-//      prop, so it arrives inside `...props` and lands on the span like any
-//      other attribute. Wrapping would buy a display-name obligation and change
+//      handler in either component, so the module stays shared - and that is
+//      load-bearing rather than tidy. The surfaces that render the most pills are
+//      Server Components: the server-rendered feed cards, the post detail page's
+//      category row and the author profile. src/components/blog/post-content.tsx
+//      in particular is deliberately directive-free so that a post's article text
+//      AND its category links are in the server-rendered HTML with no client
+//      JavaScript executed, which is the SEO acceptance criterion this product is
+//      held to. A directive here would pull that component - and the post page
+//      above it - across the client boundary to paint a static span and an
+//      anchor. `next/link` needs no directive of ours: a Server Component may
+//      render a Client Component, and Next.js server-renders the anchor into the
+//      same initial HTML.
+//   2. `forwardRef`, on either component. React 19 hands `ref` to a function
+//      component as an ordinary prop, so it arrives inside `...props` and lands
+//      on the span, or reaches the anchor `next/link` renders, like any other
+//      attribute. Wrapping would buy a display-name obligation and change
 //      nothing observable.
 //   3. A `dark:` variant, anywhere. Every colour below resolves to a semantic
 //      token that src/app/globals.css declares TWICE - once at the document root
@@ -90,9 +172,23 @@
 //      breakpoint. globals.css is this tier's only stylesheet and the engine's
 //      five breakpoints are the entire responsive vocabulary; a pill is the same
 //      size at every viewport, so it needs none of them.
+//   5. An `external` mode on `BadgeLink`. `next/link` is the right element for an
+//      href this tier BUILDS - a category's feed URL, from `@/lib/seo`. It is the
+//      wrong element for an href some author typed: authored links stay plain
+//      anchors in the component that renders authored content, and this primitive
+//      is not asked to serve both.
+//
+// Every utility in both class lists resolves to a token or to an engine scale,
+// verified by compiling them against the installed engine: `min-h-6` and `min-w-6`
+// emit `calc(var(--spacing) * 6)`, the focus ring emits `var(--app-ring)` by way
+// of `--color-ring`, and `max-w-full`, `whitespace-normal`, `wrap-anywhere` and
+// `justify-center` emit keywords. There is no literal colour, no pixel dimension
+// and no radius value anywhere below.
+
+import Link from 'next/link';
+import type { ComponentProps, JSX } from 'react';
 
 import { cva, type VariantProps } from 'class-variance-authority';
-import type { ComponentProps, JSX } from 'react';
 
 import type { CommentStatus, PostStatus } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -100,14 +196,16 @@ import { cn } from '@/lib/utils';
 /**
  * The pill's appearance, as a `class-variance-authority` table.
  *
- * Exported because the sibling `blog` and `admin` component folders sometimes
- * need this exact appearance on an element that is not a `<span>` - a category
- * chip that navigates is a `<Link>`, and a chip inside a Radix select option is
- * part of that option's own markup. Those call sites spell
+ * Exported because this exact appearance is sometimes needed on an element that
+ * is not a `<span>`. {@link BadgeLink} at the foot of this file is the first such
+ * consumer - a category chip that navigates is an anchor - and the sibling `blog`
+ * and `admin` folders reach for the table directly when a chip is part of another
+ * element's own markup, such as a Radix select option. Those call sites spell
  * `className={badgeVariants({ variant: 'category' })}` rather than nesting a
  * `Badge` inside another element or, worse, restating the class list. Reach for
- * {@link Badge} for the ordinary case; reach for this only when the element has
- * to be something else.
+ * {@link Badge} for a pill that labels and {@link BadgeLink} for one that
+ * navigates; reach for this table only when the element has to be something else
+ * again.
  *
  * Every value in the table comes from the token layer. There is no literal
  * colour, radius, size or spacing here that could drift from
@@ -357,8 +455,9 @@ type BadgeProps = ComponentProps<'span'> & VariantProps<typeof badgeVariants>;
  * Renders exactly one `<span>` and nothing else. It is not interactive and has
  * no interactive state: no hover step, no focus ring, no `tabIndex` and no click
  * handling, because a span that reacts to a pointer is a control no keyboard can
- * reach. A category chip that navigates is a `Link`, or a `Button` with
- * `asChild` wrapping one - reach for those instead of adding a handler here.
+ * reach. A category chip that navigates is {@link BadgeLink} below - the same
+ * pill on a real anchor - and a chip that performs an action is a `Button` with
+ * `asChild`; reach for one of those instead of adding a handler here.
  *
  * **The children are the message.** Tone reinforces the state; it never carries
  * it. Pass text that says what the state is, and the pill remains unambiguous to
@@ -404,4 +503,179 @@ export function Badge({ variant, className, ...props }: BadgeProps): JSX.Element
   // what lets a consumer add `title`, `id` or a data attribute without this
   // primitive having to enumerate them.
   return <span className={cn(badgeVariants({ variant }), className)} {...props} />;
+}
+
+/* -------------------------------------------------------------------------- */
+/* BadgeLink                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The navigating chip's complete appearance and interaction, composed once at
+ * module scope so the string is not rebuilt per render and cannot be assembled
+ * differently by a second call site.
+ *
+ * `badgeVariants({ variant: 'category' })` supplies the pill itself - the tone
+ * triple (ground, text, boundary), the `rounded-full` shape, the `px-2`/`py-0.5`
+ * rhythm, the `text-xs font-medium` type and the leading-glyph sizing. Nothing
+ * about the pill's look is chosen here, which is what keeps a navigating chip
+ * visually identical to a static one.
+ *
+ * The four groups added on top are the concerns a non-interactive `<span>` has no
+ * business carrying:
+ *
+ *   * **A long label wraps inside its box.** `whitespace-normal` displaces the
+ *     pill's own `whitespace-nowrap` (the same property group, so the class
+ *     merger settles it by call order rather than by stylesheet order),
+ *     `wrap-anywhere` sets `overflow-wrap: anywhere`, and `max-w-full` caps the
+ *     element at its container.
+ *
+ *     `wrap-anywhere` rather than `break-words` is the load-bearing choice, and
+ *     the difference is not cosmetic: `overflow-wrap: anywhere` is the value that
+ *     also shrinks the box's MIN-CONTENT size, and a chip is always a flex item -
+ *     of the post page's pill row, of the feed card's footer - whose automatic
+ *     minimum size is exactly that min-content size. With `break-word` the
+ *     element still refuses to shrink below its longest unbreakable run, which is
+ *     how an 80-character category name pushed past a 375px card and put the
+ *     whole document into horizontal scroll; with `anywhere` the same name wraps
+ *     inside the pill and the row reflows. That is why neither `min-w-0` nor
+ *     `overflow-hidden` appears here: with the minimum size gone there is nothing
+ *     left to clip, and clipping was only ever the mitigation for not wrapping.
+ *
+ *     Wrapping is the right answer HERE even though the shared base above chose
+ *     `nowrap`, and the two are not in conflict: the base's reason is that a
+ *     two-word lifecycle state ("Pending review") broken across lines reads as
+ *     two pills - a real risk for a closed set of short, product-authored labels.
+ *     A category name is neither closed nor short: it is administrator-authored
+ *     free text with an 80-code-point ceiling, so the label this chip carries is
+ *     the one case the base's assumption does not cover.
+ *
+ *     Measured in a real browser rather than reasoned about: an 80-character name
+ *     inside a feed card at a 375px viewport renders 293px wide and 38px tall -
+ *     two 16px lines plus the padding and borders - with its right edge at 334
+ *     against the card's 359, and the document's `scrollWidth` equal to its
+ *     `clientWidth` at 375, 768 and 1440. The same name in the post page's pill
+ *     row stays inside its list item at every one of those widths.
+ *
+ *   * **The target is at least 24px in both directions.** `min-h-6`/`min-w-6` are
+ *     `calc(var(--spacing) * 6)`. The pill's own geometry is 22px tall - a
+ *     `text-xs` 16px line box, `py-0.5`'s 4px and two 1px borders - which is 2px
+ *     under WCAG 2.5.8 AA, and `items-center` (from the badge base) centres the
+ *     label in the 2px the minimum adds. `min-w-6` closes the degenerate
+ *     one-character label, and `justify-center` keeps that label centred in the
+ *     box the minimum widened; both are inert for every label the taxonomy
+ *     actually produces, since 16px of horizontal padding plus any real name
+ *     already exceeds 24px.
+ *
+ *     BLITZY [A11Y]: this clears 2.5.8 (AA, 24x24) and does NOT reach 2.5.5
+ *     (AAA, 44x44), which is a deliberate stop rather than an oversight. A 44px
+ *     chip would be twice the height of every other pill in the product - a real
+ *     design-system violation traded for a notional one - and growing the hit
+ *     area with a pseudo-element instead would overlap the excerpt above, the
+ *     card edge below and, across a `gap-2` row, the neighbouring chip, turning a
+ *     small target into a mis-tapped one. Flagged for designer review at the size
+ *     the system specifies. The mitigations are real: the chip is a true anchor,
+ *     reachable and operable by keyboard with a 2px focus ring, its full name is
+ *     always in the accessible tree, and it is never the only route to that
+ *     content - the feed's own filter control reaches the same URL.
+ *
+ *   * **Hover is announced twice.** `hover:border-accent hover:text-accent` steps
+ *     to the emphasis token globals.css designates as the one `primary` hovers
+ *     to, so the chip brightens in the direction of the active theme with no
+ *     per-theme branching; `hover:underline` means the affordance is not carried
+ *     by colour alone, which is what a visitor who cannot distinguish these two
+ *     tones needs. This is the treatment the feed card had and the post page did
+ *     not - resolved in favour of the accessible one.
+ *
+ *     One property of the engine worth knowing before debugging this: it compiles
+ *     every `hover:` utility inside `@media (hover: hover)`, verified in the
+ *     compiled stylesheet. A touch device therefore never gets a hover state
+ *     stuck on after a tap - and a browser that reports no hovering pointer at
+ *     all, which a headless one does, will not show the step even under a
+ *     synthetic mouse. Neither is a fault in this file.
+ *
+ *   * **Focus is visible, and motion is optional.** A 2px `--color-ring` outline
+ *     offset by 2px, which the pill's `rounded-full` shapes; and the colour
+ *     transition sits behind `motion-safe:` so a visitor who has asked for less
+ *     motion gets the same states with no animation.
+ */
+const BADGE_LINK_CLASSES = cn(
+  badgeVariants({ variant: 'category' }),
+  'max-w-full whitespace-normal wrap-anywhere',
+  'min-h-6 min-w-6 justify-center',
+  'hover:border-accent hover:text-accent hover:underline',
+  'focus-visible:outline-ring focus-visible:outline-2 focus-visible:outline-offset-2',
+  'motion-safe:transition-colors motion-safe:ease-out',
+);
+
+/**
+ * Props accepted by {@link BadgeLink}.
+ *
+ * Every `next/link` prop, which makes `href` required - there is no such thing as
+ * a chip that navigates nowhere, and a caller with nothing to link to wants
+ * {@link Badge}. Not exported, for the reason {@link BadgeProps} is not: this
+ * module's documented surface is its two components and its three tables. A
+ * caller that needs the shape derives it, which also keeps it correct if a prop
+ * is ever added:
+ *
+ * ```ts
+ * type MyProps = ComponentProps<typeof BadgeLink>;
+ * ```
+ */
+type BadgeLinkProps = ComponentProps<typeof Link>;
+
+/**
+ * A pill-shaped link: the badge's `category` appearance on an element that
+ * navigates.
+ *
+ * Renders exactly one anchor - the pill IS the link, so the shape, the label, the
+ * focus ring and the click target are one element rather than a `<span>` nested
+ * inside an `<a>` with the appearance on one and the ring on the other. It is
+ * server-renderable and crawlable, which is the point of using it for a category:
+ * the taxonomy is discoverable from a post without executing any client
+ * JavaScript.
+ *
+ * **The children are the label and the accessible name.** Pass the category's
+ * name and nothing else is needed - no `aria-label`, no title attribute, no
+ * visually hidden twin. A name of any length is safe: the chip wraps rather than
+ * overflowing, and the full text stays in the DOM, in the accessible tree and in
+ * the server-rendered HTML either way.
+ *
+ * **Build the `href`, do not write it.** A category has no route of its own in
+ * this product - its page IS the category-filtered feed - so the href comes from
+ * `categoryFeedPath` in `@/lib/seo`, which is the one builder the feed's filter
+ * control and the generated sitemap also use. A hand-written query string here is
+ * how those three come to disagree about how a category is addressed.
+ *
+ * For a chip that does NOT navigate, use {@link Badge} above - it is the same
+ * pill without any interactive state. For an authored link inside a body of
+ * prose, use a plain anchor: this component is for hrefs this tier builds.
+ *
+ * @param className - Merged through `cn()`, so a caller's utility wins its own
+ *   property group. The practical case is a roomier surface than a feed card:
+ *   `className="text-sm"` replaces the type size with the next `--text-*` step
+ *   and leaves the tone, the shape and every interactive state intact.
+ * @param props - Every other `next/link` prop, `href`, `children` and `ref`
+ *   included, spread onto the element last so a caller can override any
+ *   attribute.
+ * @returns The rendered chip.
+ *
+ * @example A post's category row, in a Server Component
+ * ```tsx
+ * <BadgeLink href={categoryFeedPath(category)}>{category.name}</BadgeLink>
+ * ```
+ *
+ * @example With a leading glyph, which the pill sizes to the label
+ * ```tsx
+ * <BadgeLink href={categoryFeedPath(category)}>
+ *   <TagIcon aria-hidden="true" />
+ *   {category.name}
+ * </BadgeLink>
+ * ```
+ */
+export function BadgeLink({ className, ...props }: BadgeLinkProps): JSX.Element {
+  // `className` is destructured out above so the spread cannot clobber the
+  // composed string; every other attribute a caller passes still wins, which is
+  // what lets a consumer add `rel`, `prefetch` or a data attribute without this
+  // primitive having to enumerate them.
+  return <Link className={cn(BADGE_LINK_CLASSES, className)} {...props} />;
 }

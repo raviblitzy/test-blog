@@ -96,21 +96,39 @@ adds is the HTTP consequence of the same primitives.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from typing import Any, Final
 
 import pytest
-from httpx import AsyncClient, Response
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import delete, event, func, select
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.core.security import create_access_token
-from app.models import User, UserRole
+from app.core.config import settings
+from app.core.exceptions import UnauthorizedError
+from app.core.rate_limit import limiter
+from app.core.security import create_access_token, hash_refresh_token, refresh_token_expires_at
+from app.models import RefreshToken, User, UserRole
+from app.repositories import RefreshTokenRepository, UserRepository
+from app.schemas.admin import AdminUserUpdate
+from app.schemas.auth import (
+    DISPLAY_NAME_MAX_LENGTH,
+    DISPLAY_NAME_MIN_LENGTH,
+    PASSWORD_MAX_LENGTH,
+    PASSWORD_MIN_LENGTH,
+    REFRESH_TOKEN_MAX_LENGTH,
+    USERNAME_MAX_LENGTH,
+    USERNAME_MIN_LENGTH,
+)
+from app.services.admin_service import AdminService
+from app.services.auth_service import AuthService
+from tests import factories
 from tests.factories import DEFAULT_PASSWORD, create_refresh_token, create_user
 
 # Every test in this module drives the application in process against PostgreSQL, which is
@@ -195,6 +213,34 @@ _BEARER_CHALLENGE: Final[str] = "Bearer"
 _WWW_AUTHENTICATE: Final[str] = "WWW-Authenticate"
 _CORRELATION_KEY: Final[str] = "request_id"
 
+# The `type` a throttled response carries. `app.core.exceptions` keeps its own copy private, so
+# the value is restated here as a literal: it is part of the published error contract a client
+# switches on, and a test that imported it could not notice it changing.
+_ERROR_TYPE_RATE_LIMITED: Final[str] = "/errors/rate-limit-exceeded"
+
+# The header the 429 carries its retry interval in, and the header a rotating caller uses to
+# claim an address it does not have.
+_RETRY_AFTER: Final[str] = "Retry-After"
+_FORWARDED_FOR: Final[str] = "X-Forwarded-For"
+
+# Upper bound on the advertised retry interval, since `AUTH_RATE_LIMIT` declares a per-minute
+# window. Named rather than inlined so the assertion reads as a bound on the window rather than
+# as an arbitrary sixty.
+_SECONDS_PER_MINUTE: Final[int] = 60
+
+#: Base URL for the extra clients :func:`peer_client` builds. The same placeholder authority the
+#: shared ``client`` fixture uses - httpx needs an absolute base to build a request target from,
+#: and nothing listens on it because the transport calls the application directly.
+_PEER_BASE_URL: Final[str] = "http://testserver"
+
+#: Source port reported for a synthesised peer. slowapi's identity reads only the host half, so
+#: the value is arbitrary; it is named rather than inlined so the tuple below reads as an address.
+_PEER_PORT: Final[int] = 51234
+
+#: Two peer addresses in the documentation range reserved by RFC 5737, so neither can collide with
+#: anything routable if a future change ever puts a real socket behind these clients.
+_PEER_ADDRESSES: Final[tuple[str, str]] = ("192.0.2.11", "192.0.2.12")
+
 # Obviously fake, and deliberately unable to satisfy `verify_password` against any hash this
 # suite creates: `tests.factories.DEFAULT_PASSWORD` is the only plaintext any factory-made
 # account was hashed from. Long enough and varied enough to clear `LoginRequest`'s own bounds,
@@ -231,7 +277,7 @@ def _credentials(**overrides: Any) -> dict[str, Any]:
     collide with a body from another - which matters because the duplicate-identity tests
     below assert on ``409``, and a leaked collision would make one of them pass for the wrong
     reason. The password is ``tests.factories.DEFAULT_PASSWORD``, which satisfies
-    ``app.core.password_policy`` in full, so a caller perturbing another field never has to
+    ``app.schemas.auth`` in full, so a caller perturbing another field never has to
     reason about whether the password is also being rejected.
 
     Args:
@@ -251,6 +297,38 @@ def _credentials(**overrides: Any) -> dict[str, Any]:
     }
     body.update(overrides)
     return body
+
+
+def _varied_password(length: int, *, filler: str = "a") -> str:
+    """Return a password of exactly *length* code points drawing on three character groups.
+
+    The builder every length-boundary case below uses, so that a candidate sitting one code point
+    from a limit differs from its neighbour in **length only**. Composing such a value by hand is
+    where boundary tests quietly stop testing the boundary: a hand-written 129-character string
+    that also happens to use two character groups is refused for the wrong reason, and the test
+    passes while the length ceiling goes unexercised.
+
+    ``length`` is counted in **code points**, which is the unit
+    ``pydantic.StringConstraints(max_length=...)`` counts in. That makes *filler* the interesting
+    parameter: pass an astral character and the returned value has *length* code points, more than
+    *length* UTF-16 units and four times *length* UTF-8 bytes, so a limit implemented against
+    either of those miscounts it.
+
+    Args:
+        length: How many code points the result must contain. Values below three return a prefix
+            of the seed and therefore draw on fewer groups - only used for the sub-floor cases,
+            where length is what is being refused.
+        filler: The character repeated to reach *length*. One code point, ASCII or astral.
+
+    Returns:
+        A password of exactly *length* code points.
+    """
+    # Lowercase, uppercase and a digit: three of the five published groups, which is exactly
+    # `PASSWORD_MIN_CHARACTER_CLASSES`, so the variety rule is satisfied and nothing else is.
+    seed = "aQ7"
+    if length <= len(seed):
+        return seed[:length]
+    return seed + filler * (length - len(seed))
 
 
 def _login_form(email: str, password: str = DEFAULT_PASSWORD) -> dict[str, str]:
@@ -341,6 +419,26 @@ async def _count_users_matching(
     return int(total or 0)
 
 
+async def _user_matching(session: AsyncSession, *, email: str) -> User | None:
+    """Return the ``users`` row registered under *email*, or ``None``.
+
+    The counting sibling above answers "did a row appear"; this one answers "what does it hold",
+    which is what a boundary test needs. A ceiling enforced by truncation answers 201 exactly as a
+    ceiling enforced by validation does, and the only place the two differ is the stored value.
+
+    Read through the test's own session, so the row a request just wrote is visible. ``email`` is
+    ``CITEXT``, so the comparison is case-insensitive and performed by PostgreSQL.
+
+    Args:
+        session: The transactional session the test holds.
+        email: The address to look the account up by, in any casing.
+
+    Returns:
+        The matching :class:`~app.models.User`, or ``None`` when nothing was written.
+    """
+    return await session.scalar(select(User).where(User.email == email))
+
+
 def _assert_problem_document(response: Response, expected_status: int) -> dict[str, Any]:
     """Assert the response is the API's uniform problem document, and return its body.
 
@@ -421,7 +519,10 @@ async def _sign_in(
     """Sign in through the real route and return the token pair, asserting the ``200``."""
     response = await client.post(_LOGIN_URL, data=_login_form(email, password))
     assert response.status_code == HTTPStatus.OK, response.text
-    return response.json()
+    # Bound to an annotated local rather than returned straight out. `Response.json()` is `Any`, so
+    # returning it directly would make this function's declared shape a claim nothing checks.
+    token_pair: dict[str, Any] = response.json()
+    return token_pair
 
 
 async def _registered_session(client: AsyncClient) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -551,18 +652,37 @@ class TestRegistration:
         [
             pytest.param({"email": "not-an-email-address"}, "email", id="email-without-an-at-sign"),
             pytest.param({"email": "missing-the-domain@"}, "email", id="email-without-a-domain"),
-            pytest.param({"password": "short"}, "password", id="password-below-the-length-floor"),
             pytest.param(
-                {"password": "aaaaaaaaaaaaaaaaaaaa"},
+                {"password": _varied_password(PASSWORD_MAX_LENGTH + 1)},
+                "password",
+                id="password-one-over-the-length-ceiling",
+            ),
+            pytest.param(
+                {"password": _varied_password(PASSWORD_MIN_LENGTH - 1)},
+                "password",
+                id="password-one-short-of-the-length-floor",
+            ),
+            pytest.param(
+                # Long enough to clear the floor and drawing on a single group, so the refusal is
+                # the variety rule rather than the length one.
+                {"password": "a" * PASSWORD_MIN_LENGTH},
                 "password",
                 id="password-with-too-little-character-variety",
             ),
-            pytest.param({"username": "ab"}, "username", id="username-below-the-length-floor"),
+            pytest.param(
+                {"username": "a" * (USERNAME_MIN_LENGTH - 1)},
+                "username",
+                id="username-one-short-of-the-length-floor",
+            ),
             pytest.param({"username": "has spaces"}, "username", id="username-with-a-space"),
             pytest.param(
                 {"username": "-leading-hyphen"}, "username", id="username-starting-with-a-hyphen"
             ),
-            pytest.param({"username": "a" * 31}, "username", id="username-over-the-length-ceiling"),
+            pytest.param(
+                {"username": "a" * (USERNAME_MAX_LENGTH + 1)},
+                "username",
+                id="username-one-over-the-length-ceiling",
+            ),
             pytest.param(
                 {"display_name": "   "}, "display_name", id="whitespace-only-display-name"
             ),
@@ -636,6 +756,245 @@ class TestRegistration:
 # was rejected with a unique violation - so if one of these tests fails, the route or the
 # schema changed, not the database.
 # ---------------------------------------------------------------------------------------
+
+
+class TestCredentialFieldBoundaries:
+    """Every length limit on a credential field, from both sides, at the exact code point.
+
+    The three registration fields and the two token fields all carry a numeric bound, and a bound
+    is only established by a pair of cases: the largest value that must be **accepted** and the
+    smallest that must be **refused**. A test that only sends an obviously-too-long value proves
+    the field is bounded somewhere, not that it is bounded where the published contract says - and
+    "somewhere" is what a client cannot build a form against, because it is the accepted maximum
+    the client has to put in its own ``maxlength``.
+
+    Every value is built from the production constant by :func:`_varied_password` or by repetition,
+    never written as a literal. That is the whole point of the finding this class answers: a
+    hard-coded ``"a" * 31`` stops being the username ceiling the moment ``USERNAME_MAX_LENGTH``
+    moves, and it stops silently, because 31 characters remains a perfectly sendable value.
+
+    **Astral code points appear on purpose.** ``pydantic.StringConstraints`` counts code points, so
+    eighty ``"😀"`` is exactly at the display-name ceiling while being 160 UTF-16 units and 320
+    UTF-8 bytes. A limit implemented against either of those - a ``VARCHAR(80)`` in bytes, a
+    JavaScript ``.length`` check mirrored server-side - refuses a value this contract accepts, and
+    the pair of cases below is what would catch it.
+    """
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            pytest.param(
+                "username",
+                "a" * USERNAME_MIN_LENGTH,
+                id="username-at-the-floor",
+            ),
+            pytest.param(
+                "username",
+                "a" * USERNAME_MAX_LENGTH,
+                id="username-at-the-ceiling",
+            ),
+            pytest.param(
+                "password",
+                _varied_password(PASSWORD_MIN_LENGTH),
+                id="password-at-the-floor",
+            ),
+            pytest.param(
+                "password",
+                _varied_password(PASSWORD_MAX_LENGTH),
+                id="password-at-the-ceiling",
+            ),
+            pytest.param(
+                "password",
+                _varied_password(PASSWORD_MAX_LENGTH, filler="😀"),
+                id="password-at-the-ceiling-in-astral-code-points",
+            ),
+            pytest.param(
+                "display_name",
+                "n" * DISPLAY_NAME_MIN_LENGTH,
+                id="display-name-at-the-floor",
+            ),
+            pytest.param(
+                "display_name",
+                "n" * DISPLAY_NAME_MAX_LENGTH,
+                id="display-name-at-the-ceiling",
+            ),
+            pytest.param(
+                "display_name",
+                "😀" * DISPLAY_NAME_MAX_LENGTH,
+                id="display-name-at-the-ceiling-in-astral-code-points",
+            ),
+        ],
+    )
+    async def test_a_value_exactly_at_a_limit_is_accepted(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        field: str,
+        value: str,
+    ) -> None:
+        """A field holding exactly its published maximum, or minimum, registers successfully.
+
+        And is stored as sent, which is the second half of the assertion. A ceiling enforced by
+        silent truncation would answer 201 too, and the account would then hold a credential or a
+        byline the caller never chose - a password truncated at storage cannot be logged in with,
+        so the failure would surface as an unreproducible sign-in problem rather than as a
+        validation defect. The stored value is therefore compared code point for code point.
+        """
+        body = _credentials(**{field: value})
+
+        response = await client.post(_REGISTER_URL, json=body)
+
+        assert response.status_code == HTTPStatus.CREATED, response.text
+        stored = await _user_matching(db_session, email=str(body["email"]))
+        assert stored is not None, body["email"]
+        if field == "password":
+            # Not readable back - it was hashed - so the round trip is what proves nothing was
+            # dropped: the same value must still authenticate.
+            signed_in = await client.post(_LOGIN_URL, data=_login_form(str(body["email"]), value))
+            assert signed_in.status_code == HTTPStatus.OK, signed_in.text
+        else:
+            assert getattr(stored, field) == value
+            assert len(getattr(stored, field)) == len(value)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            pytest.param(
+                "username",
+                "a" * (USERNAME_MIN_LENGTH - 1),
+                id="username-one-under-the-floor",
+            ),
+            pytest.param(
+                "username",
+                "a" * (USERNAME_MAX_LENGTH + 1),
+                id="username-one-over-the-ceiling",
+            ),
+            pytest.param(
+                "password",
+                _varied_password(PASSWORD_MIN_LENGTH - 1),
+                id="password-one-under-the-floor",
+            ),
+            pytest.param(
+                "password",
+                _varied_password(PASSWORD_MAX_LENGTH + 1),
+                id="password-one-over-the-ceiling",
+            ),
+            pytest.param(
+                "password",
+                _varied_password(PASSWORD_MAX_LENGTH + 1, filler="😀"),
+                id="password-one-over-the-ceiling-in-astral-code-points",
+            ),
+            pytest.param(
+                "display_name",
+                "n" * (DISPLAY_NAME_MAX_LENGTH + 1),
+                id="display-name-one-over-the-ceiling",
+            ),
+            pytest.param(
+                "display_name",
+                "😀" * (DISPLAY_NAME_MAX_LENGTH + 1),
+                id="display-name-one-over-the-ceiling-in-astral-code-points",
+            ),
+            pytest.param(
+                "display_name",
+                # `StorableText` refuses U+0000 outright: `users.display_name` is `text`, and
+                # PostgreSQL cannot store a NUL in one, so the driver would raise a `ValueError`
+                # deep in the write and answer 500. Refused at the schema instead, as a 422.
+                f"Nul{chr(0)}byte",
+                id="display-name-carrying-a-null-code-point",
+            ),
+        ],
+    )
+    async def test_a_value_one_step_past_a_limit_is_refused(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        field: str,
+        value: str,
+    ) -> None:
+        """One code point past a bound is a 422 naming the field, and writes nothing.
+
+        The refusal has to leave no row behind. A partially-applied registration - the account
+        created and then rejected - would make the email address unavailable to the caller who
+        never successfully registered it, and the second attempt would answer 409 for a reason
+        nobody could see.
+        """
+        body = _credentials(**{field: value})
+
+        response = await client.post(_REGISTER_URL, json=body)
+
+        payload = _assert_problem_document(response, HTTPStatus.UNPROCESSABLE_CONTENT)
+        assert field in _field_names(payload), payload
+        assert await _count_users_matching(db_session, email=str(body["email"])) == 0
+        # The rejected value is never echoed, whatever it was: an over-long password is still a
+        # password, and a problem document is the one part of a failure that gets logged.
+        assert value not in _serialised(payload)
+
+    async def test_the_sign_in_ceiling_never_turns_a_long_password_into_a_different_answer(
+        self,
+        client: AsyncClient,
+        author_user: User,
+    ) -> None:
+        """A password past the sign-in ceiling is refused as a credential, not as a bad request.
+
+        ``LoginRequest`` bounds ``password`` at the same ceiling registration applies, for a
+        different reason: argon2id is memory-hard by design, so an unbounded password field lets an
+        unauthenticated caller choose how much work each attempt costs. The bound is a cap on that
+        work, not a judgement about the credential - which is why the route deliberately answers
+        **401 for both sides of it**. A value at the ceiling is a well-formed guess; one code point
+        more is refused before reaching the hash, and reporting that as 422 would tell an attacker
+        which of their inputs the schema rejected on the one route whose security rests on its
+        failures being alike.
+
+        Two things this pins that are easy to regress. The over-length submission must not be a
+        **500**: the handler builds ``LoginRequest`` from the password grant's unconstrained form
+        and a :class:`pydantic.ValidationError` there is a ``ValueError``, so an unguarded
+        construction would report a server fault for a wrong credential. And the plaintext must not
+        appear in the response: that same ``ValidationError`` records the value it rejected, which
+        is why the handler re-raises with ``from None``.
+
+        The two 401s do differ in the *wording* of ``detail`` - the guard raises bare, so it
+        carries the generic "credentials are missing or invalid" text rather than the credential
+        check's "Incorrect email or password." That is not asserted as equal here, deliberately:
+        pinning prose would pin a security property to a string, and the machine-readable half a
+        client switches on - the status and the ``type`` - is what is asserted instead.
+        """
+        at_ceiling = await client.post(
+            _LOGIN_URL,
+            data=_login_form(author_user.email, _varied_password(PASSWORD_MAX_LENGTH)),
+        )
+        over_ceiling = await client.post(
+            _LOGIN_URL,
+            data=_login_form(author_user.email, _varied_password(PASSWORD_MAX_LENGTH + 1)),
+        )
+
+        at_payload = _assert_problem_document(at_ceiling, HTTPStatus.UNAUTHORIZED)
+        over_payload = _assert_problem_document(over_ceiling, HTTPStatus.UNAUTHORIZED)
+        assert over_payload["type"] == at_payload["type"], (at_payload, over_payload)
+        assert _varied_password(PASSWORD_MAX_LENGTH + 1) not in _serialised(over_payload)
+        assert author_user.email not in _serialised(over_payload)
+
+    async def test_the_refresh_token_ceiling_refuses_a_longer_value_before_looking_it_up(
+        self,
+        client: AsyncClient,
+    ) -> None:
+        """``RefreshRequest`` bounds the token, and the bound is a request-boundary refusal.
+
+        ``REFRESH_TOKEN_MAX_LENGTH`` sits far above any token this service issues, so its purpose
+        is not to validate a credential's shape - the contract deliberately does not pin that to
+        the generator's encoding - but to stop an arbitrarily large body being hashed and looked
+        up. Hence the pairing: a value at the ceiling is treated as an unknown credential and
+        earns 401, while one code point more is refused as malformed.
+        """
+        at_ceiling = await client.post(
+            _REFRESH_URL, json={"refresh_token": "t" * REFRESH_TOKEN_MAX_LENGTH}
+        )
+        over_ceiling = await client.post(
+            _REFRESH_URL, json={"refresh_token": "t" * (REFRESH_TOKEN_MAX_LENGTH + 1)}
+        )
+
+        assert at_ceiling.status_code == HTTPStatus.UNAUTHORIZED, at_ceiling.text
+        payload = _assert_problem_document(over_ceiling, HTTPStatus.UNPROCESSABLE_CONTENT)
+        assert "refresh_token" in _field_names(payload), payload
 
 
 class TestDuplicateIdentity:
@@ -1527,7 +1886,7 @@ class TestSignOut:
 
 
 # ---------------------------------------------------------------------------------------
-# Phase G - the limiter is exempt under test, and this is the tripwire that proves it
+# Phase G - the limiter, from both sides
 #
 # All five credential routes carry `@auth_rate_limit`, and `app.core.rate_limit` builds the
 # limiter with `enabled=settings.ENVIRONMENT != "test"`. `backend/tests/conftest.py` sets
@@ -1535,11 +1894,701 @@ class TestSignOut:
 # is what lets this module register, sign in, rotate and sign out dozens of times without
 # tripping the five-per-minute allowance and turning a blocking gate flaky.
 #
-# The limiter's *enforcement* is deliberately not tested here. What is tested is the exemption,
-# because that is the arrangement the rest of the suite silently depends on: if anyone removes
-# it, these two tests fail immediately and by name instead of the suite becoming intermittently
-# red somewhere else entirely.
+# TWO things therefore have to be asserted, and asserting only the first is what left the
+# control untested. `TestRateLimitingIsDisabledUnderTest` pins the *exemption*, because that is
+# the arrangement the rest of the suite silently depends on: remove it and those tests fail by
+# name instead of the suite becoming intermittently red somewhere else entirely.
+# `TestRateLimitingEnforcement` pins the *control*, by switching the real limiter on for the
+# duration of one test. Without it, removing `@auth_rate_limit` from every route, breaking the
+# bucket arithmetic, answering the 429 with slowapi's own body instead of the problem document,
+# or dropping `Retry-After` all left this module green - the exemption test would have passed
+# more easily, not less.
 # ---------------------------------------------------------------------------------------
+
+
+class TestTokenOwnershipAndCaching:
+    """Two properties of the credential routes that are invisible in a happy-path body.
+
+    Both are about what a token response *permits* rather than what it contains: who may act on a
+    refresh token, and who may store one.
+    """
+
+    async def test_a_caller_cannot_revoke_another_accounts_refresh_token(
+        self, client: AsyncClient
+    ) -> None:
+        """Sign-out ignores a refresh token belonging to someone else, and says nothing about it.
+
+        The token names its own row, so before the principal was consulted this route revoked
+        whatever row the presented digest matched. Holding an account of one's own was the only
+        requirement, and the account whose session ended was chosen by the caller - the digest was
+        in effect a parameter naming the victim.
+
+        Both halves are asserted, because either alone would pass for the wrong reason. The
+        attacker must receive ``204``, so nothing is disclosed about whose token it was or whether
+        it existed; and the victim's token must **still rotate afterwards**, which is the only
+        proof the revocation did not happen. A test that checked the status alone would pass
+        against the defective behaviour, since that answered ``204`` too - while destroying the
+        victim's session.
+        """
+        _, victim_tokens = await _registered_session(client)
+        _, attacker_tokens = await _registered_session(client)
+
+        response = await client.post(
+            _LOGOUT_URL,
+            json={"refresh_token": victim_tokens["refresh_token"]},
+            headers=_bearer(str(attacker_tokens["access_token"])),
+        )
+
+        assert response.status_code == HTTPStatus.NO_CONTENT, response.text
+        assert response.content == b""
+
+        rotation = await client.post(
+            _REFRESH_URL, json={"refresh_token": victim_tokens["refresh_token"]}
+        )
+        assert rotation.status_code == HTTPStatus.OK, (
+            "the victim's refresh token was revoked by a caller who did not own it"
+        )
+        _assert_token_pair(rotation.json())
+
+    async def test_a_caller_cannot_trigger_a_family_sweep_with_another_accounts_stale_token(
+        self, client: AsyncClient
+    ) -> None:
+        """The escalation path: a *revoked* foreign token must not end the victim's other sessions.
+
+        This is the sharp edge of the finding rather than the blunt one. Presenting an
+        already-revoked refresh token is read as a replay and revokes **every** token the owning
+        account holds - a protection when the owner presents it, and a weapon when anyone else
+        does. So an attacker did not even need a live token of the victim's: one stale digest,
+        captured or left behind by an earlier sign-out, could end every session that victim had
+        open, on every device, as often as the attacker cared to repeat it.
+
+        The victim therefore holds two sessions here. The first is signed out, which revokes its
+        token and makes it the stale specimen; the second must survive the attacker presenting
+        that specimen.
+        """
+        victim, first_session = await _registered_session(client)
+        second_session = await _sign_in(client, str(victim["email"]))
+
+        signed_out = await client.post(
+            _LOGOUT_URL,
+            json={"refresh_token": first_session["refresh_token"]},
+            headers=_bearer(str(first_session["access_token"])),
+        )
+        assert signed_out.status_code == HTTPStatus.NO_CONTENT, signed_out.text
+
+        _, attacker_tokens = await _registered_session(client)
+
+        replayed = await client.post(
+            _LOGOUT_URL,
+            json={"refresh_token": first_session["refresh_token"]},
+            headers=_bearer(str(attacker_tokens["access_token"])),
+        )
+        assert replayed.status_code == HTTPStatus.NO_CONTENT, replayed.text
+
+        rotation = await client.post(
+            _REFRESH_URL, json={"refresh_token": second_session["refresh_token"]}
+        )
+        assert rotation.status_code == HTTPStatus.OK, (
+            "an attacker replaying the victim's stale token swept the victim's live sessions"
+        )
+
+    async def test_the_owner_can_still_sweep_their_own_family_with_a_stale_token(
+        self, client: AsyncClient
+    ) -> None:
+        """The protection the ownership check must not remove.
+
+        The counterpart to the test above, and the reason this is an ownership check rather than a
+        removal of the sweep. When the account's **own** holder presents a token that has already
+        been revoked, that is still evidence of a leak or a replay, and it must still end every
+        session the account holds - otherwise the successor token stays live and the sign-out the
+        caller asked for did not happen.
+        """
+        victim, first_session = await _registered_session(client)
+        second_session = await _sign_in(client, str(victim["email"]))
+
+        for _ in range(2):
+            # Twice: the first revokes the token, the second presents it while revoked, which is
+            # the replay that escalates to the family sweep.
+            signed_out = await client.post(
+                _LOGOUT_URL,
+                json={"refresh_token": first_session["refresh_token"]},
+                headers=_bearer(str(first_session["access_token"])),
+            )
+            assert signed_out.status_code == HTTPStatus.NO_CONTENT, signed_out.text
+
+        rotation = await client.post(
+            _REFRESH_URL, json={"refresh_token": second_session["refresh_token"]}
+        )
+        _assert_unauthorized(rotation)
+
+    async def test_the_lifespan_warms_the_dummy_hash_before_the_first_request(self) -> None:
+        """Startup performs the warm-up, which is what makes the parity below true in production.
+
+        The parity test that follows establishes what the login path costs *once the hash exists*.
+        This one establishes that it exists before any client can ask - because the warm-up is
+        worth nothing if it is only ever performed lazily by the first unknown-email login, which
+        is precisely the request that would then pay for it.
+
+        The lifespan is driven directly rather than through the suite's client, because
+        ``ASGITransport`` deliberately runs no lifespan events: this is the one property in this
+        module that belongs to startup rather than to a route, so it is asserted against startup.
+        """
+        from app.core.security import dummy_password_hash
+        from app.main import app, lifespan
+
+        dummy_password_hash.cache_clear()
+        assert dummy_password_hash.cache_info().currsize == 0
+
+        async with lifespan(app):
+            assert dummy_password_hash.cache_info().currsize == 1, (
+                "startup completed without warming the dummy hash, so the first unknown-email "
+                "login this process serves pays a full argon2 hash that a known-email login does "
+                "not - a difference one request is enough to measure"
+            )
+
+    async def test_a_cold_unknown_email_login_costs_the_same_argon2_work_as_a_known_one(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """First-attempt parity: neither branch computes a hash, and both perform one verify.
+
+        The timing oracle this closes is a user-enumeration one - "is this address registered?" -
+        and the previous tests could not see it, because they ran after something had already
+        warmed the stand-in hash. Reconstructing the cold state is therefore the whole setup:
+        the cache is cleared, then warmed exactly as ``app.main.lifespan`` warms it, and only then
+        are the two branches compared.
+
+        Argon2 **operations are counted rather than time measured**, deliberately. A timing
+        assertion on a shared runner is flaky, and it would also be indirect: what made the two
+        paths distinguishable was one branch performing an extra ``hash`` - a whole work factor -
+        so counting calls proves the absence of that work exactly, with no tolerance to tune. Both
+        branches must show zero hashes and one verify: zero, because the stand-in is already
+        computed, and one, because a branch that skipped the verify would be the fast answer that
+        reveals an address is unregistered.
+        """
+        from app.core import security
+
+        body, _ = await _registered_session(client)
+
+        counts = {"hash": 0, "verify": 0}
+        real_hash = security._PASSWORD_HASHER.hash
+        real_verify = security._PASSWORD_HASHER.verify
+
+        def counting_hash(password: Any, **kwargs: Any) -> str:
+            counts["hash"] += 1
+            return real_hash(password, **kwargs)
+
+        def counting_verify(password: Any, hash: Any) -> bool:
+            counts["verify"] += 1
+            return real_verify(password, hash)
+
+        # Cleared and re-warmed BEFORE the counters are attached, so the warm-up's own hash is not
+        # counted - what is under test is what a *request* costs, not what startup costs.
+        security.dummy_password_hash.cache_clear()
+        security.warm_password_hashing()
+
+        monkeypatch.setattr(security._PASSWORD_HASHER, "hash", counting_hash)
+        monkeypatch.setattr(security._PASSWORD_HASHER, "verify", counting_verify)
+
+        unknown = await client.post(
+            _LOGIN_URL, data=_login_form("no-such-account@example.com", "Wrong-Password-12345")
+        )
+        _assert_unauthorized(unknown)
+        unknown_counts = dict(counts)
+
+        counts["hash"] = 0
+        counts["verify"] = 0
+
+        wrong_password = await client.post(
+            _LOGIN_URL, data=_login_form(str(body["email"]), "Wrong-Password-12345")
+        )
+        _assert_unauthorized(wrong_password)
+        known_counts = dict(counts)
+
+        assert unknown_counts == {"hash": 0, "verify": 1}, (
+            f"the unknown-email branch performed {unknown_counts}, so its cost differs from a "
+            "known-email refusal and the route reports whether an address is registered"
+        )
+        assert known_counts == {"hash": 0, "verify": 1}, (
+            f"the known-email branch performed {known_counts}"
+        )
+        assert unknown_counts == known_counts
+
+    @pytest.mark.parametrize("route", ["login", "refresh"], ids=["login", "refresh"])
+    async def test_a_token_response_forbids_being_stored(
+        self, client: AsyncClient, route: str
+    ) -> None:
+        """Both token-minting responses carry ``no-store`` and the HTTP/1.0 ``Pragma`` spelling.
+
+        These two responses are the most sensitive bodies this service produces - an access token
+        and a refresh token in plaintext - and they are the only ones whose *request* carries no
+        ``Authorization`` header. That combination is the finding: HTTP's own rule that a shared
+        cache must not store a response to an authenticated request does not apply to them, so a
+        corporate proxy, a CDN or a browser disk cache was free to keep a copy of a credential.
+
+        ``no-store`` is the directive that matters, and it is asserted by name rather than by
+        checking the header is merely present, because ``no-cache`` alone would permit storage
+        with revalidation - which for a bearer token is not a weaker guarantee but no guarantee.
+        """
+        body, tokens = await _registered_session(client)
+
+        if route == "login":
+            response = await client.post(_LOGIN_URL, data=_login_form(str(body["email"])))
+        else:
+            response = await client.post(
+                _REFRESH_URL, json={"refresh_token": tokens["refresh_token"]}
+            )
+
+        assert response.status_code == HTTPStatus.OK, response.text
+        _assert_token_pair(response.json())
+
+        cache_control = response.headers.get("cache-control", "")
+        assert "no-store" in cache_control, (
+            f"{route} answered with Cache-Control {cache_control!r}, which does not forbid "
+            "storing a response that carries a refresh token"
+        )
+        assert "private" in cache_control, (
+            f"{route} answered with Cache-Control {cache_control!r}, so a shared cache is not "
+            "told the body belongs to one user"
+        )
+        assert response.headers.get("pragma") == "no-cache", (
+            f"{route} omitted the HTTP/1.0 Pragma spelling, which intermediaries too old to "
+            "honour Cache-Control still consult"
+        )
+
+
+class TestTokenRevocationSerialisation:
+    """Revocation and issuance are serialised per account, proved across real transactions.
+
+    **Why these tests cannot use the suite's usual fixtures.** Every other test in this module
+    drives the API through one session inside one transaction that is rolled back at the end, which
+    is exactly the right shape for asserting behaviour and exactly the wrong shape for asserting
+    *concurrency*: two requests sharing a transaction cannot race, and nothing they do is ever
+    visible to a second connection. The defect these tests cover was invisible for that reason -
+    the paths were only ever exercised sequentially, so the interleaving that loses a revocation
+    could not occur.
+
+    So each test below opens **two independent sessions** on the suite's ``NullPool`` engine, which
+    hands out a fresh connection per checkout, and commits for real. Each creates the account it
+    needs and removes it in a ``finally``; the cascade on ``users`` takes the tokens with it, so
+    nothing survives into another test.
+
+    **The interleaving is enforced by PostgreSQL rather than by timing.** One session takes the
+    account lock and holds it, which is precisely the state an in-flight rotation is in between
+    spending a token and inserting its successor. The other session then runs the operation under
+    test and *must block*. Nothing depends on which task the event loop happens to schedule first,
+    and the outcome assertions fail closed: if the lock is not taken, the second operation runs to
+    completion against a stale view and the final assertion about what is live catches it.
+    """
+
+    @staticmethod
+    def _sessions(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+        """A maker for independent sessions that COMMIT, unlike the transactional fixture."""
+        return async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+
+    async def test_a_sweep_waits_for_an_in_flight_rotation_and_then_revokes_its_successor(
+        self, engine: AsyncEngine
+    ) -> None:
+        """A sign-out cannot finish while a rotation is mid-flight, and it revokes what it inserts.
+
+        The interleaving that used to leave an account holding a live credential after a request
+        whose entire purpose was to leave it holding none:
+
+        1. a rotation spends ``T1`` - marking it revoked - and is about to insert its successor
+           ``T2``;
+        2. a sign-out presenting ``T1`` reads it as *not yet* revoked, because its snapshot predates
+           the rotation, and so revokes that one row and leaves every other session alone;
+        3. the rotation commits ``T2``.
+
+        Both transactions succeed and ``T2`` is live. The sign-out reported ``204`` and the session
+        it was asked to end is still usable. No lock over the token rows could have prevented it:
+        the row that defeats the sweep is the one added afterwards, so the thing that has to be
+        locked is the account, which is stable.
+
+        Two separate properties are therefore under test, and the scenario needs both to pass.
+        The sign-out must **block** on the account lock rather than proceeding on its stale view;
+        and once through, it must **re-read** the presented token, see that it has been spent in the
+        meantime, and treat that as the replay it is - which is what escalates to the family sweep
+        and takes ``T2`` with it. Deciding from the pre-lock snapshot would revoke only ``T1``,
+        which is already revoked, and achieve nothing at all.
+
+        The rotation's exact position is reproduced: the account row locked, ``T1`` claimed, ``T2``
+        inserted, nothing committed.
+        """
+        maker = self._sessions(engine)
+        owner_id: uuid.UUID | None = None
+
+        try:
+            async with maker() as setup:
+                owner = await factories.create_user(setup, role=UserRole.AUTHOR)
+                await setup.commit()
+                owner_id = owner.id
+                first_hash = hash_refresh_token("race-original-refresh-token")
+                await RefreshTokenRepository(setup).create(
+                    user_id=owner_id,
+                    token_hash=first_hash,
+                    expires_at=refresh_token_expires_at(),
+                )
+                await setup.commit()
+
+            async with maker() as rotating, maker() as sweeping:
+                # The in-flight rotation, in the order the service performs it: lock the account,
+                # spend the presented token, insert the successor - and commit none of it yet.
+                rotating_tokens = RefreshTokenRepository(rotating)
+                locked = await UserRepository(rotating).get_by_id(owner_id, for_update=True)
+                assert locked is not None
+                spent = await rotating_tokens.claim(first_hash)
+                assert spent is not None, "the rotation could not spend the token it was given"
+                await rotating_tokens.create(
+                    user_id=owner_id,
+                    token_hash=hash_refresh_token("race-successor-refresh-token"),
+                    expires_at=refresh_token_expires_at(),
+                )
+
+                sweeper = await sweeping.scalar(select(User).where(User.id == owner_id))
+                assert sweeper is not None
+                sweep = asyncio.create_task(
+                    AuthService(sweeping).logout("race-original-refresh-token", actor=sweeper)
+                )
+
+                # It must not be able to finish. A blocked lock never completes however long this
+                # waits, so the timeout is a floor on the evidence rather than a guess at a
+                # duration - and if the lock is absent the task completes at once and this fails.
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(sweep), timeout=1.0)
+
+                await rotating.commit()
+                await sweep
+
+            async with maker() as verify:
+                live = await verify.scalars(
+                    select(RefreshToken).where(
+                        RefreshToken.user_id == owner_id, RefreshToken.revoked_at.is_(None)
+                    )
+                )
+                remaining = list(live)
+
+            assert remaining == [], (
+                "the sign-out completed while a rotation's successor was still pending, so the "
+                "account is left holding a live refresh token after being signed out"
+            )
+        finally:
+            if owner_id is not None:
+                async with maker() as cleanup:
+                    await cleanup.execute(delete(User).where(User.id == owner_id))
+                    await cleanup.commit()
+
+    async def test_a_rotation_takes_the_account_lock_before_it_spends_anything(
+        self, engine: AsyncEngine
+    ) -> None:
+        """Rotation asks for the account lock, and asks for it *before* claiming a token.
+
+        This is the half of the protocol that the two outcome tests cannot reach, and leaving it
+        unasserted would leave the whole thing resting on nothing. The reason is subtle: a sweep
+        already blocks on the *row* lock of whichever token a rotation has spent, so an interleaving
+        test can pass while the rotation itself holds no account lock at all. It would still be
+        broken, and in the direction that matters most.
+
+        Consider a rotation that claims ``T1`` and inserts ``T2`` while holding no account lock. A
+        sweep starts, takes the account lock unopposed, and issues its bulk ``UPDATE``. That
+        statement blocks on ``T1``'s row lock, waits for the rotation to commit, then re-evaluates
+        ``T1`` - now revoked, so skipped - and never considers ``T2`` at all, because ``T2`` was
+        inserted after the statement's snapshot was taken. The sweep reports success and the
+        successor is live. Blocking on a token row is not the same as being serialised with the
+        writer that adds one.
+
+        So the assertion is made structurally instead of through an outcome: a second transaction
+        holds the account lock and touches nothing else, and the rotation must be unable to proceed.
+        Nothing but the account lock can be what stops it - the token row it would claim is
+        untouched by the other transaction - so if it completes, it never asked for the lock.
+        """
+        maker = self._sessions(engine)
+        owner_id: uuid.UUID | None = None
+
+        try:
+            async with maker() as setup:
+                owner = await factories.create_user(setup, role=UserRole.AUTHOR)
+                await setup.commit()
+                owner_id = owner.id
+                await RefreshTokenRepository(setup).create(
+                    user_id=owner_id,
+                    token_hash=hash_refresh_token("lock-order-probe-token"),
+                    expires_at=refresh_token_expires_at(),
+                )
+                await setup.commit()
+
+            async with maker() as holder, maker() as rotating:
+                # The account lock and NOTHING else. No token row is read, updated or inserted, so
+                # this transaction conflicts with the rotation on exactly one object.
+                held = await UserRepository(holder).get_by_id(owner_id, for_update=True)
+                assert held is not None
+
+                rotation = asyncio.create_task(
+                    AuthService(rotating).rotate_refresh_token("lock-order-probe-token")
+                )
+
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(rotation), timeout=1.0)
+
+                # Released without writing anything, so the rotation is free to succeed on its own
+                # terms - which it must, or this test would be asserting that the lock breaks
+                # rotation rather than that it orders it.
+                await holder.rollback()
+
+                pair = await rotation
+                assert pair.access_token
+                assert pair.refresh_token != "lock-order-probe-token"
+        finally:
+            if owner_id is not None:
+                async with maker() as cleanup:
+                    await cleanup.execute(delete(User).where(User.id == owner_id))
+                    await cleanup.commit()
+
+    async def test_a_rotation_waits_for_a_deactivation_and_then_refuses(
+        self, engine: AsyncEngine
+    ) -> None:
+        """A suspension cannot be outrun by a rotation, so no successor survives it.
+
+        The administrative half of the same race. Deactivation withdraws the account's tokens
+        precisely so that they cannot lie dormant as live credentials and spring back when the
+        account is restored - and a rotation committing beside it defeated that, because it spent a
+        token the sweep had revoked in a snapshot taken before the sweep and inserted a successor
+        the sweep had already passed. The account ended up suspended with a working credential, and
+        reactivating it reinstated a session nobody had signed into.
+
+        The suspension is held mid-flight here: the account row is locked, ``is_active`` is false
+        and the sweep has run, none of it committed. The rotation must block, and once the
+        suspension commits it must refuse - the token it holds was revoked by that sweep - and
+        leave no new row behind.
+        """
+        maker = self._sessions(engine)
+        owner_id: uuid.UUID | None = None
+
+        try:
+            async with maker() as setup:
+                owner = await factories.create_user(setup, role=UserRole.AUTHOR)
+                await setup.commit()
+                owner_id = owner.id
+                await RefreshTokenRepository(setup).create(
+                    user_id=owner_id,
+                    token_hash=hash_refresh_token("deactivation-race-token"),
+                    expires_at=refresh_token_expires_at(),
+                )
+                await setup.commit()
+
+            async with maker() as suspending, maker() as rotating:
+                locked = await UserRepository(suspending).get_by_id(owner_id, for_update=True)
+                assert locked is not None
+                locked.is_active = False
+                await suspending.flush()
+                await RefreshTokenRepository(suspending).revoke_all_for_user(owner_id)
+
+                rotation = asyncio.create_task(
+                    AuthService(rotating).rotate_refresh_token("deactivation-race-token")
+                )
+
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(rotation), timeout=1.0)
+
+                await suspending.commit()
+
+                with pytest.raises(UnauthorizedError):
+                    await rotation
+
+            async with maker() as verify:
+                live = await verify.scalars(
+                    select(RefreshToken).where(
+                        RefreshToken.user_id == owner_id, RefreshToken.revoked_at.is_(None)
+                    )
+                )
+                remaining = list(live)
+
+            assert remaining == [], (
+                "a rotation outran a suspension and left the deactivated account holding a live "
+                "refresh token, which would be usable again the moment it is reactivated"
+            )
+        finally:
+            if owner_id is not None:
+                async with maker() as cleanup:
+                    await cleanup.execute(delete(User).where(User.id == owner_id))
+                    await cleanup.commit()
+
+    async def test_a_rotation_locks_the_account_before_it_touches_a_token_row(
+        self, engine: AsyncEngine
+    ) -> None:
+        """The account row is locked **first**, which is what makes the protocol deadlock-free.
+
+        The test above proves the rotation takes the lock; this one proves *when*. The distinction
+        is not pedantry, and it is the one property in this class that no race can establish
+        reliably, because getting it wrong produces a deadlock rather than a wrong answer - and a
+        deadlock needs a window of a few microseconds to be hit, so a test that waited for one would
+        pass while broken far more often than it failed.
+
+        Reasoning is what shows it matters. Suppose a rotation claimed its token first and asked for
+        the account only afterwards, on its way to inserting the successor. A sweep starting in
+        between takes the account lock unopposed, then blocks on the claimed token's row lock; the
+        rotation then asks for the account lock the sweep is holding. Neither can proceed, and
+        PostgreSQL resolves it by killing one - so a perfectly ordinary sign-out concurrent with a
+        perfectly ordinary session renewal answers ``500``. Every writer taking the account row
+        first removes the cycle rather than making it rarer.
+
+        So the order is asserted where it is decided: in the statements the rotation emits. The
+        ``users`` lock must appear before the first write to ``refresh_tokens``, and the assertion
+        reads the SQL rather than the source so that a refactor which reorders the calls is caught
+        by a failing test rather than by an incident.
+        """
+        maker = self._sessions(engine)
+        statements: list[str] = []
+
+        def record(
+            conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, many: bool
+        ) -> None:
+            statements.append(" ".join(statement.split()))
+
+        owner_id: uuid.UUID | None = None
+        try:
+            async with maker() as setup:
+                owner = await factories.create_user(setup, role=UserRole.AUTHOR)
+                await setup.commit()
+                owner_id = owner.id
+                await RefreshTokenRepository(setup).create(
+                    user_id=owner_id,
+                    token_hash=hash_refresh_token("statement-order-token"),
+                    expires_at=refresh_token_expires_at(),
+                )
+                await setup.commit()
+
+            event.listen(engine.sync_engine, "before_cursor_execute", record)
+            try:
+                async with maker() as rotating:
+                    await AuthService(rotating).rotate_refresh_token("statement-order-token")
+            finally:
+                event.remove(engine.sync_engine, "before_cursor_execute", record)
+
+            lock_positions = [
+                index
+                for index, statement in enumerate(statements)
+                if "FROM users" in statement and "FOR UPDATE" in statement
+            ]
+            token_write_positions = [
+                index
+                for index, statement in enumerate(statements)
+                if statement.startswith("UPDATE refresh_tokens")
+                or statement.startswith("INSERT INTO refresh_tokens")
+            ]
+
+            assert lock_positions, (
+                "the rotation never emitted SELECT ... FOR UPDATE against users, so nothing "
+                f"serialises it against a concurrent sweep. Statements: {statements}"
+            )
+            assert token_write_positions, (
+                f"the rotation wrote no token row, so it did not rotate. Statements: {statements}"
+            )
+            assert lock_positions[0] < token_write_positions[0], (
+                "the rotation wrote to refresh_tokens before locking the users row. That is the "
+                "reverse of the order every sweep uses, so the two deadlock against each other. "
+                f"Statements: {statements}"
+            )
+        finally:
+            if owner_id is not None:
+                async with maker() as cleanup:
+                    await cleanup.execute(delete(User).where(User.id == owner_id))
+                    await cleanup.commit()
+
+    async def test_a_real_deactivation_and_a_real_rotation_racing_leave_no_live_token(
+        self, engine: AsyncEngine
+    ) -> None:
+        """Both services, both real, genuinely concurrent - and one invariant that must hold.
+
+        The tests above hold a lock by hand to pin a single interleaving, which is what makes them
+        precise. This one gives that up deliberately and runs the two production code paths against
+        each other on independent connections, because the finding is that these paths were *never*
+        raced: ``AdminService.update_user`` suspending the account, and
+        ``AuthService.rotate_refresh_token`` renewing its session, started together and allowed to
+        interleave however the database orders them.
+
+        Which one wins is not asserted, because either order is legitimate. What is asserted is the
+        invariant that must survive both:
+
+        * if the rotation committed first, the suspension's sweep must have seen its successor and
+          revoked it;
+        * if the suspension committed first, the rotation must have been refused;
+        * and in neither case may a live refresh token remain on a suspended account, because such a
+          token is a credential that outlives the suspension and returns the moment the account is
+          reactivated.
+
+        A second thing is asserted by omission: no failure other than the documented
+        ``UnauthorizedError`` may escape. A deadlock would surface here as a database error and a
+        ``500``, and it is what happens if the two services ever disagree about lock *order* - which
+        is why both take the account row first and why that order is documented rather than left to
+        be discovered by whichever request pays for it.
+        """
+        maker = self._sessions(engine)
+        owner_id: uuid.UUID | None = None
+        admin_id: uuid.UUID | None = None
+
+        try:
+            async with maker() as setup:
+                owner = await factories.create_user(setup, role=UserRole.AUTHOR)
+                operator = await factories.create_user(setup, role=UserRole.ADMIN)
+                await setup.commit()
+                owner_id, admin_id = owner.id, operator.id
+                await RefreshTokenRepository(setup).create(
+                    user_id=owner_id,
+                    token_hash=hash_refresh_token("contended-rotation-token"),
+                    expires_at=refresh_token_expires_at(),
+                )
+                await setup.commit()
+
+            async with maker() as suspending, maker() as rotating:
+                # A distinct name from the `operator` created in the setup session above: this is
+                # the same row re-read through the session that will perform the suspension, and
+                # the two must not be conflated - an instance is bound to the session that loaded
+                # it, and passing the setup session's copy here would attach it to a transaction
+                # that has already been committed and closed.
+                acting_operator = await suspending.scalar(select(User).where(User.id == admin_id))
+                assert acting_operator is not None
+
+                outcomes = await asyncio.gather(
+                    AdminService(suspending).update_user(
+                        owner_id, AdminUserUpdate(is_active=False), actor=acting_operator
+                    ),
+                    AuthService(rotating).rotate_refresh_token("contended-rotation-token"),
+                    return_exceptions=True,
+                )
+
+            unexpected = [
+                outcome
+                for outcome in outcomes
+                if isinstance(outcome, BaseException) and not isinstance(outcome, UnauthorizedError)
+            ]
+            assert unexpected == [], (
+                f"racing the two paths raised something other than the documented refusal: "
+                f"{unexpected!r}. A database error here means the two services disagreed about "
+                "which row to lock first."
+            )
+
+            async with maker() as verify:
+                suspended = await verify.scalar(select(User).where(User.id == owner_id))
+                assert suspended is not None
+                assert suspended.is_active is False
+                live = list(
+                    await verify.scalars(
+                        select(RefreshToken).where(
+                            RefreshToken.user_id == owner_id, RefreshToken.revoked_at.is_(None)
+                        )
+                    )
+                )
+
+            assert live == [], (
+                "a suspended account is holding a live refresh token, so the suspension can be "
+                "outlived by a session and undone by a reactivation"
+            )
+        finally:
+            async with maker() as cleanup:
+                for identifier in (owner_id, admin_id):
+                    if identifier is not None:
+                        await cleanup.execute(delete(User).where(User.id == identifier))
+                await cleanup.commit()
 
 
 class TestRateLimitingIsDisabledUnderTest:
@@ -1592,3 +2641,340 @@ class TestRateLimitingIsDisabledUnderTest:
         # counted as well - which makes this the burst most likely to trip a live limiter and
         # therefore the sharpest form of the same tripwire.
         assert statuses == [HTTPStatus.UNAUTHORIZED] * _BURST_SIZE, statuses
+
+
+# ---------------------------------------------------------------------------------------
+# Phase H - the limiter enforcing, with the real object and the real routes
+#
+# `limiter.enabled` is a plain public attribute and `limiter.reset()` clears the accumulated
+# counters, both of which `app.core.rate_limit` documents as the supported way to exercise the
+# control. The fixture below is the only place in the suite that touches either: it enables the
+# limiter, resets the buckets so a preceding test's attempts cannot count against this one, and
+# restores both in a `finally` so a failure here cannot leak a live limiter into the next test
+# and make an unrelated module intermittently red.
+#
+# The allowance is read from `settings.AUTH_RATE_LIMIT` rather than written as a literal. The
+# decorator was built from that expression at import time, so a test that assumed five would be
+# asserting against a different number the moment the configuration changed - and the failure
+# would look like a broken limiter rather than a stale test.
+# ---------------------------------------------------------------------------------------
+
+
+def _configured_allowance() -> int:
+    """Return how many requests ``settings.AUTH_RATE_LIMIT`` permits per window.
+
+    The expression is validated at startup to a ``<count>/<period>`` form - optionally several
+    separated by ``;`` - so the count of the **narrowest** item is the number of requests that
+    may be served before a 429. Parsed here rather than imported because slowapi keeps the
+    parsed limit inside the decorator it built, and reaching into that would couple this module
+    to the library's internals instead of to the project's own configuration.
+
+    Returns:
+        The smallest per-window count the configured expression allows.
+    """
+    counts = [
+        int(item.strip().split("/", maxsplit=1)[0])
+        for item in settings.AUTH_RATE_LIMIT.split(";")
+        if item.strip()
+    ]
+    assert counts, f"AUTH_RATE_LIMIT is not a parseable expression: {settings.AUTH_RATE_LIMIT!r}"
+    return min(counts)
+
+
+@pytest.fixture
+def live_limiter() -> Iterator[int]:
+    """Enable the real limiter for one test, and put it back afterwards.
+
+    Yields:
+        The configured allowance, so a test can drive exactly one request past it rather than
+        hard-coding a number the configuration is free to change.
+    """
+    previously_enabled = limiter.enabled
+    limiter.reset()
+    limiter.enabled = True
+    try:
+        yield _configured_allowance()
+    finally:
+        # Order matters on the way out as much as on the way in: disable first so nothing else
+        # can consume a bucket while it is being cleared, then clear.
+        limiter.enabled = previously_enabled
+        limiter.reset()
+
+
+@pytest.fixture
+async def peer_client(
+    client: AsyncClient,
+    app: Any,
+) -> AsyncIterator[Callable[[str], AsyncClient]]:
+    """Yield a factory for extra clients that each report a **different** peer address.
+
+    Needed because the limiter's identity is an address, and the shared ``client`` fixture
+    reports one fixed address for every request it makes. Under that single peer, a test that
+    only rotated ``X-Forwarded-For`` would pass whether or not
+    ``app.core.rate_limit._client_key`` buckets a forwarded caller - measured directly, by
+    deleting the bucketing branch and watching the test stay green. Varying the address is what
+    makes the assertion load-bearing.
+
+    ``ASGITransport(client=...)`` writes the tuple into ``scope["client"]``, which is precisely
+    what uvicorn's ``ProxyHeadersMiddleware`` does to a loopback peer that sent
+    ``X-Forwarded-For``. So a client from this factory is not an approximation of the deployed
+    situation - it reproduces the exact scope the production code sees, and it does so without a
+    server, a proxy or a socket.
+
+    The clients share the application object, and therefore the ``get_db`` override the ``client``
+    fixture installed - which is why ``client`` is requested here even though it is not used
+    directly: it is what puts the test's transaction-scoped session behind these requests too.
+    Every client the factory hands out is closed on the way out, so a test cannot leak one.
+
+    Args:
+        client: The shared client, requested for the override it installs, not for itself.
+        app: The application object every peer client drives.
+
+    Yields:
+        A callable taking a peer address and returning a client that reports it.
+    """
+    opened: list[AsyncClient] = []
+
+    def _for(address: str) -> AsyncClient:
+        peer = AsyncClient(
+            transport=ASGITransport(app=app, client=(address, _PEER_PORT)),
+            base_url=_PEER_BASE_URL,
+        )
+        opened.append(peer)
+        return peer
+
+    try:
+        yield _for
+    finally:
+        for peer in opened:
+            await peer.aclose()
+
+
+class TestRateLimitingEnforcement:
+    """With the limiter live, a credential route stops serving and says so in the one error shape.
+
+    Every test here uses :func:`live_limiter`, so each one starts from empty buckets and leaves
+    the limiter as it found it. They deliberately drive **login** rather than registration: the
+    route is the one an attacker actually hammers, its failures are the ones worth bounding, and
+    a wrong password costs one argon2id verification whether or not the limit is reached, so the
+    cost of the test is bounded by the allowance rather than by the number of accounts it creates.
+    """
+
+    async def test_the_allowance_is_served_and_the_next_request_is_throttled(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        live_limiter: int,
+    ) -> None:
+        """Exactly the configured number of sign-ins succeed; the one after that answers 429.
+
+        The boundary, from both sides, which is what makes this an assertion about the bucket
+        rather than about the presence of a decorator. A limiter that refused one request early
+        would fail on the first list; one that never refused at all - a decorator removed, an
+        `enabled` flag ignored, a bucket that resets per request because the key is derived from
+        something the caller controls - would fail on the second.
+        """
+        allowed = [
+            (await client.post(_LOGIN_URL, data=_login_form(author_user.email))).status_code
+            for _ in range(live_limiter)
+        ]
+        throttled = await client.post(_LOGIN_URL, data=_login_form(author_user.email))
+
+        assert allowed == [HTTPStatus.OK] * live_limiter, allowed
+        assert throttled.status_code == HTTPStatus.TOO_MANY_REQUESTS, throttled.text
+
+    async def test_the_throttled_response_is_the_one_problem_document(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        live_limiter: int,
+    ) -> None:
+        """The 429 is the same document every other failure in this API is, plus ``Retry-After``.
+
+        slowapi ships its own handler, and using it would have made the 429 the single error in
+        this API that does not match the documented shape - a client with one error decoder would
+        then have to special-case throttling. ``app.core.exceptions`` therefore registers its own
+        handler for ``RateLimitExceeded``, and this is the assertion that it is the one being
+        used: the media type, the six members, the ``status`` agreeing with the transport, and the
+        ``instance`` naming the path.
+
+        ``Retry-After`` is asserted as a **positive whole number of seconds**, because that is
+        the only form a specification-following client can act on, and because ``Retry-After: 0``
+        would invite an immediate retry into a window that is still closed. The header is where
+        the interval lives rather than in ``detail`` - the wording stays constant so a client
+        renders one message and reads one header.
+        """
+        for _ in range(live_limiter):
+            await client.post(_LOGIN_URL, data=_login_form(author_user.email))
+        response = await client.post(_LOGIN_URL, data=_login_form(author_user.email))
+
+        payload = _assert_problem_document(response, HTTPStatus.TOO_MANY_REQUESTS)
+        assert payload["type"] == _ERROR_TYPE_RATE_LIMITED, payload
+        retry_after = response.headers.get(_RETRY_AFTER)
+        assert retry_after is not None, dict(response.headers)
+        assert retry_after.isdigit(), retry_after
+        assert int(retry_after) > 0, retry_after
+        # The window the configured expression declares is a minute, so the advertised interval
+        # cannot be longer than that. Asserted as a bound rather than an equality because the
+        # expression is configuration and a deployment may narrow it.
+        assert int(retry_after) <= _SECONDS_PER_MINUTE, retry_after
+        # The rejected credential never reaches the body - the limiter's response is built from
+        # the rule, not from the request.
+        assert DEFAULT_PASSWORD not in _serialised(payload)
+        assert author_user.email not in _serialised(payload)
+
+    async def test_refused_credentials_consume_the_allowance_too(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        live_limiter: int,
+    ) -> None:
+        """A burst of wrong passwords is throttled, so the limit actually bounds guessing.
+
+        The property that makes the control worth having. A limiter that counted only successful
+        sign-ins would leave an attacker unlimited attempts at the one thing they are trying to
+        do, and every attempt would still cost the server a deliberate argon2id verification. So
+        the failures are counted, and the transition is asserted in place: the allowance answers
+        401, and the next attempt answers 429 rather than a further 401.
+        """
+        refused = [
+            (
+                await client.post(_LOGIN_URL, data=_login_form(author_user.email, _WRONG_PASSWORD))
+            ).status_code
+            for _ in range(live_limiter)
+        ]
+        throttled = await client.post(
+            _LOGIN_URL, data=_login_form(author_user.email, _WRONG_PASSWORD)
+        )
+
+        assert refused == [HTTPStatus.UNAUTHORIZED] * live_limiter, refused
+        assert throttled.status_code == HTTPStatus.TOO_MANY_REQUESTS, throttled.text
+
+    async def test_a_distinct_peer_address_has_its_own_allowance(
+        self,
+        peer_client: Callable[[str], AsyncClient],
+        author_user: User,
+        live_limiter: int,
+    ) -> None:
+        """Two callers at different addresses each get the whole allowance. The control.
+
+        Stated first because the test after it is only meaningful if this one holds. The limit is
+        counted per caller, and the caller is an address, so exhausting one address must leave
+        another untouched - a limiter keyed on something coarser would refuse the second caller
+        and lock every visitor out the moment one of them misbehaved.
+
+        It is also what gives the next test its teeth. It establishes that a *different*
+        ``scope["client"]`` really does buy a fresh allowance here, so when the next test varies
+        the address and the allowance is *not* refreshed, the only thing that can explain the
+        difference is the forwarded header being bucketed.
+        """
+        first, second = (peer_client(address) for address in _PEER_ADDRESSES)
+
+        exhausting = [
+            (await first.post(_LOGIN_URL, data=_login_form(author_user.email))).status_code
+            for _ in range(live_limiter)
+        ]
+        first_refused = await first.post(_LOGIN_URL, data=_login_form(author_user.email))
+        untouched = [
+            (await second.post(_LOGIN_URL, data=_login_form(author_user.email))).status_code
+            for _ in range(live_limiter)
+        ]
+
+        assert exhausting == [HTTPStatus.OK] * live_limiter, exhausting
+        assert first_refused.status_code == HTTPStatus.TOO_MANY_REQUESTS, first_refused.text
+        assert untouched == [HTTPStatus.OK] * live_limiter, untouched
+
+    async def test_a_rotating_forwarded_header_does_not_buy_attempts(
+        self,
+        peer_client: Callable[[str], AsyncClient],
+        author_user: User,
+        live_limiter: int,
+    ) -> None:
+        """A caller that volunteers ``X-Forwarded-For`` shares one bucket, whatever it claims.
+
+        This is the measured defect ``app.core.rate_limit._client_key`` exists to close, asserted
+        rather than described. slowapi's default identity reads ``request.client.host``, and
+        uvicorn's proxy-header middleware rewrites that value from ``X-Forwarded-For`` for a
+        loopback peer - so six attempts each carrying a *different* forwarded address answered
+        401 six times where the same six from one address answered ``401 401 429 429 429 429``.
+        The limit had not been raised; it had been reset per request, by a header the caller
+        chose.
+
+        The rewrite is what :func:`peer_client` reproduces: each request below arrives with a
+        different ``scope["client"]`` **and** the forwarded header that would have produced it,
+        which is the shape the deployed service sees. The previous test proves a different address
+        alone is enough to earn a fresh allowance, so if the header were ignored these requests
+        would never be refused.
+
+        They are refused, because every request that volunteers such a header is counted against
+        one fixed key. Rotating it now costs attempts from a shared budget instead of buying them,
+        and the total spent across all the rotations is still one allowance.
+        """
+        addresses = [f"203.0.113.{index + 1}" for index in range(live_limiter + 1)]
+        claimed = [
+            (
+                await peer_client(address).post(
+                    _LOGIN_URL,
+                    data=_login_form(author_user.email, _WRONG_PASSWORD),
+                    headers={_FORWARDED_FOR: address},
+                )
+            ).status_code
+            for address in addresses[:-1]
+        ]
+        throttled = await peer_client(addresses[-1]).post(
+            _LOGIN_URL,
+            data=_login_form(author_user.email, _WRONG_PASSWORD),
+            headers={_FORWARDED_FOR: addresses[-1]},
+        )
+
+        assert claimed == [HTTPStatus.UNAUTHORIZED] * live_limiter, claimed
+        assert throttled.status_code == HTTPStatus.TOO_MANY_REQUESTS, throttled.text
+
+    async def test_every_credential_route_carries_the_limit(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        auth_headers_for: AuthHeaderFactory,
+        live_limiter: int,
+    ) -> None:
+        """Each of the five credential routes is throttled once its own allowance is spent.
+
+        A per-route assertion because slowapi registers a limit under
+        ``f"{func.__module__}.{func.__name__}"``, so each handler has its own bucket and a
+        decorator missing from one route is invisible to a test that only drove another. The
+        buckets are cleared between routes for the same reason: this asserts five independent
+        limits, not one shared budget.
+
+        **The two protected routes are driven with a credential, and that is not incidental.**
+        slowapi's limit is applied to the endpoint, and FastAPI resolves a route's dependencies
+        *before* the endpoint runs, so an anonymous request to ``/auth/logout`` or ``/auth/me`` is
+        refused by ``get_current_user`` and never reaches the limiter at all - measured directly:
+        it answers 401 indefinitely rather than 429. Sending a valid bearer is therefore what
+        makes those two buckets observable, and it also states the ordering: on a protected route
+        authentication is checked first and the limit second.
+
+        The bodies are otherwise whatever each route accepts - a form for login, JSON for the
+        other three - because the status *before* the limit is reached is irrelevant here and is
+        asserted elsewhere in this module. What this asserts is only the transition: while the
+        allowance holds, the answer is not 429; once it is spent, it is.
+        """
+        headers = auth_headers_for(author_user)
+        routes: tuple[tuple[str, dict[str, Any]], ...] = (
+            (_LOGIN_URL, {"data": _login_form("nobody@example.com")}),
+            (_REGISTER_URL, {"json": _credentials()}),
+            (_REFRESH_URL, {"json": {"refresh_token": _UNISSUED_REFRESH_TOKEN}}),
+            (
+                _LOGOUT_URL,
+                {"json": {"refresh_token": _UNISSUED_REFRESH_TOKEN}, "headers": headers},
+            ),
+            (_ME_URL, {"headers": headers}),
+        )
+
+        for url, payload in routes:
+            limiter.reset()
+            request = client.get if url == _ME_URL else client.post
+            within = [(await request(url, **payload)).status_code for _ in range(live_limiter)]
+            beyond = await request(url, **payload)
+
+            assert HTTPStatus.TOO_MANY_REQUESTS not in within, (url, within)
+            assert beyond.status_code == HTTPStatus.TOO_MANY_REQUESTS, (url, beyond.text)

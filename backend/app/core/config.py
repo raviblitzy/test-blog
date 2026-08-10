@@ -15,25 +15,24 @@ place is what makes the answer to "where does this value come from?" a single lo
 what makes ``.env.example`` an enforced contract rather than documentation that drifts
 away from the code.
 
-Eleven variables, and exactly four tolerated strangers
------------------------------------------------------
-The eleven fields of :class:`Settings` mirror the eleven backend keys in the
-repository-root ``.env.example`` field for field and name for name. The four keys in
+Twelve variables, and exactly three tolerated strangers
+------------------------------------------------------
+The twelve fields of :class:`Settings` mirror the twelve backend keys in the
+repository-root ``.env.example`` field for field and name for name. The three keys in
 that file's FRONTEND block belong to the Next.js tier, so they are deliberately absent
-here: the three ``NEXT_PUBLIC_`` values are inlined into the client bundle at build time
-and are public by design, and ``API_INTERNAL_BASE_URL`` is read only while the
-presentation tier renders on a server. Fifteen keys in total, and there is no sixteenth:
-``.env.example`` is the whole of the configuration this application reads, in either
-tier.
+here: every one of them is ``NEXT_PUBLIC_``-prefixed, which means it is inlined into the
+client bundle at build time and is public by design. Fifteen keys in total, and there is
+no sixteenth: ``.env.example`` is the whole of the configuration this application reads,
+in either tier.
 
 One ``.env`` nonetheless has to serve both tiers, and the mechanism that allows it is
 deliberately narrow. ``extra`` is ``"forbid"``, and a single ``mode="before"`` model
-validator drops exactly the four names listed in :data:`_FRONTEND_ENV_KEYS` before
+validator drops exactly the three names listed in :data:`_FRONTEND_ENV_KEYS` before
 validation sees them. Every *other* unrecognised key in an env file is therefore a startup
 failure. That asymmetry is the point: a blanket ``extra="ignore"`` would swallow
 ``DATABSE_URL``, ``JWT_SECRET`` or ``ENVIRONMNET`` in silence and boot the service against
 whatever the field default happened to be - which, for a security-relevant key, is the
-worst possible outcome dressed up as a clean start. Naming the four exceptions instead
+worst possible outcome dressed up as a clean start. Naming the three exceptions instead
 means the file can be shared *and* a typo is loud.
 
 Where a value comes from
@@ -104,46 +103,49 @@ nothing may start to: catching it in order to serialise ``errors()`` into a log 
 would republish the value this module works to keep out of both. If a caller ever needs the
 detail programmatically, take ``str(exc)``, which is already sanitised.
 
-The credential policy lives one module down
-------------------------------------------
+The credential policy is declared beside the request body
+--------------------------------------------------------
 Two credential rules govern this service, and only one of them is declared here.
 
 The **per-algorithm minimum size of the HMAC signing key** is this module's, because it is a
 fact about ``JWT_ALGORITHM`` and has exactly one consumer: the validation that refuses to
 start the process below the floor its configured algorithm requires.
 
-The **password policy** is not, and used to be. It lives in ``app.core.password_policy``,
-which imports the standard library and nothing else, and every name is re-exported from
-here so that ``from app.core.config import PASSWORD_MIN_LENGTH`` still resolves. Both
-consumers therefore import downwards: :class:`Settings` below, which holds
-``SEED_ADMIN_PASSWORD`` to the same rule the registration route applies, and
-``app.schemas.auth``, which publishes the numbers in ``/openapi.json`` and rejects the same
-passwords on ``POST /api/v1/auth/register``. The rule is still declared exactly once, so
-``SEED_ADMIN_PASSWORD`` and a reader's chosen password are measured by one function,
-:func:`~app.core.password_policy.password_policy_violation`.
+The **password policy** is not. It is declared in ``app.schemas.auth``, beside the
+:class:`~app.schemas.auth.RegisterRequest` body that publishes those numbers at
+``/openapi.json`` and enforces them on ``POST /api/v1/auth/register``, and this module imports
+it from there. Both consumers therefore read one declaration: :class:`Settings` below, which
+holds ``SEED_ADMIN_PASSWORD`` to exactly the rule the registration route applies, and the
+registration route itself. ``SEED_ADMIN_PASSWORD`` and a reader's chosen password are measured
+by one function, :func:`~app.schemas.auth.password_policy_violation`.
 
-The move is not tidying. Declaring the policy here made a *contract* module depend on a
-*configured environment*, because importing this file constructs :data:`settings` -
-deliberately, so a missing variable stops a starting process. The measurable consequence was
-that ``import app.schemas`` failed with six ``Field required`` errors on a machine with no
-env file and no exported variables, since resolving that package imports every sibling and
-``app.schemas.auth`` needed four constants and one classifier at class-definition time. A
-module that describes JSON must be importable without a database URL.
+The direction is the only one available, and it is not a matter of taste. Declaring the policy
+*here* made a *contract* module depend on a *configured environment*, because importing this
+file constructs :data:`settings` - deliberately, so a missing variable stops a starting
+process. The measurable consequence was that ``import app.schemas`` failed with six ``Field
+required`` errors on a machine with no env file and no exported variables, since resolving that
+package imports every sibling and ``app.schemas.auth`` needed four constants and one classifier
+at class-definition time. A module that describes JSON must be importable without a database
+URL. Reaching the policy through ``app.core.security`` is not available either: ``security``
+imports this module, so an import back would close a cycle.
 
 Import purity
 -------------
 This module imports ``pydantic``, ``pydantic-settings``, the standard library, and exactly
-one ``app`` sibling - ``app.core.password_policy``, which is pure by contract: no pydantic,
-no environment read, no side effect, nothing but constants and two functions. No SQLAlchemy,
-no engine, no logging configuration.
+one ``app`` sibling - ``app.schemas.auth``, which is pure with respect to configuration: it
+reads no environment variable, constructs no settings object, opens no connection and performs
+no I/O, and neither does anything it imports. No SQLAlchemy engine, no session, no query and
+no logging configuration is reached from here.
 
 ``backend/alembic.ini`` deliberately declares no ``sqlalchemy.url`` so that
 ``migrations/env.py`` can take the URL from here and the application and its migrations
 share one source of truth; every ``alembic upgrade head``, ``alembic downgrade base`` and
-``alembic check`` therefore imports this file, and it has to stay cheap. Constructing
-:data:`settings` is its only import-time effect - and it remains the only module in the
-repository that reads the environment. The sibling it imports is not an exception to that
-rule; it reads nothing at all.
+``alembic check`` therefore imports this file. Resolving ``app.schemas`` is what that import
+now also costs - a package of Pydantic model definitions, no I/O and no environment read - and
+those runs already import ``app.models`` for the metadata they compare against. Constructing
+:data:`settings` remains this module's only import-time *effect*, and this remains the only
+module in the repository that reads the environment. The sibling it imports is not an exception
+to that rule; it reads nothing at all.
 """
 
 import re
@@ -156,36 +158,31 @@ from urllib.parse import urlsplit
 from pydantic import EmailStr, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-# The one `app` sibling this module imports, and the only one it may. `app.core.password_policy`
-# holds the shared password rule and imports the standard library and nothing else - no pydantic,
-# no environment read, no side effect - so it sits BELOW this module in the graph rather than
-# beside it, and importing it costs nothing and can fail for nothing. The rule lives there rather
-# than here because `app.schemas.auth` needs it too, and importing THIS module constructs
-# `settings`, which would make a JSON contract module require a configured deployment; see "The
-# credential policy lives one module down" below and that module's own docstring.
+# The one `app` sibling this module imports, and the only one it may. `app.schemas.auth` declares
+# the shared password rule beside the request body that publishes it at `/openapi.json` and
+# enforces it on `POST /api/v1/auth/register`, and `Settings` below holds SEED_ADMIN_PASSWORD to
+# that same rule rather than to a second copy of it.
 #
-# Every name is re-exported through `__all__` below, so `from app.core.config import
-# PASSWORD_MIN_LENGTH` keeps resolving and the rule is still declared exactly once.
-from app.core.password_policy import (
+# The direction is the only one available. `app.core.security` imports THIS module, so the policy
+# cannot be reached through `security`; and declaring it here instead would make a JSON contract
+# module require a configured deployment, because importing this file constructs `settings` - see
+# "The credential policy is declared beside the request body" below and that module's own
+# docstring for what that cost when it was measured. Nothing on the `app.schemas` side reads the
+# environment or touches the database, so this import costs nothing and can fail for nothing.
+from app.schemas.auth import (
     PASSWORD_CHARACTER_GROUPS,
     PASSWORD_MAX_LENGTH,
     PASSWORD_MIN_CHARACTER_CLASSES,
     PASSWORD_MIN_LENGTH,
-    PASSWORD_VARIETY_MESSAGE,
-    password_character_groups,
     password_policy_violation,
 )
 
+# These names are USED here, not re-published. `app.schemas.auth` is the single place to import
+# the password policy from, so this module's `__all__` deliberately does not re-export it: one
+# rule deserves one import path, and a second one is a second thing that can drift.
 __all__ = [
-    "PASSWORD_CHARACTER_GROUPS",
-    "PASSWORD_MAX_LENGTH",
-    "PASSWORD_MIN_CHARACTER_CLASSES",
-    "PASSWORD_MIN_LENGTH",
-    "PASSWORD_VARIETY_MESSAGE",
     "JwtAlgorithm",
     "Settings",
-    "password_character_groups",
-    "password_policy_violation",
     "settings",
 ]
 
@@ -206,25 +203,23 @@ _ENV_FILES: Final[tuple[Path, Path]] = (_REPO_ROOT / ".env", _BACKEND_DIR / ".en
 
 
 # ---------------------------------------------------------------------------------------
-# The four keys this model tolerates but does not declare
+# The three keys this model tolerates but does not declare
 #
-# The FRONTEND block of .env.example. Three are inlined into the Next.js bundle at build
-# time and are public by design; the fourth, API_INTERNAL_BASE_URL, is deliberately NOT
-# `NEXT_PUBLIC_`-prefixed - it is read only while the presentation tier renders on a
-# server, where the API may answer on an internal hostname the browser cannot resolve, and
-# a public prefix would ship that hostname to every reader. None of the four carries a
-# secret and none means anything to this tier - but one .env serves both tiers, so they
-# arrive here anyway. Listing them by exact name is what lets `extra` stay "forbid": these
-# four are dropped, and every other unrecognised key in an env file stops the process. A
-# name added to .env.example's FRONTEND block must be added here too, or the service will
-# refuse to start with it present.
+# The FRONTEND block of .env.example, in full. All three are `NEXT_PUBLIC_`-prefixed, so
+# all three are inlined into the Next.js bundle at build time and are public by design:
+# none carries a secret and none means anything to this tier - but one .env serves both
+# tiers, so they arrive here anyway. Listing them by exact name is what lets `extra` stay
+# "forbid": these three are dropped, and every other unrecognised key in an env file stops
+# the process. A name added to .env.example's FRONTEND block must be added here too, or the
+# service will refuse to start with it present - which is the mechanism, not an obstacle:
+# the configuration contract is fourteen keys, and growing it is a deliberate act in two
+# files rather than a value that quietly starts being read.
 # ---------------------------------------------------------------------------------------
 _FRONTEND_ENV_KEYS: Final[frozenset[str]] = frozenset(
     {
         "NEXT_PUBLIC_API_BASE_URL",
         "NEXT_PUBLIC_SITE_URL",
         "NEXT_PUBLIC_SITE_NAME",
-        "API_INTERNAL_BASE_URL",
     }
 )
 
@@ -519,8 +514,8 @@ class Settings(BaseSettings):
         # .env.example spells them. No case folding, so `database_url` is not DATABASE_URL.
         case_sensitive=True,
         # FAIL CLOSED on anything unrecognised. One .env serves both tiers, so it carries
-        # the four client keys from the FRONTEND block of .env.example that this model does
-        # not declare - and `_drop_frontend_keys` below removes exactly those four, by
+        # the three client keys from the FRONTEND block of .env.example that this model does
+        # not declare - and `_drop_frontend_keys` below removes exactly those three, by
         # name, before validation runs. Everything else unknown is a startup failure, which
         # is what turns `DATABSE_URL` or `ENVIRONMNET` from a silent fallback to a default
         # into an error naming the key. `extra="ignore"` would suppress both cases alike.
@@ -673,6 +668,28 @@ class Settings(BaseSettings):
         ),
     )
 
+    MAX_REQUEST_BODY_BYTES: int = Field(
+        # One mebibyte. Chosen against the largest body any route legitimately accepts rather than
+        # picked round: `posts.content` is bounded at 100 000 characters by
+        # `app.schemas.post`, and a comment at 5 000, so even a post whose every character is a
+        # four-byte code point plus its title, excerpt, cover URL and category list fits inside
+        # this with room to spare. Nothing this API accepts is a file upload - a cover image is a
+        # URL reference - so there is no legitimate multipart body to accommodate.
+        default=1_048_576,
+        # Not merely positive: a ceiling below the largest body a route accepts would make that
+        # route unusable while reporting 413, which reads as a broken endpoint rather than as a
+        # misconfiguration. 64 KiB is comfortably under every schema bound and comfortably above
+        # the smallest sensible value, so it is the floor a deployment may tighten to.
+        ge=65_536,
+        description=(
+            "Maximum size in bytes of a request body this API will read. A body whose "
+            "Content-Length declares more is refused with 413 before the application is "
+            "called; one that declares no length is refused as soon as its streamed total "
+            "crosses the ceiling. Defaults to 1048576 (1 MiB), which is well above the "
+            "largest body any route accepts, since no route takes a file upload."
+        ),
+    )
+
     # -- Seed data ----------------------------------------------------------------------
 
     SEED_ADMIN_EMAIL: EmailStr = Field(
@@ -718,11 +735,11 @@ class Settings(BaseSettings):
     @model_validator(mode="before")
     @classmethod
     def _drop_frontend_keys(cls, values: Any) -> Any:
-        """Remove the four presentation-tier keys, by exact name, before validation runs.
+        """Remove the three presentation-tier keys, by exact name, before validation runs.
 
         This is the whole of the tolerance that lets one ``.env`` serve both tiers, and it
         is deliberately an exact-name allow-list rather than ``extra="ignore"``. Running in
-        ``mode="before"`` puts it ahead of the ``extra="forbid"`` check, so the four names
+        ``mode="before"`` puts it ahead of the ``extra="forbid"`` check, so the three names
         in :data:`_FRONTEND_ENV_KEYS` are dropped and **every other** unrecognised key -
         a misspelt ``DATABSE_URL``, a hopeful ``JWT_SECRET``, a stale key left behind by an
         older revision - reaches that check and stops the process with a message naming it.
@@ -740,7 +757,7 @@ class Settings(BaseSettings):
                 normal machinery to reject.
 
         Returns:
-            The same values with the four client keys removed, or the input unchanged when
+            The same values with the three client keys removed, or the input unchanged when
             it is not a mapping.
         """
         if isinstance(values, dict):

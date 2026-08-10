@@ -63,9 +63,8 @@
 
 import * as z from 'zod';
 
-import { codePointLength } from '@/lib/text';
-
 import type { PostCreate, PostUpdate } from '@/lib/types';
+import { IMAGE_HOST_ALLOWLIST, codePointLength, isAllowedImageUrl } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Bounds
@@ -186,7 +185,7 @@ const MAX_CATEGORIES_PER_POST = 10;
  * author who writes in one of those scripts is told a perfectly valid title or body is too long, by a
  * check whose only job was to save them a round trip. `@/lib/validation/auth` already measured this
  * way and recorded two observed cases against the running service;
- * `@/lib/text#codePointLength` is now that measurement, shared by all four validators and by
+ * `@/lib/utils#codePointLength` is now that measurement, shared by all four validators and by
  * `@/lib/seo`'s truncation, so one notion of length governs the tier.
  *
  * `abort: true` matches the convention in this tier: once a length has failed, later checks on the
@@ -211,7 +210,7 @@ const MAX_CATEGORIES_PER_POST = 10;
  * that derivation had to defend against — and an empty or whitespace-only title would produce a
  * degenerate canonical URL for a post that can never be renamed out of it.
  *
- * The ceiling is a `.refine()` over `codePointLength` from `@/lib/text`, not zod's `.max()`, and the
+ * The ceiling is a `.refine()` over `codePointLength` from `@/lib/utils`, not zod's `.max()`, and the
  * three bounded fields in this module share that treatment for one reason: the server's
  * `StringConstraints` count Python code points, while `.max()` reads `String.prototype.length` and
  * scores every character above `U+FFFF` twice. A 120-character headline containing emoji or an
@@ -306,7 +305,8 @@ const postContent = z
   });
 
 /**
- * The optional cover image, as an absolute `http` or `https` URL: blank-folded to `null`.
+ * The optional cover image, as an absolute `https` URL on an allow-listed host: blank-folded to
+ * `null`.
  *
  * A URL reference and nothing more. This product has no upload pipeline and no object storage, so a
  * cover image is a link an author pastes, and `null` is the ordinary case rather than an
@@ -334,29 +334,49 @@ const postContent = z
  * writing. Measured in code points for the reason given above the title field, and applied to the
  * trimmed value the way the server applies it to what it receives.
  *
- * Verified equivalent to the server's `HttpUrl` for every case:
+ * Behaviour for every case, including the three the host policy adds:
  *
- * | Submitted                            | Result                                  |
- * | ------------------------------------ | --------------------------------------- |
- * | omitted / `null` / `''` / `'   '`    | `null` — no cover image                 |
- * | `'https://example.com/cover.png'`    | accepted                                |
- * | `'  https://example.com/cover.png '` | accepted, trimmed                       |
- * | `'http://localhost:3000/cover.png'`  | accepted — a host, just not a domain    |
- * | `'http://127.0.0.1/cover.png'`       | accepted — same reason                  |
- * | `'javascript:alert(1)'`              | rejected — scheme not allowed           |
- * | `'data:image/png;base64,…'`          | rejected — scheme not allowed           |
- * | `'ftp://example.com/cover.png'`      | rejected — scheme not allowed           |
- * | `'/covers/cover.png'`                | rejected — not absolute                 |
- * | `'http://'`                          | rejected — no host                      |
- * | 2084 code points                     | rejected — the server's own ceiling     |
+ * | Submitted                                        | Result                                      |
+ * | ------------------------------------------------ | ------------------------------------------- |
+ * | omitted / `null` / `''` / `'   '`                | `null` — no cover image                     |
+ * | `'https://images.unsplash.com/photo-1.jpg'`      | accepted                                    |
+ * | `'  https://picsum.photos/seed/a/1200/630 '`      | accepted, trimmed                           |
+ * | `'https://example.com/cover.png'`                | rejected — host not on the allow-list       |
+ * | `'http://images.unsplash.com/photo-1.jpg'`       | rejected — not TLS                          |
+ * | `'https://u:p@images.unsplash.com/p.jpg'`        | rejected — embedded credentials             |
+ * | `'http://localhost:3000/cover.png'`              | rejected — host not on the allow-list       |
+ * | `'javascript:alert(1)'`                          | rejected — scheme not allowed               |
+ * | `'data:image/png;base64,…'`                      | rejected — scheme not allowed               |
+ * | `'ftp://example.com/cover.png'`                  | rejected — scheme not allowed               |
+ * | `'/covers/cover.png'`                            | rejected — not absolute                     |
+ * | `'http://'`                                      | rejected — no host                          |
+ * | 2084 code points                                 | rejected — the server's own ceiling         |
  *
- * The **host allow-list** is deliberately not checked here, and the ownership is worth stating because
- * this is the field it applies to. `src/lib/utils.ts` holds that policy - `IMAGE_HOST_ALLOWLIST` and
- * `isAllowedImageUrl` - `frontend/next.config.ts` derives the image optimiser's `remotePatterns` from
- * it, and it is enforced where the URL is RENDERED. Restating it in this schema would create a second
- * copy to keep in step, and would refuse to save a post whose cover host an operator is about to add
- * to the allow-list. Nor is reachability checked: that would be an HTTP request this module may not
- * make, and a URL that is briefly unreachable is not an invalid URL.
+ * **The host allow-list IS checked here, through the one predicate that owns it.** `src/lib/utils.ts`
+ * holds that policy - `IMAGE_HOST_ALLOWLIST` and `isAllowedImageUrl`, which together require `https`,
+ * no embedded credentials, and a hostname on the list - `frontend/next.config.ts` derives the image
+ * optimiser's `remotePatterns` from the same constant, and every renderer (`PostCard`,
+ * `PostContent`, `Avatar`) already asks it before emitting an image. Calling it rather than restating
+ * it is what keeps this from being a second copy: the hosts are named once, in `@/lib/utils`, and
+ * adding one admits it everywhere at once.
+ *
+ * It is checked because the alternative was measured and is worse. Accepting any absolute `http(s)`
+ * URL let an author save a cover the product then refuses to render: the field validated, the request
+ * succeeded, and the image silently never appeared on the feed card or the post page, while the
+ * OpenGraph and `BlogPosting` metadata - which a crawler fetches directly, without passing through
+ * the image optimiser - still advertised it. That is a saved-but-not-rendered state with no message
+ * anywhere, and it contradicted the authoring form's own help text, which names the admitted hosts.
+ * Refusing at the authoring boundary turns it into an inline field error the author can act on, and
+ * makes one policy true of validation, rendering and metadata alike.
+ *
+ * The check is deliberately narrower than the server's, and that direction is the safe one: every
+ * value this schema accepts is a value `pydantic.HttpUrl` accepts, so nothing here can be rejected by
+ * the service for a rule this module invented. The reverse - a host an operator is about to add to the
+ * allow-list - is a code change to that constant, reviewed like any other, and until it lands the
+ * image genuinely cannot be displayed.
+ *
+ * Reachability is still not checked: that would be an HTTP request this module may not make, and a URL
+ * that is briefly unreachable is not an invalid URL.
  *
  * The fold runs before the URL rules so a cleared input becomes `null` rather than failing them, and
  * `.pipe()` carries the folded value into the URL check so the non-null branch is still fully
@@ -378,6 +398,15 @@ const optionalCoverImageUrl = z
       .refine((value) => codePointLength(value) <= COVER_IMAGE_URL_MAX_LENGTH, {
         error: `Shorten the cover image address to ${String(COVER_IMAGE_URL_MAX_LENGTH)} characters or fewer.`,
         abort: true,
+      })
+      // The shared safe-image predicate, called rather than re-implemented: `https`, no embedded
+      // credentials, and a hostname on `IMAGE_HOST_ALLOWLIST`. Placed after the length check, which
+      // aborts, so an over-long address reports its own reason and not this one as well.
+      .refine((value) => isAllowedImageUrl(value), {
+        error:
+          `The cover image must be an https address on one of: ${IMAGE_HOST_ALLOWLIST.join(', ')} — ` +
+          `and must carry no username or password. Images on other hosts are not served by this ` +
+          `site, so a cover stored from one would save and then never appear.`,
       })
       .nullable(),
   )

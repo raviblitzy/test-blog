@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * Row actions for the administrative comment moderation queue: approve, reject, delete.
+ * Row actions for the administrative comment moderation queue: approve, reject, re-queue, delete.
  *
  * This component is the client face of the comment moderation state machine. The product
  * requirement asked for a dashboard that manages comments without ever naming a moderation state;
@@ -57,8 +57,40 @@
  * at the same moment the dialog mounts and tries to claim focus - a race whose loser is the
  * dialog, leaving a modal open with focus outside it. Preventing the default keeps the menu open
  * beneath the dialog, so the dialog's focus scope is the only one taking focus, and dismissing the
- * dialog returns focus to the menu item the operator actually selected. The approve and reject
- * items do NOT prevent the default, because closing the menu is the correct outcome there.
+ * dialog returns focus to the menu item the operator actually selected. The moderation-state items
+ * do NOT prevent the default, because closing the menu is the correct outcome there.
+ *
+ * ---------------------------------------------------------------------------
+ * ONE BUSY STATE ACROSS BOTH WRITES
+ *
+ * Moderating and deleting the same comment are conflicting writes, and the second must not be
+ * startable while the first is on the wire: two requests launched a moment apart settle in whichever
+ * order the network chooses, and the loser silently overwrites the winner - a removal landing after
+ * an approval leaves an approved comment that no longer exists, and an approval landing after a
+ * removal answers 404 for a row the operator watched disappear. `isBusy` therefore spans BOTH
+ * mutations and makes every mutually exclusive affordance inert: each state row, the destructive row,
+ * and the trigger that would otherwise serve up a second menu.
+ *
+ * The confirmation is gated separately, by `isDeleting`, because the two facts are different. A
+ * request that has already been sent cannot be recalled, so dismissing the dialog would not cancel
+ * the deletion - it would only hide whichever answer arrives, which is the one message the operator
+ * most needs. Each gate lives in exactly one handler, so no exit path can be added later that
+ * quietly bypasses it.
+ *
+ * ---------------------------------------------------------------------------
+ * TWO MUTATIONS ON ONE ROW, AND THEREFORE ONE BUSY STATE
+ *
+ * This row offers a moderation transition and a deletion on the SAME record, and they are not
+ * compatible operations - a `PATCH` and a `DELETE` in flight together resolve in whatever order the
+ * network chose, and the loser is answered `404` after a success toast has already been shown for
+ * the winner. So the two are not guarded independently: `isBusy` spans both, and every conflicting
+ * affordance is closed while either is running, including the confirmation dialog's own dismissal
+ * while the DELETE specifically is in flight. See {@link CommentModerationActions}'s `isBusy` and
+ * `handleConfirmationOpenChange` for the three interleavings that were reachable before it did.
+ *
+ * Both success handlers AWAIT their cache invalidation, so "busy" ends when the queue in front of
+ * the operator has caught up rather than when the write returned. Ending it earlier re-armed the
+ * menu over a row still painting its previous state.
  *
  * ---------------------------------------------------------------------------
  * DESIGN SYSTEM COMPLIANCE
@@ -77,9 +109,9 @@
  *
  * Colour never carries meaning alone. The current moderation state is rendered as a `Badge` whose
  * TEXT says what the state is, the destructive action says "Delete comment" rather than relying on
- * its danger tint, and the menu row matching the current state is both ticked and disabled. This is
- * the one screen where approved-versus-rejected is the entire point, so a colour-only signal would
- * be a functional failure rather than a cosmetic one.
+ * its danger tint, and the menu row matching the current state is ticked, suffixed in words and
+ * disabled. This is the one screen where approved-versus-rejected is the entire point, so a
+ * colour-only signal would be a functional failure rather than a cosmetic one.
  *
  * @module
  */
@@ -88,7 +120,8 @@ import { useState } from 'react';
 import type { JSX } from 'react';
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Ban, Check, CircleCheck, MoreHorizontal, Trash2 } from 'lucide-react';
+import { Ban, Check, CircleCheck, MoreHorizontal, RotateCcw, Trash2 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { Badge, COMMENT_STATUS_BADGE_VARIANTS } from '@/components/ui/badge';
@@ -107,8 +140,10 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { invalidateForAdminMutation } from '@/lib/admin-cache';
 import { deleteAdminComment, updateAdminCommentStatus } from '@/lib/api/admin';
 import { isApiError } from '@/lib/api/client';
+import { COMMENT_STATUSES } from '@/lib/types';
 import type { AdminComment, AdminCommentStatusUpdate, CommentStatus } from '@/lib/types';
 
 /* -------------------------------------------------------------------------- */
@@ -116,17 +151,42 @@ import type { AdminComment, AdminCommentStatusUpdate, CommentStatus } from '@/li
 /* -------------------------------------------------------------------------- */
 
 /**
- * Destination state of the approve transition.
+ * What each moderation row DOES, keyed by the state it moves the comment to.
  *
- * Annotated `CommentStatus` and NOT asserted with a cast, which is the whole point: the union is
- * single-sourced with the service's `comment_status` type, so if that label set ever changes this
- * line stops compiling instead of sending a value the service will reject at runtime. The same
- * guarantee is why no status literal appears inline anywhere below.
+ * The menu is generated from `COMMENT_STATUSES` rather than from a hand-written pair of rows, and
+ * that is the difference between offering the state machine and offering part of it. The union is
+ * single-sourced with the service's `comment_status` type and the route accepts any member of it -
+ * `PATCH /admin/comments/{id}/status` is documented as "approve, reject or re-queue", and
+ * `AdminCommentStatusUpdate` exists precisely because "a rejection is reversible, and a decision
+ * made in error is not permanent". A menu that reached only `APPROVED` and `REJECTED` therefore
+ * stranded every decided comment: nothing in this dashboard could return one to the queue, even
+ * though the service, the schema and the shared type all support it.
+ *
+ * A `Record` over the closed union rather than a conditional, so a fourth state added to the service
+ * widens the union and fails to compile here until it has been given words - where a `switch` would
+ * fall through to whichever branch it happened to end on and mislabel a row silently. Each label is
+ * a complete instruction rather than a bare noun, because that is what `role="menuitem"` promises a
+ * screen reader: activating the row does the thing the row says.
  */
-const APPROVED_STATUS: CommentStatus = 'APPROVED';
+const MODERATION_ACTION_LABELS: Readonly<Record<CommentStatus, string>> = {
+  PENDING: 'Return to review',
+  APPROVED: 'Approve comment',
+  REJECTED: 'Reject comment',
+};
 
-/** Destination state of the reject transition. @see {@link APPROVED_STATUS} */
-const REJECTED_STATUS: CommentStatus = 'REJECTED';
+/**
+ * The glyph beside each destination, keyed the same way.
+ *
+ * Decorative in every case - each row's words carry the meaning, and every glyph below is rendered
+ * `aria-hidden` - so this table exists for scannability rather than for semantics. `RotateCcw` reads
+ * as "put it back" for the re-queue row, which is the one transition an operator reaches for after
+ * changing their mind.
+ */
+const MODERATION_ACTION_ICONS: Readonly<Record<CommentStatus, LucideIcon>> = {
+  PENDING: RotateCcw,
+  APPROVED: CircleCheck,
+  REJECTED: Ban,
+};
 
 /**
  * What each moderation state is called on screen.
@@ -151,21 +211,14 @@ const MODERATION_STATE_LABELS: Readonly<Record<CommentStatus, string>> = {
  * Confirmation wording per destination state, keyed by the state the SERVER reported.
  *
  * Keyed on the response rather than on the requested value, so the toast can never claim a
- * transition the service did not perform. `PENDING` is present because the endpoint can move a
- * comment back - a rejection is reversible - and because the `Record` is exhaustive over the union
- * whether or not this component offers that transition today.
+ * transition the service did not perform. `PENDING` is reachable from the menu - a rejection is
+ * reversible - so this row reports a real outcome rather than covering an unreachable case.
  */
 const MODERATION_SUCCESS_MESSAGES: Readonly<Record<CommentStatus, string>> = {
   PENDING: 'Comment returned to review.',
   APPROVED: 'Comment approved.',
   REJECTED: 'Comment rejected.',
 };
-
-/** Menu label for the approve transition while it is available. */
-const APPROVE_LABEL = 'Approve comment';
-
-/** Menu label for the reject transition while it is available. */
-const REJECT_LABEL = 'Reject comment';
 
 /** Menu label, dialog title suffix and confirm-button label for removal. */
 const DELETE_LABEL = 'Delete comment';
@@ -223,28 +276,21 @@ const DELETION_FAILURE_MESSAGE = 'The comment could not be deleted.';
 const UNKNOWN_AUTHOR_NAME = 'an unknown author';
 
 /* -------------------------------------------------------------------------- */
-/* Cache keys                                                                 */
+/* Cache invalidation lives in `@/lib/admin-cache`, not here                  */
+/*                                                                            */
+/* This file no longer names a query key. The two it used to declare - the     */
+/* queue's prefix and the overview counts - were correct for these two         */
+/* mutations, but they were also the third copy of the same convention in the  */
+/* folder, and the convention is a statement about the SERVER's cascades       */
+/* rather than about any one screen. Declaring it once, next to the cascade    */
+/* that justifies each edge, is what stops the next mutation added here from   */
+/* being reasoned about locally and getting it wrong.                          */
+/*                                                                            */
+/* The graph still says exactly what this file said: a moderation transition   */
+/* stales the queue alone, because `AdminStats.comment_count` spans pending,   */
+/* approved and rejected alike; a deletion stales the queue AND the counts,    */
+/* because the comment and every reply beneath it leave the corpus.            */
 /* -------------------------------------------------------------------------- */
-
-/**
- * The moderation queue's cache prefix.
- *
- * The four administrative screens register their listings under
- * `['admin', 'users' | 'posts' | 'comments' | 'categories', params]`, so invalidating the two-member
- * prefix matches every window and filter combination of the comment queue that is currently cached
- * - which is exactly right, because a state change can move a row in or out of a filtered view that
- * this component knows nothing about.
- */
-const COMMENTS_QUERY_KEY = ['admin', 'comments'] as const;
-
-/**
- * The overview counts.
- *
- * Invalidated after a DELETION only. Approving or rejecting moves a comment between states without
- * changing how many exist, and `AdminStats.comment_count` spans every moderation state, so a
- * transition cannot alter it; removing a comment can and does.
- */
-const STATS_QUERY_KEY = ['admin', 'stats'] as const;
 
 /* -------------------------------------------------------------------------- */
 /* Presentation helpers                                                       */
@@ -388,12 +434,13 @@ export interface CommentModerationActionsProps {
 }
 
 /**
- * Approve, reject and delete affordances for one row of the comment moderation queue.
+ * Approve, reject, re-queue and delete affordances for one row of the comment moderation queue.
  *
  * Renders the comment's current state as a text-bearing pill beside a single action trigger, so a
- * long queue stays scannable and every row exposes exactly one control. The two reversible
- * transitions are menu items and need no confirmation; deletion is behind a modal confirmation
- * because it cascades to the comment's replies and cannot be undone.
+ * long queue stays scannable and every row exposes exactly one control. Every moderation state the
+ * service accepts is a menu row - including the return to review, which is what makes a decision
+ * revisable - and none needs a confirmation, because each is itself reversible. Deletion is behind a
+ * modal confirmation because it cascades to the comment's replies and cannot be undone.
  *
  * Intended composition - injected into a column's `cell` by the queue screen, never imported by the
  * grid itself:
@@ -425,7 +472,7 @@ export function CommentModerationActions({
    * independent: the destructive menu item prevents its own default so that the menu stays open
    * while the dialog mounts (see the module header), which means the menu is still open underneath
    * and something has to close it when the dialog goes away. Holding both flags here is what makes
-   * "the confirmation is over" a single act - see {@link closeConfirmation} - instead of two states
+   * "the confirmation is over" a single act - see {@link closeOverlays} - instead of two states
    * that can disagree.
    *
    * Measured in a browser before this was controlled: dismissing the dialog with Escape left the
@@ -435,31 +482,6 @@ export function CommentModerationActions({
    */
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isConfirmingDeletion, setIsConfirmingDeletion] = useState(false);
-
-  /**
-   * Ends the confirmation: the dialog and the menu behind it close together.
-   *
-   * Called from every exit - Escape, the scrim, Cancel, the corner control, and a successful
-   * deletion - so no path can leave one of the two overlays behind. Focus restoration is then
-   * unambiguous: the dialog's own restoration is suppressed (it would aim at a menu item that is
-   * unmounting in this same commit) and the menu's built-in restoration returns focus to the
-   * trigger, which is where the operator was.
-   */
-  function closeConfirmation(): void {
-    setIsConfirmingDeletion(false);
-    setIsMenuOpen(false);
-  }
-
-  /**
-   * Drops every cached window of the queue so the row re-reads from the service.
-   *
-   * A prefix match rather than an exact key: the screen's key carries its filter and page
-   * parameters, and a transition can move a row out of a filtered view, so every window has to be
-   * refetched rather than only the one currently on screen.
-   */
-  function invalidateQueue(): void {
-    void queryClient.invalidateQueries({ queryKey: COMMENTS_QUERY_KEY });
-  }
 
   /*
    * The moderation transition. No `retry`, `staleTime`, `gcTime` or `refetchOnWindowFocus` is
@@ -479,8 +501,12 @@ export function CommentModerationActions({
 
       return updateAdminCommentStatus(comment.id, payload);
     },
-    onSuccess: (moderated: AdminComment): void => {
-      invalidateQueue();
+    onSuccess: async (moderated: AdminComment): Promise<void> => {
+      // AWAITED, so the mutation stays pending - and this row stays inert, see `isBusy` below -
+      // until the queue in front of the operator actually shows the new state. Dropping the promise
+      // ended the pending state as soon as the WRITE returned, which re-armed the menu over a row
+      // still painting its old badge.
+      await invalidateForAdminMutation(queryClient, 'comment.status');
       // Keyed on what the service reported, not on what was asked for.
       toast.success(MODERATION_SUCCESS_MESSAGES[moderated.status]);
       onChanged?.();
@@ -497,11 +523,20 @@ export function CommentModerationActions({
    */
   const deletion = useMutation({
     mutationFn: (): Promise<void> => deleteAdminComment(comment.id),
-    onSuccess: (): void => {
-      invalidateQueue();
-      // A deletion changes the corpus, so the overview screen's totals are now stale.
-      void queryClient.invalidateQueries({ queryKey: STATS_QUERY_KEY });
-      closeConfirmation();
+    onSuccess: async (): Promise<void> => {
+      // Awaited BEFORE the overlays close, before the toast and before the caller's callback, so the
+      // sequence the operator sees is the true one: the request settled, the queue caught up, and only
+      // then did the confirmation go away. In the interval the confirm control reads "Deleting…" and
+      // is disabled, which is exactly the state to be in.
+      //
+      // The two row actions on users and posts dismiss their confirmation first and await afterwards,
+      // and that is safe there for the same reason it would be safe here - the mutation stays pending
+      // either way, so the stale row is never actionable. The order differs deliberately rather than by
+      // oversight: this handler also drives `onChanged`, which the moderation screen uses to move the
+      // operator within the queue, and firing that before the queue has refetched would move them
+      // relative to a list that was about to change underneath them.
+      await invalidateForAdminMutation(queryClient, 'comment.delete');
+      closeOverlays();
       toast.success(DELETION_SUCCESS_MESSAGE, { description: DELETION_CASCADE_NOTE });
       onChanged?.();
     },
@@ -512,9 +547,106 @@ export function CommentModerationActions({
     },
   });
 
-  const isApproved = comment.status === APPROVED_STATUS;
-  const isRejected = comment.status === REJECTED_STATUS;
+  /**
+   * Whether the removal in particular is on the wire.
+   *
+   * Named separately from {@link isBusy} because it governs a different thing: the confirmation's
+   * own exits. A request that has already been sent cannot be recalled, so dismissing the dialog
+   * would not cancel the deletion - it would only hide whichever answer arrives.
+   */
+  const isDeleting = deletion.isPending;
+
+  /**
+   * Whether EITHER administrative write is on the wire.
+   *
+   * One flag over both mutations, because the two are mutually exclusive in fact and were not in
+   * code. Moderating and deleting the same comment are conflicting writes: launched a moment apart
+   * they settle in whichever order the network chooses, and the loser silently overwrites the
+   * winner - a `DELETE` landing after an approval leaves an approved comment that no longer exists,
+   * an approval landing after a `DELETE` answers 404 for a row the operator watched disappear.
+   * Neither outcome is recoverable from the queue, so this component refuses to start the second
+   * write rather than racing it. It is also the reason a row goes inert as a whole: the state rows
+   * previously consulted only the moderation flag, which left the destructive row live throughout a
+   * transition.
+   */
+  const isBusy = moderation.isPending || isDeleting;
+
+  /**
+   * Takes both overlays down together: the confirmation, and the menu behind it.
+   *
+   * Both, always, so no path can leave one of them on screen. Focus restoration is then unambiguous:
+   * the dialog's own restoration is suppressed (it would aim at a menu item that is unmounting in this
+   * same commit) and the menu's built-in restoration returns focus to the trigger, which is where the
+   * operator was.
+   *
+   * Unconditional, and reached from exactly two places: `handleConfirmationOpenChange`, which decides
+   * whether a dismissal is allowed - it gates all five of the dialog's exits, the corner control
+   * included - and the deletion's own `onSuccess`, which is closing them BECAUSE the request finished
+   * and must not be subject to that decision.
+   */
+  function closeOverlays(): void {
+    setIsConfirmingDeletion(false);
+    setIsMenuOpen(false);
+  }
+
   const authorName = authorNameOf(comment);
+
+  /**
+   * The single gate on the action menu's open state.
+   *
+   * Two independent refusals, and each closes a specific hole:
+   *
+   *   - **Opening while a write is on the wire** is refused, so the trigger cannot serve up a second
+   *     menu mid-request. It pairs with `aria-disabled` on the trigger rather than with `disabled`,
+   *     and the distinction is deliberate: `aria-disabled` is announced and, through the Button
+   *     primitive's own `aria-disabled:pointer-events-none`, makes the control inert to the pointer,
+   *     while leaving it FOCUSABLE. A real `disabled` attribute would make Radix's focus restoration
+   *     - which fires as the menu closes on a moderation selection, in the same commit that sets the
+   *     flag - aim at an element that cannot take focus, dropping the operator onto `<body>`. This
+   *     handler is what stops keyboard activation, which `pointer-events` alone does not.
+   *   - **Closing while the deletion is on the wire** is refused, because the panel is deliberately
+   *     kept mounted beneath the confirmation (see the module header) and its dismissal would take
+   *     the operator out of both surfaces while the request was still running.
+   *
+   * @param nextOpen - The state Radix is asking for.
+   */
+  function handleMenuOpenChange(nextOpen: boolean): void {
+    if (nextOpen && isBusy) {
+      return;
+    }
+
+    if (!nextOpen && isDeleting) {
+      return;
+    }
+
+    setIsMenuOpen(nextOpen);
+  }
+
+  /**
+   * The single gate on every one of the confirmation's exits.
+   *
+   * Radix routes Escape, an outside press, the corner close control and any `DialogClose` through
+   * `onOpenChange`, so this one test covers all five paths at once: a deletion already on the wire
+   * cannot be dismissed out from under itself. `onSuccess` closes the dialog by setting state
+   * directly rather than by asking to close, which is what lets it through this gate - React Query
+   * dispatches its `success` state only AFTER the success callback has run, so the mutation is still
+   * reported as pending at that moment and a request routed through here would be refused.
+   *
+   * @param nextOpen - The state Radix is asking for.
+   */
+  function handleConfirmationOpenChange(nextOpen: boolean): void {
+    if (isDeleting) {
+      return;
+    }
+
+    if (nextOpen) {
+      setIsConfirmingDeletion(true);
+
+      return;
+    }
+
+    closeOverlays();
+  }
 
   return (
     /* `justify-end` keeps the pair at the trailing edge of an actions cell, which is block-level at
@@ -523,15 +655,16 @@ export function CommentModerationActions({
        sized to its content and its own justification has nothing left to distribute. An auto inline
        margin pushes it to the end there and computes to zero on a block-level box, so one class
        covers both presentations and neither needs a breakpoint variant. */
-    <div className="ms-auto flex items-center justify-end gap-2">
+    <div aria-busy={isBusy} className="ms-auto flex items-center justify-end gap-2">
       {/* The current state, as TEXT. The variant only tones it - the label is what carries the
           meaning for anyone who cannot distinguish these colours, and on this screen the state IS
-          the information. */}
+          the information. It is also the reading a screen-reader user actually takes the state from,
+          because the menu row that marks it is disabled and therefore not reachable by keyboard. */}
       <Badge variant={COMMENT_STATUS_BADGE_VARIANTS[comment.status]}>
         {MODERATION_STATE_LABELS[comment.status]}
       </Badge>
 
-      <DropdownMenu open={isMenuOpen} onOpenChange={setIsMenuOpen}>
+      <DropdownMenu open={isMenuOpen} onOpenChange={handleMenuOpenChange}>
         <DropdownMenuTrigger asChild>
           {/* `asChild` so the menu's `aria-haspopup`, `aria-expanded` and keyboard handlers land on
               this Button instead of a second, competing one. No `id` is passed, here or through the
@@ -546,8 +679,19 @@ export function CommentModerationActions({
               specified: `size="sm"` exists precisely for these dense admin row actions - a 44px
               control in every cell of every column would make the moderation table unusable - and
               button.tsx carries the same flag on that size. Implemented as specified and flagged for
-              designer review rather than silently enlarged. */}
-          <Button variant="ghost" size="sm" className="w-8 shrink-0 px-0">
+              designer review rather than silently enlarged.
+
+              `aria-disabled` rather than `disabled` while a write is on the wire, and the primitive
+              supplies both halves of that: it is announced, and its own
+              `aria-disabled:pointer-events-none` makes the control inert to the pointer. Keeping the
+              element focusable is the point - see `handleMenuOpenChange`, which refuses the keyboard
+              path `pointer-events` cannot gate. */}
+          <Button
+            aria-disabled={isBusy || undefined}
+            variant="ghost"
+            size="sm"
+            className="w-8 shrink-0 px-0"
+          >
             <MoreHorizontal aria-hidden="true" />
             {/* The control's whole accessible name, and it identifies the RECORD. Visually hidden
                 rather than an `aria-label`, which is the pattern the layout components use. */}
@@ -571,33 +715,50 @@ export function CommentModerationActions({
               deletion below them is a different kind of act. The primitive layer offers no
               separator or label part, so the group's own accessible name does that work. */}
           <DropdownMenuGroup aria-label={MODERATION_GROUP_LABEL}>
-            <DropdownMenuItem
-              disabled={isApproved || moderation.isPending}
-              onSelect={(): void => {
-                moderation.mutate(APPROVED_STATUS);
-              }}
-            >
-              {isApproved ? <Check aria-hidden="true" /> : <CircleCheck aria-hidden="true" />}
-              {isApproved
-                ? `${MODERATION_STATE_LABELS[APPROVED_STATUS]}${CURRENT_STATE_SUFFIX}`
-                : APPROVE_LABEL}
-            </DropdownMenuItem>
+            {/* One row per member of the moderation union, in the order the service declares them,
+                so every transition the endpoint accepts is reachable - including the return to
+                review that makes a rejection reversible. Generated rather than written out, which is
+                what keeps the menu and the union from drifting apart again. */}
+            {COMMENT_STATUSES.map((status) => {
+              const isCurrent = status === comment.status;
+              const DestinationIcon = MODERATION_ACTION_ICONS[status];
 
-            <DropdownMenuItem
-              disabled={isRejected || moderation.isPending}
-              onSelect={(): void => {
-                moderation.mutate(REJECTED_STATUS);
-              }}
-            >
-              {isRejected ? <Check aria-hidden="true" /> : <Ban aria-hidden="true" />}
-              {isRejected
-                ? `${MODERATION_STATE_LABELS[REJECTED_STATUS]}${CURRENT_STATE_SUFFIX}`
-                : REJECT_LABEL}
-            </DropdownMenuItem>
+              return (
+                <DropdownMenuItem
+                  // The programmatic half of "you are already here". The visible half is the tick
+                  // and the suffix beside it, and the pill in the cell carries it a third time,
+                  // because a disabled row is not reachable by keyboard.
+                  aria-current={isCurrent ? 'true' : undefined}
+                  // Non-actionable when it is the state the comment is already in - the service
+                  // treats that as an accepted no-op, but a request that cannot change anything is
+                  // not worth offering - and inert for EVERY row while either write is on the wire.
+                  // The primitive turns this into `data-disabled`, dims the row and drops it out of
+                  // arrow-key and typeahead traversal.
+                  disabled={isCurrent || isBusy}
+                  key={status}
+                  onSelect={(): void => {
+                    moderation.mutate(status);
+                  }}
+                >
+                  {isCurrent ? (
+                    <Check aria-hidden="true" />
+                  ) : (
+                    <DestinationIcon aria-hidden="true" />
+                  )}
+                  {isCurrent
+                    ? `${MODERATION_STATE_LABELS[status]}${CURRENT_STATE_SUFFIX}`
+                    : MODERATION_ACTION_LABELS[status]}
+                </DropdownMenuItem>
+              );
+            })}
           </DropdownMenuGroup>
 
           <DropdownMenuItem
             variant="destructive"
+            // Inert while EITHER write is on the wire. This row is the one the previous version left
+            // live throughout a moderation transition, which is how two conflicting administrative
+            // writes could be launched a moment apart.
+            disabled={isBusy}
             onSelect={(event: Event): void => {
               // See the module header: without this the closing menu and the mounting dialog race
               // for focus, and the dialog loses.
@@ -617,19 +778,11 @@ export function CommentModerationActions({
           Escape.
 
           Every dismissal - Escape, the scrim, Cancel, the corner control - arrives here as
-          `onOpenChange(false)` and closes the menu with it. */}
-      <Dialog
-        open={isConfirmingDeletion}
-        onOpenChange={(open: boolean): void => {
-          if (open) {
-            setIsConfirmingDeletion(true);
-
-            return;
-          }
-
-          closeConfirmation();
-        }}
-      >
+          `onOpenChange(false)` and closes the menu with it, unless the removal is already on the
+          wire: see `handleConfirmationOpenChange`, which is the one place all five exits are gated.
+          The corner control in particular can only be neutralised here, because `DialogContent`
+          renders it for itself and takes no `disabled` from a caller. */}
+      <Dialog open={isConfirmingDeletion} onOpenChange={handleConfirmationOpenChange}>
         {/* Focus restoration is deliberately handed to the MENU. This dialog would aim at the
             element focused before it opened - the destructive menu item - which unmounts in the same
             commit as the dialog, so restoring to it lands on `<body>`: measured, and it left a
@@ -677,21 +830,30 @@ export function CommentModerationActions({
           {/* `flex-wrap` rather than a breakpoint variant: the two labels sit side by side wherever
               they fit and stack where they do not, at every width, with no media query. */}
           <div className="flex flex-wrap justify-end gap-2">
+            {/* Disabled while the removal is in flight, matching the confirm control beside it.
+                Offering a way out of a request that cannot be recalled would misrepresent what
+                cancelling does, and the guard on `onOpenChange` refuses the dismissal anyway - so a
+                live Cancel would be a control that visibly does nothing. */}
             <DialogClose asChild>
-              <Button variant="secondary">{CANCEL_LABEL}</Button>
+              <Button disabled={isDeleting} variant="secondary">
+                {CANCEL_LABEL}
+              </Button>
             </DialogClose>
 
-            {/* Disabled while in flight, so the request cannot be issued twice, and RELABELLED so
-                the pending state is announced rather than only dimmed. */}
+            {/* Disabled on `isBusy` rather than on this mutation alone, so the removal cannot be
+                started while a moderation transition on the same record is still in flight - the
+                two requests would otherwise race and the service would decide the outcome. Also
+                RELABELLED, so the pending state is announced rather than only dimmed. */}
             <Button
+              aria-busy={isDeleting}
               variant="destructive"
-              disabled={deletion.isPending}
+              disabled={isBusy}
               onClick={(): void => {
                 deletion.mutate();
               }}
             >
               <Trash2 aria-hidden="true" />
-              {deletion.isPending ? DELETE_PENDING_LABEL : DELETE_LABEL}
+              {isDeleting ? DELETE_PENDING_LABEL : DELETE_LABEL}
             </Button>
           </div>
         </DialogContent>

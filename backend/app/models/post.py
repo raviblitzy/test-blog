@@ -277,11 +277,20 @@ class PostStatus(enum.StrEnum):
     """
 
     DRAFT = "DRAFT"
-    """Authored but not public: the state every post is created in.
+    """Authored but not public: the state every post is created in, and the state unpublishing
+    returns it to.
 
     Invisible to the feed, to a category filter and to a public profile, and readable only by
-    its author or an administrator. Carries no ``published_at``, which the table's ``CHECK``
-    constraint permits and the publish transition supplies.
+    its author or an administrator.
+
+    ``published_at`` may or may not be set, and which it is carries meaning. A post created and
+    never published has none. A post that was published and then unpublished **keeps** the instant
+    it first went public: the column records *when this became public*, and ``status`` alone records
+    *whether it is public now*, so clearing it would destroy the only record of the original
+    publication and would let an unpublish-then-republish cycle present old writing as new. The
+    table's ``CHECK`` constrains only :attr:`PUBLISHED` - it requires an instant there and says
+    nothing about this state - which is exactly what permits both shapes. A null
+    ``published_at`` therefore means "never published" rather than "not published now".
     """
 
     PUBLISHED = "PUBLISHED"

@@ -71,7 +71,7 @@ Absence is reported as ``None`` (:meth:`~CategoryRepository.get_by_slug`,
 :meth:`~CategoryRepository.get_by_name`), as ``False``
 (:meth:`~CategoryRepository.is_in_use`), as ``0``
 (:meth:`~CategoryRepository.count_categories`) or as an empty collection
-(:meth:`~CategoryRepository.list_all`, :meth:`~CategoryRepository.list_paginated`,
+(:meth:`~CategoryRepository.list_all`, :meth:`~CategoryRepository.list_with_post_counts`,
 :meth:`~CategoryRepository.slugs_starting_with`). No HTTP status code is chosen, no framework
 HTTP exception is constructed and no domain exception is emitted. The service this schema
 replaces did the opposite: it constructed a framework not-found exception, complete with its
@@ -115,15 +115,18 @@ its tally, un-windowed, and it is what the public ``GET /api/v1/categories`` is 
 ``CategoryService.list_with_post_counts``. That route answers with a bare JSON array - the one
 documented exception to the page envelope in this API - because the list *is* the home page's
 filter control, and a control offering only some terms would silently hide every post filed
-exclusively under the rest.
+exclusively under the rest. It is also the only *collection* this relation publishes: the
+administrative surface owns the three writes and no listing of its own, so nothing here is
+windowed and no second read of the taxonomy exists to disagree with the public one.
 
-:meth:`~CategoryRepository.list_paginated` is the windowed, text-filterable counterpart, and it
-serves the administrator-only ``GET /api/v1/admin/categories`` through
-``CategoryService.list_paginated``. It returns a plain ``(rows, total)`` tuple, exactly as
-:meth:`~app.repositories.base.BaseRepository.paginate` does. It does **not** build the ``Page``
-envelope and this module does not import ``app/core/pagination.py`` at all. ``Page`` is a wire
-shape, and keeping wire shapes out of the data layer is what layered separation means in
-practice; the service projects the rows into response models and calls its ``build_page`` helper to
+There is no windowed counterpart, and that is the AAP's surface rather than an omission: the
+administrative categories screen reads the same bare array (§0.6.2 declares create, rename and
+delete for a category and no privileged listing), so this relation has exactly one read and the
+two screens cannot disagree about it. Every method here returns entities or plain tuples and
+none builds the ``Page`` envelope; this module does not import ``app/core/pagination.py`` at
+all. ``Page`` is a wire shape, and keeping wire shapes out of the data layer is what layered
+separation means in practice; a service projects rows into response models and calls its
+``build_page`` helper to
 produce the five-field envelope (``items``, ``total``, ``page``, ``page_size``, ``pages``) that
 every *paginated* list endpoint serialises.
 
@@ -147,13 +150,14 @@ addressed operation was a linear scan in which a miss always traversed the whole
   ``ix_post_categories_category_id`` for the two join steps, and
   ``ix_posts_status_published_at`` for the status predicate on the joined side, which is the
   same composite index the home feed's "recent published posts" ordering is built on.
-* :meth:`~CategoryRepository.list_all` and :meth:`~CategoryRepository.list_paginated` sort by
-  ``name``, which has its own unique index; the administrative text filter is a containment match,
-  served by the two GIN trigram indexes ``ix_categories_name_trgm`` and
-  ``ix_categories_slug_trgm``, which revision ``0002`` builds. Those two also serve the anchored
-  family scan in :meth:`~CategoryRepository.slugs_starting_with`, which no b-tree over a ``citext``
-  column can answer - see "Case sensitivity is the column's business" below for why the slug side
-  of both predicates is written against the text cast.
+* :meth:`~CategoryRepository.list_all` and :meth:`~CategoryRepository.list_with_post_counts`
+  sort by ``name``, which has its own unique index. ``ix_categories_slug_trgm``, which revision
+  ``0002`` builds, exists for exactly one predicate - the anchored family scan in
+  :meth:`~CategoryRepository.slugs_starting_with`, which no b-tree over a ``citext`` column can
+  answer - see "Case sensitivity is the column's business" below for why that predicate is written
+  against the text cast. There is deliberately no trigram index over ``name``: nothing reads that
+  column by containment, so one would be write amplification on every insert and rename with no
+  query it could serve.
 
 Case sensitivity is the column's business
 -----------------------------------------
@@ -164,14 +168,13 @@ correctness requirement rather than a preference: wrapping the column would make
 non-sargable and the unique index unusable, turning an index lookup into a sequential scan
 while duplicating a guarantee the column type already provides.
 
-The two **pattern** predicates are the exception, and they prove the rule rather than break it.
-:meth:`~CategoryRepository.list_paginated`'s containment search and
-:meth:`~CategoryRepository.slugs_starting_with`'s family scan compare ``slug::text``, not ``slug``,
+The **pattern** predicate is the exception, and it proves the rule rather than breaks it.
+:meth:`~CategoryRepository.slugs_starting_with`'s family scan compares ``slug::text``, not ``slug``,
 because ``ix_categories_slug_trgm`` is a GIN trigram index over that expression - and it has to be,
 since ``gin_trgm_ops`` is defined over ``text`` while citext's own ``~~``/``~~*`` operators are not
 in that operator family, so an index on the bare column would be accepted by PostgreSQL and never
-chosen. Neither predicate is an equality lookup, so neither had a usable index to give up; the cast
-is what gives them one. And because casting to ``text`` discards precisely the case-folding the
+chosen. It is not an equality lookup, so it had no usable index to give up; the cast
+is what gives it one. And because casting to ``text`` discards precisely the case-folding the
 column type was providing, both are written with ``ILIKE``, which restores it - so the result sets
 are identical to the pre-cast ones, verified on PostgreSQL 18.4 against mixed-case stored slugs.
 The equality lookups in :meth:`~CategoryRepository.get_by_slug` and
@@ -192,7 +195,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Final
 
-from sqlalchemy import ColumnElement, Text, and_, cast, func, literal, or_, select
+from sqlalchemy import ColumnElement, Text, and_, cast, func, literal, select
 
 from app.models.category import Category, post_categories
 from app.models.post import Post, PostStatus
@@ -247,9 +250,8 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
 
         repository = CategoryRepository(session)
 
-        # GET /api/v1/categories and GET /api/v1/admin/categories - one windowed statement,
-        # and one aggregate for the tallies. Never one count per row.
-        rows, total = await repository.list_paginated(q=None, limit=20, offset=0)
+        # GET /api/v1/categories - one aggregate for the whole taxonomy and its tallies.
+        # Never one count per row.
         counted = await repository.list_with_post_counts()
 
         # Creating a category: the service derives the slug, this class stores it.
@@ -257,7 +259,7 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
         slug = unique_slug(base, await repository.slugs_starting_with(base))
         category = await repository.add(Category(name=payload.name, slug=slug))
 
-    Seven inherited members carry the generic mechanics and none of them is re-implemented
+    Six inherited members carry the generic mechanics and none of them is re-implemented
     here: :meth:`~app.repositories.base.BaseRepository.get_by_id` is the one identity predicate
     in the codebase, :meth:`~app.repositories.base.BaseRepository.get_or_none` is the
     natural-key lookup :meth:`get_by_slug` and :meth:`get_by_name` delegate to,
@@ -267,11 +269,12 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
     :meth:`~app.repositories.base.BaseRepository.save` renames,
     :meth:`~app.repositories.base.BaseRepository.delete` removes - relying on
     ``ON DELETE CASCADE`` for the filings, which is exactly why it must be reached through
-    :meth:`get_for_update` and :meth:`is_in_use` rather than on its own - and
-    :meth:`~app.repositories.base.BaseRepository.paginate` windows for
-    :meth:`list_paginated`.
+    :meth:`get_for_update` and :meth:`is_in_use` rather than on its own.
 
-    One inherited member is deliberately *not* used.
+    Two inherited members are deliberately *not* used.
+    :meth:`~app.repositories.base.BaseRepository.paginate` has no caller here, because this
+    relation has no windowed read - the AAP's surface gives the taxonomy one read, the bare
+    array behind ``GET /api/v1/categories``. And
     :meth:`~app.repositories.base.BaseRepository.exists` builds its probe with
     ``select_from(self.model)``, which is ``categories``; :meth:`is_in_use` has to probe
     ``post_categories`` instead, so it composes its own ``EXISTS`` in the same shape rather than
@@ -343,9 +346,10 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
     async def list_all(self) -> Sequence[Category]:
         """Return the entire taxonomy, ordered by display name.
 
-        Unpaginated on purpose, and **not** the listing either category collection serves - both
-        of those window through :meth:`list_paginated`. This one exists for the caller that needs
-        the taxonomy as a lookup rather than as a page: ``post_service`` indexes it by identifier
+        Unpaginated on purpose, and **not** the listing the public collection serves - that one
+        carries tallies and comes from :meth:`list_with_post_counts`. This one exists for the caller
+        that needs the taxonomy as a lookup rather than as a listing: ``post_service`` indexes it by
+        identifier
         to validate every category a post is being filed under in one statement instead of probing
         once per identifier. A reference taxonomy is bounded by editorial effort rather than by
         user input, so reading all of it for that purpose has no growth curve to defend against.
@@ -491,78 +495,6 @@ class CategoryRepository(UUIDPrimaryKeyRepository[Category]):
 
         result = await self.session.execute(stmt)
         return result.tuples().all()
-
-    async def list_paginated(
-        self, *, q: str | None = None, limit: int, offset: int
-    ) -> tuple[Sequence[Category], int]:
-        """Window the taxonomy, optionally filtered by text.
-
-        Backs the administrator-only ``GET /api/v1/admin/categories``, reached through
-        ``CategoryService.list_paginated``. It is the *only* category collection that is windowed:
-        the public ``GET /api/v1/categories`` is built from :meth:`list_with_post_counts` and
-        answers with a bare array, because that list is the home page's filter control and a
-        windowed control could hide posts. Unlike :meth:`list_all`, which returns the taxonomy as a
-        lookup for a bulk membership check, this is the surface a client pages through - and unlike
-        :meth:`list_with_post_counts`, it carries no tally, so the service attaches one for the
-        identifiers on the page it returned.
-
-        Args:
-            q: Optional search text, matched as a case-insensitive containment against both
-                ``name`` and ``slug`` - an administrator looking for a term should find it by
-                either spelling. ``None``, an empty string and whitespace alone all mean "no
-                filter"; a blank search box must not be treated as a search for nothing.
-                Wildcards in the text are escaped, so ``100%`` searches for that literal name.
-            limit: Rows per page. Request-supplied values are already bounded to ``1..100`` by
-                ``PageParams`` before they reach here.
-            offset: Rows to skip.
-
-        Returns:
-            ``(rows, total)``: the categories on this page ascending by ``name``, and how many
-            match the filter in total. Deliberately not a ``Page`` - the module docstring
-            records why that wire shape belongs to the service layer.
-
-        Note:
-            An out-of-range page is not an error. An ``offset`` beyond ``total`` returns an
-            empty sequence beside the real ``total``, which is how a client detects it has run
-            off the end of the table.
-
-            No explicit ``count_stmt`` is supplied, and none is needed: this statement joins
-            nothing, so it cannot multiply rows and the count derived from it by
-            :meth:`~app.repositories.base.BaseRepository.paginate` is exact by construction.
-
-            ``ILIKE`` is a native PostgreSQL operator, so nothing here renders as a SQL
-            ``LOWER`` call - which matters, because wrapping either column in a function is what
-            would put the trigram indexes behind these two predicates out of reach.
-
-            It is applied to both columns, but for different reasons on each. On ``name`` it states
-            the case-insensitive intent over a plain ``TEXT`` column. On ``slug`` it is a
-            requirement: that column is ``CITEXT`` and folded case for free, but the predicate is
-            written against ``slug::text`` in order to match the expression
-            ``ix_categories_slug_trgm`` is built on, and the cast discards the folding, so ``ILIKE``
-            is what puts it back. The comment at each term records which case applies.
-        """
-        stmt = select(Category)
-
-        term = q.strip() if q is not None else ""
-        if term:
-            pattern = f"%{_escape_like_wildcards(term)}%"
-            stmt = stmt.where(
-                or_(
-                    # `name` is TEXT, so `ix_categories_name_trgm` is declared straight on the
-                    # column and this predicate needs nothing added to reach it.
-                    Category.name.ilike(pattern, escape=_LIKE_ESCAPE_CHARACTER),
-                    # `slug` is CITEXT, and `ix_categories_slug_trgm` therefore indexes the text
-                    # CAST: `gin_trgm_ops` is defined over `text`, and citext's own `~~`/`~~*`
-                    # operators are not in that operator family, so an index on the bare column
-                    # would be accepted by PostgreSQL and never chosen. The predicate is spelled
-                    # the way the index is. `ilike` stays `ilike` and is now load-bearing rather
-                    # than merely expressive - the cast discards citext's case-folding, so `like`
-                    # here would silently become a case-sensitive search.
-                    cast(Category.slug, Text).ilike(pattern, escape=_LIKE_ESCAPE_CHARACTER),
-                )
-            )
-
-        return await self.paginate(stmt.order_by(Category.name.asc()), limit=limit, offset=offset)
 
     async def count_categories(self) -> int:
         """Count every category in the taxonomy.

@@ -111,9 +111,9 @@ while the process is still starting rather than at the first login attempt.
 from collections.abc import Callable
 from typing import Any, Final, Protocol
 
+from fastapi import Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from starlette.requests import Request
 
 from app.core.config import settings
 from app.core.logging import client_claim_is_forwarded

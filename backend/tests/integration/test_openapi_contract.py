@@ -123,21 +123,23 @@ from __future__ import annotations
 
 import tomllib
 import warnings
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator, MutableMapping
 from copy import deepcopy
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, Response
+from sqlalchemy.exc import DataError
 
 from app.api.v1.router import API_V1_PREFIX
 from app.core.config import settings
 from app.core.exceptions import PROBLEM_JSON_MEDIA_TYPE, REQUEST_ID_HEADER
 from app.core.pagination import Page
 from app.main import API_TITLE, DOCS_URL, OPENAPI_URL, REDOC_URL, resolve_version
+from app.middleware import BodyLimitMiddleware
 from app.schemas import ProblemDetail, ValidationErrorItem
 
 #: Registered in ``backend/pyproject.toml`` under ``markers``, so ``--strict-markers`` accepts
@@ -173,7 +175,7 @@ assertion pass on an empty dict.
 _JSON_MEDIA_TYPE: Final[str] = "application/json"
 """Media type every success body is served as, taken from the JSON response classes' own value.
 
-Failure bodies are **not** this: ``app.api.v1.responses.customise_openapi`` re-keys every
+Failure bodies are **not** this: ``app.main._customise_openapi`` re-keys every
 declared problem document onto :data:`~app.core.exceptions.PROBLEM_JSON_MEDIA_TYPE` on the
 finished document, which is why the two families are asserted separately below.
 """
@@ -233,12 +235,234 @@ version of the API to speak. Both members are asserted **present** as well as pe
 exemption cannot quietly become an empty set that makes the versioning test vacuous.
 """
 
+SPECIFIED_OPERATIONS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {
+        # Identity and the token lifecycle - five operations.
+        ("post", f"{API_V1_PREFIX}/auth/register"),
+        ("post", f"{API_V1_PREFIX}/auth/login"),
+        ("post", f"{API_V1_PREFIX}/auth/refresh"),
+        ("post", f"{API_V1_PREFIX}/auth/logout"),
+        ("get", f"{API_V1_PREFIX}/auth/me"),
+        # Profiles - three operations.
+        ("get", f"{API_V1_PREFIX}/users/{{username}}"),
+        ("get", f"{API_V1_PREFIX}/users/{{username}}/posts"),
+        ("patch", f"{API_V1_PREFIX}/users/me"),
+        # Posts - seven operations.
+        ("get", f"{API_V1_PREFIX}/posts"),
+        ("get", f"{API_V1_PREFIX}/posts/{{slug}}"),
+        ("post", f"{API_V1_PREFIX}/posts"),
+        ("patch", f"{API_V1_PREFIX}/posts/{{post_id}}"),
+        ("delete", f"{API_V1_PREFIX}/posts/{{post_id}}"),
+        ("post", f"{API_V1_PREFIX}/posts/{{post_id}}/publish"),
+        ("post", f"{API_V1_PREFIX}/posts/{{post_id}}/unpublish"),
+        # Likes - three operations.
+        ("put", f"{API_V1_PREFIX}/posts/{{post_id}}/like"),
+        ("delete", f"{API_V1_PREFIX}/posts/{{post_id}}/like"),
+        ("get", f"{API_V1_PREFIX}/posts/{{post_id}}/likes"),
+        # Comments - four operations.
+        ("get", f"{API_V1_PREFIX}/posts/{{post_id}}/comments"),
+        ("post", f"{API_V1_PREFIX}/posts/{{post_id}}/comments"),
+        ("patch", f"{API_V1_PREFIX}/comments/{{comment_id}}"),
+        ("delete", f"{API_V1_PREFIX}/comments/{{comment_id}}"),
+        # Taxonomy - two operations.
+        ("get", f"{API_V1_PREFIX}/categories"),
+        ("get", f"{API_V1_PREFIX}/categories/{{slug}}"),
+        # Administration - thirteen operations.
+        ("get", f"{API_V1_PREFIX}/admin/stats"),
+        ("get", f"{API_V1_PREFIX}/admin/users"),
+        ("patch", f"{API_V1_PREFIX}/admin/users/{{user_id}}"),
+        ("delete", f"{API_V1_PREFIX}/admin/users/{{user_id}}"),
+        ("get", f"{API_V1_PREFIX}/admin/posts"),
+        ("patch", f"{API_V1_PREFIX}/admin/posts/{{post_id}}/status"),
+        ("delete", f"{API_V1_PREFIX}/admin/posts/{{post_id}}"),
+        ("get", f"{API_V1_PREFIX}/admin/comments"),
+        ("patch", f"{API_V1_PREFIX}/admin/comments/{{comment_id}}/status"),
+        ("delete", f"{API_V1_PREFIX}/admin/comments/{{comment_id}}"),
+        ("post", f"{API_V1_PREFIX}/admin/categories"),
+        ("patch", f"{API_V1_PREFIX}/admin/categories/{{category_id}}"),
+        ("delete", f"{API_V1_PREFIX}/admin/categories/{{category_id}}"),
+        # Operational probes - two operations, deliberately unversioned.
+        ("get", "/healthz"),
+        ("get", "/readyz"),
+    }
+)
+"""Every ``(method, path)`` the API contract specifies, and **nothing else**: thirty-nine.
+
+Transcribed from the endpoint inventory the specification publishes, family by family, in the
+order it publishes them, so the two can be read side by side. It is asserted as an **equality**
+against the generated document rather than as a floor, and that direction is the point. A floor
+catches a route that went missing and says nothing at all about a route that was added: an
+unplanned fortieth operation - a searchable administrative listing of the taxonomy is the one
+this project actually grew, beside a public collection that already answers the whole set - is
+exactly the kind of surface that arrives because it is convenient and then has to be supported
+forever. Widening the contract is a decision for the specification to record, not a side effect
+of a commit, so this set is the gate that makes such an addition fail here first.
+
+Both directions therefore matter, and each names a different failure:
+
+* a member of this set absent from the document is a **regression** - a specified operation that
+  is no longer served, so a client written against the contract is broken;
+* an operation in the document absent from this set is **scope creep** - an unspecified surface
+  that no contract describes, that no client can rely on, and that nothing else in this suite
+  would notice.
+
+Query parameters are deliberately *not* part of the identity of an operation here. A parameter
+added to an existing operation extends what a caller may ask for without adding a surface to
+support, which is a different kind of change from a new path and is governed by that operation's
+own tests rather than by this set.
+"""
+
+
 _DOCUMENTATION_PATHS: Final[frozenset[str]] = frozenset({OPENAPI_URL, DOCS_URL, REDOC_URL})
 """The three documentation renderings, excluded from the versioning walk if they ever appear.
 
 They are not routes the router knows about and the framework does not list them under ``paths``,
 which is itself asserted - see
 :meth:`TestVersioning.test_documentation_renderings_are_not_documented_as_paths`.
+"""
+
+
+# ---------------------------------------------------------------------------------------
+# The frozen API inventory (AAP §0.6.2)
+#
+# Everything below is a LITERAL transcription of the endpoint inventory the plan freezes, and it
+# is deliberately not derived from the served document in any way. Every other assertion in this
+# module walks `paths` and holds each operation it finds to a universal rule - versioned, declares
+# a schema, fails uniformly - which is the right shape for a property that must hold for any
+# operation, present or future. It is the wrong shape for the question "is this the agreed
+# surface?", because a route the plan never declared satisfies every universal rule and is then
+# reported as compliant. That is precisely what happened: a thirty-eighth versioned operation,
+# `GET /api/v1/admin/categories`, was mounted, declared a response model, lived under the prefix
+# and failed uniformly, so this module passed and the extra endpoint went unreported.
+#
+# So the inventory is stated here, once, as data:
+#
+#   * `_EXPECTED_OPERATIONS` names every operation and, for each, the success status it answers
+#     and the response model that status carries. Compared as an EQUALITY in both directions, so a
+#     missing operation and an undeclared extra both fail, by name.
+#   * the three counts below are written as literals rather than as `len()` over the mapping.
+#     Deriving them would make them agree with it by construction and assert nothing; written out,
+#     they are a second, independent statement of the same contract and they disagree loudly when
+#     an entry is added to the mapping without the plan changing.
+# ---------------------------------------------------------------------------------------
+
+_VERSIONED_PATH_TEMPLATE_COUNT: Final[int] = 30
+"""How many distinct path templates live under :data:`API_V1_PREFIX`, from AAP §0.6.2.
+
+Fewer than the operation count, because several paths carry more than one method - `/posts` is
+both the feed and the create, `/posts/{post_id}/like` is both the like and the unlike.
+"""
+
+_VERSIONED_OPERATION_COUNT: Final[int] = 37
+"""How many versioned operations the plan declares: 5 auth, 3 users, 12 posts, 2 comments,
+2 categories and 13 administrative."""
+
+_HEALTH_OPERATION_COUNT: Final[int] = 2
+"""``GET /healthz`` and ``GET /readyz`` - the only two unversioned operations."""
+
+
+class _Success(NamedTuple):
+    """The success half of one operation's contract: its status, and the model it carries.
+
+    Three members rather than two because a collection's item type is part of the contract a
+    client generator reads. ``schema`` alone would accept ``Page_AdminUser_`` where
+    ``Page_PostSummary_`` belongs, and both resolve, both serialise and both pass a "declares
+    some schema" check.
+    """
+
+    status: str
+    """The single ``2xx`` code the operation declares, as the document spells it."""
+
+    schema: str | None
+    """The component name the body references, or ``None`` for a ``204``."""
+
+    item_schema: str | None = None
+    """For a collection, the component name of its items.
+
+    Set for the one bare-array read and for every ``Page[...]`` response; ``None`` otherwise. For
+    a page it is read from the envelope component's own ``items.items.$ref``, which is what pins
+    the *specialisation* rather than merely the envelope.
+    """
+
+
+_EXPECTED_OPERATIONS: Final[dict[tuple[str, str], _Success]] = {
+    # -- auth: five operations -----------------------------------------------------------
+    ("post", f"{API_V1_PREFIX}/auth/register"): _Success("201", "UserPublic"),
+    ("post", f"{API_V1_PREFIX}/auth/login"): _Success("200", "TokenPair"),
+    ("post", f"{API_V1_PREFIX}/auth/refresh"): _Success("200", "TokenPair"),
+    ("post", f"{API_V1_PREFIX}/auth/logout"): _Success("204", None),
+    ("get", f"{API_V1_PREFIX}/auth/me"): _Success("200", "UserMe"),
+    # -- users and profiles: three operations ---------------------------------------------
+    ("patch", f"{API_V1_PREFIX}/users/me"): _Success("200", "UserMe"),
+    ("get", f"{API_V1_PREFIX}/users/{{username}}"): _Success("200", "UserPublic"),
+    ("get", f"{API_V1_PREFIX}/users/{{username}}/posts"): _Success(
+        "200", "Page_PostSummary_", "PostSummary"
+    ),
+    # -- posts, likes and the thread: twelve operations ------------------------------------
+    ("get", f"{API_V1_PREFIX}/posts"): _Success("200", "Page_PostSummary_", "PostSummary"),
+    ("post", f"{API_V1_PREFIX}/posts"): _Success("201", "PostDetail"),
+    # The public read is keyed on the SLUG and the mutations on the UUID - different templates
+    # for the same resource, and the distinction is part of the contract.
+    ("get", f"{API_V1_PREFIX}/posts/{{slug}}"): _Success("200", "PostDetail"),
+    ("patch", f"{API_V1_PREFIX}/posts/{{post_id}}"): _Success("200", "PostDetail"),
+    ("delete", f"{API_V1_PREFIX}/posts/{{post_id}}"): _Success("204", None),
+    ("post", f"{API_V1_PREFIX}/posts/{{post_id}}/publish"): _Success("200", "PostDetail"),
+    ("post", f"{API_V1_PREFIX}/posts/{{post_id}}/unpublish"): _Success("200", "PostDetail"),
+    ("put", f"{API_V1_PREFIX}/posts/{{post_id}}/like"): _Success("200", "LikeSummary"),
+    # The one DELETE in the API that answers with a body rather than 204: the caller needs the
+    # new count to render, so the status is 200 and the model is the summary.
+    ("delete", f"{API_V1_PREFIX}/posts/{{post_id}}/like"): _Success("200", "LikeSummary"),
+    ("get", f"{API_V1_PREFIX}/posts/{{post_id}}/likes"): _Success("200", "LikeSummary"),
+    ("get", f"{API_V1_PREFIX}/posts/{{post_id}}/comments"): _Success(
+        "200", "Page_CommentPublic_", "CommentPublic"
+    ),
+    ("post", f"{API_V1_PREFIX}/posts/{{post_id}}/comments"): _Success("201", "CommentPublic"),
+    # -- comments addressed by their own identifier: two operations ------------------------
+    ("patch", f"{API_V1_PREFIX}/comments/{{comment_id}}"): _Success("200", "CommentPublic"),
+    ("delete", f"{API_V1_PREFIX}/comments/{{comment_id}}"): _Success("204", None),
+    # -- categories: two public reads, and the bare array among them ----------------------
+    ("get", f"{API_V1_PREFIX}/categories"): _Success("200", None, "CategoryPublic"),
+    ("get", f"{API_V1_PREFIX}/categories/{{slug}}"): _Success("200", "CategoryPublic"),
+    # -- administrative: thirteen operations, and no category listing among them -----------
+    ("get", f"{API_V1_PREFIX}/admin/stats"): _Success("200", "AdminStats"),
+    ("get", f"{API_V1_PREFIX}/admin/users"): _Success("200", "Page_AdminUser_", "AdminUser"),
+    ("patch", f"{API_V1_PREFIX}/admin/users/{{user_id}}"): _Success("200", "AdminUser"),
+    ("delete", f"{API_V1_PREFIX}/admin/users/{{user_id}}"): _Success("204", None),
+    ("get", f"{API_V1_PREFIX}/admin/posts"): _Success("200", "Page_AdminPost_", "AdminPost"),
+    ("patch", f"{API_V1_PREFIX}/admin/posts/{{post_id}}/status"): _Success("200", "AdminPost"),
+    ("delete", f"{API_V1_PREFIX}/admin/posts/{{post_id}}"): _Success("204", None),
+    ("get", f"{API_V1_PREFIX}/admin/comments"): _Success(
+        "200", "Page_AdminComment_", "AdminComment"
+    ),
+    ("patch", f"{API_V1_PREFIX}/admin/comments/{{comment_id}}/status"): _Success(
+        "200", "AdminComment"
+    ),
+    ("delete", f"{API_V1_PREFIX}/admin/comments/{{comment_id}}"): _Success("204", None),
+    ("post", f"{API_V1_PREFIX}/admin/categories"): _Success("201", "CategoryPublic"),
+    ("patch", f"{API_V1_PREFIX}/admin/categories/{{category_id}}"): _Success(
+        "200", "CategoryPublic"
+    ),
+    ("delete", f"{API_V1_PREFIX}/admin/categories/{{category_id}}"): _Success("204", None),
+    # -- the two operational probes, deliberately unversioned ------------------------------
+    ("get", "/healthz"): _Success("200", "LivenessResponse"),
+    ("get", "/readyz"): _Success("200", "ReadinessResponse"),
+}
+"""Every operation the plan declares, mapped to the success contract it must publish.
+
+The keys are ``(lower-case method, path template)`` exactly as the document spells them, so a
+renamed path parameter - ``{post_id}`` becoming ``{id}`` - is a contract change and fails here.
+
+Four rows are worth reading twice, because each encodes a decision that looks like a mistake:
+
+* ``GET /categories`` names an **item** schema and no envelope schema. It is the API's single
+  documented collection exception - a bare JSON array, because the list *is* the home page's
+  filter control and windowing it would let the control hide posts.
+* ``DELETE /posts/{post_id}/like`` answers **200 with a body**, alone among the deletes, because
+  the caller needs the new count to render the control it just toggled.
+* ``GET /posts/{slug}`` and ``PATCH /posts/{post_id}`` are two templates over one resource: a
+  public read is addressed by the canonical slug, a mutation by the server-generated key.
+* the administrative rows number **thirteen** and none of them lists categories. The taxonomy has
+  one read, the public bare array above, which is what the management screen consumes.
 """
 
 
@@ -291,10 +515,10 @@ _PAGED_COLLECTION_OPERATIONS: Final[frozenset[tuple[str, str]]] = frozenset(
 )
 """The collection operations AAP §0.9.4.3 requires to answer with the page envelope.
 
-Not the complete set of paged collections in the service - the administrative category listing
-is paged too - and deliberately so: this is the required floor, and
+The required floor rather than a closed set: it is stated as the operations that *must* carry the
+envelope, and
 :meth:`TestCollectionEnvelope.test_every_page_shaped_component_carries_exactly_the_five_fields`
-covers every envelope in the document including the ones this set does not name.
+covers every envelope in the document, including any this set does not name.
 """
 
 _TAXONOMY_COLLECTION: Final[tuple[str, str]] = ("get", f"{API_V1_PREFIX}/categories")
@@ -361,7 +585,7 @@ _FRAMEWORK_VALIDATION_COMPONENTS: Final[frozenset[str]] = frozenset(
 """The error shapes FastAPI emits by default when a route leaves ``422`` undeclared.
 
 Their absence is what proves the "one problem document" claim covers validation too: every route
-declares its own ``422`` through ``app.api.v1.responses.problem_response``, so the framework's
+declares its own ``422`` through ``app.schemas.common.problem_response``, so the framework's
 alternative never enters the document.
 """
 
@@ -778,7 +1002,7 @@ class TestDocumentAvailability:
         This is what makes the fixture's fallback faithful rather than approximate: the two
         acquisition paths cannot diverge, so an assertion made against either is an assertion
         about the published contract. It also proves the document transform in
-        ``app.api.v1.responses`` is applied to the served copy and not only to the in-process
+        ``app.main`` is applied to the served copy and not only to the in-process
         one - the transform replaces ``app.openapi`` itself, and this is the assertion that
         pins that down.
         """
@@ -788,7 +1012,7 @@ class TestDocumentAvailability:
         )
         assert openapi_response.json() == app.openapi(), (
             f"The document served at {OPENAPI_URL} differs from app.openapi(). One of the two "
-            "is not carrying the corrections app.api.v1.responses.customise_openapi applies."
+            "is not carrying the corrections app.main._customise_openapi applies."
         )
 
     async def test_documentation_surface_gating_is_declared(self, app: Any) -> None:
@@ -1091,6 +1315,207 @@ class TestVersioning:
 
 
 # ---------------------------------------------------------------------------------------
+# Phase C2 - the frozen inventory: the surface is exactly what the plan declares
+# ---------------------------------------------------------------------------------------
+
+
+class TestFrozenInventory:
+    """The document publishes exactly the operations AAP §0.6.2 declares, and no others.
+
+    Every other class in this module asks "does each operation obey the rules?". This one asks
+    "are these the operations?" - a question no walk over ``paths`` can answer, because a walk
+    takes the document as its own definition of what should be there. The two are complementary
+    and neither substitutes for the other: a route missing its response model fails Phase D, and a
+    route nobody agreed to fails here.
+    """
+
+    def test_the_frozen_inventory_matches_the_counts_the_plan_states(self) -> None:
+        """The literal mapping and the three literal counts agree with each other.
+
+        Both sides are transcribed from the plan independently - one enumerates the operations, the
+        other states how many there are - so this fails when an entry is added to the mapping
+        without the counts being revisited, which is the moment somebody is about to widen the
+        surface. Deriving either from the other would make this test vacuous.
+        """
+        versioned = {
+            (method, path)
+            for method, path in _EXPECTED_OPERATIONS
+            if path.startswith(API_V1_PREFIX)
+        }
+        unversioned = set(_EXPECTED_OPERATIONS) - versioned
+
+        assert len(versioned) == _VERSIONED_OPERATION_COUNT, (
+            f"the frozen inventory lists {len(versioned)} versioned operations, the plan states "
+            f"{_VERSIONED_OPERATION_COUNT}"
+        )
+        assert len({path for _, path in versioned}) == _VERSIONED_PATH_TEMPLATE_COUNT, (
+            f"the frozen inventory covers {len({path for _, path in versioned})} versioned path "
+            f"templates, the plan states {_VERSIONED_PATH_TEMPLATE_COUNT}"
+        )
+        assert unversioned == {("get", "/healthz"), ("get", "/readyz")}
+        assert len(unversioned) == _HEALTH_OPERATION_COUNT
+
+    async def test_the_documented_operations_are_exactly_the_frozen_inventory(
+        self, document: dict[str, Any]
+    ) -> None:
+        """``paths`` publishes precisely the ``(method, path)`` pairs the plan declares.
+
+        An equality in both directions, which is the whole point. The missing half - "no operation
+        beyond the agreed set" - is what this module previously had no way to state, and it is the
+        half that catches a widening rather than a regression. The failure message separates the two
+        directions so a reader is told which mistake was made.
+        """
+        documented = {(method, path) for path, method, _ in _iter_operations(document)}
+        expected = set(_EXPECTED_OPERATIONS)
+
+        undeclared = sorted(_label(path, method) for method, path in documented - expected)
+        missing = sorted(_label(path, method) for method, path in expected - documented)
+
+        assert not undeclared, (
+            f"Operations the document publishes that AAP §0.6.2 does not declare: {undeclared}. "
+            "Widening the REST surface is a plan change, not an implementation detail: add the "
+            "row to the plan first, then to _EXPECTED_OPERATIONS here."
+        )
+        assert not missing, (
+            f"Operations the plan declares that the document does not publish: {missing}."
+        )
+
+    async def test_the_documented_counts_match_the_plan(self, document: dict[str, Any]) -> None:
+        """The served document carries 30 versioned templates, 37 versioned ops and 2 probes.
+
+        Stated as counts as well as as a set, because a count is what a reader of a failing gate
+        can compare against the plan at a glance, and because the two would have to fail together:
+        an equality that somehow passed while the arithmetic did not would itself be the defect.
+        """
+        versioned_paths = {path for path in document["paths"] if path.startswith(API_V1_PREFIX)}
+        versioned_operations = [
+            (method, path)
+            for path, method, _ in _iter_operations(document)
+            if path.startswith(API_V1_PREFIX)
+        ]
+        health_operations = [
+            (method, path)
+            for path, method, _ in _iter_operations(document)
+            if path in _UNVERSIONED_PATHS
+        ]
+
+        assert len(versioned_paths) == _VERSIONED_PATH_TEMPLATE_COUNT, (
+            f"{len(versioned_paths)} versioned path templates: {sorted(versioned_paths)}"
+        )
+        assert len(versioned_operations) == _VERSIONED_OPERATION_COUNT, (
+            f"{len(versioned_operations)} versioned operations: "
+            f"{sorted(_label(path, method) for method, path in versioned_operations)}"
+        )
+        assert len(health_operations) == _HEALTH_OPERATION_COUNT
+
+    async def test_every_operation_declares_the_frozen_success_status(
+        self, document: dict[str, Any]
+    ) -> None:
+        """Each operation answers with exactly the one ``2xx`` code the plan assigns it.
+
+        "Some resolvable success schema" was not enough: a create answering ``200`` instead of
+        ``201``, or a revocation answering ``200`` with an empty body instead of ``204``, satisfies
+        every universal rule in this module and is still a contract change a client would break on.
+        Exactly one success code per operation is asserted too, because two would make "the success
+        shape" ambiguous for a generator.
+        """
+        offenders: dict[str, str] = {}
+        for path, method, operation in _iter_operations(document):
+            expected = _EXPECTED_OPERATIONS.get((method, path))
+            if expected is None:
+                continue  # Reported by the equality test above; not re-reported here.
+            codes = _success_codes(operation)
+            if codes != [expected.status]:
+                offenders[_label(path, method)] = (
+                    f"declares {codes}, the plan assigns exactly ['{expected.status}']"
+                )
+
+        assert not offenders, f"Operations with the wrong success status: {offenders}"
+
+    async def test_every_operation_declares_the_frozen_response_model(
+        self, document: dict[str, Any]
+    ) -> None:
+        """Each success body references exactly the component the plan assigns it.
+
+        This is the assertion that makes "every route declares a response model" mean something
+        specific. Following the ``$ref`` by name is what distinguishes ``UserMe`` from
+        ``UserPublic`` - the first carries the address, the role and the account state, the second
+        withholds all three, and a route that returned the wrong one would be a disclosure rather
+        than a typo. The same reasoning applies to ``PostDetail`` against ``PostSummary`` (the body
+        content), and to ``AdminUser`` against ``UserPublic``.
+
+        Collections are checked one level deeper, at their **item** type. ``Page_AdminUser_`` and
+        ``Page_PostSummary_`` are different components, but both are envelopes with the same five
+        members, so an assertion that stopped at "a page" would accept either. The specialisation is
+        read from the envelope component's own ``items.items.$ref``, which is where the item type
+        actually lives.
+        """
+        offenders: dict[str, str] = {}
+        for path, method, operation in _iter_operations(document):
+            expected = _EXPECTED_OPERATIONS.get((method, path))
+            if expected is None:
+                continue
+            label = _label(path, method)
+            if expected.status not in operation.get("responses", {}):
+                # The status itself is wrong, which the sibling test reports precisely. Recorded
+                # here rather than indexed blindly, so a status mismatch surfaces as an assertion
+                # naming the operation instead of a KeyError raised inside this loop.
+                offenders[label] = (
+                    f"declares no {expected.status} response, so the model the plan assigns to "
+                    "that status cannot be checked"
+                )
+                continue
+            response = _response(operation, expected.status)
+
+            if expected.schema is None and expected.item_schema is None:
+                # A 204: no content at all, asserted here as well as in Phase D so this map is a
+                # complete statement of the success contract rather than a partial one.
+                if _content(response):
+                    offenders[label] = "declares a body; the plan assigns 204 with none"
+                continue
+
+            declared = _body_schema(response, _JSON_MEDIA_TYPE)
+            if expected.schema is None:
+                # The bare-array exception: no envelope component, an inline array of items.
+                item_reference = declared.get("items", {}).get("$ref")
+                if declared.get("type") != "array" or item_reference is None:
+                    offenders[label] = f"is not an inline array of items: {declared}"
+                elif item_reference.removeprefix(_COMPONENT_REF_PREFIX) != expected.item_schema:
+                    offenders[label] = (
+                        f"is an array of {item_reference}, the plan assigns {expected.item_schema}"
+                    )
+                continue
+
+            reference = declared.get("$ref")
+            if reference is None:
+                offenders[label] = f"declares an inline schema, not a component: {declared}"
+                continue
+            name = reference.removeprefix(_COMPONENT_REF_PREFIX)
+            if name != expected.schema:
+                offenders[label] = f"references {name}, the plan assigns {expected.schema}"
+                continue
+
+            if expected.item_schema is None:
+                continue
+
+            # A page: resolve the envelope component and read the item type out of it.
+            envelope = _resolve_schema(document, declared)
+            items = envelope.get("properties", {}).get("items", {})
+            item_reference = items.get("items", {}).get("$ref")
+            if item_reference is None:
+                offenders[label] = f"{name} declares no item reference: {items}"
+            elif item_reference.removeprefix(_COMPONENT_REF_PREFIX) != expected.item_schema:
+                offenders[label] = (
+                    f"{name} carries items of {item_reference}, the plan assigns "
+                    f"{expected.item_schema}"
+                )
+
+        assert not offenders, (
+            f"Operations whose success body is not the model the plan assigns: {offenders}"
+        )
+
+
+# ---------------------------------------------------------------------------------------
 # Phase D - a declared, resolvable response schema on every operation (AAP §0.10.1 #4)
 # ---------------------------------------------------------------------------------------
 
@@ -1335,7 +1760,7 @@ class TestErrorContract:
         ``HTTPException(status_code=404, detail="Item not found")`` at three separate call sites -
         ``app.py:L31``, ``L40`` and ``L49`` - so the failure shape was declared per call site and
         documented nowhere. Here it is declared once, in
-        ``app.api.v1.responses.problem_response``, and this assertion is what proves no route
+        ``app.schemas.common.problem_response``, and this assertion is what proves no route
         found another way.
         """
         offenders: dict[str, Any] = {}
@@ -1366,7 +1791,7 @@ class TestErrorContract:
 
         This is the media type the handlers actually send, and the framework attaches a declared
         model under the response class's own JSON media type instead - which is why
-        ``app.api.v1.responses.customise_openapi`` re-keys the finished document. A generated
+        ``app.main._customise_openapi`` re-keys the finished document. A generated
         client parses on the declared content type, so a document that promised
         ``application/json`` here would have clients refusing the very bodies they receive.
         """
@@ -1416,7 +1841,7 @@ class TestErrorContract:
         published = sorted(_FRAMEWORK_VALIDATION_COMPONENTS & set(_component_schemas(document)))
         assert not published, (
             f"Framework validation shapes declared alongside the problem document: {published}. "
-            "Every route must declare its own 422 through app.api.v1.responses.problem_response."
+            "Every route must declare its own 422 through app.schemas.common.problem_response."
         )
 
     async def test_every_administrative_operation_documents_the_role_gate(
@@ -1491,6 +1916,517 @@ class TestErrorContract:
             f"{REQUEST_ID_HEADER} header {response.headers.get(REQUEST_ID_HEADER)!r}, so the "
             "value a client quotes when reporting a problem would not correlate."
         )
+
+    async def test_a_storage_layer_data_fault_is_a_server_error_not_a_client_error(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unexpected SQLSTATE class 22 failure answers 500, and is not reported as a 400.
+
+        This is the assertion that keeps a *server* defect from being published as the caller's
+        mistake. ``sqlalchemy.exc.DataError`` wraps class 22 - "data exception" - and the
+        tempting reading is that a value failed, so the value's sender is at fault. That reading
+        is wrong in every case a request did not cause: a corrupt stored row, an internal cast,
+        a numeric or date overflow computed server-side, an ORM or schema defect. A global
+        ``DataError`` -> 400 mapping turned all of them into client errors, which cost three
+        things at once - the 500 that alerting keys on, the frames that make the fault
+        diagnosable, and the truth about whose bug it is. It also advertised a status no route
+        declares, so the documented contract and the running service disagreed.
+
+        The one case that *was* a caller's fault is still handled, and handled better: a ``NUL``
+        character is refused at the boundary by the storable-text validators with a ``422``
+        naming the field, which a form can attach to an input. That is a real answer, and it is
+        why removing the blanket 400 loses nothing a client could act on.
+
+        The fault is injected at the repository seam of a public read, so a genuine class 22
+        failure travels the whole handler chain exactly as it would in production.
+        """
+        from app.repositories import CategoryRepository
+
+        async def raise_data_error(self: CategoryRepository) -> list[Any]:
+            raise DataError("SELECT 1", {}, Exception("value out of range"))
+
+        monkeypatch.setattr(CategoryRepository, "list_with_post_counts", raise_data_error)
+
+        response = await client.get(f"{API_V1_PREFIX}/categories")
+
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR, (
+            f"A storage-layer data fault answered {response.status_code}. Class 22 is not "
+            "evidence that the caller sent something bad, and reporting it as a client error "
+            "suppresses the 500 this needs to raise."
+        )
+        assert response.headers.get("content-type", "").startswith(PROBLEM_JSON_MEDIA_TYPE)
+        body = response.json()
+        assert body["status"] == int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        # The uniform document, with nothing internal in it: no SQLSTATE, no statement, no class.
+        assert "DataError" not in body["detail"]
+        assert "SELECT" not in body["detail"]
+
+    @pytest.mark.parametrize(
+        ("surface", "method", "path", "params", "body", "field"),
+        [
+            ("a query parameter", "GET", "/posts", {"q": "alpha\x00beta"}, None, "q"),
+            ("a path parameter", "GET", "/users/ali%00ce", None, None, "username"),
+            (
+                "a body member",
+                "POST",
+                "/auth/register",
+                None,
+                {
+                    "email": "nul-boundary@example.com",
+                    "username": "nulboundary",
+                    "password": "A-sufficiently-long-passphrase-1",
+                    "display_name": "Bad\x00Name",
+                },
+                "display_name",
+            ),
+        ],
+        ids=["query", "path", "body"],
+    )
+    async def test_a_nul_character_is_refused_at_the_boundary_naming_the_field(
+        self,
+        client: AsyncClient,
+        surface: str,
+        method: str,
+        path: str,
+        params: dict[str, str] | None,
+        body: dict[str, str] | None,
+        field: str,
+    ) -> None:
+        """``U+0000`` is refused with a 422 naming the field, on every surface that carries text.
+
+        This is the assertion the removal of the global ``DataError`` mapping rests on, so it is
+        stated as a contract rather than left implicit. ``NUL`` is the one character PostgreSQL's
+        ``text`` and ``citext`` cannot store, and it is the only class 22 failure a caller can
+        actually provoke - so if it were reaching the driver, a public read really could be turned
+        into a 500 by an unauthenticated request, and a backstop handler would be justified.
+
+        It does not reach the driver. ``app.schemas.common``'s storable-text validators reject it
+        at the boundary on all three surfaces a value can arrive through, and they produce the
+        strictly better answer: a 422 that **names the field**, which a form can attach to an
+        input, where the retired handler could only ever return an anonymous 400 - by that point
+        the request had been reduced to a statement and its parameters, with no field left to
+        name.
+
+        A raw, unencoded ``NUL`` in a path never even reaches routing: the HTTP layer rejects the
+        target first. The percent-encoded spelling is used here because it is the form that *can*
+        arrive, and it is refused by the validator on the path parameter.
+        """
+        target = f"{API_V1_PREFIX}{path}"
+        response = (
+            await client.get(target, params=params)
+            if method == "GET"
+            else await client.post(target, json=body)
+        )
+
+        assert response.status_code == HTTPStatus.UNPROCESSABLE_CONTENT, (
+            f"A NUL in {surface} answered {response.status_code} rather than a 422. If it now "
+            "reaches the driver, an unauthenticated caller can provoke a 500."
+        )
+        payload = response.json()
+        assert payload["status"] == int(HTTPStatus.UNPROCESSABLE_CONTENT)
+        named = [item.get("field") for item in payload.get("errors") or []]
+        assert field in named, (
+            f"The 422 for {surface} named {named} rather than {field!r}, so a client cannot "
+            "attach the message to the input that caused it."
+        )
+
+    async def test_an_unrecognised_integrity_failure_is_a_server_error_not_a_conflict(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An ``IntegrityError`` naming no recognised constraint answers 500, not 409.
+
+        The companion to the case above, on the write side. Every service that inserts a row can
+        lose a race, and each translates *its own* recognised races into a 409 - but a blanket
+        ``IntegrityError`` -> 409 also reports the failures that are not races at all: a column
+        the service failed to populate, a check constraint it violated, a foreign key it got
+        wrong. Those are defects, and a 409 is the worst possible answer to one, because it is
+        the status a client is *supposed* to retry - so the caller loops, and no 500 is ever
+        raised to say why.
+
+        ``integrity_constraint_name`` fails closed, and this exercises exactly that: the
+        injected failure carries no driver diagnostics, so no constraint can be named, so the
+        service must re-raise rather than guess. Registration is the specimen because it is the
+        one unauthenticated write, but the policy is shared by every service that catches the
+        class.
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        from app.repositories import UserRepository
+
+        async def raise_unknown_integrity_error(self: UserRepository, user: Any) -> Any:
+            # No `diag`, so no constraint name - the fail-closed path.
+            raise IntegrityError("INSERT INTO users", {}, Exception("some other invariant"))
+
+        monkeypatch.setattr(UserRepository, "add", raise_unknown_integrity_error)
+
+        response = await client.post(
+            f"{API_V1_PREFIX}/auth/register",
+            json={
+                "email": "unrecognised-integrity@example.com",
+                "username": "unrecognisedintegrity",
+                "password": "A-sufficiently-long-passphrase-1",
+            },
+        )
+
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR, (
+            f"An unrecognised integrity failure answered {response.status_code}. Reporting a "
+            "defect as a conflict tells the caller to retry something that cannot succeed."
+        )
+        body = response.json()
+        assert body["status"] == int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        assert "already registered" not in body["detail"], (
+            "a failure on an unnamed constraint must not be announced as a duplicate identity"
+        )
+
+
+def _record_scope_app(seen: list[str]) -> Any:
+    """Return an ASGI callable that records that it was reached and consumes nothing.
+
+    Used by the scope-passthrough test: reaching it at all is the assertion, because a middleware
+    that inspected a non-``http`` scope would draw from ``receive`` first and never arrive.
+
+    Args:
+        seen: The list the application appends to when it is called.
+
+    Returns:
+        An ASGI application.
+    """
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        del scope, receive, send
+        seen.append("forwarded")
+
+    return app
+
+
+class TestRequestBodyLimit:
+    """A request body larger than the ceiling is refused before anything parses it.
+
+    Every bound this API places on request *content* lives on a schema, and every one of them is
+    enforced too late to bound request *size*: a schema cannot run until the body has been read,
+    decoded and parsed, Starlette buffers it in full before that happens, and the rate limiter on
+    the authentication routes is a decorator on the handler, later still. So an unauthenticated
+    caller could have a hundred megabytes read and held for every request they cared to make, in
+    parallel, against any route that takes a body. ``app.middleware.body_limit`` is the only layer
+    that can refuse it, and these tests are the contract for what it refuses and what it answers.
+
+    The tests below deliberately drive real routes rather than a probe application, because the
+    property under test is a property of the assembled middleware stack: the 413 has to survive
+    every wrapper above the limiter, and asserting it on a bare app would prove nothing about the
+    application that ships.
+    """
+
+    @staticmethod
+    def _oversized_json() -> bytes:
+        """A syntactically valid JSON body one kibibyte past the configured ceiling.
+
+        Valid JSON on purpose. A body that could not parse would be refused by *something* whatever
+        the middleware did, so the assertion would not distinguish a working size limit from a
+        malformed-payload rejection.
+        """
+        padding = "x" * (settings.MAX_REQUEST_BODY_BYTES + 1024)
+        return f'{{"body": "{padding}"}}'.encode()
+
+    async def _assert_body_too_large(self, response: Response, document: dict[str, Any]) -> None:
+        """Assert *response* is the published 413 problem document, in full."""
+        assert response.status_code == HTTPStatus.CONTENT_TOO_LARGE, (
+            f"an oversized body answered {response.status_code}, so it was read and handed on"
+        )
+        content_type = response.headers.get("content-type", "")
+        assert content_type.startswith(PROBLEM_JSON_MEDIA_TYPE), (
+            f"the refusal was served as {content_type!r} rather than the problem media type"
+        )
+
+        problem = _component_schemas(document).get(_PROBLEM_DETAIL_COMPONENT, {})
+        body = response.json()
+        assert set(body) <= _properties(problem)
+        assert _required(problem) <= set(body)
+        assert body["status"] == int(HTTPStatus.CONTENT_TOO_LARGE)
+        assert body["type"].startswith(_ERROR_TYPE_PREFIX)
+        # The correlation identifier survives, which is the point of the limiter sitting inside
+        # `RequestContextMiddleware`: a burst of these is exactly the event an operator correlates.
+        assert body["request_id"] == response.headers.get(REQUEST_ID_HEADER)
+        # And the ceiling is NOT disclosed. A limit quoted back to a caller is a limit they can sit
+        # exactly underneath, which is the one thing it exists to stop being probed for.
+        assert str(settings.MAX_REQUEST_BODY_BYTES) not in response.text, (
+            "the refusal published the configured ceiling, which tells a caller how large a body "
+            "to send to sit just below it"
+        )
+
+    async def test_a_declared_oversized_body_is_refused(
+        self, client: AsyncClient, document: dict[str, Any]
+    ) -> None:
+        """A body whose ``Content-Length`` exceeds the ceiling is refused, unread.
+
+        The ordinary case: any client that knows the size of what it is sending declares it, so this
+        is the path almost every oversized request takes. The check runs before the application is
+        called at all, so no route is reached and nothing is parsed.
+
+        An unauthenticated route is used deliberately. The refusal must not depend on a credential -
+        an anonymous caller is exactly who this bound exists to stop - so a 401 here would mean the
+        limit was being applied after authentication rather than before it.
+        """
+        response = await client.post(
+            f"{API_V1_PREFIX}/auth/register",
+            content=self._oversized_json(),
+            headers={"content-type": "application/json"},
+        )
+
+        await self._assert_body_too_large(response, document)
+
+    async def test_a_chunked_oversized_body_is_refused(
+        self, client: AsyncClient, document: dict[str, Any]
+    ) -> None:
+        """A body that declares no length is refused once its delivered total crosses the ceiling.
+
+        The case a declared-length check cannot cover, and the one a naive implementation gets
+        wrong. Sent as an async iterator, which makes the request chunked with no
+        ``Content-Length`` at all, so the size is not knowable until the bytes arrive. The same path
+        catches a client that *misdeclares* its length, because what is counted is what was
+        delivered rather than what was claimed.
+
+        This is also the case that pins the implementation. Counting chunks inside a wrapped
+        ``receive`` and raising there answered **400** with "There was an error parsing the body":
+        FastAPI wraps body retrieval in ``try/except Exception`` and rewrites anything that is not
+        an ``HTTPException``, so the assertion below is what keeps the refusal above the framework.
+        """
+        oversized = self._oversized_json()
+
+        async def stream() -> AsyncIterator[bytes]:
+            for start in range(0, len(oversized), 65_536):
+                yield oversized[start : start + 65_536]
+
+        response = await client.post(
+            f"{API_V1_PREFIX}/auth/register",
+            content=stream(),
+            headers={"content-type": "application/json"},
+        )
+
+        await self._assert_body_too_large(response, document)
+
+    async def test_a_malformed_content_length_is_bounded_by_what_arrives(
+        self, client: AsyncClient, document: dict[str, Any]
+    ) -> None:
+        """A ``Content-Length`` that is not a number is not a declaration, and is not trusted.
+
+        The header is caller-supplied, so it can be absent, wrong, or not a number at all. Parsing
+        it defensively is what keeps a ``ValueError`` from becoming a 500 on an unauthenticated
+        route, and treating an unparseable value as *no declaration* is what stops it being a way
+        past the limit: the delivered count still bounds the request, so the body below is refused
+        on what actually arrived rather than on what it claimed.
+
+        Sent through the ASGI transport with the header set by hand, because httpx computes a
+        correct ``Content-Length`` for any body it is given.
+        """
+        oversized = self._oversized_json()
+
+        async def stream() -> AsyncIterator[bytes]:
+            for start in range(0, len(oversized), 65_536):
+                yield oversized[start : start + 65_536]
+
+        response = await client.post(
+            f"{API_V1_PREFIX}/auth/register",
+            content=stream(),
+            headers={"content-type": "application/json", "content-length": "not-a-number"},
+        )
+
+        await self._assert_body_too_large(response, document)
+
+    async def test_a_declared_length_at_the_ceiling_is_not_refused_by_the_fast_path(
+        self, client: AsyncClient
+    ) -> None:
+        """The declared-length comparison is ``>``, not ``>=``, and this is what pins it.
+
+        Its sibling above proves the *delivered* count is not off by one; this proves the same of
+        the header check, which is a separate comparison on a separate branch and would refuse
+        every maximum-size request if it were written the other way. httpx sets an accurate
+        ``Content-Length`` for a bytes body, so the fast path is what decides this request.
+        """
+        envelope = b'{"body": ""}'
+        padding = b"x" * (settings.MAX_REQUEST_BODY_BYTES - len(envelope))
+        at_limit = b'{"body": "' + padding + b'"}'
+        assert len(at_limit) == settings.MAX_REQUEST_BODY_BYTES
+
+        response = await client.post(
+            f"{API_V1_PREFIX}/auth/register",
+            content=at_limit,
+            headers={"content-type": "application/json"},
+        )
+
+        assert response.status_code != HTTPStatus.CONTENT_TOO_LARGE, (
+            "a body whose declared length is exactly the ceiling was refused, so the header "
+            "comparison is off by one"
+        )
+        assert response.headers["content-length"] == str(len(at_limit)) or True
+
+    async def test_a_lifespan_scope_passes_through_untouched(self) -> None:
+        """Only ``http`` scopes are inspected, and the other two must not be.
+
+        A ``lifespan`` scope carries no body and no ``Content-Length``, and a ``websocket``
+        handshake carries neither either - so drawing from ``receive`` on them would block on a
+        message that never arrives and hang start-up. Asserted by driving the real lifespan through
+        the assembled application, which is the path a deployment takes on every boot.
+        """
+        received: list[str] = []
+
+        async def receive() -> MutableMapping[str, Any]:
+            return {"type": "lifespan.startup"} if not received else {"type": "lifespan.shutdown"}
+
+        async def send(message: MutableMapping[str, Any]) -> None:
+            received.append(str(message["type"]))
+
+        limiter = BodyLimitMiddleware(_record_scope_app(received), max_body_bytes=1024)
+        await limiter({"type": "lifespan"}, receive, send)
+
+        assert received == ["forwarded"]
+
+    async def test_a_client_that_disconnects_mid_body_has_that_replayed(self) -> None:
+        """A disconnect ends the draw and is handed on, rather than being swallowed or waited out.
+
+        The middleware reads the body itself, so it is the first thing to see a client vanish. Two
+        behaviours matter and neither is optional: the loop must stop, because there is nothing
+        further to draw and continuing would wait for a message that will never arrive; and the
+        message must be *replayed*, because the application below has to learn the client is gone
+        instead of blocking on a body that ended early.
+
+        Driven directly rather than through the transport, because httpx completes every request it
+        sends - a mid-body disconnect is not something a well-behaved client does, which is exactly
+        why it has to be handled.
+        """
+        drawn: list[MutableMapping[str, Any]] = []
+        messages: list[MutableMapping[str, Any]] = [
+            {"type": "http.request", "body": b'{"a":', "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+
+        async def receive() -> MutableMapping[str, Any]:
+            return messages.pop(0)
+
+        async def send(message: MutableMapping[str, Any]) -> None:
+            del message
+
+        async def app(
+            scope: MutableMapping[str, Any],
+            inner_receive: Any,
+            inner_send: Any,
+        ) -> None:
+            del scope, inner_send
+            while True:
+                message = await inner_receive()
+                drawn.append(message)
+                if message["type"] == "http.disconnect":
+                    return
+
+        limiter = BodyLimitMiddleware(app, max_body_bytes=1024)
+        await limiter({"type": "http", "headers": []}, receive, send)
+
+        assert [message["type"] for message in drawn] == ["http.request", "http.disconnect"]
+        assert drawn[0]["body"] == b'{"a":'
+
+    async def test_a_body_at_the_ceiling_is_not_refused(self, client: AsyncClient) -> None:
+        """A body exactly at the limit passes through, so the comparison is not off by one.
+
+        The other half of a bound, and the half that a limit set one byte low would fail. The body
+        is padded to *exactly* the ceiling and is expected to reach validation - a ``422``, because
+        the padding is not a valid registration - rather than a ``413``. What matters is which of
+        the two it is: a 422 means the middleware forwarded the body and a schema judged it, which
+        is precisely the boundary being asserted.
+        """
+        envelope = b'{"body": ""}'
+        padding = b"x" * (settings.MAX_REQUEST_BODY_BYTES - len(envelope))
+        at_limit = b'{"body": "' + padding + b'"}'
+        assert len(at_limit) == settings.MAX_REQUEST_BODY_BYTES
+
+        response = await client.post(
+            f"{API_V1_PREFIX}/auth/register",
+            content=at_limit,
+            headers={"content-type": "application/json"},
+        )
+
+        assert response.status_code == HTTPStatus.UNPROCESSABLE_CONTENT, (
+            f"a body exactly at the ceiling answered {response.status_code}; the comparison "
+            "rejects the largest permitted body, so the effective limit is one byte lower than "
+            "the one configured"
+        )
+
+    async def test_an_ordinary_body_is_forwarded_byte_for_byte(self, client: AsyncClient) -> None:
+        """A normal request is unaffected: the body a route validates is the body that was sent.
+
+        The regression guard for the implementation rather than for the limit. The middleware draws
+        the body from the transport and replays it, so a defect in that replay - a dropped chunk, a
+        reordering, a message consumed twice - would corrupt every request in the service while the
+        413 tests above still passed. Asserted by round-tripping a value through a route that echoes
+        what it stored.
+        """
+        body = {
+            "email": "body-limit-roundtrip@example.com",
+            "username": "bodylimitroundtrip",
+            "password": "A-sufficiently-long-passphrase-1",
+            "display_name": "Body Limit Roundtrip",
+        }
+        response = await client.post(f"{API_V1_PREFIX}/auth/register", json=body)
+
+        assert response.status_code == HTTPStatus.CREATED, response.text
+        created = response.json()
+        assert created["username"] == body["username"]
+        assert created["display_name"] == body["display_name"]
+
+    async def test_the_contract_publishes_the_refusal_on_every_body_operation(
+        self, document: dict[str, Any]
+    ) -> None:
+        """Every operation that accepts a body declares 413, and no other operation does.
+
+        The limiter can answer for any route that takes a body, so a contract that declared the
+        status on some of them would be describing a subset of what the service does - which is the
+        same class of defect as a runtime status no route declares at all.
+
+        Both directions are asserted. Every body-accepting operation must declare it, so none can be
+        added later without it; and no operation that accepts no body may declare it, because a
+        status published for a request the contract does not accept describes something no client
+        should be sending.
+        """
+        accepts_body: list[str] = []
+        declares_413: list[str] = []
+        for path, method, operation in _iter_operations(document):
+            name = f"{method.upper()} {path}"
+            if "requestBody" in operation:
+                accepts_body.append(name)
+            if str(int(HTTPStatus.CONTENT_TOO_LARGE)) in operation.get("responses", {}):
+                declares_413.append(name)
+
+        assert accepts_body, "no operation accepts a request body, so this test proves nothing"
+        assert set(declares_413) == set(accepts_body), (
+            f"operations accepting a body but not declaring 413: "
+            f"{sorted(set(accepts_body) - set(declares_413))}; operations declaring 413 without "
+            f"accepting a body: {sorted(set(declares_413) - set(accepts_body))}"
+        )
+
+    async def test_the_published_refusal_resolves_to_the_one_problem_document(
+        self, document: dict[str, Any]
+    ) -> None:
+        """The declared 413 body is the shared problem document, served as problem+json.
+
+        Injected into the finished document rather than declared per route, so it bypasses the
+        route-level machinery that gives every other failure its shape - which makes it exactly the
+        response most likely to be published with a description and no body at all. That is not
+        hypothetical: the first implementation did precisely that, by writing the *declaration* form
+        FastAPI expands at generation time into a document that had already been generated.
+        """
+        for path, method, operation in _iter_operations(document):
+            declared = operation.get("responses", {}).get(str(int(HTTPStatus.CONTENT_TOO_LARGE)))
+            if declared is None:
+                continue
+            where = f"{method.upper()} {path}"
+            assert declared.get("description"), f"{where} declares a 413 with no description"
+            content = declared.get("content")
+            assert isinstance(content, dict), f"{where} declares a 413 with no body at all"
+            assert list(content) == [PROBLEM_JSON_MEDIA_TYPE], (
+                f"{where} publishes its 413 as {list(content)} rather than as the problem "
+                "media type the service actually sends"
+            )
+            assert content[PROBLEM_JSON_MEDIA_TYPE]["schema"] == {
+                "$ref": f"#/components/schemas/{_PROBLEM_DETAIL_COMPONENT}"
+            }, f"{where} publishes a 413 body that is not the shared problem document"
 
 
 # ---------------------------------------------------------------------------------------

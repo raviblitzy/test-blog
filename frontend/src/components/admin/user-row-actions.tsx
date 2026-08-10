@@ -128,34 +128,34 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { invalidateForAdminMutation } from '@/lib/admin-cache';
+import type { AdminMutation } from '@/lib/admin-cache';
 import { deleteAdminUser, updateAdminUser } from '@/lib/api/admin';
 import { isApiError } from '@/lib/api/client';
 import { USER_ROLES } from '@/lib/types';
 import type { AdminUser, UserRole } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
- * Cache keys
+ * Cache invalidation lives in `@/lib/admin-cache`, not here
  *
- * Written as the PREFIX of the listing key rather than the whole thing. The users screen registers
- * its query under `['admin', 'users', params]`, and React Query matches invalidations by prefix, so
- * this one call refreshes every windowed and filtered variant that is currently cached - which is
- * the point, because an administrator who changed a role on page three of a role-filtered listing
- * has just changed whether that row belongs in the result set at all.
+ * This file used to name its own two keys - the users listing and the overview counts - and that list
+ * was short by three tables on the one mutation that matters most.
  *
- * `as const` keeps each tuple readonly so neither can be mutated in place by a caller.
+ * `DELETE /admin/users/{id}` is the widest cascade in the API. `admin_service.delete_user` issues a
+ * single statement; every foreign key referencing `users.id` carries `ON DELETE CASCADE`, so
+ * PostgreSQL removes the account's posts, comments, likes and refresh tokens, then cascades again from
+ * each removed post to that post's own comments and likes, and the `post_categories` filings that go
+ * with those posts move `post_count` on the category table. Refreshing users and the counts alone left
+ * the POSTS table and the MODERATION QUEUE serving rows the service had already removed - actionable,
+ * for the whole stale window, each action answered `404` with nothing on screen to explain it.
+ *
+ * The role and deactivation mutations are genuinely narrower, and the graph says so: `AdminUser` is
+ * the only projection carrying a role or an active flag, and `AdminPost.author` is a `UserPublic`
+ * which carries neither - so neither mutation stales another table, and neither moves a count.
+ *
+ * Both facts belong next to the server behaviour that justifies them rather than in a row action, so
+ * they live in that module's graph. See its header for why every invalidation is awaited.
  * ---------------------------------------------------------------------------------------------- */
-
-/** Prefix of every `GET /admin/users` listing key. Invalidated after any successful mutation. */
-const ADMIN_USERS_QUERY_KEY = ['admin', 'users'] as const;
-
-/**
- * Key of the overview counts.
- *
- * Invalidated after a DELETION only. A role change and a deactivation both leave the number of
- * accounts, posts, comments and categories exactly as it was, so refetching the overview for them
- * would be a request that cannot change a single rendered digit.
- */
-const ADMIN_STATS_QUERY_KEY = ['admin', 'stats'] as const;
 
 /* -------------------------------------------------------------------------------------------------
  * Copy
@@ -350,14 +350,15 @@ export function UserRowActions({ user, onChanged }: UserRowActionsProps): JSX.El
   const triggerRef = useRef<HTMLButtonElement>(null);
 
   /**
-   * Refreshes every cached users listing.
+   * Refreshes everything the named mutation staled, and resolves once it has.
    *
-   * Awaited by the success handlers, so the mutation remains pending until the table has actually
-   * caught up. That is what stops a stale row from being visible next to a toast announcing it
-   * changed.
+   * A one-line delegation to `@/lib/admin-cache`, kept so the three handlers below read the same way
+   * they did when the keys were local. Awaited by each of them, so the mutation remains pending until
+   * the affected tables have actually caught up - which is what stops a stale row from being visible
+   * next to a toast announcing it changed, and stops a second press acting on it.
    */
-  async function refreshUsers(): Promise<void> {
-    await queryClient.invalidateQueries({ queryKey: ADMIN_USERS_QUERY_KEY });
+  async function refreshAfter(mutation: AdminMutation): Promise<void> {
+    await invalidateForAdminMutation(queryClient, mutation);
   }
 
   /*
@@ -382,7 +383,7 @@ export function UserRowActions({ user, onChanged }: UserRowActionsProps): JSX.El
     onSuccess: async (updated) => {
       toast.success(`${updated.username} is now ${ROLE_OUTCOME_LABELS[updated.role]}.`);
       onChanged?.();
-      await refreshUsers();
+      await refreshAfter('user.update');
     },
     onError: (error) => {
       toast.error(failureMessage(error, `${user.username}'s role could not be changed.`));
@@ -402,7 +403,7 @@ export function UserRowActions({ user, onChanged }: UserRowActionsProps): JSX.El
           : `${updated.username} can no longer sign in.`,
       );
       onChanged?.();
-      await refreshUsers();
+      await refreshAfter('user.update');
     },
     onError: (error) => {
       toast.error(
@@ -431,13 +432,13 @@ export function UserRowActions({ user, onChanged }: UserRowActionsProps): JSX.El
       setIsConfirmingDelete(false);
       toast.success(`${user.username}'s account has been deleted.`);
       onChanged?.();
-      // Both keys, and only here: a deletion is the one action in this menu that changes a count on
-      // the overview screen. The cascade the service performs - posts, comments, likes and rotation
-      // credentials - is why more than one of those counts moves.
-      await Promise.all([
-        refreshUsers(),
-        queryClient.invalidateQueries({ queryKey: ADMIN_STATS_QUERY_KEY }),
-      ]);
+      // FOUR TABLES AND THE COUNTS, not two keys: a deletion is the one action in this menu whose
+      // effects reach past the users listing. The cascade the service performs - the account's posts,
+      // comments, likes and rotation credentials, then each removed post's own comments and likes, and
+      // with them the category filings that feed `post_count` - is what makes the posts table, the
+      // moderation queue and the category tallies stale too, and it is why more than one overview count
+      // moves. The full list, and the justification for each edge, is in `@/lib/admin-cache`.
+      await refreshAfter('user.delete');
     },
     onError: (error) => {
       toast.error(failureMessage(error, `${user.username}'s account could not be deleted.`));

@@ -491,7 +491,9 @@ class TestEnsureCanModify:
         user = make_user(role)
         owner_id = _owner_id_for(user, owns=owns)
 
-        assert ensure_can_modify(user, owner_id) is None
+        # Called for effect, not for a value. The guard signals refusal by raising and has
+        # nothing to return, so reaching the end of this test IS the assertion that it permitted.
+        ensure_can_modify(user, owner_id)
 
     @pytest.mark.parametrize(("role", "owns"), _DENIED_OWNERSHIP_ROWS, ids=_DENIED_OWNERSHIP_IDS)
     def test_raises_forbidden_when_the_principal_is_denied(
@@ -612,7 +614,9 @@ class TestEnsureCanAuthor:
         user = make_user(role)
 
         if expected:
-            assert ensure_can_author(user) is None
+            # Returning rather than raising is the whole of "permitted" - see the ownership
+            # guard's counterpart above for why the call is a statement and not a comparison.
+            ensure_can_author(user)
             return
 
         with pytest.raises(ForbiddenError):
@@ -683,5 +687,6 @@ class TestTheTwoHalvesOfPostAuthority:
         """The ordinary case both guards are written for, asserted end to end."""
         author = make_user(UserRole.AUTHOR)
 
-        assert ensure_can_author(author) is None
-        assert ensure_can_modify(author, author.id) is None
+        # Both halves called for effect: either one refusing would raise out of this test.
+        ensure_can_author(author)
+        ensure_can_modify(author, author.id)

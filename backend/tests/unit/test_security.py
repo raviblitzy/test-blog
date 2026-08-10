@@ -1,11 +1,20 @@
 """Unit tests for ``app.core.security``: argon2id hashing, access tokens, refresh tokens.
 
 Pure and **database-free**. The module under test is the bottom of the authentication stack -
-its only ``app`` imports are ``app.core.config``, ``app.core.exceptions`` and
-``app.core.concurrency`` - so nothing here opens a session, builds an engine, constructs a
-mapped row or issues a request. Every test is a plain synchronous function, no test requests a
-fixture from ``backend/tests/conftest.py``, and ``backend/tests/factories.py`` is not imported,
-because every helper in it needs an ``AsyncSession``. The one thing this module does rely on
+its only ``app`` imports are ``app.core.config`` and ``app.core.exceptions`` - so nothing here
+opens a session, builds an engine, constructs a
+mapped row or issues a request. ``app.core.logging`` is imported too, for the last section of
+this file: the log-redaction guarantee is a guarantee *about credentials*, and every marker it
+plants is one of the values this module's subject computes - a password, a JWT, a bearer token,
+a connection URL. ``app.core.security`` deliberately has no logger of its own, and
+``app.core.logging`` names it specifically when explaining why structured tracebacks are
+configured with ``show_locals=False``; asserting that the redaction backstop holds therefore
+belongs beside the primitives whose output it is protecting.
+
+Every test is a plain synchronous function; only the redaction section requests a fixture, and it
+is declared in this file rather than taken from ``backend/tests/conftest.py``.
+``backend/tests/factories.py`` is not imported, because every helper in it needs an
+``AsyncSession``. The one thing this module does rely on
 from its parent conftest is the *environment*: ``app.core.config`` builds and validates its
 ``settings`` singleton at import time and ``JWT_SECRET_KEY`` has no default, so the
 pre-import bootstrap in ``conftest.py`` is what makes ``import app.core.security`` succeed at
@@ -17,6 +26,8 @@ No user rules govern this file
 window - so **no user-specified rule governs this file and no rule placed it in scope**. It is
 in scope solely by the Agent Action Plan's file inventory (§0.4.4.5, "hashing and token
 behaviour including expiry") and its execution plan (§0.7.1.11, "including expiry rejection").
+That inventory fixes the unit suite at exactly four modules, which is why the redaction
+assertions live here rather than in a fifth file of their own.
 Nothing below is invented to fill that gap, and the absence of rules is not read as licence to
 test less rigorously: the substitute standard is the AAP's own §0.10.1 enterprise standards,
 four of which this module discharges.
@@ -89,8 +100,11 @@ type-confusion branches cheap to reach.
 from __future__ import annotations
 
 import dataclasses
+import io
+import json
 import math
 import re
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID, uuid4
@@ -101,6 +115,12 @@ import pytest
 
 from app.core.config import Settings, settings
 from app.core.exceptions import InvalidTokenError, TokenExpiredError, UnauthorizedError
+from app.core.logging import (
+    LOG_REDACTION_PLACEHOLDER,
+    configure_logging,
+    get_logger,
+    redact_sensitive_text,
+)
 from app.core.security import (
     REFRESH_TOKEN_ENTROPY_BYTES,
     TOKEN_TYPE_ACCESS,
@@ -116,8 +136,16 @@ from app.core.security import (
     verify_and_update_password,
     verify_password,
     verify_refresh_token,
+    warm_password_hashing,
 )
 from app.models import UserRole
+
+# Every test here is fast, isolated, and touches neither the database nor the network, which is
+# the marker `backend/pyproject.toml` registers for exactly this. Applied at module scope so
+# `-m unit` selects the whole file - and that selection is only truthful because
+# `tests/conftest.py`'s schema fixture is not autouse, so hashing and token tests no longer
+# require a migrated database to exist.
+pytestmark = pytest.mark.unit
 
 # ---------------------------------------------------------------------------------------
 # Fixed material
@@ -537,6 +565,39 @@ class TestPasswordHashing:
         assert first.startswith(_ARGON2ID_PREFIX)
         assert dummy_password_hash() == first
         assert verify_password(_PASSWORD, first) is False
+
+    def test_warming_computes_the_dummy_hash_before_any_request_can_observe_it(self) -> None:
+        """``warm_password_hashing`` moves the one expensive computation into startup.
+
+        The cache is what makes every unknown-email login after the first cost what a known-email
+        login costs. It is also what made the *first* one different: computing a real argon2id
+        hash is the whole work factor, tens of milliseconds, so the first attempt against an
+        unregistered address paid a hash **plus** a verify while the first against a registered one
+        paid only the verify. That gap is readable from a single request by whoever reaches a
+        freshly started process first, and no amount of warming *during* the test suite hides it
+        from production.
+
+        The cache is cleared deliberately here to reconstruct the cold state, which is exactly the
+        state the previous tests could not observe because they ran after something had already
+        warmed it. ``cache_info`` is then the evidence: nothing stored before, one entry after.
+        """
+        dummy_password_hash.cache_clear()
+        assert dummy_password_hash.cache_info().currsize == 0, (
+            "the cold state could not be reconstructed, so this test proves nothing"
+        )
+
+        warm_password_hashing()
+
+        assert dummy_password_hash.cache_info().currsize == 1, (
+            "warming left the cache empty, so the first unknown-email login still pays the hash"
+        )
+        warmed = dummy_password_hash()
+        assert warmed.startswith(_ARGON2ID_PREFIX)
+        # Idempotent: a second warm-up is a dictionary lookup and must not mint a second value,
+        # because two different stand-ins would make two unknown-email attempts distinguishable.
+        warm_password_hashing()
+        assert dummy_password_hash() == warmed
+        assert dummy_password_hash.cache_info().currsize == 1
 
 
 # ---------------------------------------------------------------------------------------
@@ -1035,3 +1096,361 @@ class TestSigningKeyFloor:
                 _env_file=None,
                 **_settings_kwargs(JWT_SECRET_KEY="k" * 32, JWT_ALGORITHM="HS512"),
             )
+
+
+# ---------------------------------------------------------------------------------------
+# The log-redaction backstop
+#
+# Every value this file's subject computes is a credential or a key: a plaintext password, a
+# password hash, a raw refresh token, a token digest, a bearer token, the signing key itself.
+# `app.core.security` protects them by having no logger at all - auditable in one line - but
+# that only covers the code IT owns. A message composed by whatever raised an exception, or a
+# field a caller populated one layer up, can still quote one, and `app.core.logging` carries the
+# backstop that rewrites those before they reach a collector. These assertions are what prove it
+# holds, and they are here because what they protect is declared here.
+#
+# Every assertion below is written the same way, and the shape is deliberate. A distinctive
+# MARKER is planted in a value - `s3cr3t-marker-value`, `marker@example.test`,
+# `MARKER_DSN_PASSWORD` - the value is put through the real logging chain, and the rendered
+# output is then searched for that marker. A pattern that silently stopped matching, a chain a
+# future edit reordered, or a renderer that bypassed the processor would all leave the marker in
+# the output and fail. Asserting the presence of `LOG_REDACTION_PLACEHOLDER` as well is what
+# distinguishes "the value was withheld" from "the field was never populated", so a rule that
+# dropped a field instead of rewriting it would fail too.
+#
+# Two properties are exercised that no single-environment test can establish:
+#
+#   1. BOTH CHAINS. `ENVIRONMENT=development` renders through `ConsoleRenderer` after
+#      `format_exc_info`, and every other stage renders through `JSONRenderer` after
+#      `ExceptionRenderer`. The two produce entirely different representations of one exception -
+#      a formatted string and a list of frame dictionaries - and the redaction processor has to
+#      cover both. It is parametrised over the stages rather than asserted once, because a
+#      developer's terminal is scraped into a scrollback buffer, a CI transcript and a pasted bug
+#      report, so a secret that leaks only there has still leaked.
+#   2. THROUGH AN EXCEPTION, not just a field. A message composed by whatever raised it is the
+#      value most likely to quote a connection URL or an address, and it is the one a caller
+#      cannot audit. Both an exception message and an exception *note* are exercised.
+#
+# These are the only tests in this file that use a fixture and the only ones that write anything:
+# they render into a capture buffer rather than to process stdout, so they assert on exactly the
+# bytes a log collector would have received. `configure_logging` is called with the real settings
+# object, with both the stage and the threshold pinned for the duration of a test and restored
+# afterwards, so nothing here depends on how the environment happens to be configured while the
+# suite runs - including the quiet `LOG_LEVEL` that `backend/tests/conftest.py` sets to keep a
+# failing assertion legible.
+# ---------------------------------------------------------------------------------------
+
+# other three select the JSON chain, so parametrising over all four covers both terminal
+# renderers without naming either.
+_STAGES: Final[tuple[str, ...]] = ("development", "test", "staging", "production")
+
+# Markers. Each is a string that could not plausibly appear in a log for any other reason, so a
+# substring search for it is an exact test of whether the value survived.
+_MARKER_PASSWORD: Final[str] = "s3cr3t-marker-value"
+_MARKER_EMAIL: Final[str] = "marker@example.test"
+_MARKER_DSN: Final[str] = (
+    "postgresql+psycopg://marker_user:MARKER_DSN_PASSWORD@db.marker.test:5432/blog"
+)
+_MARKER_JWT: Final[str] = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJzdWIiOiJtYXJrZXIiLCJyb2xlIjoiQURNSU4ifQ."
+    "MARKERsignatureMARKERsignature"
+)
+_MARKER_BEARER_TOKEN: Final[str] = "MARKERopaqueRefreshTokenValue123"
+_MARKER_DETAIL_VALUE: Final[str] = "marker-conflicting-slug"
+
+# Addresses, and the network each must be reduced to. Both are documentation-only ranges -
+# 203.0.113.0/24 is TEST-NET-3 (RFC 5737) and 2001:db8::/32 is the documentation prefix
+# (RFC 3849) - so neither can belong to a real host, and the host bits of each are distinctive
+# enough that a substring search for them is an exact test of whether the address survived.
+_MARKER_IPV4: Final[str] = "203.0.113.147"
+_MARKER_IPV4_NETWORK: Final[str] = "203.0.113.0/24"
+_MARKER_IPV6: Final[str] = "2001:db8:85a3:1234:5678:8a2e:370:7334"
+_MARKER_IPV6_NETWORK: Final[str] = "2001:db8:85a3:1234::/64"
+
+_MARKER_DRIVER_MESSAGE: Final[str] = (
+    f'connection to server at "db.marker.test" ({_MARKER_IPV4}), port 5432 failed: '
+    "Connection refused"
+)
+"""The shape psycopg actually raises: the host it was given, and in parentheses the address it
+resolved to. It is the concrete reason the two address rules exist - this message is composed by
+the driver, reaches a log record through an exception, and nobody audits it on the way."""
+
+
+@pytest.fixture
+def captured_logs() -> Iterator[Any]:
+    """Configure logging into a buffer and restore the process configuration afterwards.
+
+    Yields a callable taking the stage name and returning the buffer, so a test can reconfigure
+    per stage without repeating the save/restore dance. The stage is set on the shared settings
+    singleton - which the model is deliberately not ``frozen`` to allow - and put back in a
+    ``finally``, so a failing assertion cannot leave the suite logging as ``production``.
+
+    The **threshold** is pinned as well as the stage, and for the same reason: this module
+    asserts on what redaction does to a record, not on which records clear a level, so a record
+    it emits has to reach the buffer whatever the ambient ``LOG_LEVEL`` happens to be.
+    ``backend/tests/conftest.py`` deliberately runs the suite at ``WARNING`` to keep a failing
+    assertion legible, and without this pin the one test that logs at ``info`` would find an
+    empty buffer and fail with an ``IndexError`` that says nothing about redaction. ``DEBUG`` is
+    the most permissive setting, so every level a test might use is admitted, and it is restored
+    in the same ``finally`` as the stage.
+    """
+    original_stage = settings.ENVIRONMENT
+    original_level = settings.LOG_LEVEL
+    buffers: list[io.StringIO] = []
+
+    def configure(stage: str) -> io.StringIO:
+        settings.ENVIRONMENT = stage  # type: ignore[assignment]
+        # No `type: ignore` here, unlike the line above: `ENVIRONMENT` is assigned a plain `str`
+        # against a `Literal` annotation, whereas `"DEBUG"` is one of the members
+        # `Settings.LOG_LEVEL` declares, so the assignment type-checks as written and an ignore
+        # would be flagged as unused under the strict settings in backend/pyproject.toml.
+        settings.LOG_LEVEL = "DEBUG"
+        buffer = io.StringIO()
+        buffers.append(buffer)
+        configure_logging(stream=buffer)
+        return buffer
+
+    try:
+        yield configure
+    finally:
+        settings.ENVIRONMENT = original_stage
+        settings.LOG_LEVEL = original_level
+        configure_logging()
+
+
+def _assert_withheld(rendered: str, marker: str) -> None:
+    """Assert *marker* is absent from *rendered* and that a redaction marker took its place."""
+    assert marker not in rendered, f"{marker!r} reached the log output:\n{rendered}"
+    assert LOG_REDACTION_PLACEHOLDER in rendered, (
+        f"nothing was marked as withheld, so the value may simply have been dropped:\n{rendered}"
+    )
+
+
+class TestRedactSensitiveText:
+    """The function on its own, independent of any chain."""
+
+    def test_strips_userinfo_from_a_connection_url(self) -> None:
+        redacted = redact_sensitive_text(f"could not connect to {_MARKER_DSN}")
+        assert "MARKER_DSN_PASSWORD" not in redacted
+        assert "marker_user" not in redacted
+        # The scheme and host survive, because a reader still needs to know WHICH database.
+        assert "postgresql+psycopg://" in redacted
+        assert "db.marker.test:5432/blog" in redacted
+
+    def test_strips_a_json_web_token(self) -> None:
+        redacted = redact_sensitive_text(f"token rejected: {_MARKER_JWT}")
+        assert "MARKERsignature" not in redacted
+        assert LOG_REDACTION_PLACEHOLDER in redacted
+
+    def test_strips_a_bearer_credential_but_keeps_the_scheme(self) -> None:
+        redacted = redact_sensitive_text(f"Authorization: Bearer {_MARKER_BEARER_TOKEN}")
+        assert _MARKER_BEARER_TOKEN not in redacted
+        assert "Bearer" in redacted
+
+    def test_strips_a_named_secret_but_keeps_the_name(self) -> None:
+        for phrase in (
+            f"password={_MARKER_PASSWORD}",
+            f"JWT_SECRET_KEY: {_MARKER_PASSWORD}",
+            f'api_key="{_MARKER_PASSWORD}"',
+            f"refresh_token={_MARKER_PASSWORD}",
+        ):
+            redacted = redact_sensitive_text(phrase)
+            assert _MARKER_PASSWORD not in redacted, phrase
+            assert LOG_REDACTION_PLACEHOLDER in redacted, phrase
+
+    def test_strips_an_email_address(self) -> None:
+        redacted = redact_sensitive_text(f"account {_MARKER_EMAIL} already exists")
+        assert _MARKER_EMAIL not in redacted
+        assert "already exists" in redacted
+
+    def test_strips_a_postgresql_diagnostic_tail(self) -> None:
+        message = (
+            'duplicate key value violates unique constraint "uq_posts_slug"\n'
+            f"DETAIL:  Key (slug)=({_MARKER_DETAIL_VALUE}) already exists.\n"
+        )
+        redacted = redact_sensitive_text(message)
+        assert _MARKER_DETAIL_VALUE not in redacted
+        # The label survives, so the reader knows a diagnostic was withheld rather than missing.
+        assert "DETAIL:" in redacted
+        assert "uq_posts_slug" in redacted
+
+    def test_reduces_an_ipv4_address_to_its_network(self) -> None:
+        """An address identifies a person; the network it sits in answers the operator's
+        question."""
+        redacted = redact_sensitive_text(_MARKER_DRIVER_MESSAGE)
+        assert _MARKER_IPV4 not in redacted
+        assert _MARKER_IPV4_NETWORK in redacted
+        # Anonymised, not blanked: everything an operator reads this line for survives.
+        assert "db.marker.test" in redacted
+        assert "port 5432 failed" in redacted
+
+    def test_reduces_an_ipv6_address_to_its_network(self) -> None:
+        redacted = redact_sensitive_text(f"peer {_MARKER_IPV6} exceeded the limit")
+        assert _MARKER_IPV6 not in redacted
+        assert _MARKER_IPV6_NETWORK in redacted
+        assert "exceeded the limit" in redacted
+
+    def test_reduces_the_compressed_and_mapped_ipv6_spellings(self) -> None:
+        """``::1`` and ``::ffff:...`` are addresses too, and are the ones a local run produces."""
+        for spelling in ("::1", "::ffff:203.0.113.147", "fe80::1ff:fe23:4567:890a%eth2"):
+            redacted = redact_sensitive_text(f"peer {spelling} disconnected")
+            assert spelling not in redacted, spelling
+            assert "/64" in redacted, spelling
+
+    def test_leaves_an_already_anonymised_network_alone(self) -> None:
+        """Every access record carries one, so rewriting it twice would corrupt a safe field."""
+        for network in (_MARKER_IPV4_NETWORK, "127.0.0.0/24", "2001:db8::/64", "10.0.0.0/8"):
+            assert redact_sensitive_text(f"client_network={network}") == f"client_network={network}"
+
+    def test_leaves_numeric_text_that_is_not_an_address_alone(self) -> None:
+        """The address rules validate every candidate, so address-shaped text is not enough."""
+        for ordinary in (
+            "2026-08-09T22:34:43.123456Z app startup version=1.0.0",
+            "sqlstate=28P01 failure_class=connection_failure",
+            "request_id=81ac91f15c39474d9f850b4cdc437c81 http_method=GET path=/api/v1/posts",
+            "python 3.14.7 postgres 18.4 gunicorn 26.0.0",
+            "window 1.2.3.4.5 mac 00:1a:2b:3c:4d:5e time 22:34:43",
+            "pool_size=5 max_overflow=0 pool_timeout=5.0 recycle=1800",
+            "999.999.999.999 is not an address",
+        ):
+            assert redact_sensitive_text(ordinary) == ordinary, ordinary
+
+    def test_is_idempotent(self) -> None:
+        once = redact_sensitive_text(
+            f"password={_MARKER_PASSWORD} for {_MARKER_EMAIL} from {_MARKER_IPV4} "
+            f"and {_MARKER_IPV6}"
+        )
+        assert redact_sensitive_text(once) == once
+
+    def test_leaves_an_ordinary_record_alone(self) -> None:
+        ordinary = "post published slug=scaling-fastapi status_code=200 duration_ms=12.5"
+        assert redact_sensitive_text(ordinary) == ordinary
+
+
+class TestRedactionThroughTheConfiguredChain:
+    """The processor in place, in every environment the service can run as."""
+
+    @pytest.mark.parametrize("stage", _STAGES)
+    def test_an_address_in_an_exception_message_never_reaches_the_output(
+        self, captured_logs: Any, stage: str
+    ) -> None:
+        """The path a real one takes: composed by the driver, carried by an exception.
+
+        Parametrised over every stage for the same reason as the secrets below - the console
+        chain renders a formatted traceback string and the JSON chain a list of frame
+        dictionaries, and an address has to be removed from both.
+        """
+        buffer = captured_logs(stage)
+        try:
+            raise ConnectionError(f"{_MARKER_DRIVER_MESSAGE} peer {_MARKER_IPV6}")
+        except ConnectionError:
+            get_logger(__name__).exception("marker_address_failure")
+        rendered = buffer.getvalue()
+        assert "marker_address_failure" in rendered, rendered
+        for address in (_MARKER_IPV4, _MARKER_IPV6):
+            assert address not in rendered, f"{address!r} reached the log output:\n{rendered}"
+        # Reduced rather than dropped, so the operator still learns which network it was.
+        assert _MARKER_IPV4_NETWORK in rendered, rendered
+        assert _MARKER_IPV6_NETWORK in rendered, rendered
+
+    @pytest.mark.parametrize("stage", _STAGES)
+    def test_an_address_in_a_field_never_reaches_the_output(
+        self, captured_logs: Any, stage: str
+    ) -> None:
+        buffer = captured_logs(stage)
+        get_logger(__name__).error(
+            "marker_address_event", peer=_MARKER_IPV4, upstream=f"[{_MARKER_IPV6}]:5432"
+        )
+        rendered = buffer.getvalue()
+        assert "marker_address_event" in rendered, rendered
+        assert _MARKER_IPV4 not in rendered, rendered
+        assert _MARKER_IPV6 not in rendered, rendered
+
+    def test_an_anonymised_client_network_field_survives_the_chain_unchanged(
+        self, captured_logs: Any
+    ) -> None:
+        """``app.middleware.request_context`` writes one on every access record.
+
+        It has already been reduced to a network at its own call site, so the redaction pass must
+        leave it exactly as it is: a second reduction would produce ``127.0.0.0/24/24`` and make
+        the one field every access record carries unparseable as a network.
+        """
+        buffer = captured_logs("production")
+        get_logger(__name__).info("http_request", client_network="127.0.0.0/24")
+        record = json.loads([ln for ln in buffer.getvalue().splitlines() if ln.strip()][-1])
+        assert record["client_network"] == "127.0.0.0/24"
+
+    @pytest.mark.parametrize("stage", _STAGES)
+    def test_a_secret_in_a_field_never_reaches_the_output(
+        self, captured_logs: Any, stage: str
+    ) -> None:
+        buffer = captured_logs(stage)
+        get_logger(__name__).error(
+            "marker_event",
+            detail=f"password={_MARKER_PASSWORD}",
+            account=_MARKER_EMAIL,
+            dsn=_MARKER_DSN,
+        )
+        rendered = buffer.getvalue()
+        assert "marker_event" in rendered, rendered
+        for marker in (_MARKER_PASSWORD, _MARKER_EMAIL, "MARKER_DSN_PASSWORD"):
+            _assert_withheld(rendered, marker)
+
+    @pytest.mark.parametrize("stage", _STAGES)
+    def test_a_secret_in_the_event_message_never_reaches_the_output(
+        self, captured_logs: Any, stage: str
+    ) -> None:
+        buffer = captured_logs(stage)
+        get_logger(__name__).warning(f"connection to {_MARKER_DSN} refused")
+        _assert_withheld(buffer.getvalue(), "MARKER_DSN_PASSWORD")
+
+    @pytest.mark.parametrize("stage", _STAGES)
+    def test_a_secret_in_an_exception_message_never_reaches_the_output(
+        self, captured_logs: Any, stage: str
+    ) -> None:
+        buffer = captured_logs(stage)
+        try:
+            raise RuntimeError(f"could not connect to {_MARKER_DSN} as {_MARKER_EMAIL}")
+        except RuntimeError:
+            get_logger(__name__).exception("marker_failure")
+        rendered = buffer.getvalue()
+        assert "marker_failure" in rendered, rendered
+        for marker in ("MARKER_DSN_PASSWORD", _MARKER_EMAIL):
+            _assert_withheld(rendered, marker)
+
+    @pytest.mark.parametrize("stage", _STAGES)
+    def test_a_secret_in_an_exception_note_never_reaches_the_output(
+        self, captured_logs: Any, stage: str
+    ) -> None:
+        buffer = captured_logs(stage)
+        try:
+            error = ValueError("rejected")
+            error.add_note(f"supplied password={_MARKER_PASSWORD}")
+            raise error
+        except ValueError:
+            get_logger(__name__).exception("marker_noted_failure")
+        _assert_withheld(buffer.getvalue(), _MARKER_PASSWORD)
+
+    def test_the_json_chain_still_emits_parsable_records(self, captured_logs: Any) -> None:
+        """Redaction must not corrupt the structure a collector parses."""
+        buffer = captured_logs("production")
+        get_logger(__name__).error("marker_event", account=_MARKER_EMAIL)
+        lines = [line for line in buffer.getvalue().splitlines() if line.strip()]
+        assert lines, "nothing was written"
+        record = json.loads(lines[-1])
+        assert record["event"] == "marker_event"
+        assert record["account"] == LOG_REDACTION_PLACEHOLDER
+        assert record["level"] == "error"
+
+    def test_an_ordinary_record_is_unchanged_in_every_field(self, captured_logs: Any) -> None:
+        """The backstop must not rewrite a value that carries nothing sensitive."""
+        buffer = captured_logs("production")
+        get_logger(__name__).info(
+            "post published", slug="scaling-fastapi", status_code=200, duration_ms=12.5
+        )
+        record = json.loads([ln for ln in buffer.getvalue().splitlines() if ln.strip()][-1])
+        assert record["slug"] == "scaling-fastapi"
+        assert record["status_code"] == 200
+        assert record["duration_ms"] == 12.5
+        assert LOG_REDACTION_PLACEHOLDER not in json.dumps(record)

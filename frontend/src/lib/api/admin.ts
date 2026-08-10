@@ -2,7 +2,7 @@
  * Typed wrapper over the administrator-only `/admin` namespace.
  *
  * The transport half of the administrative dashboard - "manage users, posts, comments and
- * categories" - and the largest of the seven wrappers beside `@/lib/api/client` at fourteen
+ * categories" - and the largest of the seven wrappers beside `@/lib/api/client` at thirteen
  * operations. Nothing here renders; the screens under `src/app/(admin)/` and the components under
  * `src/components/admin/` do that, and they reach the service only through the functions below.
  *
@@ -61,7 +61,7 @@
  * `require_admin` is applied **once**, as a router-level dependency on the administrative include -
  * one `dependencies=[Depends(require_admin)]` for the whole namespace - precisely so that no
  * individual route can omit the gate. Authority is therefore already established before any handler
- * runs, on every one of these fourteen endpoints, without exception.
+ * runs, on every one of these thirteen endpoints, without exception.
  *
  * So this module inspects no privilege, decodes no token, reads no backend configuration and throws
  * nothing early. `src/middleware.ts` keeps an unauthenticated visitor out of `/admin/*` and the
@@ -78,7 +78,7 @@
  *
  * ## Naming: every export is prefixed `Admin`
  *
- * Deliberate, and not merely for tidiness. Four of these operations have a same-named counterpart
+ * Deliberate, and not merely for tidiness. Three of these operations have a same-named counterpart
  * elsewhere in this folder that does something materially different, and the pairs are easy to
  * confuse precisely because they read alike:
  *
@@ -87,10 +87,9 @@
  * | {@link updateAdminPostStatus}  | `posts.ts` `updatePost`         | Forces a lifecycle state vs. edits own content |
  * | {@link deleteAdminPost}        | `posts.ts` `deletePost`         | Any post vs. only the caller's own             |
  * | {@link listAdminPosts}         | `posts.ts` `listPosts`          | Every state vs. published only                 |
- * | {@link listAdminCategories}    | `categories.ts` `listCategories`| A searchable page vs. the whole bare array     |
  *
  * A bare `updatePost` is therefore **not** exported here, and neither is a bare `listPosts` or
- * `deletePost`. A screen that imports from both wrappers gets fourteen unambiguous names and needs
+ * `deletePost`. A screen that imports from both wrappers gets thirteen unambiguous names and needs
  * no aliasing to disambiguate them. Named exports only; this folder has no barrel, so consumers
  * import `@/lib/api/admin` directly.
  *
@@ -119,8 +118,6 @@ import {
   type ProtectedRequestOptions,
   type QueryParams,
 } from '@/lib/api/client';
-import { encodePathSegment } from '@/lib/paths';
-import { codePointLength } from '@/lib/text';
 import {
   adminCommentSchema,
   adminPostSchema,
@@ -146,6 +143,7 @@ import type {
   PostStatus,
   UserRole,
 } from '@/lib/types';
+import { codePointLength, encodePathSegment } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Endpoint paths
@@ -173,8 +171,10 @@ const ADMIN_POSTS_PATH = '/admin/posts';
 const ADMIN_COMMENTS_PATH = '/admin/comments';
 
 /**
- * Category collection: the searchable management listing, and the only place in the API where the
- * taxonomy can be mutated.
+ * Category collection: the only place in the API where the taxonomy can be mutated. There is no
+ * administrative *listing* of it - the public `GET /api/v1/categories`, wrapped by `listCategories`
+ * in `@/lib/api/categories.ts`, answers the whole taxonomy with each term's tally in one round
+ * trip, and the management table renders from that.
  */
 const ADMIN_CATEGORIES_PATH = '/admin/categories';
 
@@ -334,28 +334,9 @@ export interface AdminCommentListParams extends AdminPageParams {
 }
 
 /**
- * Query parameters of {@link listAdminCategories}.
- *
- * One filter beyond the window, and the two together are what separate this listing from the public
- * one in `@/lib/api/categories.ts`: that read answers with the whole taxonomy as a bare array, because
- * it *is* the home page's filter control and a window could hide the posts filed under a term that
- * fell outside it, while this one is a management table and windows and searches like every other.
- * Searching a controlled vocabulary is a management affordance, so the term lives here rather than on
- * the read every home-feed render performs. The item projection is identical on both, down to the
- * meaning of `post_count`.
- */
-export interface AdminCategoryListParams extends AdminPageParams {
-  /**
-   * Free-text term matched case-insensitively against **both** the name and the slug, so a term is
-   * findable by either spelling. A blank or whitespace-only value is treated as no filter.
-   */
-  q?: string;
-}
-
-/**
  * The per-call transport controls **every** operation in this module accepts.
  *
- * All fourteen are administrator-only: the versioned router applies `require_admin` once, at the
+ * All thirteen are administrator-only: the versioned router applies `require_admin` once, at the
  * mount, so every route beneath `/admin` requires a credential and a privileged one. Anonymity is
  * therefore not a mode any of them has, and {@link ProtectedRequestOptions} is what removes
  * `anonymous` and `anonymousFallback` so it cannot be asked for - a request without a credential
@@ -746,23 +727,23 @@ export function deleteAdminComment(
 /* -------------------------------------------------------------------------------------------------
  * Categories - the whole lifecycle lives here
  *
- * The taxonomy is administrative reference data, so the three mutating functions below are the *only*
- * way it changes. `src/lib/api/categories.ts` is read-only by design and the service's public category
+ * The taxonomy is administrative reference data, so the three functions below are the *only* way it
+ * changes. `src/lib/api/categories.ts` is read-only by design and the service's public category
  * router declares no mutation at all: an author files a post under existing terms rather than
  * inventing them, which is what keeps the taxonomy a controlled vocabulary instead of a free-text
  * field.
  *
- * The fourth function, {@link listAdminCategories}, is the management table those three act on. It
- * exists beside the public listing rather than in place of it because it accepts a search term, and
- * only because of that - both answer the identical page envelope of the identical item type, and both
- * reach one service method behind the API, so the management table and the home page's filter control
- * cannot disagree about what a category is. It reads a category rather than mutating one, and is
- * grouped here so that the four operations over one resource are read together.
+ * There is deliberately no administrative *listing* of categories, and none is missing. The taxonomy
+ * is small and bounded, and `listCategories` in `@/lib/api/categories.ts` already returns the whole of
+ * it in one round trip - ascending by name, every term carrying the same `post_count` a reader sees,
+ * including the terms with none - so the management table renders that array and no privileged
+ * duplicate of it can disagree with the home page's filter control. It is the surface the AAP's REST
+ * inventory declares (§0.6.2): create, rename and delete for a category, and one public read.
  *
- * There is no administrative *projection* of a category, and none is missing: a category has no owner,
- * no address, no credential and no moderation state, so `CategoryPublic` already carries every member
- * this screen shows. That is why this is the one family on the namespace whose listing does not return
- * an `Admin`-prefixed type.
+ * There is no administrative *projection* of a category either, and none is missing: a category has no
+ * owner, no address, no credential and no moderation state, so `CategoryPublic` already carries every
+ * member such a screen shows. That is why this is the one family on the namespace with no
+ * `Admin`-prefixed type at all.
  *
  * Neither input accepts an identifier or a slug, and the request types make that structural rather
  * than merely conventional. Identity is generated by the database. The slug is derived from the name
@@ -771,48 +752,6 @@ export function deleteAdminComment(
  * every published link and every crawled page pointing at it. A client-supplied slug could also
  * collide with an existing category. So neither field is sent, and there is no way to send one.
  * ---------------------------------------------------------------------------------------------- */
-
-/**
- * List categories for the category management table.
- *
- * `GET /admin/categories` &rarr; `200` with a {@link Page} of {@link CategoryPublic}.
- *
- * **The item type is the public one**, not an `Admin`-prefixed projection, and that is deliberate -
- * see this section's header. A screen may therefore render a row from this listing with the same
- * component that renders the home page's filter option.
- *
- * Two things separate this from `listCategories` in `@/lib/api/categories.ts`: `q`, and the envelope
- * itself - that read returns a bare `CategoryPublic[]` covering the whole taxonomy, because it is the
- * home page's filter control and windowing it could hide posts, whereas this is a table and pages like
- * every other. The item type is the same on both, and so is `post_count`, which counts PUBLISHED posts
- * on either, so a moderator reads the figure a reader would see. A term with nothing
- * filed under it is present with a `post_count` of `0` rather than omitted, which is how the table
- * shows an unused category - and how {@link deleteAdminCategory} becomes available for it, since that
- * deletion is refused while any post is still filed.
- *
- * @param params - Window and search term. Omit entirely for the first page of the whole taxonomy.
- * @param options - Per-request controls, forwarded untouched. A `query` here is superseded by
- * `params` - see {@link listRequestOptions}.
- * @returns One page of categories, its five envelope fields exactly as the service sent them.
- * @throws The client's normalised error.
- */
-export function listAdminCategories(
-  params: AdminCategoryListParams = {},
-  options?: AdminRequestOptions,
-): Promise<Page<CategoryPublic>> {
-  assertSearchTermLength(params.q, 'listAdminCategories');
-
-  const query: QueryParams = {
-    page: params.page,
-    page_size: params.page_size,
-    q: params.q,
-  };
-  return apiGet(
-    ADMIN_CATEGORIES_PATH,
-    pageOf(categoryPublicSchema),
-    listRequestOptions(query, options),
-  );
-}
 
 /**
  * Create a category.

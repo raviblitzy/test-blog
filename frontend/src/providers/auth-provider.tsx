@@ -47,19 +47,31 @@
 // to a request.
 //
 // ---------------------------------------------------------------------------
-// THE COST OF THAT CHOICE, WHICH IS ACCEPTED AND MUST NOT BE "FIXED"
+// HOW A SESSION SURVIVES A FULL NAVIGATION, AND WHERE THE CREDENTIAL IS
 //
 // A full page reload starts a fresh JavaScript context, so the in-memory
-// credential is gone. This provider then finds a marker with no token behind it,
-// clears the marker, and presents an anonymous session: the reader signs in
-// again. It makes NO request in that state - there is nothing to authenticate
-// with, so GET /auth/me could only answer 401.
+// credential is gone. That used to end the session: this provider found a marker
+// with no token behind it, cleared the marker, and presented an anonymous
+// session, so a reader was signed out by every reload, every new tab and every
+// external link back into the site, having done nothing.
 //
-// Restoring a session across a reload would mean persisting a long-lived
-// credential where scripts can read it, which is strictly worse than one
-// re-login. This is the same trade the refresh token already makes below, drawn
-// at the same place. Do not resolve it by putting a token in the cookie, in
-// localStorage or in sessionStorage.
+// It is resolved by a credential NO SCRIPT IN THIS TIER CAN READ, which is the
+// only resolution worth having. `src/app/api/session/route.ts` is a Route
+// Handler on this application's own origin, and it holds the refresh token in a
+// cookie that is HttpOnly, SameSite=Strict, scoped to that route's own path and
+// Secure wherever the request arrived over https. On mount, a document that finds
+// a marker but no in-memory credential asks that route to ROTATE the stored token
+// and hand back a usable pair - see the restoration effect. Rotation is also the
+// validation, because a refresh token is single-use: one the service has revoked,
+// expired or already seen is refused, and only then is the session over.
+//
+// The rule that produced the original trade is unchanged and still binding: DO
+// NOT put a credential anywhere a script can read it - not in the marker cookie,
+// not in localStorage, not in sessionStorage. Everything a browser script can
+// write, a browser script can read, and a script-written cookie cannot be
+// HttpOnly. The fix is not a laxer store; it is a store the document does not
+// have. This provider still never sees that cookie, and neither does
+// @/lib/api/client: both only ask the route to act on it.
 //
 // ---------------------------------------------------------------------------
 // DIVISION OF LABOUR WITH src/lib/api/client.ts
@@ -103,18 +115,27 @@
 // session exists, and which role it claims. It must not treat either as proof.
 //
 // ---------------------------------------------------------------------------
-// THE REFRESH TOKEN IS MEMORY-ONLY, AND WHAT THAT COSTS
+// WHERE THE REFRESH TOKEN IS, IN BOTH PLACES IT EXISTS
 //
-// client.ts holds the refresh token in a module variable and nothing else - this
-// file never puts it in state, in a ref, in a cookie or in durable browser
-// storage (neither localStorage nor sessionStorage appears anywhere in this
-// tier). It is an opaque high-entropy value rather than a JWT, so it is never
-// decoded or inspected either.
+// client.ts holds it in a module variable, which is what its own single-flight
+// rotation presents on a 401. This file never puts it in state, in a ref, in the
+// marker cookie or in durable browser storage - neither localStorage nor
+// sessionStorage appears anywhere in this tier. It is an opaque high-entropy
+// value rather than a JWT, so it is never decoded or inspected either.
 //
-// The accepted consequence, stated plainly so nobody "fixes" it: after a full
-// page reload there is no refresh token, so the session cannot be renewed and
-// the reader signs in again. That is the correct trade, and it is NOT to be
-// resolved by persisting the refresh token client-side.
+// It ALSO exists in the session route's HttpOnly cookie, written by a server and
+// unreadable from any document, which is what a new document rotates to recover.
+// Both copies move together: `setCredentials` and `clearCredentials` are the
+// funnels every transition passes through, and this provider arms the mirror on
+// them - see the effect that calls `setDurableSessionMirror`. So the durable copy
+// cannot hold a token the store has already replaced.
+//
+// The one honest window: a rotation whose mirror write has not landed when the
+// document is destroyed leaves a spent token in the cookie, and the next
+// document's recovery is refused. That degrades to a sign-in - the behaviour
+// before any of this existed - and never to a wrong or resurrected session,
+// because the service revokes a presented refresh token as it issues the
+// replacement.
 //
 // ---------------------------------------------------------------------------
 // A NULL ACCOUNT HAS THREE MEANINGS, AND CONSUMERS MUST TELL THEM APART
@@ -225,8 +246,10 @@ import {
   clearCredentials,
   getAccessToken,
   isApiError,
+  recoverDurableSession,
   rotateSession,
   setCredentials,
+  setDurableSessionMirror,
   setUnauthorizedHandler,
 } from '@/lib/api/client';
 import { USER_ROLES } from '@/lib/types';
@@ -299,11 +322,14 @@ const HTTP_FORBIDDEN = 403;
  * fail for two unrelated kinds of reason, and treating them alike is a defect in
  * whichever direction it is made:
  *
- *   * **Terminal.** `401` means the token expired or was revoked while the tab
- *     was closed, and after a reload there is no refresh token to renew it with;
- *     `403` means the account was deactivated. In both the credential is worth
- *     nothing, so keeping it would leave every later request to fail the same
- *     way. The session is ended.
+ *   * **Terminal.** `401` means the credential is finished - and after the
+ *     restoration effect, that is a stronger statement than it looks. A document
+ *     with no in-memory credential presents the durable refresh token FIRST, so a
+ *     `401` from either that rotation or the `GET /auth/me` behind it means the
+ *     single-use token was revoked, expired or already spent, and there is nothing
+ *     left to renew with. `403` means the account was deactivated. In both the
+ *     credential is worth nothing, so keeping it would leave every later request
+ *     to fail the same way. The session is ended.
  *   * **Not terminal.** A transport failure - the API unreachable, DNS down, a
  *     CORS preflight refused, the request aborted - arrives as
  *     {@link ApiError.status} `0`, because no response was received at all. A
@@ -723,21 +749,53 @@ export function AuthProvider({ children }: AuthProviderProps): React.JSX.Element
     };
   }, [endSession]);
 
+  // Arm the durable session mirror.
+  //
+  // Declared BEFORE the restoration effect for the same reason as the handler
+  // above: effects run in declaration order, so the mirror is armed before the
+  // first credential this provider adopts, and no adoption can slip past it.
+  //
+  // What it switches on is one thing: `@/lib/api/client`'s `setCredentials` and
+  // `clearCredentials` will now tell the session route to update or drop the
+  // HttpOnly refresh cookie it owns. Those two functions are the funnels EVERY
+  // credential transition passes through - sign-in, single-flight rotation,
+  // sign-out, an abandoned session - which is what makes the durable copy
+  // incapable of holding a token the store has already replaced.
+  //
+  // It is armed here rather than being unconditional inside the client because
+  // this provider is the tier's single owner of the session lifecycle, exactly as
+  // it is for the marker and the unauthorised handler. The practical consequence
+  // is that a test or a Server Component that touches the credential store
+  // directly acquires no same-origin request it did not ask for.
+  useEffect(() => {
+    setDurableSessionMirror(true);
+    return () => {
+      setDurableSessionMirror(false);
+    };
+  }, []);
+
   // Session restoration, once per mount.
   //
-  // What can and cannot be restored is the whole of this effect's logic. The
-  // marker in the cookie says a session EXISTED; only the in-memory credential
-  // can show one still does, and after a full page reload there is none - see the
-  // header. So:
+  // What can and cannot be restored is the whole of this effect's logic, and it
+  // turns on the difference between the two cookies this tier now has. The
+  // script-written `blog_session` MARKER says a session EXISTED and which role it
+  // claimed; it is not a credential and proves nothing. The HttpOnly refresh
+  // cookie owned by `src/app/api/session/route.ts` IS a credential, and it is the
+  // only thing that survives into a new document. So:
   //
-  //   * No credential in memory -> no request is made at all, and a marker left
-  //     over from the previous context is cleared. Making GET /auth/me here could
-  //     only produce a 401, on every anonymous page load, and it is also what
-  //     would force every component test that renders this provider to mock a
-  //     request it has no interest in.
-  //   * A credential in memory (a StrictMode re-mount, or a provider re-mounted
-  //     inside one context) -> re-read the account, which is authoritative and
-  //     picks up a role an administrator has just changed.
+  //   * No credential in memory AND no marker -> genuinely anonymous. No request
+  //     is made at all. GET /auth/me could only produce a 401, on every anonymous
+  //     page load, and it is also what would force every component test that
+  //     renders this provider to mock a request it has no interest in.
+  //   * No credential in memory BUT a marker -> the ordinary state after any full
+  //     navigation. RECOVER: ask the session route to rotate its stored refresh
+  //     token, adopt the pair it returns, and only then read the account. This is
+  //     what stops a reload signing the reader out, and rotation doubles as the
+  //     validation - a single-use token that has been revoked, has expired or has
+  //     already been spent is refused, and then the session genuinely is over.
+  //   * A credential in memory (a StrictMode re-mount, a successful recovery, or a
+  //     provider re-mounted inside one context) -> re-read the account, which is
+  //     authoritative and picks up a role an administrator has just changed.
   //
   // Why this cannot be derived during render instead: the cookie is invisible to
   // the server render (there is no document there), so a `useState` initialiser
@@ -760,12 +818,40 @@ export function AuthProvider({ children }: AuthProviderProps): React.JSX.Element
         const marker = readSessionMarker();
 
         if (getAccessToken() === null) {
-          // Nothing to restore. Clear a marker that has outlived its credential so
-          // the middleware stops admitting navigations this context cannot serve.
-          if (marker !== null) {
-            clearSessionMarker();
+          if (marker === null) {
+            // GENUINELY ANONYMOUS, and no request is made. No marker means no
+            // previous document in this browser signed in, so there is nothing to
+            // recover and nothing to ask about: `GET /auth/me` here could only
+            // answer 401, on every anonymous page load, and it is also what would
+            // force every component test that renders this provider to mock a
+            // request it has no interest in.
+            return;
           }
-          return;
+
+          // A PREVIOUS DOCUMENT HELD A SESSION, AND THIS ONE HAS NO CREDENTIAL.
+          //
+          // That is the ordinary state after any full navigation - a reload, a new
+          // tab, an external link back into the site - because the credential lives
+          // in a module variable and a module variable dies with its JavaScript
+          // context. It is NOT evidence that the session is over, and treating it as
+          // such is what used to sign the reader out here: the marker was cleared,
+          // an anonymous session was presented, and nothing had been asked.
+          //
+          // So the durable credential is presented instead. `recoverDurableSession`
+          // asks the same-origin session route to rotate the HttpOnly refresh cookie
+          // it owns and adopts the pair it returns, which arms the bearer before
+          // `getMe` below is called. Rotation is also the VALIDATION: a refresh token
+          // is single-use, so a token the service has revoked, expired or already
+          // seen is refused, and the session really is over.
+          //
+          // A failure here is classified by the same `catch` as everything else in
+          // this effect, which is the point of letting it throw an `ApiError`: a 401
+          // ends the session, and a transport failure or a 5xx leaves it untouched
+          // for a later retry. Neither case needs a branch of its own.
+          await recoverDurableSession(controller.signal);
+          if (cancelled) {
+            return;
+          }
         }
 
         const account = await getMe({ signal: controller.signal });
@@ -793,10 +879,12 @@ export function AuthProvider({ children }: AuthProviderProps): React.JSX.Element
           //    object is exactly what must not be handed over.
           setRestoreDefect(cause instanceof Error ? cause : new Error(String(cause)));
         } else if (isTerminalAuthFailure(cause)) {
-          // 2. THE SESSION IS OVER. A dead cookie on load is an ordinary state
-          //    and not a crash: the token expired or was revoked while the tab
-          //    was closed, and after a reload there is no refresh token to renew
-          //    it with. End the session and let the reader sign in.
+          // 2. THE SESSION IS OVER. A dead session on load is an ordinary state
+          //    and not a crash: the token expired, was revoked while the tab was
+          //    closed, or - for a recovered document - the stored refresh token
+          //    had already been spent, so the rotation above was refused and
+          //    there is nothing left to renew with. End the session and let the
+          //    reader sign in.
           endSession();
         } else {
           // 3. THE ATTEMPT FAILED, THE SESSION DID NOT. The service was

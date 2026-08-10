@@ -104,9 +104,11 @@ __all__ = [
     "OptionalStorableText",
     "Page",
     "ProblemDetail",
+    "ProblemResponses",
     "StorableText",
     "ValidationErrorItem",
     "omit_null_default",
+    "problem_response",
 ]
 
 
@@ -582,3 +584,81 @@ class ProblemDetail(BaseModel):
     or the reverse, reintroduces exactly the guard the pair exists to remove: change them
     together.
     """
+
+
+# ---------------------------------------------------------------------------------------
+# The one response object every documented failure is declared with
+#
+# Two things in this API are uniform by design and were, until this helper existed, restated
+# by hand in nine router modules: every failure at every status returns one `ProblemDetail`
+# document, and every one of those documents is served as `application/problem+json`. Nine
+# copies of `{"model": ProblemDetail, "description": ...}` is nine chances to omit the model -
+# which publishes a status with no body schema at all - and no number of copies could have
+# fixed the media type, because the framework does not let a route declare it.
+#
+# The helper lives HERE, beside the model it names, and it could not live under `app.core`.
+# `app.core.exceptions` records the rule in its own docstring: `app.core` is the root of the
+# import graph and may not import `app.schemas`, precisely because this module imports
+# `app.core.pagination` - an import back the other way would close a cycle. The half of the
+# contract that cannot be expressed on a route at all, the media-type remap, is therefore in
+# `app.main` instead, applied to the finished document.
+# ---------------------------------------------------------------------------------------
+
+ProblemResponses = dict[int | str, dict[str, Any]]
+"""Shape of a route's ``responses=`` mapping: status code to response object.
+
+``int | str`` keys because that is what the framework accepts - a range key such as ``"4XX"`` is
+legal - and the alias exists so each router's constants are annotated explicitly rather than
+having their type inferred from a literal nested in a decorator argument.
+"""
+
+
+def problem_response(description: str) -> dict[str, Any]:
+    """Build the response object for one documented failure.
+
+    The single place in this service that names :class:`ProblemDetail` in a route declaration.
+    A router writes::
+
+        from app.schemas import ProblemResponses, problem_response
+
+        _NOT_FOUND: Final[dict[str, Any]] = problem_response(
+            "No post is addressable that way. A draft the caller may not read answers this "
+            "identically to a post that does not exist."
+        )
+
+        _DETAIL_RESPONSES: Final[ProblemResponses] = {
+            status.HTTP_404_NOT_FOUND: _NOT_FOUND,
+            status.HTTP_422_UNPROCESSABLE_CONTENT: _VALIDATION_FAILED,
+        }
+
+    The wording stays with the route, because a description is specific to the operation that
+    emits it; the *shape* stops being the route's business.
+
+    ``model`` is the load-bearing key: without it the failure body is absent from the generated
+    document and a client generator emits no type for the error path, which is exactly the gap
+    the *explicit API contracts* standard closes. Routing every declaration through this
+    function is what makes forgetting it impossible rather than merely unlikely.
+
+    The media type is deliberately **not** set here, and it cannot be. Both alternatives were
+    executed against FastAPI 0.141.1 and both fail: adding ``"content": {"application/problem
+    +json": {}}`` beside ``"model"`` publishes *both* media types, because the framework merges
+    rather than replaces, so the document would advertise an ``application/json`` error body the
+    service never sends; and omitting ``"model"`` to write the ``content`` block by hand
+    publishes the right media type and loses the ``$ref``, leaving the error body untyped in the
+    very document a client generator reads. The framework attaches a declared model under
+    ``route.response_class.media_type`` and offers no per-response override, so the only place
+    the two facts can be reconciled is the finished document - which is what
+    ``app.main._customise_openapi`` does.
+
+    Args:
+        description: What this failure means and what a client should do about it, in Markdown.
+            Written by the route that emits it, because the condition is specific to the
+            operation: "no post carries that identifier" and "the `author` filter names no
+            account" are both 404 and are not the same sentence.
+
+    Returns:
+        A fresh ``{"model": ProblemDetail, "description": ...}`` mapping. Fresh on every call, so
+        two routes sharing a description cannot end up sharing one mutable object that a third
+        could edit.
+    """
+    return {"model": ProblemDetail, "description": description}

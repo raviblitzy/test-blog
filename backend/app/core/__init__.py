@@ -6,21 +6,15 @@
 package depends on none of them in return. That one-way relationship is what keeps the
 layer boundaries reviewable, so it must never be inverted.
 
-The ten sibling modules this marker makes importable, in dependency order, own the
+The eight sibling modules this marker makes importable, in dependency order, own the
 concerns that have no other single owner:
 
-* ``password_policy`` - the single declaration of what makes a password acceptable: four
-  bounds, one rejection message and two pure functions. Imports the standard library and
-  nothing else - not even ``pydantic`` - which is what lets both ``config`` below and
-  ``app.schemas.auth`` reach the same rule while only one of them needs a configured
-  environment. The true root of the graph.
-* ``concurrency`` - the bounded worker-thread offload every CPU-bound call in a request path
-  goes through, so argon2 hashing and HTML sanitisation cannot stall the event loop and cannot
-  answer a request flood with a thread flood. Imports ``anyio`` and no sibling at all, which
-  puts it beside ``password_policy`` at the root of the graph.
 * ``config`` - the typed settings contract over the environment, and the only module in
-  the repository permitted to read it. Imports ``password_policy`` and re-exports it, and
-  imports no other sibling.
+  the repository permitted to read it. Imports exactly one sibling of a higher layer,
+  ``app.schemas.auth``, for the password policy that ``SEED_ADMIN_PASSWORD`` is held to: that
+  rule is declared beside the request body which publishes it, because importing this module
+  constructs the settings singleton and a JSON contract module must stay importable with
+  nothing configured. Nothing on that side reads the environment, so the import costs nothing.
 * ``pagination`` - the page envelope (``items``, ``total``, ``page``, ``page_size``,
   ``pages``) every list endpoint returns, so one client control can page them all.
 * ``slug`` - collision-safe derivation of the URL-safe slugs behind canonical post and
@@ -29,8 +23,12 @@ concerns that have no other single owner:
 * ``exceptions`` - the domain exception hierarchy plus the handlers that render every
   failure as one machine-readable problem document.
 * ``security`` - argon2id password hashing and verification, access-token issuance, and
-  refresh-token generation, hashing and decoding. Imports ``concurrency`` for the awaitable
-  form of each password primitive, ``config`` for the signing parameters, and ``exceptions``.
+  refresh-token generation, hashing and decoding. It also owns the bounded worker-thread
+  offload every CPU-bound call in a request path goes through, because the argon2 hashing
+  declared there is the most expensive claimant on it and one bound over the machine's CPU is
+  one declaration; ``app.services.post_service`` and ``app.services.comment_service`` reach it
+  from here for their bleach sanitisation. Imports ``anyio``, ``config`` for the signing
+  parameters, and ``exceptions``.
 * ``rate_limit`` - the limiter and the decorators guarding the authentication routes.
 * ``dependencies`` - request-scoped injection: the database session, the resolved
   principal, the administrator guard and the normalised pagination parameters.

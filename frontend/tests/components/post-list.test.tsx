@@ -156,7 +156,7 @@ vi.mock('next/navigation', () => ({
 /* -------------------------------------------------------------------------------------------------
  * The component's contract, restated
  *
- * These values are declared in `post-list.tsx`, `ui/pagination.tsx` and `lib/pagination.ts` as
+ * These values are declared in `post-list.tsx`, `ui/pagination.tsx` and `lib/utils.ts` as
  * module-private constants, so they cannot be imported. Restating them is the correct shape for a
  * test rather than a duplication to remove: the test is what PINS the contract, so changing the
  * default copy or the placeholder count becomes a deliberate two-file edit instead of a silent one.
@@ -242,6 +242,16 @@ const MULTI_PAGE_NEXT = 3;
 
 /** A page number well past the end of {@link MULTI_PAGE_TOTAL}, as a stale bookmark would name. */
 const OUT_OF_RANGE_PAGE = 9;
+
+/**
+ * An origin on the remote-image allow-list, used to give a row a cover that actually renders.
+ *
+ * Written out rather than imported: `IMAGE_HOST_ALLOWLIST` in `@/lib/utils` is the single source of the
+ * policy and is deliberately source code rather than configuration, so this literal is the restatement
+ * with a note pointing at its origin. If the allow-list ever loses this host, this is the line that has
+ * to follow it.
+ */
+const ADMITTED_COVER_HOST = 'https://images.unsplash.com';
 
 /* -------------------------------------------------------------------------------------------------
  * Fixtures
@@ -400,6 +410,31 @@ function singlePageWindow(): Page<PostSummary> {
 }
 
 /**
+ * A full window whose every row carries a cover on an ADMITTED host.
+ *
+ * The distinction from {@link singlePageWindow} is the whole reason this builder exists.
+ * `makePostSummary` sets `cover_image_url: null`, so no card in that window renders an `img` at all -
+ * and `prioritizeFirstCover` then has nothing to act on, which means a component that ignored the flag
+ * entirely would satisfy every other case in this file.
+ *
+ * The host is `images.unsplash.com`, which is on the allow-list `@/lib/utils` declares and
+ * `next.config.ts` derives `images.remotePatterns` from. That matters twice: `next/image` throws on a
+ * host absent from that list, and the card's own `allowedImageUrl` guard withholds the element for an
+ * unlisted one - so an unadmitted host here would produce no image and quietly restore the same blind
+ * spot.
+ *
+ * @returns Three rows, each with a distinct admitted cover URL, `page: 1`, `pages: 1`.
+ */
+function coveredWindow(): Page<PostSummary> {
+  const rows = makePostSummaries(SINGLE_PAGE_TOTAL).map((post, offset) => ({
+    ...post,
+    cover_image_url: `${ADMITTED_COVER_HOST}/photo-${String(offset + 1)}.jpg`,
+  }));
+
+  return makePage(rows, { page: 1, page_size: WINDOW_SIZE, total: SINGLE_PAGE_TOTAL });
+}
+
+/**
  * The middle page of a four-page collection, so the control renders and has a page either side.
  *
  * @returns A full window of three rows, `page: 2`, `pages: 4`.
@@ -488,6 +523,45 @@ describe('PostList', () => {
   });
 
   describe('page envelope contract', () => {
+    it('matches a wire envelope written out independently of the builders', () => {
+      // THE ORACLE IS FROZEN, not computed. Every other envelope in this file comes from `makePage`,
+      // which derives `pages` as `ceil(total / page_size)` - so asserting that derivation against a
+      // constant derived the same way proves only that the helper agrees with itself. This case is the
+      // one place the arithmetic is checked against numbers a person wrote down: the literal below is
+      // a verbatim `GET /api/v1/posts?page=2&page_size=3` response body for a ten-row collection, with
+      // `pages: 4` because four is what `ceil(10 / 3)` comes to and 4 is what the service sends.
+      //
+      // The comparison runs in both directions. Equality against the frozen literal catches a helper
+      // that starts producing a different shape, and the key-set assertion catches an ADDED sixth
+      // field - which the type-only import cannot, since an extra property is still assignable.
+      const frozen = {
+        items: [],
+        page: 2,
+        page_size: 3,
+        pages: 4,
+        total: 10,
+      } as const;
+
+      const built = makePage([], {
+        page: frozen.page,
+        page_size: frozen.page_size,
+        total: frozen.total,
+      });
+
+      expect(built).toEqual(frozen);
+      expect(Object.keys(built).sort()).toEqual(['items', 'page', 'page_size', 'pages', 'total']);
+
+      // The three boundary answers of that arithmetic, each written as a literal rather than derived:
+      // an empty collection reports ZERO pages (not one), a collection that does not divide evenly
+      // rounds up, and one that divides evenly does not gain a trailing empty page. The first of those
+      // is the number that separates "nothing matches" from "you are past the end", and the two states
+      // render differently further down this file.
+      expect(makePage([], { page: 1, page_size: 3, total: 0 }).pages).toBe(0);
+      expect(makePage([], { page: 1, page_size: 3, total: 10 }).pages).toBe(4);
+      expect(makePage([], { page: 1, page_size: 3, total: 9 }).pages).toBe(3);
+      expect(makePage([], { page: 1, page_size: 3, total: 1 }).pages).toBe(1);
+    });
+
     it('carries exactly the five snake_case fields the service returns', () => {
       // The uniform pagination contract, pinned once, in the one file that reads the envelope's
       // numeric fields. `Page<T>` documents EXACTLY five: `has_next`, `has_prev`, `offset`, cursors
@@ -527,6 +601,38 @@ describe('PostList', () => {
       // And each row is really the one that was passed in, found by its title's accessible name.
       for (const post of feed.items) {
         expect(screen.getByRole('heading', { name: post.title })).toBeInTheDocument();
+      }
+    });
+
+    it('renders the window as one list whose items are the rows', () => {
+      const feed = singlePageWindow();
+
+      render(<PostList page={feed} />);
+
+      // COLLECTION SEMANTICS, which the per-card `article` count does not carry. A screen reader
+      // announces "list, 3 items" from these roles and nothing else, so a grid of sibling cards with no
+      // list around them reads as three unrelated articles - and a reader has no way to know how many
+      // results are in front of them or where the set ends. The component's own header records that
+      // this is why the loaded branch is a `<ul>` of `<li>` while the loading branch deliberately is
+      // not, so the roles are the contract rather than an implementation detail.
+      const list = screen.getByRole('list');
+      const items = within(list).getAllByRole('listitem');
+      expect(items).toHaveLength(feed.items.length);
+
+      // Exactly ONE list: a nested or duplicated list would double every announced count. The category
+      // pills inside a card are `navigation` landmarks rather than lists, which is what keeps this
+      // count at one.
+      expect(screen.getAllByRole('list')).toHaveLength(1);
+
+      // Each list item holds exactly one card, so the two structures agree rather than merely
+      // coexisting - one `li` per row AND one `article` per `li`.
+      for (const [index, item] of items.entries()) {
+        const row = feed.items[index];
+        if (row === undefined) {
+          throw new Error(`Expected a row at index ${String(index)}.`);
+        }
+        expect(within(item).getAllByRole('article')).toHaveLength(1);
+        expect(within(item).getByRole('heading', { name: row.title })).toBeInTheDocument();
       }
     });
 
@@ -591,6 +697,45 @@ describe('PostList', () => {
 
       for (const post of feed.items) {
         expect(screen.getByRole('heading', { name: post.title })).toBeInTheDocument();
+      }
+    });
+
+    it('prioritises the first cover and only the first when asked to', () => {
+      const feed = coveredWindow();
+
+      const { container } = render(<PostList page={feed} prioritizeFirstCover />);
+
+      // Every row in this window has a cover on an admitted host, which is what makes the branch
+      // reachable at all: the other windows in this file carry `cover_image_url: null`, so no `img` is
+      // rendered and `prioritizeFirstCover` has nothing to act on - the flag could be ignored entirely
+      // and those cases would still pass.
+      const covers = Array.from(container.querySelectorAll('img'));
+      expect(covers).toHaveLength(feed.items.length);
+
+      // The first cover loads eagerly, because on the first page of the feed it is the Largest
+      // Contentful Paint candidate. `loading` is the observable consequence in jsdom; the
+      // fetch-priority hint itself is the browser's business and is not asserted.
+      expect(covers[0]?.getAttribute('loading')).not.toBe('lazy');
+
+      // AND ONLY THE FIRST. `index === 0` is the whole of the rule, and a flag applied to every card
+      // would make every below-the-fold cover contend for bandwidth with the one above it - which is
+      // the exact regression this half of the assertion catches and the previous version could not.
+      for (const cover of covers.slice(1)) {
+        expect(cover.getAttribute('loading')).toBe('lazy');
+      }
+    });
+
+    it('defers every cover when not asked to prioritise one', () => {
+      const feed = coveredWindow();
+
+      const { container } = render(<PostList page={feed} />);
+
+      // The default, and the correct one for a list that may be rendered anywhere on a page: nothing
+      // is above the fold until a caller says so.
+      const covers = Array.from(container.querySelectorAll('img'));
+      expect(covers).toHaveLength(feed.items.length);
+      for (const cover of covers) {
+        expect(cover.getAttribute('loading')).toBe('lazy');
       }
     });
   });

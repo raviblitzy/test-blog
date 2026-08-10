@@ -131,7 +131,7 @@ classifiers = [
 # other.
 #
 # The two files are deliberately not identical, and the difference is one thing:
-# requirements.txt carries a second section pinning the 29 transitive
+# requirements.txt carries a second section pinning the 30 transitive
 # distributions this set resolves to, so an install reproduces the whole
 # environment rather than only the request. That belongs there and not here,
 # because this array states what the DISTRIBUTION depends on - a consumer that
@@ -141,33 +141,29 @@ classifiers = [
 # dependency declaration. When the direct set changes, both change - and the
 # closure in requirements.txt has to be regenerated, not edited.
 #
-# Every package the backend imports is here, including the ones a parent would
-# have supplied anyway: `starlette` because three modules import it directly,
-# and `pydantic` and `greenlet` for the same reason applied to a runtime need.
-# Inheriting a pin from another project's metadata means that project can move
-# it, or drop it, on its own release schedule.
+# Eighteen entries, and the set is exact: every package this project reaches for
+# by name is here, including the two a parent would have supplied anyway -
+# `pydantic`, imported directly by every schema module, and `greenlet`, a runtime
+# need of SQLAlchemy's async layer that nothing here imports but everything here
+# depends on. Inheriting a pin from another project's metadata means that project
+# can move it, or drop it, on its own release schedule.
+#
+# `starlette` is deliberately NOT one of them. A handful of modules do import it
+# by name - the ASGI protocol aliases and `MutableHeaders` in the two middleware,
+# the base `HTTPException`, `Match` and `ExceptionHandler` in the error contract,
+# and `ExceptionMiddleware` in the application factory - and each of those is the
+# spelling FastAPI itself uses, with no `fastapi`-surface equivalent to prefer.
+# Every one is reached through the Starlette that `fastapi==0.141.1` pins and
+# installs, so the resolved version is FastAPI's decision rather than a second
+# opinion this file could disagree with, and there is no version here for a
+# resolver to reconcile. `requirements.txt` still pins `starlette==1.4.1` with
+# hashes, as it does for every one of the transitive distributions, so a
+# deployment is exact even though this declaration is not a claim of ownership.
+# Where a FastAPI re-export does exist it is used instead: `fastapi.Request` and
+# `fastapi.datastructures.Headers`.
 dependencies = [
     # Web framework and ASGI server stack
     "fastapi==0.141.1",
-    # Starlette is a DIRECT dependency, not merely fastapi's. Three modules
-    # import it by name:
-    #   app/core/exceptions.py            starlette.exceptions.HTTPException
-    #   app/middleware/request_context.py starlette.datastructures.{Headers,
-    #                                     MutableHeaders}, starlette.types.
-    #                                     {ASGIApp,Message,Receive,Scope,Send}
-    #   app/middleware/security_headers.py starlette.datastructures.
-    #                                     MutableHeaders, starlette.types.*
-    # Both middleware are written against the raw ASGI protocol rather than
-    # BaseHTTPMiddleware, so Starlette's type and datastructure API is a
-    # first-class part of this project's own contract. Declaring it makes that
-    # visible and pins it: without this line the installed Starlette is whatever
-    # fastapi's range happens to resolve to on the day of the install, and a
-    # release that is compatible with fastapi could still move the
-    # `MutableHeaders` or `Message` surface underneath code that reaches for it
-    # directly. 1.4.1 is the release fastapi 0.141.1 resolves to here and the one
-    # every gate in this repository was verified against; it is also the version
-    # backend/requirements.txt locks, hashes included.
-    "starlette==1.4.1",
     "uvicorn[standard]==0.52.1",
     "gunicorn==26.0.0",
     # Schema and settings layer
@@ -358,12 +354,17 @@ skip-magic-trailing-comma = false
 #
 # CONFIG DISCOVERY: unlike ruff, mypy does NOT search upwards. It reads
 # mypy.ini, .mypy.ini, pyproject.toml, then setup.cfg from the CURRENT WORKING
-# DIRECTORY only. The three canonical, equivalent invocations - each verified to
-# exit 0 - are:
+# DIRECTORY only. The four canonical invocations - each verified to exit 0 - are:
 #
 #   cd backend && mypy                                        # uses `files` below
-#   cd backend && mypy app                                    # identical scope
+#   cd backend && mypy app tests                              # identical scope
+#   cd backend && mypy app                                    # application only
 #   mypy --config-file backend/pyproject.toml backend/app     # from the root
+#
+# The first two are equivalent and are THE gate: `files` names both `app` and
+# `tests`, so a bare `mypy` checks 82 source files. The third and fourth check the
+# 64 application files alone, which is a narrower scope rather than a different
+# outcome - useful when only application code has moved.
 #
 # A bare `mypy backend/app` from the repository root is NOT equivalent: it finds
 # no configuration, runs on mypy's permissive defaults, and fails on the one
@@ -382,9 +383,34 @@ skip-magic-trailing-comma = false
 # =============================================================================
 [tool.mypy]
 python_version = "3.14"
-files = ["app"]
-mypy_path = ["."]
+files = ["app", "tests"]
+# TWO bases, and the second is what keeps the root-relative invocation working.
+#
+# `mypy_path` is resolved against the CURRENT WORKING DIRECTORY rather than against
+# this file, and so is package-base derivation under `explicit_package_bases` below.
+# From `backend/`, "." makes `app` and `tests` top-level packages. From the
+# repository root, "." is the root - where neither exists - and only "backend"
+# makes `backend/app/main.py` resolve as `app.main` rather than as
+# `backend.app.main`, which is what the third invocation above needs and what the
+# per-module overrides further down are written against. A missing entry is ignored,
+# so each form uses whichever of the two applies to it and neither costs the other
+# anything. Verified: all three invocations exit 0 with both entries present, and
+# the third fails with 265 errors in 52 files with only "." present.
+mypy_path = [".", "backend"]
 exclude = ['^\.venv/']
+
+# LOAD-BEARING for the `tests` entry above, and only for it. backend/tests/ carries
+# no `__init__.py` at any level - deliberately, because pytest's `prepend` import
+# mode does not need one and adding eight of them would exist solely to satisfy a
+# type checker. Without this setting mypy derives a module name from each file's
+# own directory and then reports
+#
+#   Source file found twice under different module names: "conftest" and "tests.conftest"
+#
+# which aborts the whole run before a single check. With it, module names are
+# derived from `mypy_path` above, so every test module is `tests.<path>` exactly as
+# the [[tool.mypy.overrides]] block for `tests.*` further down already assumes.
+explicit_package_bases = true
 
 strict = true
 
@@ -407,22 +433,48 @@ plugins = ["pydantic.mypy"]
 
 # Third-party modules with no inline type information. Audited against the
 # pinned dependency set rather than guessed: of the packages application code
-# imports, only `bleach` ships no py.typed marker, and mypy reports
-# `Library stubs not installed for "bleach"  [import-untyped]` for it. The other
-# three are listed because they are the untyped-import candidates in this
-# dependency set and the entry is provably inert while they keep shipping
-# py.typed; it costs nothing and survives a future release dropping the marker.
-# greenlet, gunicorn and python-multipart also lack markers, but no application
-# module imports them - they are needed at runtime rather than at type-check time
-# - so they are not listed. `starlette` IS imported by application code and does
-# ship py.typed, which is why declaring it above added no override here.
+# imports, `bleach` and `gunicorn` ship no py.typed marker, and mypy reports
+# `Library stubs not installed` for each. pwdlib, slowapi and slugify are listed
+# because they are the untyped-import candidates in this dependency set and the
+# entry is provably inert while they keep shipping py.typed; it costs nothing and
+# survives a future release dropping the marker.
+#
+# `gunicorn` is imported at type-check time from two directions, and both are
+# inside `files`. `app/core/logging.py` subclasses `gunicorn.glogging.Logger` to
+# give the arbiter process the structured chain - see StructlogGunicornLogger, and
+# note the narrow `type: ignore[misc]` on that class statement, which is what
+# `disallow_subclassing_any` requires of a base that resolves to `Any`. And
+# `backend/tests/unit/test_gunicorn_logging.py` imports gunicorn.arbiter and
+# gunicorn.glogging to assert that the production entry point reshapes the
+# arbiter's log lines and that the hook it uses is the only one early enough.
+# Listing it here is what keeps both the application pass and the explicit pass
+# over backend/tests clean; backend/gunicorn.conf.py sits outside `files`
+# entirely, as backend/migrations/ does. greenlet and python-multipart also lack
+# markers but are imported by nothing at type-check time - they are runtime
+# dependencies - so they are not listed. `starlette` IS imported by application
+# code and does ship py.typed, which is why declaring it above added no override
+# here.
 [[tool.mypy.overrides]]
-module = ["bleach.*", "pwdlib.*", "slowapi.*", "slugify.*"]
+module = ["bleach.*", "gunicorn.*", "pwdlib.*", "slowapi.*", "slugify.*"]
 ignore_missing_imports = true
 
 # The gate is the application package, so `app/` carries full strictness. Test
 # and migration modules are held to a lower bar: fixtures and Alembic's
 # generated `upgrade()`/`downgrade()` bodies gain nothing from full annotation.
+#
+# `tests` IS in `files` above, so this lower bar is a deliberate relaxation of a
+# scope that is genuinely checked rather than a description of one that is skipped.
+# That distinction was worth making: while `files` named only `app`, the whole test
+# tree was outside the shipped gate, and thirty-one real diagnostics accumulated in
+# six modules - unnecessarily broad `# type: ignore` codes, a `**dict` expansion
+# colliding with a keyword argument, `Row[Any]` leaking into an untyped mapping -
+# none of which any command in this repository would have reported.
+#
+# `migrations` is deliberately NOT in `files`: Alembic's revision modules are
+# generated, are addressed by path rather than imported as a package, and each one
+# declares module-level `revision`/`down_revision` strings that mypy would check
+# in isolation for no benefit. The override entry stays so that a revision imported
+# transitively is held to the same lower bar.
 [[tool.mypy.overrides]]
 module = ["tests.*", "migrations.*"]
 disallow_untyped_defs = false

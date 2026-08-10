@@ -106,32 +106,41 @@ This module still performs no configuration on import, for the reasons under *Im
 below - a settings read must not reconfigure the root logger of whatever process happens to be
 reading it.
 
-Under Gunicorn the window does not close, and closing it is the entry point's job
---------------------------------------------------------------------------------
+Under Gunicorn the arbiter is a second process, and :class:`StructlogGunicornLogger` closes it
+----------------------------------------------------------------------------------------------
 The trick above works because uvicorn imports the application before it logs anything. Gunicorn
 does not: its **arbiter** binds the socket, forks workers and handles signals in a process that
-never imports ``app.main`` at all, so no call this module could make is reachable from it. Only
-the forked workers import the application, and only their lines can be reshaped.
+never imports ``app.main`` at all, so nothing on the application's own import path is reachable
+from it. Only the forked workers import the application, and left alone only their lines can be
+reshaped.
 
 Measured under ``gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2`` at
-``ENVIRONMENT=production``: 10 of 34 lines were plain text, and all 10 came from the arbiter -
-six at boot (``Starting gunicorn``, ``Listening at:``, ``Using worker:``, two ``Booting worker
-with pid:``, ``Control socket listening at``) and four at shutdown (``Handling signal: term``,
-two ``Worker … was sent SIGTERM!``, ``Shutting down: Master``). **Every** worker-side line,
-including all request records, was JSON. The content is harmless - no secret, no request data -
-but a JSON-only collector treats each of them as unparsed, which is a real cost per container
-lifecycle rather than a cosmetic one, and the canonical documented launch
-(``uvicorn app.main:app``) has no such gap.
+``ENVIRONMENT=production`` before this was addressed: 9 plain-text lines, every one of them from
+the arbiter - five at boot (``Starting gunicorn``, ``Listening at:``, ``Using worker:``, two
+``Booting worker with pid:``) and four at shutdown (``Handling signal: term``, two ``Worker … was
+sent SIGTERM!``, ``Shutting down: Master``); a run without ``--no-control-socket`` adds
+``Control socket listening at`` for ten. **Every** worker-side line, including all request
+records, was already JSON. The content is harmless - no secret, no request data - but a JSON-only
+collector treats each of them as unparsed, which is a real cost per container lifecycle rather
+than a cosmetic one, and the canonical documented launch (``uvicorn app.main:app``) has no such
+gap.
 
-The remedy belongs to whatever authors the production entry point - ``backend/Dockerfile`` and
-the Gunicorn invocation in it - because that is the only place with a hook that runs inside the
-arbiter. Either supply a ``gunicorn.conf.py`` whose ``on_starting`` (and ``post_fork``) calls
-:func:`configure_logging` and whose ``logconfig_dict`` routes the ``gunicorn.error`` logger
-through the structlog ``ProcessorFormatter``, or pass a ``--logger-class`` that does the same.
-Note that ``gunicorn`` and ``gunicorn.error`` are already in :data:`_DELEGATED_LOGGERS` and
-``gunicorn.access`` is already silenced, so once the arbiter's own handler is installed by such
-a hook, everything else here applies to it unchanged - no further work is needed in this module,
-and none should be attempted from it.
+Gunicorn does offer one hook that runs inside the arbiter, and it is a class rather than a
+callback: ``Arbiter.setup`` constructs ``cfg.logger_class(cfg)`` **before** the arbiter logs its
+first line. :class:`StructlogGunicornLogger` is that class, and ``backend/Dockerfile`` passes it
+as ``--logger-class app.core.logging.StructlogGunicornLogger``. It lives here rather than in a
+``gunicorn.conf.py`` for two reasons: this module owns the processor chain and the logger bridge,
+so the remedy is one subclass whose whole body is ``super().setup(cfg)`` then
+:func:`configure_logging`; and a class named on the command line is loaded by ``gunicorn`` itself,
+with no second configuration file whose ``logconfig_dict`` would restate a chain that already
+exists. Measured after the change, same command and same stage: **0** plain-text lines, with the
+arbiter's boot and shutdown records rendered as JSON on the ``gunicorn.error`` logger.
+
+No further work is needed in this module for it: ``gunicorn`` and ``gunicorn.error`` are already
+in :data:`_DELEGATED_LOGGERS`, so :func:`configure_logging` detaches the arbiter's own plain-text
+handler and lets its records reach the one handler installed here, and ``gunicorn.access`` is
+already in :data:`_SILENCED_ACCESS_LOGGERS`, so the server's own access log stays off and
+``app.middleware.request_context`` remains the single owner of the access record.
 
 Deliberate exclusions
 ---------------------
@@ -214,11 +223,12 @@ import logging
 import re
 import sys
 import unicodedata
-from collections.abc import Iterable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from functools import cache
 from typing import Any, Final, TextIO
 
 import structlog
+from gunicorn.glogging import Logger as _GunicornLogger
 from structlog.tracebacks import ExceptionDictTransformer
 from structlog.typing import FilteringBoundLogger, Processor
 
@@ -231,6 +241,7 @@ __all__ = [
     "LOG_EXCEPTION_VALUE_MAX_LENGTH",
     "LOG_REDACTION_PLACEHOLDER",
     "LOG_TEXT_MAX_LENGTH",
+    "StructlogGunicornLogger",
     "anonymised_client_network",
     "client_claim_is_forwarded",
     "configure_logging",
@@ -608,11 +619,12 @@ def _resolve_level(level_name: str) -> int:
 # ---------------------------------------------------------------------------------------
 # Redaction of sensitive values
 #
-# Seven patterns, each for a class of value this service is known to handle and none of
+# Nine patterns, each for a class of value this service is known to handle and none of
 # which may be retained in a log. They are applied in the order declared, and the order is
-# deliberate: userinfo is stripped from a URL before the address pattern runs, so a DSN's
-# `user:password@host` is removed as a credential rather than partially matched as an
-# address.
+# deliberate: userinfo is stripped from a URL before the two address patterns run, so a
+# DSN's `user:password@host` is removed as a credential rather than partially matched as an
+# address, and IPv6 runs before IPv4 so that `::ffff:192.0.2.1` is recognised as the single
+# address it is rather than as a dotted quad inside something else.
 #
 # Every pattern rewrites rather than drops, and the replacement is visible. A field that
 # silently loses its value looks like a field that never had one, which is how a reader
@@ -623,12 +635,90 @@ LOG_REDACTION_PLACEHOLDER: Final[str] = "[redacted]"
 """What replaces a redacted value. Deliberately conspicuous, and never an empty string.
 
 A reader who finds it knows a value was removed on purpose, which is a different fact from a
-field that was never populated. It is also what a test asserts on: the marker test in
-``backend/tests/unit/test_logging_redaction.py`` checks that the secret is gone *and* that this
-took its place, so a pattern that silently stopped matching would fail rather than pass quietly.
+field that was never populated. It is also what a test asserts on: ``_assert_withheld`` in
+``backend/tests/unit/test_security.py`` checks that the secret is gone *and* that this took its
+place, so a pattern that silently stopped matching would fail rather than pass quietly.
 """
 
-_REDACTION_RULES: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
+#: Candidate IPv6 literal: hex groups joined by colons, optionally ending in a dotted quad
+#: (`::ffff:192.0.2.1`) and optionally carrying a zone identifier (`fe80::1%eth0`).
+#:
+#: A colon at minimum, so a bare `28P01` or a `1234` cannot match, and the boundaries stop it
+#: starting or ending mid-token. It is deliberately permissive about arrangement and is NOT the
+#: arbiter of validity: `_anonymise_address` hands every candidate to `ipaddress`, and anything
+#: that is not really an address is returned untouched. That division is what keeps a timestamp
+#: (`22:34:43`), a MAC address and a hex identifier out of harm's way while still recognising
+#: every spelling of an IPv6 literal - `::1` and `2001:db8:85a3::8a2e:370:7334` alike - which no
+#: single readable regex does.
+#:
+#: A bare `::` is deliberately NOT matched even though it is the valid unspecified address:
+#: nothing in this service can log a peer as `::`, and a rule that claimed it would rewrite the
+#: scope operator in any quoted C++ or Rust identifier that happened to follow punctuation.
+#:
+#: What remains, stated rather than hidden: a `word::word` token whose halves are both spelled
+#: entirely from hexadecimal letters - `a::b`, `cafe::beef` - IS a valid IPv6 literal and is
+#: anonymised as one. No PostgreSQL type name, module path or identifier in this project's logs
+#: has that shape (`::text`, `::uuid`, `std::fs` all contain a non-hex letter and are untouched),
+#: and where the ambiguity is genuinely undecidable this rule prefers over-redaction to a
+#: retained address.
+#:
+#: The trailing `(?!/\d)` is what makes redaction idempotent, and it is load-bearing rather
+#: than tidy: `HTTP_LOG_FIELD_CLIENT_NETWORK` already carries an anonymised `2001:db8::/64` on
+#: every access record, and a rule that rewrote it would produce `2001:db8::/64/64` and corrupt
+#: a field that was already safe.
+_IPV6_CANDIDATE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![0-9A-Za-z:.%])"
+    r"(?:[0-9A-Fa-f]{1,4})?(?::{1,2}[0-9A-Fa-f]{1,4}){1,7}(?::{1,2})?"
+    r"(?:\.[0-9]{1,3}){0,3}"
+    r"(?:%[0-9A-Za-z._-]+)?"
+    r"(?![0-9A-Za-z:.%])(?!/\d)"
+)
+
+#: Candidate IPv4 literal: four dotted decimal groups, bounded so it cannot be part of a
+#: longer dotted-numeric string. `1.2.3.4.5` is therefore untouched entirely rather than
+#: half-matched, and `10.0.0.0/8` is left as the network it already is - see the note on
+#: idempotency above.
+#:
+#: One honest consequence, stated rather than hidden: a four-component version string is the
+#: same token as an address and is anonymised as one. Nothing in this project logs one - the
+#: versions that appear are three-component (`1.0.0`, `3.14.7`) or two (`18.4`) - and the
+#: trade is deliberate, because the failure it prefers is a mangled version number rather than
+#: a retained address.
+_IPV4_CANDIDATE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![0-9A-Za-z._-])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9A-Za-z._-])(?!/\d)"
+)
+
+
+def _anonymise_address(match: re.Match[str]) -> str:
+    """Replace a matched address with the network it sits in, or leave the text alone.
+
+    The policy is :func:`anonymised_client_network`'s, called rather than restated: an IPv4
+    address keeps its ``/24`` and an IPv6 address its ``/64``, so a reader can still see that a
+    burst of failures shares an origin and cannot identify the individual behind it. One
+    definition of "anonymised" governs both the access record's ``client_network`` field and any
+    address that turns up inside a message, which is what stops the two drifting apart.
+
+    A candidate that is not really an address is returned **unchanged**. That is the whole
+    reason the two patterns above can be permissive: validity is decided by ``ipaddress``, not
+    by a regex, so a timestamp or a hex identifier that happens to fit the shape passes through
+    untouched instead of being corrupted.
+
+    Args:
+        match: The candidate match. Only group 0 is read.
+
+    Returns:
+        The anonymised network in CIDR form, or the original text when it does not parse.
+    """
+    token = match.group(0)
+    network = anonymised_client_network(token)
+    return token if network is None else network
+
+
+#: What a rule substitutes: a template string, or a callback for the two address rules, which
+#: have to parse a candidate before they can decide what to write.
+_RedactionReplacement = str | Callable[[re.Match[str]], str]
+
+_REDACTION_RULES: Final[tuple[tuple[re.Pattern[str], _RedactionReplacement], ...]] = (
     # 1. Userinfo in any URL. This is the DSN case - `postgresql+psycopg://user:pw@host/db`,
     #    which `Settings.DATABASE_URL` holds and which psycopg quotes back in a connection
     #    failure - and also `https://token@host`. The scheme class admits `+`, `.` and `-`
@@ -679,7 +769,34 @@ _REDACTION_RULES: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
         re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
         LOG_REDACTION_PLACEHOLDER,
     ),
-    # 6. The diagnostic tails a PostgreSQL error carries. `DETAIL` quotes the conflicting
+    # 6. An IPv6 address, reduced to its /64. IPv6 FIRST, so that `::ffff:192.0.2.1` is read
+    #    as the one address it is instead of having its embedded quad rewritten in place.
+    (_IPV6_CANDIDATE, _anonymise_address),
+    # 7. An IPv4 address, reduced to its /24.
+    #
+    #    Both address rules exist because an address identifies a person for practical and for
+    #    regulatory purposes, and because this service handles them constantly in text it did
+    #    not compose: psycopg's connection-failure message names the host it tried and, in
+    #    parentheses, the address it resolved to - `connection to server at "db" (10.1.2.3),
+    #    port 5432 failed` - and a proxy header, an origin, a `Host` value or an operator's
+    #    own note can carry one just as easily. The `client_network` field was already
+    #    anonymised at its own call site; these two rules are what extend the same policy to
+    #    every address that arrives inside a message rather than as a field.
+    #
+    #    Anonymised rather than blanked, unlike every other rule here, because the network is
+    #    the diagnostic: "the failures all came from one /24" and "the database we could not
+    #    reach was on the loopback" are the questions an operator actually has, and neither
+    #    needs the host bits. `[redacted]` would answer neither.
+    #
+    #    One visible consequence, because it is better documented than discovered: an address
+    #    this process is describing about ITSELF is anonymised too. Gunicorn's boot line reads
+    #    `Listening at: http://127.0.0.0/24:8123` rather than `http://127.0.0.1:8123`. Text is
+    #    text - a rule reading a rendered message cannot know whose address it is - and the
+    #    parts that identify the socket to an operator, the scheme and the port, both survive.
+    #    The bind address is also in the deployment's own configuration, so nothing that only
+    #    this line could have told them is lost.
+    (_IPV4_CANDIDATE, _anonymise_address),
+    # 8. The diagnostic tails a PostgreSQL error carries. `DETAIL` quotes the conflicting
     #    key and its value verbatim, `CONTEXT` and `QUERY` quote statement text, and any of
     #    them can therefore carry a row a reader authored. Consumed to the end of the line,
     #    so this must run while the text still has its newlines - see `redact_log_event`.
@@ -687,7 +804,7 @@ _REDACTION_RULES: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
         re.compile(r"(?im)^[ \t]*(DETAIL|HINT|CONTEXT|QUERY)[ \t]*:.*$"),
         rf"\g<1>: {LOG_REDACTION_PLACEHOLDER}",
     ),
-    # 7. A PEM block. Nothing in this service logs one, and if anything ever does it must not
+    # 9. A PEM block. Nothing in this service logs one, and if anything ever does it must not
     #    survive: the body is dropped and only the label is kept.
     (
         re.compile(r"(?s)-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----"),
@@ -715,16 +832,21 @@ def redact_sensitive_text(value: str) -> str:
     PostgreSQL diagnostic keeps the label that says which diagnostic it was. What a reader loses
     is exactly the part that must not be retained.
 
-    Idempotent: running it twice changes nothing, because :data:`LOG_REDACTION_PLACEHOLDER`
-    matches none of the patterns. That matters because two processors and one call site all use
-    it, and a value can legitimately pass through more than one of them.
+    Idempotent: running it twice changes nothing. :data:`LOG_REDACTION_PLACEHOLDER` matches
+    none of the patterns, and the two address rules decline a candidate that is already a
+    network, so an anonymised ``10.1.2.0/24`` is not anonymised again. That matters because two
+    processors and one call site all use this function, and a value can legitimately pass
+    through more than one of them.
 
     Args:
         value: Text about to be written into a log record.
 
     Returns:
-        The same text with every recognised secret, credential, address and database diagnostic
-        replaced by :data:`LOG_REDACTION_PLACEHOLDER`. Never raises, and never returns ``None``.
+        The same text with every recognised secret, credential and database diagnostic replaced
+        by :data:`LOG_REDACTION_PLACEHOLDER`, and every IPv4 or IPv6 address replaced by the
+        network it sits in - a ``/24`` or a ``/64``, the same reduction
+        :func:`anonymised_client_network` applies to a peer address. Never raises, and never
+        returns ``None``.
     """
     redacted = value
     for pattern, replacement in _REDACTION_RULES:
@@ -1191,3 +1313,65 @@ def get_logger(name: str | None = None) -> FilteringBoundLogger:
         structlog.get_logger() if name is None else structlog.get_logger(name)
     )
     return logger
+
+
+# ---------------------------------------------------------------------------------------
+# The Gunicorn arbiter, which is the one process this module cannot reach on its own
+#
+# See "Under Gunicorn the arbiter is a second process" in the module docstring for the
+# measurement. In short: the arbiter binds the socket, forks and handles signals without ever
+# importing `app.main`, so its own boot and shutdown lines are the only ones that escape the
+# structured stream - and `--logger-class` is the only hook gunicorn offers inside it.
+#
+# The base class has to be imported at module scope, because a base class cannot be resolved
+# lazily, and that is safe here on both counts this module cares about. `gunicorn==26.0.0` is a
+# pinned RUNTIME dependency in backend/requirements.txt - not a development one - so it is
+# present wherever the application is, and `gunicorn.glogging` imports the standard library and
+# `gunicorn.util` and does nothing on import: no handler, no logger mutation, no configuration
+# read. Import purity as this module defines it is therefore untouched; what would break it is
+# calling `configure_logging` from here, which only the method below does, and only when gunicorn
+# constructs it.
+# ---------------------------------------------------------------------------------------
+
+
+class StructlogGunicornLogger(_GunicornLogger):  # type: ignore[misc]
+    """Gunicorn's logger, reconfigured so the arbiter's own records are structured too.
+
+    Passed on the command line by ``backend/Dockerfile`` as ``--logger-class
+    app.core.logging.StructlogGunicornLogger``. ``Arbiter.setup`` constructs
+    ``cfg.logger_class(cfg)`` before the arbiter logs anything, and ``Application.load_config``
+    has already put the working directory on ``sys.path``, so this dotted path resolves in the
+    arbiter process and this class is in place for its first line.
+
+    One method, and the order inside it is the whole design.
+    """
+
+    def setup(self, cfg: Any) -> None:
+        """Let gunicorn configure itself, then take the handlers back.
+
+        ``super().setup(cfg)`` runs first and is not skipped: it is what sets ``self.loglevel``
+        from ``--log-level``, honours ``--capture-output``, and leaves gunicorn's own bookkeeping
+        (``error_handlers``, ``access_handlers``, ``logfile``) in the state the rest of the class
+        expects. Skipping it to avoid the plain-text handler it attaches would mean maintaining a
+        copy of that bookkeeping here.
+
+        :func:`configure_logging` then runs and undoes exactly the part that matters. It installs
+        this service's single root handler and calls :func:`_bridge_library_loggers`, which
+        detaches the handler ``super().setup`` just attached to ``gunicorn.error``, restores its
+        propagation so its records reach the structured handler instead, and re-silences
+        ``gunicorn.access`` so the server's access log stays off and
+        ``app.middleware.request_context`` remains the sole owner of the access record. The
+        arbiter's threshold therefore comes from ``LOG_LEVEL`` like every other logger's, not
+        from ``--log-level``: one setting decides what this deployment records.
+
+        It is called for the arbiter and again in each forked worker, and both are wanted -
+        :func:`configure_logging` is idempotent by construction, and the worker additionally
+        re-applies it when it imports ``app.main``.
+
+        Args:
+            cfg: Gunicorn's own configuration object. Typed as :class:`~typing.Any` because
+                ``gunicorn`` ships no type information, and this signature must match the
+                superclass's exactly for gunicorn to call it.
+        """
+        super().setup(cfg)
+        configure_logging()

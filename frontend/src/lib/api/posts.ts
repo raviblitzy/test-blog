@@ -86,11 +86,18 @@ import {
   type OptionalAuthRequestOptions,
   type ProtectedRequestOptions,
 } from '@/lib/api/client';
-import { encodePathSegment } from '@/lib/paths';
-import { codePointLength } from '@/lib/text';
 import { pageOf, postDetailSchema, postSummarySchema } from '@/lib/types';
-import type { Page, PostCreate, PostDetail, PostSort, PostSummary, PostUpdate } from '@/lib/types';
+import type {
+  Page,
+  PostCreate,
+  PostDetail,
+  PostSort,
+  PostStatus,
+  PostSummary,
+  PostUpdate,
+} from '@/lib/types';
 import { MAX_SEARCH_TERM_LENGTH } from '@/lib/types';
+import { codePointLength, encodePathSegment } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Paths
@@ -280,6 +287,25 @@ export interface ListPostsParams {
    * options inside that range rather than relying on the service to trim them.
    */
   page_size?: number | null;
+  /**
+   * Switch the route from the public feed to the **private author workspace**: your own posts, in
+   * every lifecycle state. This is how a dashboard lists drafts.
+   *
+   * The public feed is published-only for *every* caller - anonymous, reader, author and
+   * administrator alike - so an author's unpublished work is reached by asking for it here rather
+   * than by being logged in. Requires a credential: `mine: true` without one is `401`, not a quiet
+   * fall back to the public feed. The scope is the authenticated account, so {@link author} may not
+   * be combined with it (`422`).
+   */
+  mine?: boolean | null;
+  /**
+   * Narrow the workspace to a single lifecycle state, which is how it groups by status.
+   *
+   * Accepted **only** alongside `mine: true`; sending it on the public feed is refused with `422`,
+   * because the public feed is published-only and narrowing it is either a no-op or a request for
+   * another author's unpublished work.
+   */
+  status?: PostStatus | null;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -348,11 +374,16 @@ function assertSearchTermLength(term: string | null | undefined, caller: string)
  * a title and an excerpt. Call {@link getPost} when the body will actually be rendered; a summary
  * cannot be turned into a detail without that request.
  *
- * @param params - The six feed parameters. Omit the argument entirely for the default feed.
+ * Two modes, chosen by `mine`. Without it this is the public feed and it answers published posts
+ * only, identically for every caller. With `mine: true` it is the private author workspace: the
+ * caller's own posts in every lifecycle state, optionally narrowed to one by `status`.
+ *
+ * @param params - The feed parameters. Omit the argument entirely for the default public feed.
  * @param options - Per-call transport controls. See {@link PostReadOptions}.
  * @returns The page of summaries, unmodified.
- * @throws The client module's normalised error - notably `404` when `author` names no account, and
- * `422` when `page` or `page_size` is out of range.
+ * @throws The client module's normalised error - notably `404` when `author` names no account,
+ * `401` when `mine` is requested with no credential, and `422` when `page` or `page_size` is out of
+ * range, when `status` is sent without `mine`, or when `author` is sent with it.
  *
  * @example The home feed, reading its state from the URL in a Server Component
  * ```tsx
@@ -365,9 +396,9 @@ function assertSearchTermLength(term: string | null | undefined, caller: string)
  * );
  * ```
  *
- * @example An author's own workspace, listing their drafts - authenticated, filtered to themselves
+ * @example An author's own workspace, listing their drafts - authenticated, self-scoped
  * ```ts
- * const mine = await listPosts({ author: viewer.username, page_size: 50 });
+ * const drafts = await listPosts({ mine: true, status: 'DRAFT', page_size: 50 });
  * ```
  */
 export function listPosts(
@@ -379,8 +410,10 @@ export function listPosts(
   return apiGet(POSTS_PATH, pageOf(postSummarySchema), {
     ...options,
     anonymousFallback: true,
-    // Each of the six is forwarded raw. Blank members are dropped by the client module's query
-    // builder, so an unfiltered request produces `/posts` rather than a string of empty parameters.
+    // Each member is forwarded raw. Blank members are dropped by the client module's query
+    // builder, so an unfiltered request produces `/posts` rather than a string of empty parameters -
+    // which is also why `mine` is only ever sent as `true`: `false` is the public feed, and the
+    // public feed is the request with no `mine` parameter at all.
     query: {
       q: params.q,
       category: params.category,
@@ -388,6 +421,8 @@ export function listPosts(
       sort: params.sort,
       page: params.page,
       page_size: params.page_size,
+      mine: params.mine === true ? true : undefined,
+      status: params.status,
     },
   });
 }

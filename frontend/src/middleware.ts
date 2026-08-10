@@ -47,6 +47,15 @@
 // document this at length; the access token lives only in that client module's
 // in-memory store.
 //
+// There IS a second cookie in this tier, and this file never reads it. The
+// refresh credential that lets a new document recover a session is held in
+// `blog_refresh`, written by src/app/api/session/route.ts on the SERVER, so it is
+// HttpOnly and scoped to that route's own path - which means it is not sent with
+// a navigation and is not visible here even in principle. That is the whole
+// reason it is safe to keep, and the reason this file is unchanged by its
+// existence: route protection still decides from a role literal that
+// authenticates nothing.
+//
 // Two consequences for this file, both deliberate:
 //
 //   1. THERE IS NOTHING TO DECODE AND NO SIGNATURE TO VERIFY. No JWT parsing, no
@@ -55,13 +64,25 @@
 //      browser bundle would be the vulnerability this design avoids. Reading a
 //      role literal is the whole job.
 //   2. THERE IS NO EXPIRY TO CHECK, so this file cannot sign anybody out. That
-//      is the correct behaviour and not an omission. src/lib/api/client.ts
-//      rotates a session, single-flight, when a request that carried a
-//      credential is answered 401; a visitor whose access token has just expired
-//      but whose refresh token is still good must reach the route so that
-//      recovery can happen. Redirecting them here would log out a reader who was
-//      never signed out. Nothing sensitive renders in the meantime, because the
-//      service refuses the stale bearer regardless.
+//      is the correct behaviour and not an omission, and it is what makes the
+//      cross-document bootstrap possible at all. A visitor arriving on a fresh
+//      document has NO credential in memory - a module variable dies with its
+//      JavaScript context - and recovers one by asking
+//      src/app/api/session/route.ts to rotate the HttpOnly refresh cookie it
+//      owns; src/providers/auth-provider.tsx does that on mount, before it reads
+//      GET /auth/me. Equally, a visitor whose access token has merely expired is
+//      renewed by src/lib/api/client.ts's single-flight rotation on the first
+//      401. Both recoveries happen INSIDE the route, so the route has to be
+//      reachable: redirecting here on a marker whose credential this file cannot
+//      see would sign out a reader who was never signed out. Nothing sensitive
+//      renders in the meantime, because the service refuses a stale bearer
+//      regardless.
+//
+//      The corollary is that the marker admitting a navigation is not a promise
+//      that a session will be restored. It is a claim that one existed, and the
+//      recovery either succeeds or ends the session and sends the reader to sign
+//      in from inside the route. That is a redirect this file does not make and
+//      must not try to.
 //
 // ---------------------------------------------------------------------------
 // WHY THE COOKIE NAME IS RESTATED HERE, AND WHY THAT IS NOW DRIFT-PROOF

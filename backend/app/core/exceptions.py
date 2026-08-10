@@ -125,11 +125,6 @@ Exception                   Status   Notes
                                      recomputed across every route matching the
                                      path, because the framework's own value names
                                      only the one route that raised.
-``DataError``               400      A value the storage layer refuses - SQLSTATE
-                                     class 22 - is the caller's to fix, so it is
-                                     reported as a client error instead of becoming
-                                     a 500. The guarantee behind the boundary
-                                     validators, not a substitute for them.
 ``Exception``               500      Generic detail, nothing internal, logged in full.
 =========================== ======== =================================================
 
@@ -154,17 +149,17 @@ Import purity
 ``app.core`` is the root of the backend import graph, and this module keeps it that way. It
 imports the standard library, FastAPI, Starlette, slowapi, ``sqlalchemy.exc`` and
 ``app.core.logging`` - nothing else, and in particular **not** ``app.schemas``. The SQLAlchemy
-import is the exception class alone, for the ``DataError`` handler above, and it adds no edge to
-the graph that ``app.core.dependencies`` does not already have: no model, no session and no
-query is imported, and nothing here touches the database. That asymmetry is deliberate rather than
-tidy: ``app.schemas.common`` declares the Pydantic model of this document for the OpenAPI
-surface and therefore may import from ``app.core``, so an import back the other way would
-close a cycle. The handlers here build the body as a plain dict instead, which is also why
+import is one exception class, ``IntegrityError``, for :func:`integrity_constraint_name`, and it
+adds no edge to the graph that ``app.core.dependencies`` does not already have: no model, no
+session and no query is imported, and nothing here touches the database. That asymmetry is
+deliberate rather than tidy: ``app.schemas.common`` declares the Pydantic model of this document
+for the OpenAPI surface and therefore may import from ``app.core``, so an import back the other
+way would close a cycle. The handlers here build the body as a plain dict instead, which is also why
 there is exactly one function in the codebase that assembles a problem document.
 """
 
 import re
-from collections.abc import Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from http import HTTPStatus
 from types import MappingProxyType
 from typing import ClassVar, Final, TypedDict, cast
@@ -183,7 +178,14 @@ from fastapi.exceptions import RequestValidationError
 # unrelated deprecations for the whole process.
 from fastapi.responses import ORJSONResponse
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy.exc import DataError
+
+# Reached through the Starlette that FastAPI pins and installs, and each of the three has no
+# FastAPI-surface equivalent to prefer. `StarletteHTTPException` is the BASE class - FastAPI's own
+# `HTTPException` is a subclass, and it is the base that the router itself raises for an unmatched
+# path or method, so a handler registered on the subclass would not see a 404 or a 405 at all.
+# `Match` and `ExceptionHandler` are re-exported nowhere under `fastapi`. None of the three is a
+# reason to declare starlette directly in `backend/pyproject.toml`: see that file for why.
+from sqlalchemy.exc import DataError, IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 from starlette.types import ExceptionHandler
@@ -213,9 +215,11 @@ __all__ = [
     "ForbiddenError",
     "InvalidTokenError",
     "NotFoundError",
+    "RequestBodyTooLargeError",
     "TokenExpiredError",
     "UnauthorizedError",
     "inner_exception_handlers",
+    "integrity_constraint_name",
     "is_usable_request_id",
     "register_exception_handlers",
 ]
@@ -387,6 +391,7 @@ _DETAIL_NOT_FOUND: Final[str] = "The requested resource was not found."
 _DETAIL_CONFLICT: Final[str] = "The request conflicts with the current state of the resource."
 _DETAIL_FORBIDDEN: Final[str] = "You do not have permission to perform this action."
 _DETAIL_VALIDATION: Final[str] = "The request could not be processed as submitted."
+_DETAIL_REQUEST_BODY_TOO_LARGE: Final[str] = "The request body is larger than this API accepts."
 _DETAIL_UNAUTHORIZED: Final[str] = "Authentication credentials are missing or invalid."
 _DETAIL_TOKEN_EXPIRED: Final[str] = "The authentication token has expired."
 _DETAIL_INVALID_TOKEN: Final[str] = "The authentication token is invalid."
@@ -429,6 +434,59 @@ _DETAIL_INVALID_FIELD: Final[str] = "This value is invalid."
 # actionable without being specific, because the boundary validators name the field for every
 # case that is expected to occur and this is the residue.
 _DETAIL_DATA_ERROR: Final[str] = "The request contained a value that could not be processed."
+
+# ---------------------------------------------------------------------------------------
+# Which data exceptions are the caller's fault
+#
+# `DataError` covers the whole of SQLSTATE class 22, and the class alone says nothing about
+# WHOSE value failed. The four codes below are the ones that, in THIS schema, only a submitted
+# value can produce - so they are the ones `_data_error_handler` answers 400 for, and every
+# other class-22 condition is left to the 500 owner with its traceback intact.
+#
+# The reasoning is per code, and it is a property of the schema rather than of the codes:
+#
+#   22001 string_data_right_truncation   A value longer than the column can hold. Every text
+#                                       column here is unbounded `text` or `citext`, so this
+#                                       cannot be provoked by anything this service derives -
+#                                       it takes a submitted value against a length the
+#                                       storage layer imposes.
+#   22021 character_not_in_repertoire    A byte sequence the server encoding cannot represent.
+#   22P05 untranslatable_character       The same condition on the way out of a conversion.
+#                                       Both require text this service did not compose: it
+#                                       writes ASCII identifiers and slugs, and everything
+#                                       else it stores came from a request body.
+#   22P02 invalid_text_representation    A value that could not be parsed as its target type.
+#                                       Every cast in this API is applied to a bound parameter
+#                                       - a UUID, an enum member, a timestamp - and every one
+#                                       of those parameters arrives from the request.
+#
+# Deliberately ABSENT, and the two that make the case: `22012 division_by_zero` and `2201B
+# invalid_regular_expression` are properties of the STATEMENT, and this API composes every
+# statement itself and accepts no caller-supplied expression or pattern. A 400 for either would
+# report a defect in this code as the caller's mistake. `22003 numeric_value_out_of_range`,
+# `22007 invalid_datetime_format` and `22008 datetime_field_overflow` are absent for the
+# adjacent reason: the numbers and instants this schema writes - `view_count`, `published_at`,
+# both audit timestamps - are derived by the service or by the database clock, so a range or
+# format failure in one of them is far more likely to be a bug here than a submitted value.
+# ---------------------------------------------------------------------------------------
+_REQUEST_CAUSED_DATA_SQLSTATES: Final[frozenset[str]] = frozenset(
+    {
+        "22001",
+        "22021",
+        "22P02",
+        "22P05",
+    }
+)
+
+# psycopg's client-side refusal of a NUL byte in a bound text parameter. It is raised before the
+# statement reaches the server, so it carries NO SQLSTATE - which is why it needs recognising by
+# phrase rather than by code, and why `_data_error_is_request_caused` explains at length that a
+# NUL is nonetheless of certain request provenance: PostgreSQL cannot STORE one, so it can never
+# have come back out of a column. Matched loosely on the invariant part of psycopg 3.3.4's
+# wording ("PostgreSQL text fields cannot contain NUL (0x00) bytes") so a punctuation change does
+# not break it; a wholesale rewording makes this stop matching, and the failure is then a logged
+# 500 rather than a misfiled 400.
+_NUL_PARAMETER_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?i)cannot contain nul")
 
 
 # ---------------------------------------------------------------------------------------
@@ -752,6 +810,62 @@ class FieldError(TypedDict):
     type: str
 
 
+def integrity_constraint_name(
+    error: IntegrityError,
+    *,
+    sqlstates: Collection[str],
+) -> str | None:
+    """Name the database constraint an integrity failure violated, or ``None`` to re-raise it.
+
+    **The one place a service is allowed to ask "which invariant failed?", and the reason no
+    service may answer it from the exception's message.** Every service that inserts a row can lose
+    a race, and each needs to translate *its own* recognised races into a domain conflict while
+    letting everything else propagate as the defect it is. Written once here because the answer
+    depends on two driver details that are easy to get wrong independently: which SQLSTATE the
+    server assigned, and the constraint name it reported alongside it.
+
+    Both are required, and the pairing is the safety. Matching only the name would let a
+    differently-classed failure that happens to mention the same object satisfy the test; matching
+    only the SQLSTATE would collapse every unique violation in the schema into one, so a service
+    would report "that title is taken" for a duplicate email. Matching neither - a substring search
+    of ``str(error)`` - depends on the server's locale and on wording that is free to change
+    between releases, and would also mean reading a message that embeds the failing statement.
+
+    Failing closed is deliberate: a driver that exposes no ``diag``, a SQLSTATE outside
+    *sqlstates*, or a missing constraint name all yield ``None``, which callers treat as "re-raise
+    untouched". An unrecognised integrity failure is a defect, and a defect must surface as a
+    ``500`` with frames rather than as a plausible-looking conflict a client would retry forever.
+
+    Args:
+        error: The failure SQLAlchemy raised. Its ``orig`` is the driver's own exception, which is
+            where the diagnostics live; ``psycopg`` populates ``diag.constraint_name`` from the
+            server's error fields.
+        sqlstates: The SQLSTATE classes the caller is willing to translate. ``23505``
+            (``unique_violation``) and ``23503`` (``foreign_key_violation``) are the two a
+            concurrent request can cause. ``23514`` (``check_violation``) and ``23502``
+            (``not_null_violation``) belong in no caller's set: both mean the service assembled a
+            row it should not have.
+
+    Returns:
+        The constraint name PostgreSQL reported, when the SQLSTATE is one the caller accepts;
+        ``None`` otherwise.
+
+    Examples:
+        >>> # In a service, with its own allow-list of recognised constraints:
+        >>> # constraint = integrity_constraint_name(error, sqlstates=frozenset({"23505"}))
+        >>> # if constraint not in _MY_RACES: raise
+        pass
+    """
+    driver_error = error.orig
+    diagnostic = getattr(driver_error, "diag", None)
+    if diagnostic is None:
+        return None
+    if getattr(driver_error, "sqlstate", None) not in sqlstates:
+        return None
+    constraint = getattr(diagnostic, "constraint_name", None)
+    return constraint if isinstance(constraint, str) else None
+
+
 class AppError(Exception):
     """Base class for every failure this API reports deliberately.
 
@@ -866,6 +980,28 @@ class ConflictError(AppError):
     error_type: str = _ERROR_TYPE_CONFLICT
     title: str = _TITLE_CONFLICT
     detail: str = _DETAIL_CONFLICT
+
+
+class RequestBodyTooLargeError(AppError):
+    """413 - the request body exceeds the configured ceiling, so it was not read.
+
+    Raised by ``app.middleware.body_limit``, and by nothing else: no service and no route decides
+    this, because the decision has to be made *before* a body is parsed and therefore before any
+    route is reached. The middleware raises it in two places - once from the declared
+    ``Content-Length``, before the application is called at all, and once from the running total of
+    a body that declared no length - and both spellings produce this one status and this one
+    document.
+
+    The detail names no number. A ceiling stated in an error response tells a caller exactly how
+    large a body to send to sit just underneath it, which is the one thing the ceiling exists to
+    prevent being probed for; the published limit belongs in the API documentation, where it is a
+    contract rather than a hint returned to whoever was testing it.
+    """
+
+    status_code: int = HTTPStatus.CONTENT_TOO_LARGE
+    error_type: str = _ERROR_TYPE_CONTENT_TOO_LARGE
+    title: str = _TITLE_CONTENT_TOO_LARGE
+    detail: str = _DETAIL_REQUEST_BODY_TOO_LARGE
 
 
 class ForbiddenError(AppError):
@@ -1611,6 +1747,15 @@ async def _http_exception_handler(request: Request, exc: Exception) -> ORJSONRes
         # runs in the application lifespan after every import has completed. The request
         # identifier bound by `app.middleware.request_context` is already on the line, so an
         # operator can move from a caller's correlation header to this entry.
+        # The field NAMES come from `app.core.logging`, exactly as the unhandled-500 record and
+        # the middleware's access record take theirs, and that agreement is the whole reason they
+        # are constants rather than literals: three records describing one request have to be
+        # joinable on more than the correlation identifier, and a record keyed `http_path` cannot
+        # be queried beside two keyed `path`. The method and the path go through `log_safe_text`
+        # for the same reason they do on every other HTTP record - `request.url.path` arrives
+        # percent-DECODED, so it can carry a newline that forges a second log line, and it is
+        # unbounded.
+        #
         # `suppressed_detail` is the one field in this module that carries a message composed
         # somewhere else, so it is redacted and bounded AT THE CALL SITE rather than left to the
         # processor chain. Both are deliberate. `redact_sensitive_text` is what stops a framework
@@ -1623,9 +1768,11 @@ async def _http_exception_handler(request: Request, exc: Exception) -> ORJSONRes
         # default, since this is an exception message and is bounded by the same rule as one.
         get_logger(__name__).error(
             "http_exception_detail_suppressed",
-            http_method=request.method,
-            http_path=request.url.path,
-            http_status=error.status_code,
+            **{
+                HTTP_LOG_FIELD_METHOD: log_safe_text(request.method),
+                HTTP_LOG_FIELD_PATH: log_safe_text(request.url.path),
+                HTTP_LOG_FIELD_STATUS: int(error.status_code),
+            },
             suppressed_detail=log_safe_text(
                 redact_sensitive_text(detail), limit=LOG_EXCEPTION_VALUE_MAX_LENGTH
             ),
@@ -1642,48 +1789,106 @@ async def _http_exception_handler(request: Request, exc: Exception) -> ORJSONRes
     )
 
 
-async def _data_error_handler(request: Request, exc: Exception) -> ORJSONResponse:
-    """Render a driver-level *data* exception as a 400 rather than letting it become a 500.
+def _data_error_is_request_caused(error: DataError) -> bool:
+    """Whether *error* is provably a failure of a value the CALLER supplied.
 
+    The question this handler exists to answer, and the reason it is asked narrowly.
     ``sqlalchemy.exc.DataError`` wraps the driver's SQLSTATE class 22 conditions - "data
-    exception" - which are failures of a *value* rather than of the service: a string the column
-    cannot represent, a number outside its range, a malformed cast. Every value bound into a
-    statement in this API arrives from a request, so this class of failure is the caller's to
-    fix, and answering 500 misreported both whose fault it was and what a retry would achieve.
+    exception" - and the class is *not* proof that a request is at fault. It is raised just as
+    readily by a value this service derived itself, by a column whose type has drifted from the
+    model, by converting a result the database returned, and by stored data that is no longer
+    representable. Answering 400 for those files a server defect as a client error: it leaves the
+    5xx rate flat while the service is broken, and it discards the traceback that would have said
+    where. So provenance has to be established rather than assumed, and anything this function
+    cannot vouch for is left to the generic 500 owner.
 
-    The concrete case this closes is a ``NUL`` character. PostgreSQL's ``text`` and ``citext``
-    cannot store ``U+0000``, so a username, slug, search term or body carrying one reached
-    psycopg and raised here, and an unauthenticated caller could turn any of several public
-    reads into a 500 - inflating the error rate, writing a traceback per attempt, and making
-    genuine 500 alerting untrustworthy. ``app.schemas.common``'s storable-text validators reject
-    that character at the boundary, with a ``422`` naming the field, and they are the *fix*; this
-    handler is the guarantee, covering every remaining path by which a value the storage layer
-    refuses could otherwise escape as a server error.
+    Two things establish it, and nothing else does:
 
-    Both halves are needed and neither is redundant. A boundary validator produces the better
-    answer - it names the field, so a form can attach it - but it can only cover the members it
-    is attached to. This handler cannot name a field, because by the time the driver refuses a
-    value the request has been reduced to a statement and its parameters, but it covers
-    everything. So the 422 is what a client normally sees, and a 400 here means a value slipped
-    past the boundary: a signal worth logging.
+    1. **A SQLSTATE in** :data:`_REQUEST_CAUSED_DATA_SQLSTATES`. The server refused a *value* for
+       a reason that, in this schema, only a submitted value can produce - see that set for the
+       per-code argument. Codes outside it, ``22012 division_by_zero`` and ``2201B
+       invalid_regular_expression`` being the sharp examples, describe the statement rather than
+       its parameters: this API composes every statement itself and takes no caller-supplied
+       expression or pattern, so either one means a defect in this code.
+    2. **A client-side refusal of a bound NUL character.** psycopg rejects ``U+0000`` in a text
+       parameter *before* the statement is sent, so the failure carries no SQLSTATE at all - and
+       its provenance is nonetheless certain, which no other client-side data error can claim:
+       PostgreSQL's ``text`` and ``citext`` cannot STORE a NUL, so a NUL can never have arrived
+       from a column, a result conversion or corrupted stored data. It can only be on its way in.
 
-    The failure is logged at warning rather than error, because a rejected request is not an
-    incident. ``exception_type`` is recorded so the class is visible, alongside the message
-    redacted by ``app.core.logging.redact_sensitive_text`` and bounded by ``log_safe_text`` -
-    SQLAlchemy's message embeds the statement, and although ``hide_parameters=True`` keeps the
-    bound values out of it, the same treatment the 5xx path gives a framework detail is applied
-    here rather than trusting that. No frames: a value rejected at the boundary of storage has
-    no stack worth keeping, and the request identifier already on the line is what correlates it
-    with the access record.
+    The concrete case (2) closes is worth naming, because it is why this handler was written. A
+    username, slug, search term or body carrying a NUL reached psycopg and raised here, so an
+    unauthenticated caller could turn a public read into a 500 - inflating the error rate,
+    writing a traceback per attempt and making genuine 500 alerting untrustworthy.
+    ``app.schemas.common``'s storable-text validators now reject that character at the boundary
+    with a ``422`` naming the field, and they are the *fix*; this remains the guarantee for any
+    path they do not cover. Both halves are needed and neither is redundant: a boundary validator
+    gives the better answer but only where it is attached, and this handler cannot name a field -
+    by the time the driver refuses a value the request is a statement and its parameters - but it
+    covers everything.
+
+    Matching (2) on the driver's message is deliberate and its failure mode is safe. A
+    client-side psycopg error has no code to key on, so the condition is recognised by the phrase
+    psycopg uses for it; if a future release rewords that phrase, this returns ``False`` and the
+    failure becomes a logged, alerted 500 rather than a silent misclassification. Wrong in the
+    loud direction, which is the only acceptable direction here.
+
+    Args:
+        error: The wrapped driver failure.
+
+    Returns:
+        ``True`` when the value is the caller's to fix, ``False`` for everything else.
+    """
+    driver_error = getattr(error, "orig", None)
+    sqlstate = getattr(driver_error, "sqlstate", None)
+    if isinstance(sqlstate, str):
+        return sqlstate.upper() in _REQUEST_CAUSED_DATA_SQLSTATES
+    if driver_error is None:
+        return False
+    return _NUL_PARAMETER_PATTERN.search(str(driver_error)) is not None
+
+
+async def _data_error_handler(request: Request, exc: Exception) -> ORJSONResponse:
+    """Render a *request-caused* data exception as a 400, and re-raise everything else.
+
+    :func:`_data_error_is_request_caused` is the whole of the decision, and the two outcomes are
+    deliberately asymmetric:
+
+    * **Request-caused**: a 400 problem document with a fixed, safe ``detail``, and one record at
+      ``warning`` - because a rejected request is not an incident. ``exception_type`` is recorded
+      so the class is visible, alongside the message redacted by
+      ``app.core.logging.redact_sensitive_text`` and bounded by ``log_safe_text``: SQLAlchemy's
+      message embeds the statement, and although ``hide_parameters=True`` keeps the bound values
+      out of it, the same treatment the 5xx path gives a framework detail is applied here rather
+      than trusting that. No frames - a value refused at the boundary of storage has no stack
+      worth keeping, and the request identifier already on the line correlates it with the access
+      record.
+    * **Anything else**: re-raised, untouched. It is a server failure, so it belongs to the owner
+      of server failures: the exception leaves this handler, reaches the ``ExceptionMiddleware``
+      ``app.main`` registers as the innermost user middleware, and
+      :func:`_inner_unhandled_exception_handler` renders the same 500 problem document every
+      other unanticipated failure produces - with the traceback logged once, with locals
+      suppressed and every frame redacted, and inside the CORS layer so a browser can read it.
+      Nothing about the 500 path is reimplemented here, which is what keeps one shape and one
+      log owner for a server error no matter which class raised it.
+
+    ``raise`` with no argument rather than ``raise error``: the traceback that led here is the
+    diagnostic, and re-raising by name would truncate it to this line.
 
     Args:
         request: The request being answered.
         exc: The raised exception. Always a ``DataError``, by MRO dispatch.
 
     Returns:
-        A 400 problem document with a fixed, safe ``detail``.
+        A 400 problem document with a fixed, safe ``detail``, for a request-caused failure only.
+
+    Raises:
+        DataError: The same exception, when its provenance is not the caller's - so that it is
+            answered as, logged as and alerted on as the server error it is.
     """
     error = cast(DataError, exc)
+    if not _data_error_is_request_caused(error):
+        raise error
     get_logger(__name__).warning(
         "data_error_response",
         **{
@@ -2197,7 +2402,7 @@ def inner_exception_handlers() -> dict[type[Exception], ExceptionHandler]:
     it is therefore rendered *within* the CORS layer, so a browser can read the problem document
     instead of seeing a cross-origin failure with no readable body.
 
-    Two keys, and both are needed:
+    Three keys, and each is needed:
 
     * ``Exception`` is the one this exists for. Starlette routes a bare-``Exception``
       registration to ``ServerErrorMiddleware`` at the very outside of the stack and offers no
@@ -2208,6 +2413,12 @@ def inner_exception_handlers() -> dict[type[Exception], ExceptionHandler]:
       middleware handles the class first - but leaving it in place would mean one path through
       this service could answer with something other than the problem document, and the point of
       a single error contract is that no such path exists.
+    * :class:`AppError` is what lets a *middleware* refuse a request and still answer the one
+      document. The framework's own exception middleware sits inside every wrapper added by
+      ``add_middleware``, so it cannot see a failure raised by one of them:
+      ``app.middleware.body_limit`` rejecting an oversized body would otherwise escape as an
+      unhandled 500. Registered here, that refusal renders as the 413 problem document - and does
+      so while ``CORSMiddleware`` is still on the stack, so a browser can read it.
 
     Returns:
         A fresh mapping per call, so no caller can mutate a shared one. The values are the same
@@ -2215,6 +2426,7 @@ def inner_exception_handlers() -> dict[type[Exception], ExceptionHandler]:
         document shape from one implementation.
     """
     return {
+        AppError: _app_error_handler,
         Exception: _inner_unhandled_exception_handler,
         StarletteHTTPException: _http_exception_handler,
     }
@@ -2234,8 +2446,19 @@ def register_exception_handlers(app: FastAPI) -> None:
     ``type(exc).__mro__`` and takes the first registered class, so the most-derived
     registration always wins - and the order is written most-specific-first purely to document
     that specificity. It is also why ``RateLimitExceeded`` reliably reaches its own handler
-    despite subclassing ``HTTPException``, and why ``DataError`` reaches its own rather than the
-    bare-``Exception`` handler it also derives from.
+    despite subclassing ``HTTPException`` rather than the ``HTTPException`` handler it would
+    otherwise match.
+
+    ``DataError``'s handler is the one that does not always answer. It renders a 400 only for a
+    failure it can prove the caller caused and **re-raises** everything else, which is what sends
+    a server-side data failure to the unhandled-500 owner with its traceback rather than filing it
+    as a client error. Starlette's exception middleware does not catch an exception raised by a
+    handler, so the re-raise leaves this dispatch site and is caught by the ``ExceptionMiddleware``
+    ``app.main`` registers as the innermost user middleware - the same site that renders every
+    other unanticipated failure, inside the CORS layer. Were that wrapper ever absent,
+    ``ServerErrorMiddleware`` and this module's outer registration would answer instead, and
+    ``app.middleware.request_context`` would log the frames on its way out: one 500 and one
+    traceback either way.
 
     Registration is by exception class throughout, never by status code. Starlette consults its
     integer status handlers *before* walking the MRO for an ``HTTPException``, so a status-keyed

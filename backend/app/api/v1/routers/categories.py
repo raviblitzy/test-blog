@@ -38,13 +38,13 @@ for a window to protect against: the whole set is a row of chips, and one reques
 it. ``Page`` is therefore not imported by this module at all, no ``page`` or ``page_size``
 parameter is accepted, and ``PageParamsDep`` is deliberately absent from both handlers.
 
-A client is still entitled to assume the envelope everywhere else, because everywhere else has it.
-The searchable, windowed view over this same relation exists and is where the envelope lives:
-``GET /api/v1/admin/categories`` is administrator-only, adds a ``q`` term and answers with the
-page envelope over the same item type, through ``CategoryService.list_paginated``. So the two
-surfaces over the taxonomy differ in shape because they differ in purpose - one renders a control,
-the other pages a management table - and neither has to compensate for the other. In particular no
-client needs to walk pages to obtain a complete taxonomy: ``listCategories`` in
+A client is still entitled to assume the envelope everywhere else, because everywhere else has a
+collection whose size a reader can influence. This one does not: the taxonomy is curated, bounded by
+editorial effort, and read whole by the control it exists for. It is also this relation's *only*
+read - the AAP's administrative surface (§0.6.2) declares create, rename and delete for a category
+and no privileged listing - so the administrative screen consumes this same array and there is no
+second shape over the taxonomy for the two screens to disagree about. No client ever needs to walk
+pages to obtain a complete taxonomy: ``listCategories`` in
 ``frontend/src/lib/api/categories.ts`` returns ``CategoryPublic[]`` in one round trip.
 
 What deliberately does not live here
@@ -100,9 +100,8 @@ from typing import Annotated, Final
 
 from fastapi import APIRouter, status
 
-from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import DbSession
-from app.schemas import CategoryPublic
+from app.schemas import CategoryPublic, ProblemResponses, problem_response
 from app.schemas.common import StorableText
 from app.services import CategoryService
 
@@ -129,7 +128,7 @@ Reached as ``from app.api.v1.routers.categories import router``, never through t
 # ---------------------------------------------------------------------------------------
 # Declared failure modes
 #
-# Every entry is built by `app.api.v1.responses.problem_response`, which names the model -
+# Every entry is built by `app.schemas.common.problem_response`, which names the model -
 # without it the failure body is absent from the generated document and a generated client
 # emits no type for it, which is the gap the "every route declares its shapes" standard closes
 # - and which is the single place the published error media type is decided. So a caller parses
@@ -201,8 +200,8 @@ a character the column cannot store."""
 # code reports. The module docstring records the reasoning in full, and `Page` is deliberately not
 # imported here at all so the shape cannot creep back in.
 #
-# No `PageParamsDep`, and no `page`/`page_size` query parameter. The searchable, windowed view over
-# this same relation is the administrator-only `GET /api/v1/admin/categories`.
+# No `PageParamsDep`, and no `page`/`page_size` query parameter. There is no windowed view over
+# this relation anywhere in the API, administrative or otherwise - a bounded taxonomy needs none.
 # ---------------------------------------------------------------------------------------
 
 
@@ -225,9 +224,9 @@ a character the column cannot store."""
         "control is expected to show an empty term rather than omit it. Drafts and archived "
         "posts are never counted, so each tally agrees exactly with the number of results "
         "`GET /api/v1/posts?category={slug}` returns to an anonymous caller.\n\n"
-        "An empty taxonomy answers 200 with an empty array. The searchable, paginated view over "
-        "the same taxonomy is `GET /api/v1/admin/categories`, which is administrator-only, adds "
-        "a `q` filter and returns the usual page envelope."
+        "An empty taxonomy answers 200 with an empty array. This is the only read over the "
+        "taxonomy: the administrative categories screen renders this same array, and the "
+        "administrator-only namespace carries the three category mutations and no listing."
     ),
 )
 async def list_categories(db: DbSession) -> list[CategoryPublic]:
@@ -250,11 +249,11 @@ async def list_categories(db: DbSession) -> list[CategoryPublic]:
 
     Note:
         Neither a window nor a ``q`` is accepted here, and the two omissions have the same cause:
-        this route serves a control that needs the complete set, and searching or paging a
-        taxonomy is a management affordance that already has a home on the administrator-only
-        ``GET /api/v1/admin/categories``. Admitting either would put a parameter on the busiest
-        read in the service for no reader-facing benefit, and admitting the window would make the
-        control able to hide posts.
+        this route serves a control that needs the complete set. Admitting either would put a
+        parameter on the busiest read in the service for no reader-facing benefit, and admitting
+        the window would make the control able to hide posts. A management screen that wants to
+        narrow the list filters this one small array client-side rather than asking the service
+        for a second, windowed read of a bounded relation.
     """
     return await CategoryService(db).list_with_post_counts()
 

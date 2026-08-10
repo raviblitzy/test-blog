@@ -35,13 +35,13 @@ and declares no category shape of its own.
 
 No collection wrapper is declared here, and that is deliberate
 --------------------------------------------------------------
-Two collections are served over this taxonomy, and each is expressed with a shape it already has.
+One collection is served over this taxonomy, and it is expressed with a shape it already has.
 ``GET /api/v1/categories`` is the public read the home page's filter control is built from, and it
 answers with a **bare JSON array** of :class:`CategoryPublic` - ``list[CategoryPublic]`` declared
-at the route, which needs no wrapper model here because Python's own list type is the wrapper.
-``GET /api/v1/admin/categories`` is the administrator-only management table, which additionally
-admits a ``q`` search term and answers with the generic page envelope re-exported from
-``app.schemas.common``, parameterised at that route with :class:`CategoryPublic` as its item type.
+at the route, which needs no wrapper model here because Python's own list type is the wrapper. The
+administrative categories screen reads that same array: the AAP's surface (§0.6.2) declares create,
+rename and delete for a category and no privileged listing, so there is no second, windowed read of
+this relation for the two screens to disagree about.
 
 The bare array is the **one sanctioned exception** to the page envelope in this API, it is exactly
 one route wide, and it is specified rather than improvised. The list *is* the filter control: a
@@ -312,10 +312,10 @@ class CategorySummary(BaseModel):
 class CategoryPublic(CategorySummary):
     """A category as its own resource: the summary, plus the description, tally and age.
 
-    The declared ``response_model`` of ``GET /api/v1/categories/{slug}`` and the item type of both
-    collections over this taxonomy - the public ``GET /api/v1/categories``, which returns a bare
-    array of them, and the administrator-only ``GET /api/v1/admin/categories``, which returns a page
-    of them. Paths are relative in the public decorators below because ``app.api.v1.router``
+    The declared ``response_model`` of ``GET /api/v1/categories/{slug}``, the item type of the one
+    collection over this taxonomy - the public ``GET /api/v1/categories``, which returns a bare
+    array of them - and the response of both administrative mutations. Paths are relative in the
+    public decorators below because ``app.api.v1.router``
     attaches the ``/categories`` prefix::
 
         @router.get("", response_model=list[CategoryPublic])

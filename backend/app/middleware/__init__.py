@@ -72,6 +72,7 @@ from __future__ import annotations
 # else: this module declares no class, function or constant of its own and has no import-time
 # effect.
 # ---------------------------------------------------------------------------------------
+from app.middleware.body_limit import BodyLimitMiddleware
 from app.middleware.request_context import (
     REQUEST_ID_HEADER,
     RequestContextMiddleware,
@@ -79,13 +80,14 @@ from app.middleware.request_context import (
 )
 from app.middleware.security_headers import SecurityHeadersMiddleware
 
-# Explicit, and functional rather than decorative: it is what makes the four re-exports above
+# Explicit, and functional rather than decorative: it is what makes the five re-exports above
 # legitimate both to pyflakes, which would otherwise report each as unused, and to mypy's
 # strict `no_implicit_reexport` - which is why a blanket lint-suppression comment is not used
 # instead. Sorted so a future member has one obvious insertion point, in the same order the
-# two sibling modules use: constants, then classes, then functions.
+# three sibling modules use: constants, then classes, then functions.
 __all__ = [
     "REQUEST_ID_HEADER",
+    "BodyLimitMiddleware",
     "RequestContextMiddleware",
     "SecurityHeadersMiddleware",
     "get_request_id",

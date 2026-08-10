@@ -718,6 +718,19 @@ class RefreshTokenRepository(UUIDPrimaryKeyRepository[RefreshToken]):
         the instant already recorded on rows revoked earlier. Calling this twice is therefore
         safe - the second call matches nothing and returns ``0``.
 
+        **Precondition: the caller must already hold the exclusive lock on the owning ``users``
+        row.** This statement revokes the rows it can *see*, and on its own that is not the same as
+        revoking everything the account holds: a concurrent rotation inserting a successor produces
+        a row this UPDATE never considers, because the row did not exist when the statement's
+        snapshot was taken - and no row-level lock over the current members can exclude an insert
+        that adds a new one. Every caller therefore locks the account first, which forces the
+        rotation to either finish before this runs (so the successor is visible and revoked) or wait
+        until after it (so the token it was spending is already revoked and it refuses).
+        ``AuthService._lock_account`` is where that lock is taken and where the protocol is
+        documented; ``AdminService.update_user`` takes the same lock before its suspension sweep. Do
+        not call this from a path that does not hold it - the statement will succeed and report a
+        count, and the account will still be holding a live credential.
+
         Args:
             user_id: The account whose tokens are being withdrawn.
             now: Optional timezone-aware instant to record; defaults to :func:`_utc_now`.

@@ -90,7 +90,13 @@
 // =============================================================================
 
 import { fireEvent, render, screen } from '@testing-library/react';
-import { useEffect, useRef, type ChangeEventHandler, type MouseEventHandler } from 'react';
+import {
+  useEffect,
+  useRef,
+  type ChangeEventHandler,
+  type FocusEventHandler,
+  type MouseEventHandler,
+} from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { Input } from '@/components/ui/input';
@@ -218,6 +224,59 @@ describe('Input', () => {
     // mock afterwards, so the assertion is about what the handler was actually
     // given at call time.
     expect(received).toEqual(['ada@example.com']);
+  });
+
+  it('reports leaving the field to `onBlur`, which is what runs form validation', () => {
+    const handleBlur = vi.fn<FocusEventHandler<HTMLInputElement>>();
+    const handleChange = vi.fn<ChangeEventHandler<HTMLInputElement>>();
+
+    render(
+      <>
+        <label htmlFor="title">Title</label>
+        <Input id="title" onBlur={handleBlur} onChange={handleChange} value="" />
+      </>,
+    );
+
+    const field = screen.getByLabelText('Title');
+
+    fireEvent.blur(field);
+
+    // `register()` returns `{ name, onChange, onBlur, ref }` and all four halves have to arrive. This
+    // is the one that decides WHEN a message appears: the post editor's form is built with
+    // `mode: 'onBlur'`, so leaving a field is what runs the resolver against it and puts an error
+    // beside the control before anything is submitted. A primitive that swallowed this handler would
+    // leave every inline validation message in the product silently waiting for a submit - and every
+    // other case in this file would still pass, which is why it is asserted on its own.
+    expect(handleBlur).toHaveBeenCalledTimes(1);
+
+    // The event carries the element the label names, so a handler that reads `event.target.value`
+    // - which is how a validating form reads the field it is leaving - gets the right node.
+    expect(handleBlur.mock.calls[0]?.[0].target).toBe(field);
+
+    // And the two handlers are independent: leaving a field is not editing it, so a blur must not be
+    // reported as a change. Firing both from one gesture would double every validation pass.
+    expect(handleChange).not.toHaveBeenCalled();
+  });
+
+  it('reports entering the field to `onFocus`, independently of leaving it', () => {
+    const handleFocus = vi.fn<FocusEventHandler<HTMLInputElement>>();
+    const handleBlur = vi.fn<FocusEventHandler<HTMLInputElement>>();
+
+    render(
+      <>
+        <label htmlFor="excerpt">Excerpt</label>
+        <Input id="excerpt" onBlur={handleBlur} onFocus={handleFocus} />
+      </>,
+    );
+
+    const field = screen.getByLabelText('Excerpt');
+
+    fireEvent.focus(field);
+
+    // The other half of the focus pair, and the reason both are asserted: a primitive that forwarded
+    // one of the two would look correct in any test that only ever checked the one it forwarded.
+    expect(handleFocus).toHaveBeenCalledTimes(1);
+    expect(handleBlur).not.toHaveBeenCalled();
   });
 
   it('accepts an uncontrolled `defaultValue` and lets the DOM own it afterwards', () => {

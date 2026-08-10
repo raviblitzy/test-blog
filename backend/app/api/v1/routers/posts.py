@@ -54,11 +54,20 @@ module as the owner of the other four for exactly that reason. Folding the filte
 shared window would document four parameters on the comment listing and on every
 administrative table that have no use for them.
 
-There is deliberately **no** ``status`` parameter. Which lifecycle states are in scope is
-decided from the resolved viewer by ``app.services.post_service.visible_statuses_for``, so
-draft confidentiality is one rule in one place rather than a filter a client supplies and
-could therefore omit. An author's workspace reaches their own drafts by calling this same
-route authenticated with ``?author=<their username>``.
+The collection has two modes, and the difference between them is what a caller **asks for**
+rather than who they are. By default it is the public feed and it answers ``PUBLISHED`` posts
+only - to every caller, anonymous, reader, author or administrator alike - which is what keeps
+one URL's ``total`` and page boundaries the same for everybody and keeps a draft out of the
+feed, out of a category-filtered result and off a public profile. Passing ``mine=true`` makes
+it the private author workspace: it requires a bearer token, scopes the listing to the
+principal's own posts, and admits every lifecycle state, with an optional ``status`` narrowing
+it to one. So the widening is requested and self-scoped; a caller who did not ask can never be
+shown an unpublished post, and a caller who did ask can only ever be shown their own.
+
+``status`` is refused outside that mode, and ``author`` is refused inside it. Both refusals are
+the same rule seen twice: the workspace's scope is the principal, so pointing it at another
+username would be a request for somebody else's drafts, and narrowing the *public* feed by
+lifecycle state is either a no-op or that same request by another spelling.
 
 What this module does not do, and why
 -------------------------------------
@@ -137,9 +146,25 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query, status
 
-from app.api.v1.responses import OPTIONAL_AUTHENTICATION, ProblemResponses, problem_response
-from app.core.dependencies import AuthorUser, DbSession, OptionalUser, PageParamsDep
-from app.schemas import Page, PostCreate, PostDetail, PostSortOption, PostSummary, PostUpdate
+from app.core.dependencies import (
+    OPTIONAL_AUTHENTICATION,
+    AuthorUser,
+    DbSession,
+    OptionalUser,
+    PageParamsDep,
+)
+from app.core.exceptions import AppValidationError, FieldError, UnauthorizedError
+from app.models.post import PostStatus
+from app.schemas import (
+    Page,
+    PostCreate,
+    PostDetail,
+    PostSortOption,
+    PostSummary,
+    PostUpdate,
+    ProblemResponses,
+    problem_response,
+)
 from app.schemas.common import (
     MAX_SEARCH_TERM_LENGTH,
     OptionalStorableText,
@@ -232,7 +257,7 @@ router-level dependency, because all three are the aggregate's to attach.
 # ---------------------------------------------------------------------------------------
 # Documented failure modes
 #
-# Every entry is built by `app.api.v1.responses.problem_response`, which is the one place in
+# Every entry is built by `app.schemas.common.problem_response`, which is the one place in
 # this package that names `ProblemDetail` and the one place the published media type is
 # decided. So `/openapi.json` describes the one document `app.core.exceptions` actually emits
 # - `type`, `title`, `status`, `detail`, `instance`, and `errors` on a 422 - under the one
@@ -288,8 +313,8 @@ router-level dependency, because all three are the aggregate's to attach.
 # the framework finds the bearer scheme in the dependency tree and would publish it as
 # REQUIRED - making a generated client refuse a call any anonymous visitor may make, and making
 # the interactive documentation hide it behind an authorisation prompt. The marker publishes
-# both alternatives, anonymous first. See `app.api.v1.responses` for why it cannot be written
-# as a `security` override.
+# both alternatives, anonymous first. See `app.core.dependencies.OPTIONAL_AUTHENTICATION` for
+# why it cannot be written as a `security` override.
 # ---------------------------------------------------------------------------------------
 
 _UNAUTHORIZED_ON_READ: Final[dict[str, Any]] = problem_response(
@@ -345,14 +370,27 @@ _CATEGORY_FILING_CONFLICT: Final[dict[str, Any]] = problem_response(
 """409 on create and update, the two routes that rewrite ``post_categories``."""
 
 _FEED_RESPONSES: Final[ProblemResponses] = {
-    status.HTTP_401_UNAUTHORIZED: _UNAUTHORIZED_ON_READ,
+    status.HTTP_401_UNAUTHORIZED: problem_response(
+        "Either a credential was presented and could not be used - malformed, expired, of the "
+        "wrong token type, or naming an account that no longer exists - or `mine=true` was "
+        "requested with no credential at all. Omitting the `Authorization` header is **not** an "
+        "error on the public feed: an anonymous caller is served the same published posts as "
+        "everybody else. It is an error on the workspace mode, which has no anonymous form. A "
+        "client seeing this should refresh its access token and retry."
+    ),
     status.HTTP_404_NOT_FOUND: problem_response(
         "The `author` filter names no account. Reported rather than answered with an "
         "empty page, so a mistyped username is distinguishable from an author who has "
         "published nothing. A `category` that matches nothing is **not** an error - a "
         "filter over a taxonomy legitimately selects zero posts."
     ),
-    status.HTTP_422_UNPROCESSABLE_CONTENT: _VALIDATION_FAILED,
+    status.HTTP_422_UNPROCESSABLE_CONTENT: problem_response(
+        "The request did not satisfy the contract. The problem document carries an `errors` "
+        "list naming each offending field and why it was rejected. Reached by an out-of-range "
+        "`page_size`, a `sort` value outside the two accepted ones, a `status` outside the "
+        "three lifecycle states - and by the two mode rules: `status` without `mine=true`, or "
+        "`author` together with it."
+    ),
 }
 
 _DETAIL_RESPONSES: Final[ProblemResponses] = {
@@ -370,12 +408,15 @@ _CREATE_RESPONSES: Final[ProblemResponses] = {
         "draft behind."
     ),
     status.HTTP_409_CONFLICT: problem_response(
-        "A concurrent write got there first, in one of two ways. Either the slug derived "
-        "from the title was taken between the moment the taken set was read and the moment "
-        "the row was inserted - two concurrent creates of the same title, with the `citext` "
-        "unique index on `posts.slug` as the backstop - or a category this post was being "
-        "filed under changed underneath the insert. A retry resolves both: it sees the row "
-        "that won and derives the next free suffix, and it re-reads the taxonomy."
+        "A concurrent write got there first, in one of two ways, and only one of them "
+        "reaches you. A category this post was being filed under changed underneath the "
+        "insert: that is reported, because re-filing is a decision about *your* submitted "
+        "`category_ids` and the server will not silently pick different ones. A slug taken "
+        "between the moment the taken set was read and the moment the row was inserted is "
+        "**not** reported - it is re-derived and re-inserted internally, so two concurrent "
+        "creates of one title both succeed with adjacent suffixes. The slug therefore "
+        "appears here only under sustained contention on a single title, when every one of "
+        "those bounded attempts lost; the detail then says to retry rather than to rename."
     ),
     status.HTTP_422_UNPROCESSABLE_CONTENT: _VALIDATION_FAILED,
 }
@@ -422,10 +463,18 @@ identifier and the principal, and whose failure modes are therefore identical.""
         "The home feed. Composes free-text search, category filtering, author filtering, "
         "ordering and page-based windowing into a single query and answers with the uniform "
         "page envelope every listing in this API uses.\n\n"
-        "Anonymous callers see published posts only. An authenticated caller additionally "
-        "sees their own drafts and archived posts, and an administrator sees every post - "
-        "which is how an author's workspace lists its drafts, by calling this route "
-        "authenticated with `author=<their own username>`.\n\n"
+        "**Every caller sees published posts only.** Anonymous, reader, author and "
+        "administrator alike: one URL is one result set, with one `total` and one set of page "
+        "boundaries, and a draft or an archived post appears here for nobody - not in the "
+        "unfiltered feed, and not in a category-filtered or author-filtered one.\n\n"
+        "**`mine=true` switches this route into the private author workspace.** It requires a "
+        "bearer token (`401` without one), scopes the listing to *your own* posts whatever "
+        "`author` might have said, and returns every lifecycle state - which is how an "
+        "author\u2019s dashboard lists its drafts. `status` narrows that mode to one state, so "
+        "the workspace can group by lifecycle without paging through the rest. Outside the "
+        "workspace mode `status` is refused with `422`, and inside it `author` is refused with "
+        "`422`: the scope is the principal, so naming somebody else would be a request for "
+        "their unpublished work.\n\n"
         "Every parameter narrows the result independently, and all of them are optional, so "
         "the bare path is the default feed: published posts, newest first. Adding `q` without "
         "`sort` ranks the page by relevance instead - the ordering follows what was asked, so "
@@ -496,6 +545,34 @@ async def list_posts(
             ),
         ),
     ] = None,
+    mine: Annotated[
+        bool,
+        Query(
+            description=(
+                "Set `true` to read **your own** posts in every lifecycle state instead of the "
+                "public feed - the author workspace. Requires a bearer token; without one the "
+                "request is refused with `401` rather than quietly answered with the public "
+                "feed, because silently returning a different result set than the one asked "
+                "for is how a dashboard comes to look empty.\n\n"
+                "The scope is the authenticated principal, so `author` may not be combined "
+                "with it (`422`). Every other parameter - `q`, `category`, `sort`, `page`, "
+                "`page_size` - behaves exactly as it does on the public feed."
+            ),
+        ),
+    ] = False,
+    post_status: Annotated[
+        PostStatus | None,
+        Query(
+            alias="status",
+            description=(
+                "Narrow the workspace to a single lifecycle state - `DRAFT`, `PUBLISHED` or "
+                "`ARCHIVED`. Accepted **only** with `mine=true`; sending it on the public feed "
+                "is refused with `422`, because the public feed is published-only and "
+                "narrowing it is either a no-op or a request for another author\u2019s "
+                "unpublished work. Omit it to receive every state."
+            ),
+        ),
+    ] = None,
 ) -> Page[PostSummary]:
     """Answer the feed for ``GET /api/v1/posts``.
 
@@ -518,6 +595,11 @@ async def list_posts(
             **passed through as ``None``** rather than defaulted here. The default is
             conditional on ``q`` and the service owns it; see the note above the router on why
             substituting a value at this boundary is what made relevance ranking unreachable.
+        mine: Whether to answer the private author workspace instead of the public feed.
+        post_status: The lifecycle state to narrow the workspace to, or ``None`` for every
+            state. Named ``post_status`` locally and ``status`` on the wire through ``alias``,
+            for the reason the administrative router records: the local name must not shadow
+            the imported ``fastapi.status`` module that every decorator in this file uses.
 
     Returns:
         The page of :class:`~app.schemas.post.PostSummary` the service assembled, returned
@@ -535,6 +617,47 @@ async def list_posts(
         service resolves the username to an identifier, because the wire speaks usernames and
         the query speaks identifiers.
     """
+    # The two mode rules, enforced before anything is queried. Refusing rather than ignoring is
+    # the point in both directions: a workspace request without a credential that was answered
+    # with the public feed would look to an author like their drafts had vanished, and a
+    # `status` filter that was accepted and then ignored on the public feed would look like a
+    # published-only result was the whole of what they asked for.
+    if mine and viewer is None:
+        raise UnauthorizedError(
+            "Reading your own posts requires a credential. Present a bearer token, or omit "
+            "`mine` to read the public feed."
+        )
+    if mine and author is not None:
+        raise AppValidationError(
+            "`author` cannot be combined with `mine`.",
+            errors=[
+                FieldError(
+                    field="author",
+                    message=(
+                        "The workspace listing is scoped to the authenticated account, so it "
+                        "cannot be pointed at another author. Drop `author`, or drop `mine` "
+                        "and read that author's published posts from the public feed."
+                    ),
+                    type="value_error",
+                )
+            ],
+        )
+    if post_status is not None and not mine:
+        raise AppValidationError(
+            "`status` is only accepted with `mine=true`.",
+            errors=[
+                FieldError(
+                    field="status",
+                    message=(
+                        "The public feed answers published posts only, so narrowing it by "
+                        "lifecycle state is either a no-op or a request for another author's "
+                        "unpublished work. Add `mine=true` to filter your own posts by state."
+                    ),
+                    type="value_error",
+                )
+            ],
+        )
+
     return await PostService(db).list_feed(
         page=window.page,
         page_size=window.page_size,
@@ -543,6 +666,8 @@ async def list_posts(
         author_username=author,
         sort=sort,
         viewer=viewer,
+        own=mine,
+        status=post_status,
     )
 
 

@@ -636,7 +636,8 @@ class CommentPublic(BaseModel):
     ``reply_count``
         A tally would have to be a correlated aggregate, and this model is embedded once per thread
         *and* once per reply, so the cost would be paid per row of a page that already carries the
-        replies themselves - a client counts ``len(replies)``.
+        replies themselves - a client reads ``reply_count``, which is the *visible* total and not
+        merely the number returned.
     ``post_title``, or any other member of the post
         A join per row to render text a thread's page already displays in its heading.
         :attr:`post_id` is the whole of the relationship a client needs, and the administrative
@@ -677,6 +678,10 @@ class CommentPublic(BaseModel):
                 "status": CommentStatus.APPROVED.value,
                 "created_at": "2026-02-03T11:05:00Z",
                 "updated_at": "2026-02-03T11:05:00Z",
+                # Three visible replies exist and one was returned, so this collection is a prefix
+                # and says so. The other two are read with `?parent=9c2f1b84-...`.
+                "reply_count": 3,
+                "has_more_replies": True,
                 "replies": [
                     {
                         "id": "5b8e0d17-92c4-4a6f-bd31-0c7a4e2f8916",
@@ -694,6 +699,10 @@ class CommentPublic(BaseModel):
                         "status": CommentStatus.APPROVED.value,
                         "created_at": "2026-02-03T12:40:00Z",
                         "updated_at": "2026-02-03T12:40:00Z",
+                        # A leaf: nothing answered it, so the count is zero and there is no more
+                        # to fetch. The pair distinguishes this from a truncated collection.
+                        "reply_count": 0,
+                        "has_more_replies": False,
                         "replies": [],
                     }
                 ],
@@ -781,6 +790,31 @@ class CommentPublic(BaseModel):
             "approved after that edit rather than before it."
         ),
     )
+    reply_count: int = Field(
+        ...,
+        description=(
+            "How many direct replies this comment has that **you** are entitled to see. Counted "
+            "under the same moderation filter as the comments themselves, so an anonymous reader "
+            "is told how many approved replies exist while an administrator is told how many "
+            "exist in every state - which is why this is a computed number and not a stored "
+            "column.\n\n"
+            "It is not `len(replies)`. A thread response is bounded, so `replies` may carry fewer "
+            "than this number reports; compare the two, or read `has_more_replies`, to know "
+            "whether what you received is the whole of it."
+        ),
+    )
+    has_more_replies: bool = Field(
+        ...,
+        description=(
+            "`true` when `replies` is incomplete - more visible replies exist than were returned. "
+            "Fetch the rest with `GET /api/v1/posts/{post_id}/comments?parent=<this comment's "
+            "id>`, which pages this comment's replies as a collection in their own right with "
+            "their own `total`, so every reply stays reachable however wide the discussion "
+            "becomes.\n\n"
+            "`false` covers both a complete collection and the ordinary case of no replies at all; "
+            "`reply_count` is what distinguishes those two."
+        ),
+    )
     replies: list[CommentPublic] = Field(
         default_factory=list,
         description=(
@@ -790,8 +824,10 @@ class CommentPublic(BaseModel):
             "present and never null: a comment nobody has answered reports `[]`. On the listing "
             "route these are filtered by the same moderation rule as their parent, so a public "
             "caller never receives an unapproved reply through an approved comment. How deeply a "
-            "given response nests is decided by the query that produced it, not by this type, "
-            "which imposes no limit."
+            "given response nests, and how many replies it carries, are decided by the query that "
+            "produced it rather than by this type - which imposes no limit of its own. Because "
+            "that query is bounded, this collection may be a prefix of what exists: "
+            "`has_more_replies` says when it is, and `reply_count` says how many there are."
         ),
     )
 

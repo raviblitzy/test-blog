@@ -100,9 +100,9 @@ import {
   type OptionalAuthRequestOptions,
   type ProtectedRequestOptions,
 } from '@/lib/api/client';
-import { encodePathSegment } from '@/lib/paths';
 import { likeSummarySchema } from '@/lib/types';
 import type { LikeSummary } from '@/lib/types';
+import { encodePathSegment } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Per-call options

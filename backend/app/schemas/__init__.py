@@ -29,8 +29,7 @@ effect of every migration command - before any migration had been asked for. The
 correctness requirement, and it is specific to where they sit.
 
 Nothing on this path has that property. Resolving this package loads :mod:`pydantic`, the eight
-siblings, :class:`~app.core.pagination.Page`, :mod:`app.core.password_policy` for the credential
-bounds ``app.schemas.auth`` publishes, and the three enumerations the siblings take from the
+siblings, :class:`~app.core.pagination.Page`, and the three enumerations the siblings take from the
 mapped-relation package rather than redeclaring - ``UserRole``, ``PostStatus`` and
 ``CommentStatus``. It reaches no engine, no session, no connection, no typed configuration object,
 no service, no router and no application factory, and it performs no work at import time beyond
@@ -46,10 +45,11 @@ singleton at module scope. ``import app.schemas`` consequently failed with six `
 validation errors - ``DATABASE_URL``, ``JWT_SECRET_KEY``, ``CORS_ALLOW_ORIGINS``, ``ENVIRONMENT``,
 ``SEED_ADMIN_EMAIL``, ``SEED_ADMIN_PASSWORD`` - on any machine without a full environment, which
 is exactly the opposite of what the paragraph above claims. The rule now lives in
-``app.core.password_policy``, a module of constants and two pure functions that imports the
-standard library and nothing else, so the claim is true rather than aspirational. Anything added
-to a sibling from here on inherits the same obligation: a settings read placed in any one of the
-eight makes all thirty names unreachable without a configured deployment.
+``app.schemas.auth`` itself, beside the request body that publishes it, and ``app.core.config``
+imports it from there instead - so the claim is true rather than aspirational, and the one
+declaration is still one declaration. Anything added to a sibling from here on inherits the same
+obligation: a settings read placed in any one of the eight makes all thirty-two names
+unreachable without a configured deployment.
 
 Two names have one source, not two
 ----------------------------------
@@ -67,12 +67,17 @@ itself.
 
 What is deliberately absent
 ---------------------------
-This surface is thirty types and nothing else: twenty-nine models, and
+This surface is thirty-two names and nothing else: twenty-nine models;
 :data:`~app.schemas.post.PostSortOption`, the enumerated alias that types the ``sort`` query
-parameter of ``GET /api/v1/posts``. That one alias is here for the same reason every model is -
-a router binds it to describe a request - and the test of membership is exactly that: a shape or
-vocabulary that crosses the wire belongs on this list, and nothing else does. Three categories of
-name are kept off it on purpose, and each exclusion is a decision rather than an omission.
+parameter of ``GET /api/v1/posts``; and the two members of the documented-failure contract,
+:func:`~app.schemas.common.problem_response` and
+:data:`~app.schemas.common.ProblemResponses`. The alias is here for the same reason every model
+is - a router binds it to describe a request - and so are the last two: every router in the
+service attaches the response objects that helper builds, and what it names is
+:class:`~app.schemas.common.ProblemDetail`, which is already on this list. The test of membership
+is exactly that: a shape or vocabulary that crosses the wire belongs here, and nothing else does.
+Three categories of name are kept off it on purpose, and each exclusion is a decision rather than
+an omission.
 
 *Validation bounds.* ``app.schemas.auth`` publishes ten of them - the password and username
 length limits, the character-group table, the refresh-token ceiling. None is re-exported here, and
@@ -122,7 +127,7 @@ nothing configured and no database running::
     import app.schemas as schemas
 
     assert [name for name in schemas.__all__ if not hasattr(schemas, name)] == []
-    assert len(schemas.__all__) == 30
+    assert len(schemas.__all__) == 32
 
 A name in the list that does not resolve is not a lint finding; it is an ``ImportError`` the first
 time anything imports this package, which means it is a start-up failure of the whole service.
@@ -145,7 +150,13 @@ from app.schemas.admin import (
 from app.schemas.auth import LoginRequest, RefreshRequest, RegisterRequest, TokenPair
 from app.schemas.category import CategoryCreate, CategoryPublic, CategorySummary, CategoryUpdate
 from app.schemas.comment import CommentCreate, CommentPublic, CommentUpdate
-from app.schemas.common import Page, ProblemDetail, ValidationErrorItem
+from app.schemas.common import (
+    Page,
+    ProblemDetail,
+    ProblemResponses,
+    ValidationErrorItem,
+    problem_response,
+)
 from app.schemas.like import LikeSummary
 from app.schemas.post import PostCreate, PostDetail, PostSortOption, PostSummary, PostUpdate
 from app.schemas.user import UserMe, UserPublic, UserUpdate
@@ -187,6 +198,7 @@ __all__ = [
     "PostSummary",
     "PostUpdate",
     "ProblemDetail",
+    "ProblemResponses",
     "RefreshRequest",
     "RegisterRequest",
     "TokenPair",
@@ -194,4 +206,5 @@ __all__ = [
     "UserPublic",
     "UserUpdate",
     "ValidationErrorItem",
+    "problem_response",
 ]

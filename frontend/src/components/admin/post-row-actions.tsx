@@ -142,34 +142,28 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { invalidateForAdminMutation } from '@/lib/admin-cache';
 import { deleteAdminPost, updateAdminPostStatus } from '@/lib/api/admin';
 import { isApiError } from '@/lib/api/client';
 import { POST_STATUSES, type AdminPost, type PostStatus } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
- * Query keys
+ * Cache invalidation lives in `@/lib/admin-cache`, not here
  *
- * The folder shares one convention and it is owned by the callers: administrative lists are
- * `['admin', <entity>, params]` and the overview counts are `['admin', 'stats']`. Invalidating the
- * two-element prefixes below therefore matches EVERY windowed and filtered posts query in the cache,
- * whatever parameters a screen happened to register, which is the point of a prefix match.
+ * Neither of this file's mutations names a query key any more, and that is a correctness change
+ * rather than tidying. Both invalidations were wrong while they were local, in the same way: they
+ * refreshed the entity this component is named after and nothing else, and BOTH of this file's
+ * mutations stale rows in a table this component never mentions.
+ *
+ * A forced status change moves `post_count` on the CATEGORY table, because that tally is a `COUNT`
+ * over published posts rather than a stored column - so publishing a filed draft left the category
+ * listing one short. A deletion cascades the post's comments, so it stales the MODERATION QUEUE as
+ * well, and removes the `post_categories` filings that fed the same tally.
+ *
+ * Neither fact is visible from inside a posts row action, which is exactly why the dependency graph
+ * is declared once, next to the server behaviour that justifies each edge, and consulted from here.
+ * See that module's header for the full graph and for why each invalidation is awaited.
  * ---------------------------------------------------------------------------------------------- */
-
-/**
- * Prefix matching every administrative posts listing, whatever filters it carries.
- *
- * Invalidated after a status change and after a deletion alike: both change what a row says.
- */
-const ADMIN_POSTS_QUERY_KEY = ['admin', 'posts'] as const;
-
-/**
- * Key of the overview counts.
- *
- * Invalidated ONLY after a deletion. A status change moves a post between lifecycle states, and
- * `GET /admin/stats` counts posts across every state - so the total is unchanged by a transition and
- * invalidating it there would be a refetch that could not produce a different number.
- */
-const ADMIN_STATS_QUERY_KEY = ['admin', 'stats'] as const;
 
 /* -------------------------------------------------------------------------------------------------
  * Labels
@@ -477,19 +471,23 @@ export function PostRowActions({ post, onChanged }: PostRowActionsProps): JSX.El
     // see section 1 of the header. `status` is required by the contract, so there is no partial form
     // of this request.
     mutationFn: (status: PostStatus) => updateAdminPostStatus(post.id, { status }),
-    onSuccess: (updated) => {
-      // Prefix match, so every windowed and filtered administrative posts query is refreshed whatever
-      // parameters its screen registered. NOT `['admin','stats']`: the counts span every lifecycle
-      // state, so a transition cannot change them.
+    onSuccess: async (updated): Promise<void> => {
+      // AWAITED, and the `await` is the fix rather than a style choice.
       //
-      // Not awaited, deliberately. Returning this promise would hold the mutation in its pending state
-      // until the grid's refetch settled, which reads well until the refetch is the slow one - a
-      // listing retrying behind the tier's retry policy would leave this row's menu disabled for as
-      // long as it took, for a request that had already succeeded. So `isPending` here means exactly
-      // "my request is on the wire", and the pill keeps showing the service's last word until the
-      // refetch lands. The alternative - painting the new state early - is the optimism section 2
-      // rules out.
-      void queryClient.invalidateQueries({ queryKey: ADMIN_POSTS_QUERY_KEY });
+      // React Query holds a mutation `isPending` until this handler's promise settles, and `isBusy`
+      // below is derived from that - so awaiting here is what keeps the menu closed until the table
+      // in front of the operator actually shows the new state. Dropping the promise instead ended the
+      // pending state the moment the WRITE returned, one refetch too early: the pill repainted the
+      // OLD status, the menu re-opened offering the same transition, and a second press sent a second
+      // `PATCH` for a change that had already happened.
+      //
+      // It is deliberately not solved by painting the new state early. That is the optimism section 2
+      // of this file's header rules out, and on a forced transition in particular: what the operator
+      // must see is the state the SERVICE resolved, not the one this component asked for.
+      //
+      // Which keys go stale is decided by `@/lib/admin-cache`, because a status change also moves
+      // `post_count` on the category table - see the note above the imports.
+      await invalidateForAdminMutation(queryClient, 'post.status');
 
       // Reported from the state the SERVICE returned rather than the one requested, so the message
       // cannot claim a transition the service resolved differently.
@@ -509,15 +507,20 @@ export function PostRowActions({ post, onChanged }: PostRowActionsProps): JSX.El
     // the post's comments and likes going with it - is the service's concern, enforced by
     // `ON DELETE CASCADE`, and is never simulated here.
     mutationFn: () => deleteAdminPost(post.id),
-    onSuccess: () => {
+    onSuccess: async (): Promise<void> => {
       // Dismissed only now that the service has agreed. Closing on submit would have hidden a refusal
       // behind a modal that had already gone.
       setIsConfirmingDelete(false);
 
-      void queryClient.invalidateQueries({ queryKey: ADMIN_POSTS_QUERY_KEY });
-      // The one mutation that DOES move the overview counts: a post has left the corpus, and the
-      // comment count follows it through the cascade.
-      void queryClient.invalidateQueries({ queryKey: ADMIN_STATS_QUERY_KEY });
+      // AWAITED, for the reason on the status mutation above, and here the cost of not awaiting was
+      // worse: the row stayed actionable over a post the service had already removed, so a second
+      // press sent a `DELETE` answered `404` - a failure the operator has no way to interpret, because
+      // the row they pressed was still on screen.
+      //
+      // The cascade is the service's - `ON DELETE CASCADE` takes the post's comments and likes - and
+      // it is never simulated here. It is, though, what makes the moderation queue and the category
+      // tallies stale as well as this table; `@/lib/admin-cache` owns that list.
+      await invalidateForAdminMutation(queryClient, 'post.delete');
 
       toast.success(`“${title}” was deleted, along with its comments and likes.`);
       onChanged?.();

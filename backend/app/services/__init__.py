@@ -1,10 +1,11 @@
 """The service layer's public surface: every business rule the API tier is allowed to reach.
 
-Seven modules sit beside this one, one per bounded piece of the blog domain, and together they
-are the only place in the backend where a business rule is settled or an authority check made.
-This file is what makes them a single named surface rather than seven addresses every router has
+Eight modules sit beside this one - seven for the bounded pieces of the blog domain and one for
+the readiness verdict - and together they are the only place in the backend where a business
+rule is settled or an authority check made.
+This file is what makes them a single named surface rather than eight addresses every router has
 to learn separately: ``app.api.v1.routers.*`` imports the services it needs from here, so the
-nine names listed at the foot of this module *are* the contract between the layer that speaks
+ten names listed at the foot of this module *are* the contract between the layer that speaks
 HTTP and the layer that decides what an operation means. A router reaching past this surface into
 a deep module path has not broken anything, but it has started splitting one contract into
 several, which is the drift this barrel exists to prevent.
@@ -16,8 +17,8 @@ same name elsewhere on ``sys.path`` from contributing to it, and ``from app.serv
 PostService`` - the spelling every router uses - resolves to nothing at all. A regular package
 with a declared surface is the fix.
 
-The nine names this package publishes
--------------------------------------
+The ten names this package publishes
+------------------------------------
 * :class:`~app.services.auth_service.AuthService` - registration, credential verification,
   token-pair issuance, refresh rotation with reuse detection, revocation on logout (R1).
 * :class:`~app.services.category_service.CategoryService` - the taxonomy's lifecycle: the slug
@@ -36,8 +37,13 @@ The nine names this package publishes
   self-service write behind them, hard-filtered to published posts (R5).
 * :class:`~app.services.admin_service.AdminService` - the single administrator-only surface over
   users, posts, comments and categories, plus the aggregate overview counts (R11).
+* :class:`~app.services.health_service.HealthService` - the readiness verdict behind
+  ``GET /readyz``: one round trip, a five-way classification of whatever went wrong, and the
+  disclosure rule that keeps a driver's host, port, database and user out of both the response
+  and the log. The one member that settles no *domain* rule, and it is here because the
+  layering rule has no exemption for a probe - see its module docstring.
 
-Why two functions sit beside seven classes
+Why two functions sit beside eight classes
 ------------------------------------------
 :func:`~app.services.post_service.visible_statuses_for` and
 :func:`~app.services.post_service.can_view_post` are pure predicates over a viewer and a post,
@@ -56,7 +62,7 @@ a method of.
 What every module in this package is, and is not
 ------------------------------------------------
 The uniformity is the whole value of naming the layer, so it is stated once here rather than
-rediscovered seven times below.
+rediscovered eight times below.
 
 * **Business rules and authority, and nothing else.** A service decides what an operation means
   and who may perform it - an author may act only on their own post, an administrator on any -
@@ -110,7 +116,7 @@ rediscovered seven times below.
 
 The import direction runs one way
 ---------------------------------
-This file imports its seven siblings. **No sibling imports this package.** Four real edges run
+This file imports its eight siblings. **No sibling imports this package.** Four real edges run
 inside this folder, and every one of them names the module it needs rather than this package::
 
     from app.services.post_service import can_view_post  # comment_service, like_service
@@ -127,13 +133,13 @@ short: inside this package always name the module, and from outside it always na
 
 No import-time side effects
 ---------------------------
-Beyond the seven imports there is nothing in this file. Nothing *here* builds an engine, a session
+Beyond the eight imports there is nothing in this file. Nothing *here* builds an engine, a session
 factory or a connection pool, nothing here reads the environment, nothing here configures a log
 handler, and there is no constant, no convenience factory and no ``__version__`` - ``[project]
 version`` in ``backend/pyproject.toml`` is the single source of the version ``app.main``
 publishes.
 
-What the seven imports transitively pull in is worth stating precisely rather than waving at,
+What the eight imports transitively pull in is worth stating precisely rather than waving at,
 because the honest answer is larger than "the service modules" and the difference has misled a
 reader before. Resolving this package loads ``app.core``, ``app.db``, ``app.models``,
 ``app.repositories`` and ``app.schemas`` - and ``app.db.session`` specifically, because
@@ -172,7 +178,7 @@ A name in the list that does not resolve is not a lint finding; it is an ``Impor
 time anything imports this package, which means it is a start-up failure of the whole service.
 """
 
-# The import edge runs ONE WAY: this file imports all seven siblings, and no sibling may ever
+# The import edge runs ONE WAY: this file imports all eight siblings, and no sibling may ever
 # import `app.services`. A sibling that needs a peer names that peer's module directly -
 # `comment_service` and `like_service` do so for `can_view_post`, and `admin_service` for
 # `CategoryService` and `CommentService`. Rewriting any of them as
@@ -191,6 +197,7 @@ from app.services.admin_service import AdminService
 from app.services.auth_service import AuthService
 from app.services.category_service import CategoryService
 from app.services.comment_service import CommentService
+from app.services.health_service import HealthService
 from app.services.like_service import LikeService
 from app.services.post_service import PostService, can_view_post, visible_statuses_for
 from app.services.profile_service import ProfileService
@@ -212,12 +219,13 @@ from app.services.profile_service import ProfileService
 # underscore-prefixed helper appears because a private name is private.
 #
 # The ordering is the linter's isort-style ordering for `__all__` - class-cased names first in
-# natural order, then everything else - which is why the two predicates trail the seven services.
+# natural order, then everything else - which is why the two predicates trail the eight services.
 __all__ = [
     "AdminService",
     "AuthService",
     "CategoryService",
     "CommentService",
+    "HealthService",
     "LikeService",
     "PostService",
     "ProfileService",

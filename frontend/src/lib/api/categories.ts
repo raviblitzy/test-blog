@@ -21,9 +21,11 @@
  * protect against: the whole set is a row of chips and one request renders it.
  *
  * So there is no page walk here and no second "give me all of them" function: {@link listCategories}
- * returns the complete taxonomy in one round trip. The searchable, paginated view over the same
- * relation exists and is administrator-only - `listAdminCategories` in `@/lib/api/admin`, which adds
- * a `q` term and does answer with the envelope.
+ * returns the complete taxonomy in one round trip. Nor is there a windowed view of this relation
+ * anywhere else - the administrative namespace carries the three category mutations and no listing
+ * (AAP §0.6.2), so the management table renders this same array and cannot disagree with the filter
+ * control about what a category is. A screen that wants to narrow it filters these few rows
+ * client-side.
  *
  * The consumers are `src/app/page.tsx` (which resolves the term named by the feed's `category`
  * search parameter so `buildFeedMetadata` can title and describe the filtered view),
@@ -91,9 +93,9 @@
  */
 
 import { apiGet, type PublicRequestOptions } from '@/lib/api/client';
-import { encodePathSegment } from '@/lib/paths';
 import { arrayOf, categoryPublicSchema } from '@/lib/types';
 import type { CategoryPublic } from '@/lib/types';
+import { encodePathSegment } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Paths
@@ -191,8 +193,8 @@ function assertAddressableSlug(slug: string): string {
  * A bare `CategoryPublic[]`, never the page envelope, and never a page walk to reconstruct one. This
  * is the API's single sanctioned collection exception: the array IS the home page's filter control,
  * so windowing it would let the control hide the posts filed under whatever fell outside the window.
- * The module header records the reasoning in full; `@/lib/api/admin`'s `listAdminCategories` is where
- * a searchable, paginated view of the same relation lives.
+ * The module header records the reasoning in full. There is no windowed view of this relation
+ * anywhere in the API: the administrative categories screen consumes this same array.
  * ---------------------------------------------------------------------------------------------- */
 
 /**

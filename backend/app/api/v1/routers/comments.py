@@ -154,14 +154,27 @@ post being commented on is taken from the path; and *blocking quality gates*, wh
 ``ruff``, ``mypy`` and ``backend/tests/integration/test_comments_api.py`` all have to pass on it.
 """
 
-from typing import Any, Final
+from typing import Annotated, Any, Final
 from uuid import UUID
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Query, status
 
-from app.api.v1.responses import OPTIONAL_AUTHENTICATION, ProblemResponses, problem_response
-from app.core.dependencies import CurrentUser, DbSession, OptionalUser, PageParamsDep
-from app.schemas import CommentCreate, CommentPublic, CommentUpdate, Page, UserPublic
+from app.core.dependencies import (
+    OPTIONAL_AUTHENTICATION,
+    CurrentUser,
+    DbSession,
+    OptionalUser,
+    PageParamsDep,
+)
+from app.schemas import (
+    CommentCreate,
+    CommentPublic,
+    CommentUpdate,
+    Page,
+    ProblemResponses,
+    UserPublic,
+    problem_response,
+)
 from app.services import CommentService
 
 __all__ = ["post_comments_router", "router"]
@@ -204,7 +217,7 @@ this package uses for its principal object, and the aggregate relies on it."""
 # rather than inferred from a literal nested in an argument, and so the two descriptions that are
 # genuinely identical between routes have one definition instead of four.
 #
-# Every entry is built by `app.api.v1.responses.problem_response`, which is the single place in
+# Every entry is built by `app.schemas.common.problem_response`, which is the single place in
 # this package that names the one problem document this API returns for every failure at every
 # status - and the single place its published media type is decided. Without a model the failure
 # mode is undocumented and a generated client emits no type for it, which is precisely the gap
@@ -376,7 +389,8 @@ an empty body" a statement in this file instead of an accident of the generator.
     responses=_LIST_RESPONSES,
     # Anonymous OR bearer, in that order. This handler resolves `OptionalUser`, so the framework
     # would otherwise publish the bearer scheme as REQUIRED and a generated client would refuse
-    # to read a public discussion without one. See `app.api.v1.responses`.
+    # to read a public discussion without one. See
+    # `app.core.dependencies.OPTIONAL_AUTHENTICATION`.
     openapi_extra=OPTIONAL_AUTHENTICATION,
     summary="List a post's comments",
     description=(
@@ -386,7 +400,14 @@ an empty body" a statement in this file instead of an accident of the generator.
         "overlap. Public: an anonymous caller receives approved comments only, replies included. "
         "An author or an administrator additionally sees the comments they are entitled to see, "
         "at every level of the thread. A page beyond the last one answers 200 with an empty "
-        "`items` list."
+        "`items` list.\n\n"
+        "**Nested replies are bounded, and every comment tells you whether you have them all.** "
+        "Each thread on a page receives an equal share of a fixed reply budget, so no single busy "
+        "discussion can crowd the others out. A comment whose share was not enough reports "
+        "`has_more_replies: true` alongside `reply_count`, the number of replies visible to you. "
+        "Read the remainder by calling this same route with `parent` set to that comment's id, "
+        "which pages its replies as a collection in their own right - with their own `total` and "
+        "`pages` - so breadth is paged rather than silently truncated."
     ),
 )
 async def list_post_comments(
@@ -394,6 +415,24 @@ async def list_post_comments(
     db: DbSession,
     viewer: OptionalUser,
     page: PageParamsDep,
+    parent: Annotated[
+        UUID | None,
+        Query(
+            description=(
+                "Page the **replies** to this comment instead of the post's top-level comments. "
+                "The continuation window for a discussion that is wide rather than deep: a "
+                "comment reporting `has_more_replies: true` carries only part of its replies in "
+                "the thread response, and this is how the rest are reached - they become the page "
+                "members, with their own `total` and `pages`, so every accepted reply is "
+                "addressable however many there are.\n\n"
+                "The moderation rule is unchanged: you receive only the replies you were already "
+                "entitled to see. An identifier naming no comment, or one belonging to a "
+                "different post, answers an empty page rather than an error - it is "
+                "indistinguishable from a comment nobody has answered, and distinguishing the two "
+                "would report whether a given identifier exists."
+            ),
+        ),
+    ] = None,
 ) -> Page[CommentPublic]:
     """Read one post's thread, and return the service's page envelope untouched.
 
@@ -415,6 +454,10 @@ async def list_post_comments(
             credential is still a 401.
         page: The validated window. ``page`` is at least 1 and ``page_size`` is bounded to 1..100
             before this function is entered, so nothing here validates or clamps either value.
+        parent: Optional comment identifier selecting the continuation window - that comment's
+            replies become the page members. Validated as a UUID by the framework, so a malformed
+            value is a 422 before this function is entered; whether it names an existing comment on
+            this post is decided by the query, which answers an empty page when it does not.
 
     Returns:
         The service's page envelope, returned exactly as received. It already carries ``items``,
@@ -432,6 +475,7 @@ async def list_post_comments(
     return await CommentService(db).list_for_post(
         post_id,
         viewer=viewer,
+        parent_id=parent,
         # The two window members are handed over individually rather than as the object, because
         # the service's signature is the contract and it takes plain integers - it reconstructs its
         # own bounded window from them, so the arithmetic still has exactly one definition.
@@ -515,6 +559,8 @@ async def create_post_comment(
         model would read an unloaded collection, which under an async session raises rather than
         yielding an empty list. Constructing the model member by member and omitting ``replies``
         keeps the unfiltered edge untouched and lets the field's empty default stand.
+        ``reply_count`` and ``has_more_replies`` are passed as the constants they must be for a
+        comment that did not exist a moment ago: nothing can have replied to it.
     """
     comment = await CommentService(db).create(post_id, payload, author=principal)
 
@@ -532,6 +578,13 @@ async def create_post_comment(
         status=comment.status,
         created_at=comment.created_at,
         updated_at=comment.updated_at,
+        # Constants rather than reads, and they are the only honest values here: this comment was
+        # created a moment ago, so nothing can have answered it yet. Stating them explicitly keeps
+        # `replies` omitted - reading `comment.reply_count` would be correct too, but it is a
+        # property over an instance whose collection is deliberately unloaded, and spelling the
+        # known answer is clearer than relying on that property's fallback.
+        reply_count=0,
+        has_more_replies=False,
     )
 
 

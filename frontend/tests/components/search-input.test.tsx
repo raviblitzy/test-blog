@@ -56,7 +56,7 @@
  *      as one), so `searchbox` is the role queried throughout and `textbox` is asserted absent.
  */
 
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The unit under test. It is imported here, above the `vi.mock` call below, because Vitest hoists
@@ -64,6 +64,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // navigation mock is installed before this module evaluates, while the file still reads top-down and
 // keeps every import in one place.
 import { SearchInput } from '@/components/blog/search-input';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { MAX_SEARCH_TERM_LENGTH } from '@/lib/types';
 
 /* -------------------------------------------------------------------------- */
 /* Types for the navigation harness                                           */
@@ -545,6 +547,210 @@ describe('SearchInput', () => {
   });
 
   /* ------------------------------------------------------------------------ */
+  /* Reconciliation with a URL that changed from outside                      */
+  /*                                                                          */
+  /* Hydration on FIRST paint is covered above. This group covers the case    */
+  /* that only appears on a LATER render: Back, Forward, or a link into the    */
+  /* feed carrying a different `q`. Each of those moves the URL without going  */
+  /* through the control's own commit path, so the field has to follow or it   */
+  /* keeps displaying a term that no longer produced the results beneath it -  */
+  /* and it must follow WITHOUT pushing the stale term back, which would undo  */
+  /* the reader's navigation a fraction of a second after it happened.        */
+  /*                                                                          */
+  /* Every case here re-renders after replacing the search parameters, which   */
+  /* is what a real Back does: the router hands the component a new           */
+  /* `URLSearchParams` instance and re-renders it. Nothing below could fail    */
+  /* without that second render, which is why the previous version of this     */
+  /* file - which only ever rendered once - could not see any of it.          */
+  /* ------------------------------------------------------------------------ */
+
+  describe('reconciliation with an external URL change', () => {
+    it('adopts a term that arrived from outside, and pushes nothing back', () => {
+      nav.state.params = new URLSearchParams('q=react&category=engineering');
+      const { rerender } = render(<SearchInput />);
+      expect(searchField()).toHaveValue('react');
+
+      // Back, Forward, or a link: a new parameter instance and a re-render.
+      nav.state.params = new URLSearchParams('q=fastapi&category=engineering');
+      rerender(<SearchInput />);
+
+      // The field follows the URL, because the results below it already have.
+      expect(searchField()).toHaveValue('fastapi');
+      // And the reconciliation is silent. A push here would fight the reader's own navigation.
+      expect(nav.router.replace).not.toHaveBeenCalled();
+    });
+
+    it('empties the field when Back lands on a URL with no term', async () => {
+      nav.state.params = new URLSearchParams('q=react');
+      const { rerender } = render(<SearchInput />);
+      expect(clearButton()).toBeInTheDocument();
+
+      nav.state.params = new URLSearchParams();
+      rerender(<SearchInput />);
+
+      expect(searchField()).toHaveValue('');
+      // The clear affordance withdraws with the term, because there is nothing left to clear.
+      expect(screen.queryByRole('button', { name: CLEAR_LABEL })).toBeNull();
+      // Still silent, including after any timer the reconciliation might have left behind.
+      await advance(DEFAULT_DELAY_MS * 2);
+      expect(nav.router.replace).not.toHaveBeenCalled();
+    });
+
+    it('abandons an uncommitted edit when a navigation lands mid-window', async () => {
+      const { rerender } = render(<SearchInput />);
+
+      // The reader has typed but the quiet period has not elapsed, so nothing has been pushed.
+      typeTerm('reac');
+      await advance(PARTIAL_DELAY_MS);
+      expect(nav.router.replace).not.toHaveBeenCalled();
+
+      // Back lands. The URL now says something the reader did not type.
+      nav.state.params = new URLSearchParams('q=postgres');
+      rerender(<SearchInput />);
+      expect(searchField()).toHaveValue('postgres');
+
+      // Waiting out the rest of the window must NOT resurrect the abandoned keystrokes. This is the
+      // navigation loop the design has to avoid: the draft has been reset by the reconciliation while
+      // the debounced value still holds the old term, and pushing it would replace the URL the reader
+      // just navigated to a fraction of a second after they got there.
+      await advance(DEFAULT_DELAY_MS * 2);
+      expect(nav.router.replace).not.toHaveBeenCalled();
+      expect(searchField()).toHaveValue('postgres');
+    });
+
+    it('does not clobber a reader who kept typing while a navigation was in flight', async () => {
+      const { rerender } = render(<SearchInput />);
+
+      typeTerm('react');
+      await advance(DEFAULT_DELAY_MS);
+      expect(nav.router.replace).toHaveBeenCalledTimes(1);
+      expect(lastNavigation().url.searchParams.get('q')).toBe('react');
+
+      // The reader keeps going while that navigation is still in flight, which is the ordinary case
+      // rather than a race worth calling exotic: a `replace` takes a moment and typing does not stop
+      // for it.
+      typeTerm('reactor');
+      await advance(PARTIAL_DELAY_MS);
+
+      // NOW the earlier navigation lands, and the router reports `q=react`. That value arrived from
+      // this control's own push, so it is not an external change - and the reconciliation has to
+      // recognise its own work. Treating it as external would overwrite the three characters the reader
+      // has typed since, and would discard their pending intent along with them.
+      nav.state.params = new URLSearchParams('q=react');
+      rerender(<SearchInput />);
+
+      // The reader's text survives the landing.
+      expect(searchField()).toHaveValue('reactor');
+      expect(nav.router.replace).toHaveBeenCalledTimes(1);
+
+      // And their intent survives it too: the window they were in the middle of still commits.
+      await advance(DEFAULT_DELAY_MS);
+      expect(nav.router.replace).toHaveBeenCalledTimes(2);
+      expect(lastNavigation().url.searchParams.get('q')).toBe('reactor');
+    });
+
+    it('re-renders without pushing again while a navigation is still in flight', async () => {
+      const { rerender } = render(<SearchInput />);
+
+      typeTerm('fastapi');
+      await advance(DEFAULT_DELAY_MS);
+      expect(nav.router.replace).toHaveBeenCalledTimes(1);
+
+      // A parent's state change or a sibling control re-renders this one BEFORE the router reports the
+      // new parameters. The URL still says the old thing, so a check against the URL alone would
+      // conclude the push is still needed and issue it a second time - one href in flight, two
+      // navigations asked for.
+      rerender(<SearchInput />);
+      await advance(DEFAULT_DELAY_MS * 2);
+
+      expect(nav.router.replace).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /* ------------------------------------------------------------------------ */
+  /* Term boundaries                                                          */
+  /* ------------------------------------------------------------------------ */
+
+  describe('term boundaries', () => {
+    it('sends the trimmed term, leaving the reader’s surrounding spaces out of the URL', async () => {
+      render(<SearchInput />);
+      typeTerm('   react   ');
+      await advance(DEFAULT_DELAY_MS);
+
+      // Trimmed on the way out, so `?q=react` and `?q=%20%20react` are not two crawlable URLs for one
+      // result set. The field itself keeps what the reader typed - it is their text until they leave.
+      expect(lastNavigation().url.searchParams.get('q')).toBe('react');
+      expect(searchField()).toHaveValue('   react   ');
+    });
+
+    it('treats a whitespace-only term as no term at all, and navigates nowhere', async () => {
+      render(<SearchInput />);
+      typeTerm('     ');
+      await advance(DEFAULT_DELAY_MS);
+
+      // The URL already carries no term, and whitespace trims to the same nothing - so this is a
+      // semantic no-op and the correct number of navigations is zero. A control that pushed `?q=` here
+      // would strip a deep-linked page and add a duplicate URL for the unfiltered feed.
+      expect(nav.router.replace).not.toHaveBeenCalled();
+    });
+
+    it('drops a term that becomes whitespace-only, rather than pushing spaces', async () => {
+      nav.state.params = new URLSearchParams('q=react');
+      render(<SearchInput />);
+
+      typeTerm('   ');
+      await advance(DEFAULT_DELAY_MS);
+
+      // Here there IS something to change, so one navigation - and it removes the parameter outright.
+      expect(nav.router.replace).toHaveBeenCalledTimes(1);
+      expect(lastNavigation().url.searchParams.has('q')).toBe(false);
+    });
+
+    it('caps the field at the longest term the service will accept', () => {
+      render(<SearchInput />);
+
+      // 256 is the service's own bound, declared on the shared `SearchTerm` alias and published as
+      // `maxLength` on every search parameter in the OpenAPI document. The service REFUSES a longer
+      // term with a problem document rather than truncating it, so a control without this cap would
+      // spend a request to show the reader an error.
+      expect(searchField()).toHaveAttribute('maxlength', String(MAX_SEARCH_TERM_LENGTH));
+    });
+
+    it('carries a term of exactly the maximum length through to the URL', async () => {
+      const atBound = 'a'.repeat(MAX_SEARCH_TERM_LENGTH);
+
+      render(<SearchInput />);
+      typeTerm(atBound);
+      await advance(DEFAULT_DELAY_MS);
+
+      // The bound is a ceiling rather than an off-by-one: the longest acceptable term is acceptable,
+      // and it arrives whole rather than clipped by one character somewhere in the pipeline.
+      const term = lastNavigation().url.searchParams.get('q');
+      expect(term).toBe(atBound);
+      expect(term?.length).toBe(MAX_SEARCH_TERM_LENGTH);
+    });
+
+    it('measures its cap in UTF-16 units, which can only be stricter than the service', () => {
+      render(<SearchInput />);
+
+      // Worth stating rather than leaving to be rediscovered: the DOM's `maxlength` counts UTF-16 code
+      // units while the service counts code points, so a term of astral characters is capped by the
+      // field at half the number the service would accept. That asymmetry is in the safe direction -
+      // the field can never produce a term the service refuses for length - and it is not a truncation
+      // the control performs, because `maxlength` refuses the keystroke rather than trimming the value.
+      const astral = '\u{1F600}';
+      expect(astral.length).toBe(2);
+      expect([...astral]).toHaveLength(1);
+
+      // A term the field would admit at full width, submitted whole: nothing here shortens it.
+      const admitted = astral.repeat(MAX_SEARCH_TERM_LENGTH / 2);
+      typeTerm(admitted);
+      expect(searchField()).toHaveValue(admitted);
+      expect(admitted.length).toBe(MAX_SEARCH_TERM_LENGTH);
+    });
+  });
+
+  /* ------------------------------------------------------------------------ */
   /* Clear                                                                    */
   /* ------------------------------------------------------------------------ */
 
@@ -628,5 +834,169 @@ describe('SearchInput', () => {
       await advance(DEFAULT_DELAY_MS * 2);
       expect(nav.router.replace).not.toHaveBeenCalled();
     });
+  });
+});
+
+/* ============================================================================ */
+/* useDebouncedValue                                                            */
+/*                                                                              */
+/* The hook the control's whole navigation contract rests on, exercised on its   */
+/* own. Everything above reaches it through `SearchInput`, which means a defect  */
+/* in its lifecycle - a window that does not restart, a timer that outlives an   */
+/* unmount, a delay change that is ignored - is only ever visible here through   */
+/* the one consumer that happens to be under test. The hook is generic over its  */
+/* value and `src/hooks/use-debounced-value.ts` records that it knows nothing    */
+/* about search, so the cases below include a non-string value to hold it to     */
+/* that.                                                                        */
+/*                                                                              */
+/* Tested in this file rather than in one of its own: the component suite is a   */
+/* fixed inventory, and the hook has exactly one consumer, whose contract these  */
+/* cases explain.                                                               */
+/* ============================================================================ */
+
+describe('useDebouncedValue', () => {
+  it('returns the initial value immediately, with no window to wait out', () => {
+    const { result } = renderHook(() => useDebouncedValue('react'));
+
+    // First paint must be correct without a timer: a hook that started at `undefined` would blank a
+    // deep-linked field for one window and then fill it in, which reads as a flash of wrong content.
+    expect(result.current).toBe('react');
+  });
+
+  it('withholds a new value until the window has elapsed', async () => {
+    const { rerender, result } = renderHook(({ value }) => useDebouncedValue(value), {
+      initialProps: { value: 'r' },
+    });
+
+    rerender({ value: 'react' });
+    // Still the previous value: this is the debounce doing its job rather than lagging.
+    expect(result.current).toBe('r');
+
+    await advance(DEFAULT_DELAY_MS - 1);
+    expect(result.current).toBe('r');
+
+    await advance(1);
+    expect(result.current).toBe('react');
+  });
+
+  it('restarts the window on every change, so only the final value lands', async () => {
+    const { rerender, result } = renderHook(({ value }) => useDebouncedValue(value), {
+      initialProps: { value: '' },
+    });
+
+    // Four changes, each well inside the window. A hook that did not clear its previous timer would
+    // emit each of them in turn - which through `SearchInput` is one navigation per keystroke.
+    for (const value of ['r', 're', 'rea', 'reac']) {
+      rerender({ value });
+      await advance(PARTIAL_DELAY_MS);
+    }
+    expect(result.current).toBe('');
+
+    rerender({ value: 'react' });
+    await advance(DEFAULT_DELAY_MS);
+
+    // One value, and it is the last one - not the first, and not each in sequence.
+    expect(result.current).toBe('react');
+  });
+
+  it('adopts a shortened delay for the change that follows it', async () => {
+    const { rerender, result } = renderHook(
+      ({ delayMs, value }) => useDebouncedValue(value, delayMs),
+      { initialProps: { delayMs: 1_000, value: 'first' } },
+    );
+
+    rerender({ delayMs: PARTIAL_DELAY_MS, value: 'second' });
+
+    // The effect depends on the delay as well as the value, so a changed delay restarts the window
+    // under the new number rather than serving out the old one. Past the short window, and still far
+    // short of the long one.
+    await advance(PARTIAL_DELAY_MS);
+    expect(result.current).toBe('second');
+  });
+
+  it('restarts a pending window when only the delay changes', async () => {
+    const longDelayMs = 1_000;
+    const { rerender, result } = renderHook(
+      ({ delayMs, value }) => useDebouncedValue(value, delayMs),
+      { initialProps: { delayMs: longDelayMs, value: 'first' } },
+    );
+
+    rerender({ delayMs: longDelayMs, value: 'second' });
+    await advance(longDelayMs / 2);
+    expect(result.current).toBe('first');
+
+    // The DELAY moves and the value does not. This is the case that distinguishes an effect keyed on
+    // both from one keyed on the value alone: with only `value` in the dependency list the effect does
+    // not re-run, the original long window is still in flight, and the short one below never happens.
+    rerender({ delayMs: PARTIAL_DELAY_MS, value: 'second' });
+    await advance(PARTIAL_DELAY_MS);
+
+    expect(result.current).toBe('second');
+  });
+
+  it('keeps a lengthened delay from letting an earlier window fire', async () => {
+    const { rerender, result } = renderHook(
+      ({ delayMs, value }) => useDebouncedValue(value, delayMs),
+      { initialProps: { delayMs: PARTIAL_DELAY_MS, value: 'first' } },
+    );
+
+    rerender({ delayMs: 1_000, value: 'second' });
+
+    // The short window that was in flight is cleared, not honoured.
+    await advance(PARTIAL_DELAY_MS);
+    expect(result.current).toBe('first');
+
+    await advance(1_000 - PARTIAL_DELAY_MS);
+    expect(result.current).toBe('second');
+  });
+
+  it('clears its pending timer on unmount', async () => {
+    const { rerender, unmount } = renderHook(({ value }) => useDebouncedValue(value), {
+      initialProps: { value: 'first' },
+    });
+
+    rerender({ value: 'second' });
+    // Exactly one window is pending: the mount scheduled one and the change replaced it rather than
+    // adding to it. This count is half the assertion - without the cleanup there would be two.
+    expect(vi.getTimerCount()).toBe(1);
+
+    unmount();
+
+    // And unmounting cancels it, measured immediately rather than after advancing. Advancing first
+    // would be no assertion at all: the timer count reaches zero either way once the window elapses,
+    // because a timer that FIRED and a timer that was CLEARED are indistinguishable afterwards. The
+    // cleanup is what makes the control's own unmount case true, and a state update after unmount is
+    // the failure it prevents: React reports it, and through `SearchInput` a stale term would land on
+    // whatever page the reader had already reached.
+    expect(vi.getTimerCount()).toBe(0);
+
+    await advance(DEFAULT_DELAY_MS * 3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('is generic over its value rather than specific to a search term', async () => {
+    const { rerender, result } = renderHook(({ value }) => useDebouncedValue(value), {
+      initialProps: { value: 0 },
+    });
+
+    rerender({ value: 42 });
+    await advance(DEFAULT_DELAY_MS);
+
+    // A number, carried through unchanged and with its type intact. The hook is used only by the
+    // search control today, and this is what keeps it usable by the next consumer without a change.
+    expect(result.current).toBe(42);
+  });
+
+  it('carries a falsy value through, distinguishing it from "nothing yet"', async () => {
+    const { rerender, result } = renderHook(({ value }) => useDebouncedValue(value), {
+      initialProps: { value: 'react' },
+    });
+
+    rerender({ value: '' });
+    await advance(DEFAULT_DELAY_MS);
+
+    // The empty string is a real value here - it is how the search control expresses "no term" - so a
+    // hook that treated it as absent would make clearing a search impossible to debounce.
+    expect(result.current).toBe('');
   });
 });

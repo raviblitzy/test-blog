@@ -1,11 +1,23 @@
 // Badge - component test for the design system's category and status pill.
 //
-// UNIT UNDER TEST: src/components/ui/badge.tsx. That module publishes the
-// `Badge` component, the `badgeVariants` class-variance-authority table (exported
-// so a sibling can carry the identical appearance on an element that is not a
-// `<span>` - `badge-link.tsx` is that consumer), and the two lookup tables
+// UNIT UNDER TEST: src/components/ui/badge.tsx, and specifically the labelling
+// half of it. That module publishes the `Badge` component, the `badgeVariants`
+// class-variance-authority table (exported so the identical appearance can be
+// carried on an element that is not a `<span>`), the two lookup tables
 // POST_STATUS_BADGE_VARIANTS / COMMENT_STATUS_BADGE_VARIANTS that map a wire
-// literal onto the variant that renders it.
+// literal onto the variant that renders it, and `BadgeLink` - the same pill on a
+// `next/link` anchor, for a category chip that navigates.
+//
+// `BadgeLink` is exercised where it is rendered rather than in isolation here:
+// post-card.test.tsx's "renders every category as a link to its filtered feed"
+// and post-content.test.tsx's "renders one crawlable link per category inside a
+// labelled landmark" both resolve the chip by `getByRole('link', { name })` and
+// then read its `href` - which is where an anchor's accessible name and its
+// destination actually mean something. What this file adds on top is the
+// invariant neither of those can see, in the "stays non-interactive" case below:
+// that `Badge` itself remains a span with no role, no tabindex and no
+// link-or-button role anywhere in its output, even though the module beside it
+// now publishes something that IS a link.
 //
 // ---------------------------------------------------------------------------
 // 1. WHAT THIS FILE DELIBERATELY DOES NOT ASSERT
@@ -223,18 +235,54 @@ describe('Badge', () => {
     expect(pill).toHaveTextContent('Pending review');
   });
 
-  it('stays non-interactive, so nothing announces a span as a control', () => {
-    render(<Badge variant="category">Engineering</Badge>);
+  it('adds no interactivity of its own, under any variant', () => {
+    // Every variant, not one: the tone is chosen per call site, and a focus ring or a tabindex added
+    // to a single tone would be invisible to a case that only rendered `category`.
+    for (const variant of documentedVariants) {
+      const { unmount } = render(<Badge variant={variant}>{variant}</Badge>);
+      const pill = screen.getByText(variant);
 
-    const pill = screen.getByText('Engineering');
+      // What the PRIMITIVE contributes, which is the whole of what it can promise: no role, no
+      // tabindex, no handler, and nothing focusable. badge.tsx records the reasoning - a span that
+      // reacts to a pointer is a control no keyboard can reach - and this is that reasoning asserted.
+      expect(pill.tagName).toBe('SPAN');
+      expect(pill).not.toHaveAttribute('role');
+      expect(pill).not.toHaveAttribute('tabindex');
+      expect(pill.tabIndex).toBe(-1);
+      expect(screen.queryByRole('button')).toBeNull();
+      expect(screen.queryByRole('link')).toBeNull();
 
-    // badge.tsx documents this as an invariant: a pill that responds to a pointer while announcing
-    // itself as a span is a control no keyboard can reach. A clickable chip is a link or a button
-    // with `asChild`, both of which are focusable and both of which already exist.
-    expect(pill).not.toHaveAttribute('role');
-    expect(pill).not.toHaveAttribute('tabindex');
-    expect(screen.queryByRole('button')).toBeNull();
-    expect(screen.queryByRole('link')).toBeNull();
+      // Not focusable, asserted as an outcome rather than inferred from the absent attribute: a
+      // keyboard user cannot land here even if something tried to send them.
+      pill.focus();
+      expect(document.activeElement).not.toBe(pill);
+
+      unmount();
+    }
+  });
+
+  it('does not prevent a caller from making one interactive, which is a deliberate limit', () => {
+    // THE NARROW TRUTH, stated rather than overclaimed. `BadgeProps` is `ComponentProps<'span'>` and
+    // the spread is last, which badge.tsx documents as its contract: a caller can attach any span
+    // attribute, `id`, `title`, a data hook - or, as here, a role and a tabindex. So "stays
+    // non-interactive" is a promise about what this component ADDS, never a guard against what a
+    // consumer passes, and asserting the stronger version would describe a component that does not
+    // exist.
+    render(
+      <Badge onClick={() => undefined} role="button" tabIndex={0} variant="category">
+        Engineering
+      </Badge>,
+    );
+
+    const pill = screen.getByRole('button', { name: 'Engineering' });
+    expect(pill.tagName).toBe('SPAN');
+    expect(pill).toHaveAttribute('tabindex', '0');
+
+    // Which is exactly why the design supplies focusable alternatives instead: `BadgeLink` for a chip
+    // that navigates, and `Button` with `asChild` wrapping a `Link` for one that acts. A span given a
+    // role by hand is announced as a control while carrying none of a control's behaviour - no Enter,
+    // no Space, no disabled state - and neither of those two has that problem.
+    expect(pill).not.toHaveAccessibleDescription();
   });
 
   it('exposes badgeVariants as a callable producing a non-empty class string', () => {

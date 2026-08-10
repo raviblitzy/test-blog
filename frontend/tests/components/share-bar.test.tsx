@@ -115,6 +115,54 @@ const POST: Pick<PostSummary, 'slug' | 'title'> = {
   title: 'Scaling FastAPI on PostgreSQL',
 };
 
+/**
+ * The post's canonical URL, WRITTEN OUT.
+ *
+ * This literal is the independent oracle, and its independence is the point. Every other expectation
+ * about the canonical URL in this file goes through {@link canonicalPostUrl}, which calls the same
+ * `absoluteUrl(postPath(...))` pair the component calls - so it agrees with the component by
+ * construction and would keep agreeing if both were wrong together. A URL a person typed out cannot
+ * do that: it pins the origin, the `/blog/` prefix, the single separator and the absence of a
+ * trailing slash to values chosen here rather than derived there.
+ *
+ * It has to be exact, because this is the address a social platform stores, the address
+ * `alternates.canonical` emits on the post page, and the address the generated sitemap enumerates. Two
+ * spellings of it split an article's ranking signal between them, which is the SEO failure this
+ * component's whole existence is meant to avoid.
+ */
+const EXPECTED_CANONICAL_URL = 'https://example.test/blog/scaling-fastapi-on-postgres';
+
+/**
+ * A post whose title carries every character a query string treats as structure.
+ *
+ * `&` ends a parameter, `=` separates a name from a value, `?` starts the query, `#` starts the
+ * fragment, `+` decodes to a space, `%` opens an escape and `/` is a path separator - so a title
+ * interpolated raw into a share URL would not merely look wrong, it would silently change the URL's
+ * shape: everything after the first `&` becomes a sibling parameter and everything after the first `#`
+ * leaves the query altogether. The non-ASCII characters cover the other half of the same guarantee,
+ * where a byte-wise escape and a code-point-wise one differ.
+ *
+ * The slug is left URL-safe, matching what the service generates - `python-slugify` produces
+ * `[a-z0-9-]` and the column is unique - so the path is asserted verbatim while the title carries the
+ * encoding load.
+ */
+const RESERVED_CHARACTER_POST: Pick<PostSummary, 'slug' | 'title'> = {
+  slug: 'q-and-a-100-percent',
+  title: 'Q&A: 100% faster? Yes — see /docs#results + a=b',
+};
+
+/** The canonical URL of {@link RESERVED_CHARACTER_POST}, written out for the same reason. */
+const RESERVED_CHARACTER_CANONICAL_URL = 'https://example.test/blog/q-and-a-100-percent';
+
+/**
+ * Characters from {@link RESERVED_CHARACTER_POST}'s title that must never reach a query string raw.
+ *
+ * `%` is deliberately NOT in this list, and its absence is not an oversight: it is the escape
+ * introducer, so a correctly encoded segment is full of it. The title's own literal `%` is asserted
+ * separately, by decoding the parameter back and comparing it to the title.
+ */
+const QUERY_STRUCTURE_CHARACTERS = ['&', '=', '?', '#', '+', '/', ' '] as const;
+
 /* -------------------------------------------------------------------------------------------------
  * The component's own copy, restated
  *
@@ -489,6 +537,106 @@ describe('ShareBar', () => {
 
       expectNamedByLabelAlone(copyControl(), COPY_LABEL);
     });
+
+    it('matches a canonical URL written out independently of the builders', () => {
+      render(<ShareBar {...POST} />);
+
+      // The oracle first: the builders this component uses must agree with a URL a person typed. Both
+      // directions matter - a builder that started emitting a trailing slash, a different prefix or a
+      // different origin fails here rather than being ratified by an expectation derived from it.
+      expect(canonicalPostUrl()).toBe(EXPECTED_CANONICAL_URL);
+
+      // And then the component: every social control carries that exact string, not merely something
+      // the same builder produced.
+      for (const target of SHARE_TARGETS) {
+        const link = screen.getByRole('link', { name: accessibleNameOf(target) });
+        const shareUrl = new URL(link.getAttribute('href') ?? '');
+        expect(shareUrl.searchParams.get(target.urlParam)).toBe(EXPECTED_CANONICAL_URL);
+      }
+    });
+
+    it('percent-encodes a title carrying query-structure characters', () => {
+      render(<ShareBar {...RESERVED_CHARACTER_POST} />);
+
+      for (const target of SHARE_TARGETS) {
+        const link = screen.getByRole('link', { name: accessibleNameOf(target) });
+        const rawHref = link.getAttribute('href') ?? '';
+        const shareUrl = new URL(rawHref);
+
+        // The URL parameter still decodes to the canonical address, whatever the title did to the
+        // query string around it.
+        expect(shareUrl.searchParams.get(target.urlParam)).toBe(RESERVED_CHARACTER_CANONICAL_URL);
+
+        if (target.titleParam === null) {
+          // A platform that ignores a title is handed none, so none of its parameters can carry the
+          // characters either.
+          for (const value of shareUrl.searchParams.values()) {
+            expect(value).not.toContain(RESERVED_CHARACTER_POST.title);
+          }
+          continue;
+        }
+
+        // DECODED equality proves the round trip: every reserved character survives, including the
+        // em dash and the `%` that a double-encoding bug would turn into `%25`.
+        expect(shareUrl.searchParams.get(target.titleParam)).toBe(RESERVED_CHARACTER_POST.title);
+
+        // And the RAW href proves the encoding actually happened rather than the parser being
+        // forgiving. `&` is the character that matters most: interpolated raw, everything after it in
+        // the title becomes a sibling parameter - so the parameter count is the first assertion, and it
+        // is exactly the two this component composes.
+        expect(Array.from(shareUrl.searchParams.keys())).toHaveLength(2);
+
+        const marker = `${target.titleParam}=`;
+        const titleValue = rawHref.slice(rawHref.indexOf(marker) + marker.length);
+        for (const character of QUERY_STRUCTURE_CHARACTERS) {
+          expect(titleValue).not.toContain(character);
+        }
+
+        // The escape introducer must be there, which is the positive half: a value with none of the
+        // characters above AND no `%` would mean the title had been stripped rather than encoded.
+        expect(titleValue).toContain('%26');
+      }
+    });
+
+    it('makes no HTTP request for any share affordance', async () => {
+      // Sharing is composed entirely from the post's canonical URL on the client: three anchors the
+      // reader follows, one clipboard write and one share sheet. There is no share endpoint on the API
+      // and there must not be one here - a request would put the reader's interest in an article, and
+      // the referring page, on this product's own server for no functional gain.
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      const openSpy = vi.spyOn(XMLHttpRequest.prototype, 'open');
+      const writeText = withClipboard();
+      const share = withWebShare();
+
+      try {
+        render(<ShareBar {...POST} />);
+
+        // Read every href - the anchors are the affordance, and reading them must not fetch anything.
+        for (const target of SHARE_TARGETS) {
+          expect(
+            screen.getByRole('link', { name: accessibleNameOf(target) }).getAttribute('href'),
+          ).toContain(encodeURIComponent(EXPECTED_CANONICAL_URL));
+        }
+
+        fireEvent.click(copyControl());
+        fireEvent.click(nativeShareControl());
+
+        await waitFor(() => {
+          expect(writeText).toHaveBeenCalledTimes(1);
+        });
+        await waitFor(() => {
+          expect(share).toHaveBeenCalledTimes(1);
+        });
+
+        // The prohibition, asserted rather than assumed. Both transports are covered because a
+        // component could reach for either, and `sendBeacon` is checked where the environment has it.
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(openSpy).not.toHaveBeenCalled();
+      } finally {
+        fetchSpy.mockRestore();
+        openSpy.mockRestore();
+      }
+    });
   });
 
   describe('copy link', () => {
@@ -695,6 +843,127 @@ describe('ShareBar', () => {
       await waitFor(() => {
         expect(writeText).toHaveBeenCalledWith(canonicalPostUrl());
       });
+    });
+  });
+
+  /* -----------------------------------------------------------------------------------------------
+   * Capability transitions
+   *
+   * Every case above describes ONE browser and never changes its mind. These describe the transitions
+   * between them, which is where the component's two most easily lost decisions live: retracting the
+   * manual fallback once a copy finally works, and re-resolving the share sheet at CLICK time rather
+   * than trusting the snapshot the control was rendered from. Neither is observable from a single
+   * fixed environment, which is why neither was covered before.
+   * -------------------------------------------------------------------------------------------- */
+  describe('capability transitions', () => {
+    it('retracts the manual fallback once a later copy succeeds', async () => {
+      // A clipboard that refuses - a denied permission, which rejects even where the API exists.
+      const refusing = vi.fn<WriteText>(() => Promise.reject(new Error('Permission denied.')));
+      withClipboard(refusing);
+
+      render(<ShareBar {...POST} />);
+      fireEvent.click(copyControl());
+
+      // The fallback appears, because the reader still needs the URL.
+      expect(await screen.findByText(EXPECTED_CANONICAL_URL)).toBeVisible();
+      expect(screen.getByText(MANUAL_COPY_PREAMBLE)).toBeInTheDocument();
+      expect(toastError).toHaveBeenCalledWith(COPY_FAILED_MESSAGE);
+
+      // The reader grants the permission and tries again. Same document, same component, working
+      // clipboard - which is exactly what happens after a browser permission prompt is accepted.
+      const granted = withClipboard();
+      fireEvent.click(copyControl());
+
+      await waitFor(() => {
+        expect(granted).toHaveBeenCalledWith(EXPECTED_CANONICAL_URL);
+      });
+      await waitFor(() => {
+        expect(toastSuccess).toHaveBeenCalledWith(COPY_SUCCEEDED_MESSAGE);
+      });
+
+      // AND THE FALLBACK IS WITHDRAWN. Leaving it on screen would tell the reader the copy had not
+      // worked while the toast told them it had - two answers to one question, with the wrong one
+      // occupying the larger surface. This is the assertion the fixed-environment cases could not make:
+      // they never reach a success after a failure.
+      await waitFor(() => {
+        expect(screen.queryByText(MANUAL_COPY_PREAMBLE)).toBeNull();
+      });
+      expect(screen.queryByText(EXPECTED_CANONICAL_URL)).toBeNull();
+    });
+
+    it('keeps the manual fallback when a second attempt fails too', async () => {
+      const refusing = vi.fn<WriteText>(() => Promise.reject(new Error('Permission denied.')));
+      withClipboard(refusing);
+
+      render(<ShareBar {...POST} />);
+      fireEvent.click(copyControl());
+      expect(await screen.findByText(EXPECTED_CANONICAL_URL)).toBeVisible();
+
+      fireEvent.click(copyControl());
+
+      await waitFor(() => {
+        expect(refusing).toHaveBeenCalledTimes(2);
+      });
+
+      // Still one fallback, not two, and it has not been retracted by an attempt that also failed.
+      expect(screen.getAllByText(MANUAL_COPY_PREAMBLE)).toHaveLength(1);
+      expect(screen.getByText(EXPECTED_CANONICAL_URL)).toBeVisible();
+      expect(toastSuccess).not.toHaveBeenCalled();
+    });
+
+    it('reports a share sheet that disappeared between render and click', async () => {
+      const share = withWebShare();
+
+      render(<ShareBar {...POST} />);
+      const control = nativeShareControl();
+
+      // The capability goes away after the control was rendered. In a browser this is the reader
+      // spending a minute reading and an extension, a permissions change or a navigation-adjacent
+      // teardown removing the implementation in the meantime.
+      forgetNavigatorCapabilities();
+
+      fireEvent.click(control);
+
+      // Re-resolving at click time is what turns this into a reported failure instead of a
+      // `TypeError` on an undefined call - the component deliberately does not trust the snapshot the
+      // control was rendered from, and this is the case that holds it to that.
+      await waitFor(() => {
+        expect(toastError).toHaveBeenCalledWith(NATIVE_SHARE_FAILED_MESSAGE);
+      });
+      expect(share).not.toHaveBeenCalled();
+      expect(toastSuccess).not.toHaveBeenCalled();
+    });
+
+    it('offers the share control once the capability is observed on a later render', () => {
+      const { rerender } = render(<ShareBar {...POST} />);
+
+      // Absent at first: no capability, and the server snapshot is `false` so the initial HTML never
+      // promises a control the client might not have.
+      expect(screen.queryByRole('button', { name: NATIVE_SHARE_LABEL })).toBeNull();
+
+      withWebShare();
+      rerender(<ShareBar {...POST} />);
+
+      // The snapshot is re-read on render rather than captured once, so a later observation is
+      // honoured. That is what makes hydration on a capable browser end with the control present.
+      expect(nativeShareControl()).toBeVisible();
+      expect(screen.getAllByRole('button')).toHaveLength(2);
+    });
+
+    it('withdraws the share control when the capability is gone on a later render', () => {
+      withWebShare();
+      const { rerender } = render(<ShareBar {...POST} />);
+      expect(nativeShareControl()).toBeVisible();
+
+      forgetNavigatorCapabilities();
+      rerender(<ShareBar {...POST} />);
+
+      // Absent rather than disabled, on this path as on the initial one: a reader cannot tell why an
+      // enabled-looking control does nothing. The rest of the row is untouched.
+      expect(screen.queryByRole('button', { name: NATIVE_SHARE_LABEL })).toBeNull();
+      expect(screen.getAllByRole('button')).toHaveLength(1);
+      expect(copyControl()).toBeVisible();
+      expect(screen.getAllByRole('link')).toHaveLength(SHARE_TARGETS.length);
     });
   });
 });

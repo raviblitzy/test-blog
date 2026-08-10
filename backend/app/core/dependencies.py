@@ -133,7 +133,7 @@ constructed objects.
 
 import dataclasses
 from collections.abc import AsyncGenerator
-from typing import Annotated, Final
+from typing import Annotated, Any, Final
 from uuid import UUID
 
 from fastapi import Depends, Query, Request
@@ -151,6 +151,8 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "MIN_PAGE",
     "MIN_PAGE_SIZE",
+    "OPTIONAL_AUTHENTICATION",
+    "OPTIONAL_AUTHENTICATION_EXTENSION",
     "TOKEN_URL",
     "AdminUser",
     "AuthorUser",
@@ -674,6 +676,54 @@ For a public endpoint whose projection widens for a known caller. Two values col
 ``None``: no credential at all, and a usable credential naming a deactivated account - so a
 projection built from this value can never widen for an account that has been withdrawn. A
 *present but unusable* credential is still a 401 - see :func:`get_current_user_optional`.
+"""
+
+
+# ---------------------------------------------------------------------------------------
+# How an optional credential is DOCUMENTED
+#
+# Declared here because it is a property of the dependency above rather than of any one
+# route: "this operation accepts a credential and does not require one" is exactly what
+# `OptionalUser` means, so the marker that publishes it belongs beside it. Four read
+# operations resolve that dependency - the feed, a post by slug, a post's comment thread and
+# a post's like summary - and each attaches the marker at the decorator that declares the
+# dependency, rather than having `app.main` infer the fact by walking the dependency tree,
+# which would couple the document transform to framework internals and would silently stop
+# working the day a dependency is wrapped.
+#
+# WHY A VENDOR EXTENSION AND NOT A `security` OVERRIDE. The framework sees the security
+# scheme in the dependency tree and publishes `security: [{"OAuth2PasswordBearer": []}]`,
+# which states that a credential is REQUIRED - so a generated client refuses the call without
+# one and interactive documentation hides it behind an authorisation prompt. The accurate
+# declaration is `security: [{}, {"OAuth2PasswordBearer": []}]`: two alternatives, the first
+# of which is "none". `openapi_extra` cannot express that directly, because FastAPI merges it
+# into the operation with `deep_dict_update`, which CONCATENATES lists rather than replacing
+# them: a `security` key supplied there is appended to the framework's own entry and yields
+# `[{"OAuth2PasswordBearer": []}, {}]`, which reads as "a credential is required, or
+# optional" - an incoherent claim that also leaves the mandatory alternative first. So the
+# route marks itself, and `app.main._publish_optional_authentication` rewrites the list on the
+# finished document and removes the marker, which is why no `x-` key reaches a consumer.
+# ---------------------------------------------------------------------------------------
+
+OPTIONAL_AUTHENTICATION_EXTENSION: Final[str] = "x-optional-authentication"
+"""Name of the operation-level marker ``app.main`` consumes and removes.
+
+Public so that the transform in ``app.main`` reads the same string this module publishes,
+rather than restating it - the two must agree exactly, or a marked operation keeps its
+mandatory security list *and* ships a vendor extension.
+"""
+
+OPTIONAL_AUTHENTICATION: Final[dict[str, Any]] = {OPTIONAL_AUTHENTICATION_EXTENSION: True}
+"""``openapi_extra`` for an operation that accepts a bearer credential without requiring one.
+
+Attach it to the four reads that resolve :data:`OptionalUser`::
+
+    @router.get("", response_model=Page[PostSummary], openapi_extra=OPTIONAL_AUTHENTICATION)
+
+and the served document declares ``security: [{}, {"OAuth2PasswordBearer": []}]`` for that
+operation - anonymous *or* bearer, in that order - instead of the framework's mandatory
+single-alternative list. Attaching it to a route that genuinely requires a credential would be a
+security-documentation defect, so it belongs only where the handler takes :data:`OptionalUser`.
 """
 
 

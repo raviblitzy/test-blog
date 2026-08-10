@@ -221,12 +221,19 @@ const product: CategoryPublic = {
 };
 
 /**
- * The whole taxonomy, in the order the server reported it.
+ * The whole taxonomy, in the order the server really reports it: BY NAME, ASCENDING.
+ *
+ * `category_repository.py` orders `GET /api/v1/categories` by `Category.name.asc()`, so Design comes
+ * before Engineering before Product - and the order is alphabetical rather than by tally, by creation
+ * instant or by identifier. This array was previously `[engineering, design, product]` while the case
+ * that consumed it claimed "in server order", which is the combination worth avoiding: the claim read
+ * as verified while the fixture described an ordering the API never sends, so a component that decided
+ * to sort by `post_count` descending would have looked correct against it.
  *
  * A BARE array - what `listCategories` answers - and `readonly`, so no test can quietly reorder or
  * extend the set another test depends on.
  */
-const categories: readonly CategoryPublic[] = [engineering, design, product];
+const categories: readonly CategoryPublic[] = [design, engineering, product];
 
 /** The announced tally for a category, assembled exactly as the component assembles it. */
 function tallyPhrase(category: CategoryPublic): string {
@@ -260,6 +267,30 @@ function renderFilter(options: RenderOptions = {}): void {
   nav.searchParams = new URLSearchParams(search);
 
   render(<CategoryFilter categories={[...taxonomy]} label={label} />);
+}
+
+/**
+ * Mount the picker and hand back a function that navigates the URL beneath it.
+ *
+ * The distinction from {@link renderFilter} is the whole point of the reconciliation group below: a
+ * single render can only ever prove hydration on FIRST paint. Back, Forward and an in-app link all
+ * change the query string and re-render the same mounted component, which is a second observation this
+ * file could not make while every case rendered once.
+ *
+ * The returned function replaces the parameter instance - the router hands out a new one rather than
+ * mutating - and then re-renders the same element, exactly as the App Router does.
+ */
+function renderFilterWithNavigation(options: RenderOptions = {}): (search: string) => void {
+  const { search = '', label, categories: taxonomy = categories } = options;
+
+  nav.searchParams = new URLSearchParams(search);
+
+  const { rerender } = render(<CategoryFilter categories={[...taxonomy]} label={label} />);
+
+  return (nextSearch: string): void => {
+    nav.searchParams = new URLSearchParams(nextSearch);
+    rerender(<CategoryFilter categories={[...taxonomy]} label={label} />);
+  };
 }
 
 /** The trigger, found the only way a reader finds it: by its accessible name. */
@@ -405,6 +436,22 @@ describe('CategoryFilter', () => {
       options.forEach((option, index) => {
         expect(option).toHaveAccessibleName(expectedNames[index]);
       });
+
+      // THE FIXTURE'S ORDER IS THE SERVER'S, asserted rather than asserted-about. Without this the
+      // case above only proves the component preserves whatever order it was handed, which is true of
+      // a fixture in any order at all - and the claim being made is the stronger one: the order a
+      // reader sees is the alphabetical order the API sends, so a component that sorted by tally, or
+      // a fixture that drifted out of the API's order, is a failure rather than a rewording.
+      const renderedNames = categories.map((category) => category.name);
+      expect(renderedNames).toEqual(
+        [...renderedNames].sort((left, right) => left.localeCompare(right)),
+      );
+      // And not the orders it must NOT be, so the assertion above cannot be satisfied by coincidence.
+      expect(renderedNames).not.toEqual(
+        [...categories]
+          .sort((left, right) => right.post_count - left.post_count)
+          .map((c) => c.name),
+      );
     });
 
     it('names each option by its category alone and announces the tally as a description', async () => {
@@ -479,21 +526,143 @@ describe('CategoryFilter', () => {
       );
     });
 
-    it('falls back to the unfiltered label when the URL names a category that no longer exists', async () => {
+    it('resolves the slug case-insensitively, because the service does', async () => {
+      // `categories.slug` is a `citext` column and the feed's `category` filter is documented as
+      // matched case-insensitively, so this URL returns the Design posts. A control comparing with
+      // `===` did not recognise it and displayed "All categories" over a plainly filtered page - the
+      // picker contradicting the result set beneath it.
+      renderFilter({ search: `${CATEGORY_PARAM}=${design.slug.toUpperCase()}` });
+
+      const trigger = getTrigger();
+
+      expect(trigger).toHaveTextContent(design.name);
+      expect(trigger).not.toHaveTextContent(ALL_CATEGORIES_LABEL);
+
+      const listbox = await openPicker();
+
+      await waitFor(() => {
+        expect(within(listbox).getByRole('option', { name: design.name })).toHaveAttribute(
+          'aria-selected',
+          'true',
+        );
+      });
+    });
+
+    it('names the still-active filter when the URL points at a category that no longer exists', async () => {
       renderFilter({ search: `${CATEGORY_PARAM}=does-not-exist` });
 
       const trigger = getTrigger();
 
-      // A category deleted from the admin dashboard leaves live links pointing at its slug. The
-      // trigger must not go blank on one of those: it reads the truth about the feed beneath it.
-      expect(trigger).toHaveTextContent(ALL_CATEGORIES_LABEL);
+      // A category deleted from the admin dashboard leaves live links pointing at its slug. Two
+      // things must hold on one of those, and only the first used to.
+      //
+      // The trigger must not go blank - Radix has no item to take a label from, so the label is
+      // resolved in the component and passed to `SelectValue` as children.
+      //
+      // AND it must not claim the feed is unfiltered. The parameter is still in the URL, `listPosts`
+      // still forwards it, and the service still filters on it: an unmatched slug answers an EMPTY
+      // page rather than an error. "All categories" over an empty feed told the reader the one thing
+      // that was false and hid the only thing that explained what they were seeing.
+      expect(trigger).toHaveTextContent('Unknown category: does-not-exist');
+      expect(trigger).not.toHaveTextContent(ALL_CATEGORIES_LABEL);
 
       const listbox = await openPicker();
 
-      // No option claims to be selected either, because on that URL none of them is active.
+      // No option claims to be selected either, because on that URL none of the LISTED ones is
+      // active - which is what keeps the reset affordance a genuine change rather than a no-op.
       for (const option of within(listbox).getAllByRole('option')) {
         expect(option).toHaveAttribute('aria-selected', 'false');
       }
+    });
+
+    it('calls a blank category unfiltered, and still lets the reader canonicalise it', async () => {
+      // `?category=` is the one present-but-unresolvable value that really IS the unfiltered feed:
+      // `post_service._omit_blank` folds a whitespace-only filter to `None` before the query is
+      // built. So the label tells the truth about the results, while the VALUE stays unresolved so
+      // that choosing "All categories" is a real change and deletes the redundant parameter.
+      renderFilter({ search: `${CATEGORY_PARAM}=` });
+
+      expect(getTrigger()).toHaveTextContent(ALL_CATEGORIES_LABEL);
+
+      const listbox = await openPicker();
+      fireEvent.click(within(listbox).getByRole('option', { name: ALL_CATEGORIES_LABEL }));
+
+      expect(pushedUrl().searchParams.has(CATEGORY_PARAM)).toBe(false);
+    });
+  });
+
+  /* -----------------------------------------------------------------------------------------------
+   * Reconciling with a URL that changed after the first paint
+   *
+   * `category-filter.tsx` records the decision this group verifies: there is NO `useState` in that
+   * file and no effect synchronising one, because the selection is derived from `useSearchParams()` on
+   * every render. That design is what makes Back, Forward and an in-app link correct for free - and it
+   * is also exactly the kind of decision a later "optimisation" undoes by mirroring the URL into local
+   * state. A mirror passes every hydration case above, because those render once; it fails here.
+   * -------------------------------------------------------------------------------------------- */
+  describe('reconciling with an external URL change', () => {
+    it('follows the URL when Back moves to a different category', () => {
+      const navigate = renderFilterWithNavigation({
+        search: `${CATEGORY_PARAM}=${design.slug}`,
+      });
+      expect(getTrigger()).toHaveTextContent(design.name);
+
+      navigate(`${CATEGORY_PARAM}=${engineering.slug}`);
+
+      // The trigger reads the truth about the feed beneath it, which has already changed. A mirrored
+      // selection would still be showing Design over a feed filtered to Engineering.
+      expect(getTrigger()).toHaveTextContent(engineering.name);
+      expect(getTrigger()).not.toHaveTextContent(design.name);
+      // And following the URL is not the same as writing it: nothing is pushed by a reconciliation, or
+      // the reader's own Back press would be undone a moment after it landed.
+      expect(nav.router.push).not.toHaveBeenCalled();
+    });
+
+    it('returns to the unfiltered label when Back leaves the filter behind', () => {
+      const navigate = renderFilterWithNavigation({
+        search: `${CATEGORY_PARAM}=${engineering.slug}&${PAGE_PARAM}=3`,
+      });
+      expect(getTrigger()).toHaveTextContent(engineering.name);
+
+      navigate('');
+
+      expect(getTrigger()).toHaveTextContent(ALL_CATEGORIES_LABEL);
+      expect(nav.router.push).not.toHaveBeenCalled();
+    });
+
+    it('adopts a filter that arrives on a URL which had none', () => {
+      const navigate = renderFilterWithNavigation();
+      expect(getTrigger()).toHaveTextContent(ALL_CATEGORIES_LABEL);
+
+      // An in-app link into the filtered feed - a category chip on a post card, which is a real
+      // navigation this control has to answer for without being the one that made it.
+      navigate(`${CATEGORY_PARAM}=${product.slug}&${QUERY_PARAM}=indexes`);
+
+      expect(getTrigger()).toHaveTextContent(product.name);
+      expect(nav.router.push).not.toHaveBeenCalled();
+    });
+
+    it('names the still-active filter when a URL change points at a category that no longer exists', () => {
+      const navigate = renderFilterWithNavigation({
+        search: `${CATEGORY_PARAM}=${design.slug}`,
+      });
+
+      // The administrator deletes a category while the reader is on it, and Forward carries them onto
+      // a URL naming the deleted slug. Two things have to hold on that URL, and the second is the one
+      // this case used to get backwards.
+      //
+      // The trigger must stop displaying a term the taxonomy no longer contains - Radix has no item
+      // left to take a label from.
+      //
+      // AND it must not claim the feed is unfiltered. The parameter is still in the URL, the feed
+      // still forwards it and the service still filters on it: an unmatched slug answers an EMPTY
+      // page rather than an error, so "All categories" over an empty feed asserts the one thing that
+      // is false and hides the only thing that explains what the reader is looking at.
+      navigate(`${CATEGORY_PARAM}=deleted-in-the-meantime`);
+
+      expect(getTrigger()).toHaveTextContent('Unknown category: deleted-in-the-meantime');
+      expect(getTrigger()).not.toHaveTextContent(ALL_CATEGORIES_LABEL);
+      expect(getTrigger()).not.toHaveTextContent(design.name);
     });
   });
 
@@ -558,7 +727,13 @@ describe('CategoryFilter', () => {
 
       const listbox = await openPicker();
       const reset = within(listbox).getByRole('option', { name: ALL_CATEGORIES_LABEL });
-      const firstCategory = within(listbox).getByRole('option', { name: engineering.name });
+      // Derived from the taxonomy rather than named, so this case follows the server's ordering
+      // instead of encoding a guess at which term happens to come first.
+      const [firstTerm] = categories;
+      if (firstTerm === undefined) {
+        throw new Error('Expected the taxonomy fixture to be non-empty.');
+      }
+      const firstCategory = within(listbox).getByRole('option', { name: firstTerm.name });
 
       // Radix supplies the roving-focus model; driving it here is what proves the wrapper has not
       // broken it. Focus starts on the active option, and the arrow-key move is applied in a
@@ -572,7 +747,7 @@ describe('CategoryFilter', () => {
       });
       fireEvent.keyDown(firstCategory, { key: 'Enter' });
 
-      expect(pushedUrl().searchParams.get(CATEGORY_PARAM)).toBe(engineering.slug);
+      expect(pushedUrl().searchParams.get(CATEGORY_PARAM)).toBe(firstTerm.slug);
     });
 
     it('does not navigate when the category chosen is already the active one', async () => {

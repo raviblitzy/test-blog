@@ -11,9 +11,12 @@
 #
 #     docker build -t blog-api-backend backend/
 #
-# so every COPY source below is relative to backend/. docker-compose.yml builds this same
-# service from this same file with that same context, and the port, the module path and the
-# probe path chosen here are the values it publishes and gates on.
+# so every COPY source below is relative to backend/. That context is a property of this file
+# alone and is stated here because it is not guessable from the outside: a build launched from
+# the repository root fails on the first COPY. The plan schedules a `docker-compose.yml` for a
+# later stage; no such file exists in the repository yet, so nothing here depends on one, and
+# when it arrives it will need this same context, and the port, module path and probe path
+# chosen below are the values it should publish and gate on.
 #
 # RUN IT with configuration supplied at run time and nothing baked in:
 #
@@ -21,18 +24,22 @@
 #
 # WHAT THIS IMAGE DELIBERATELY DOES NOT DO
 #
-#   * It does not apply migrations. `alembic upgrade head` is docker-compose.yml's job on
-#     service start, so putting it in CMD here would run it a second time and weld the image
-#     to one orchestration. The image's duty is to make the command POSSIBLE - which is why
-#     alembic.ini and migrations/ are copied in and the venv's `alembic` is on PATH - and to
-#     stop there. `docker run --rm --env-file .env blog-api-backend alembic upgrade head`
-#     works, as does compose overriding `command:`.
+#   * It does not apply migrations. Applying them belongs to whatever starts the service -
+#     the plan gives that job to the `docker-compose.yml` it schedules for a later stage -
+#     because putting `alembic upgrade head` in CMD here would run it again on every restart
+#     and weld the image to one orchestration. The image's duty is to make the command
+#     POSSIBLE - which is why alembic.ini and migrations/ are copied in and the venv's
+#     `alembic` is on PATH - and to stop there. `docker run --rm --env-file .env
+#     blog-api-backend alembic upgrade head` works today, and an orchestrator that overrides
+#     `command:` will work the same way.
 #   * It does not carry configuration. Not one of the eleven backend environment variables
 #     has a default here, and no secret appears as ENV, as a build ARG, or in a comment: the
-#     only ENV entries are non-secret interpreter and pip behaviour flags. `.env` is never
-#     copied - the root `.gitignore` excludes it precisely so it cannot be committed, and
-#     backend/.env is a symlink to a path OUTSIDE this build context, so a blanket copy would
-#     not merely leak configuration, it would fail. `.env.example` is the documented contract.
+#     only ENV entries are non-secret interpreter and pip behaviour flags. No `.env` is ever
+#     copied, and two independent things keep it that way: the root `.gitignore` excludes the
+#     file so it cannot be committed in the first place, and no COPY below names it, so even a
+#     local `backend/.env` - which a developer may create, commonly as a symlink to the root
+#     one, and which would then point OUTSIDE this build context and be uncopyable anyway -
+#     cannot reach the image. `.env.example` is the documented contract.
 #   * It does not run as root. See the `blog` user below.
 #
 # WHY EVERY COPY IS NARROW AND EXPLICIT, AND WHY THERE IS NO `COPY . .`
@@ -110,6 +117,15 @@ RUN python -m venv /opt/venv \
 #   app/          the service itself, entered at app.main:app
 #   migrations/   Alembic's script_location, so `alembic upgrade head` is available
 #   alembic.ini   Alembic's entry point: script_location=migrations, prepend_sys_path=.
+#   gunicorn.conf.py  REQUIRED for a single-format log stream, not optional polish. Gunicorn's
+#                 arbiter forks workers in a process that never imports app.main, so the
+#                 import-time and lifespan calls to configure_logging cannot reach it and every
+#                 arbiter line - boot, signals, shutdown - stays plain text in an otherwise JSON
+#                 stream. Measured in this image's own invocation: 9 of 30 lines plain without
+#                 this file, 0 of 30 with it. It supplies a --logger-class that reconfigures
+#                 logging inside the arbiter before its first line is written; the file itself
+#                 documents why a logger class rather than an on_starting hook is the only
+#                 placement that closes the window.
 #   pyproject.toml  DELIBERATE, and the one inclusion that looks wrong at first glance. It is
 #                 mostly tool configuration - ruff, mypy, pytest, coverage - which the
 #                 container never reads. But backend/app/main.py resolves the service version
@@ -124,6 +140,7 @@ RUN python -m venv /opt/venv \
 COPY app /payload/app
 COPY migrations /payload/migrations
 COPY alembic.ini /payload/alembic.ini
+COPY gunicorn.conf.py /payload/gunicorn.conf.py
 COPY pyproject.toml /payload/pyproject.toml
 
 # Strip the host's byte-code caches, then ASSERT the strip worked. The test is not decoration:
@@ -185,8 +202,8 @@ COPY --from=builder --chown=root:blog /payload ./
 
 # One port, used consistently by EXPOSE, by the health probe and by the bind address below, and
 # it is the port the rest of the project already assumes: `.env.example` points the frontend at
-# http://localhost:8000/api/v1. Operators remap it with `-p` or compose's `ports:` rather than
-# by rebuilding.
+# http://localhost:8000/api/v1. Operators remap it at run time - `-p`, or the port mapping of
+# whatever orchestrates the container - rather than by rebuilding.
 EXPOSE 8000
 
 # Liveness, and `/healthz` rather than `/readyz` on purpose. `/healthz` answers 200 from the
@@ -231,7 +248,7 @@ USER blog
 # Multiple workers are correct here only because the system of record moved into PostgreSQL -
 # the retired in-memory design gave each worker a private list and answered identical requests
 # differently. Tune without rebuilding via gunicorn's own GUNICORN_CMD_ARGS, or by overriding
-# `command:` in compose.
+# the container's command from whatever starts it.
 #
 # --no-control-socket because gunicorn 26 otherwise opens a control socket under $HOME on every
 # boot. The `blog` account below does have a writable home, so the default would work as
@@ -246,8 +263,36 @@ USER blog
 # Both logs go to `-`, which gunicorn maps to stdout for access lines and stderr for error
 # lines, so the container log stream is the only place logs live - no files, no rotation, no
 # writable volume required.
+#
+# --logger-class is what makes the log stream structured END TO END, and it is a correctness
+# requirement of this image rather than a preference. The arbiter - the process this CMD starts -
+# binds the socket, forks the workers and handles signals WITHOUT ever importing app.main, so the
+# `configure_logging()` call on the application's import path cannot reach it. Measured here
+# before this flag existed: 9 plain-text lines per container lifecycle, every one from the
+# arbiter (`Starting gunicorn`, `Listening at:`, `Using worker:`, two `Booting worker with pid:`,
+# `Handling signal: term`, two `Worker … was sent SIGTERM!`, `Shutting down: Master`), while every
+# worker-side line including all request records was already JSON. A JSON-only collector treats
+# each of those as unparsed, so the boot and shutdown of every container is exactly the window an
+# operator cannot query.
+#
+# `app.core.logging.StructlogGunicornLogger` closes it: gunicorn's `Arbiter.setup` constructs
+# `cfg.logger_class(cfg)` before the arbiter logs its first line, and `Application.load_config`
+# has already put this WORKDIR on sys.path, so the dotted path resolves in the arbiter process.
+# The class calls gunicorn's own `setup()` and then `configure_logging()`, which detaches the
+# plain-text handler gunicorn attached to `gunicorn.error` and lets those records reach the one
+# structlog handler instead - measured after: 0 plain-text lines. `gunicorn.access` stays
+# silenced by that same call, so `--access-logfile -` above remains correct and inert:
+# app.middleware.request_context is the single owner of the access record, and the flag is kept
+# so that nothing falls back to gunicorn's default access sink if that ever changes.
+# --config names ./gunicorn.conf.py explicitly even though gunicorn would discover that exact
+# path in the working directory by itself. The redundancy is the point: an explicit --config that
+# names a missing file is a hard startup error, whereas discovery of a missing file is silent and
+# the only symptom is a log stream that quietly goes back to being half plain text. A COPY
+# dropped from the payload above should break the container, not degrade its observability.
 CMD ["gunicorn", "app.main:app", \
+  "--config", "gunicorn.conf.py", \
   "--worker-class", "uvicorn.workers.UvicornWorker", \
+  "--logger-class", "app.core.logging.StructlogGunicornLogger", \
   "--workers", "2", \
   "--bind", "0.0.0.0:8000", \
   "--no-control-socket", \

@@ -101,11 +101,17 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.concurrency import run_cpu_bound
 from app.core.dependencies import PageParams, ensure_can_author, ensure_can_modify, is_admin
-from app.core.exceptions import AppValidationError, ConflictError, FieldError, NotFoundError
+from app.core.exceptions import (
+    AppValidationError,
+    ConflictError,
+    FieldError,
+    NotFoundError,
+    integrity_constraint_name,
+)
 from app.core.logging import get_logger, log_safe_text
 from app.core.pagination import Page, build_page
+from app.core.security import run_cpu_bound
 from app.core.slug import slugify_title, unique_slug
 from app.models import Category, Post, PostStatus, User
 from app.repositories import CategoryRepository, PostRepository, PostSort, UserRepository
@@ -393,10 +399,22 @@ never match. Matching at a position rather than against a slice is what keeps th
 document with a thousand links would otherwise copy a tail per link.
 """
 
-_MARKDOWN_AUTOLINK_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"<(?P<destination>[^<>\s]+:[^<>\s]*)>"
-)
-"""Matches a CommonMark autolink - a scheme-bearing URI inside angle brackets."""
+_MARKDOWN_AUTOLINK_PATTERN: Final[re.Pattern[str]] = re.compile(r"<(?P<destination>[^<>\s]+)>")
+r"""Matches an angle-bracketed, whitespace-free token - a CommonMark autolink, or one spelled
+like one.
+
+The colon is deliberately **not** required by the pattern, and that is a widening over the obvious
+spelling ``<[^<>\s]+:[^<>\s]*>``. The scheme is decided by :func:`_is_safe_destination`, which
+decodes the destination first, so requiring a literal colon here would have made
+``<javascript&#58;alert(1)>`` unmatchable - it carries no colon in the source - and left it in the
+stored row. Strict CommonMark does not read that as an autolink either, so the one renderer in this
+repository renders it inert; the stored representation nonetheless has to be safe for **any**
+consumer, including a laxer renderer, which is the whole reason this pass exists.
+
+Matching more is free here because deciding is separate from matching: a token that names no
+scheme - ``<em>``, ``</em>``, ``<0>`` - is reported safe and returned untouched, so ordinary markup
+and ordinary prose pass through unchanged.
+"""
 
 _MARKDOWN_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"""
@@ -414,20 +432,58 @@ definitions matter as much as inline links: a body may carry ``[x][ref]`` far fr
 destinations would leave the whole indirect form untouched.
 """
 
+_MARKDOWN_BACKSLASH_ESCAPE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\\([!-/:-@\[-`{-~])")
+r"""Matches a CommonMark backslash escape: ``\`` followed by one ASCII punctuation character.
+
+The character class is exactly the ASCII punctuation set the CommonMark specification names as
+escapable, which is why it is written as four ranges rather than as a generic non-word class: a
+backslash before a letter, a digit or a space is *not* an escape and must survive unchanged, while
+``\:`` **is** a colon and is what makes ``[x](javascript\:alert(1))`` resolve as a ``javascript:``
+URL in a renderer while carrying no colon at all in the source.
+"""
+
+_DESTINATION_HEAD_LIMIT: Final[int] = 4096
+"""How much of an unparsed destination the safety net decodes before checking its scheme.
+
+A bound is needed because the net works at an offset inside the document rather than on a parsed
+destination, and decoding an unbounded tail per ``](`` would make the pass quadratic. 4096 is far
+beyond any legitimate scheme: the longest dangerous one is ten characters, each of which can be
+spelled as a character reference of at most ten (``&#x0006A;``), so even a fully obfuscated
+``javascript:`` occupies barely a hundred. The structural pass above has no such bound - it decodes
+the whole destination it captured - so this limit applies only to spellings that pass parsing
+altogether, and the net's answer for those is to break the link syntax rather than to trust them.
+"""
+
 _NO_TAGS: Final[frozenset[str]] = frozenset()
 """The empty tag allow-list used for the title and the excerpt: strip every element, keep the
 text."""
 
-_TITLE_SANITISE_PASSES: Final[int] = 3
-"""How many strip-and-decode passes :func:`_sanitize_title` performs before it stops.
+_TITLE_SANITISE_PASSES: Final[int] = 12
+"""How many strip-and-decode passes :func:`_sanitize_title` may perform before it gives up.
 
-Three, and the number is measured rather than chosen for comfort. One pass handles plain markup.
-A second is needed for the entity-encoded form, ``&lt;script&gt;``, which the first pass sees as
-text and hands back unchanged before the decode turns it into real markup. A third settles a
-doubly encoded one, ``&amp;lt;script&amp;gt;``, which is the deepest form reachable through a
-120-character title. The loop exits as soon as a pass changes nothing, so the ordinary title costs
-one pass; the bound exists so that the function is total on input designed to keep it working.
+A **bound on a search for a fixed point**, not a number of passes to perform. The loop stops as
+soon as a pass changes nothing - which is what "fixed point" means here, and which the ordinary
+title reaches in one - and if it has not converged within this many passes the title is *refused*
+rather than stored. That distinction is the whole correctness argument: a bounded number of passes
+that stores whatever the last one produced can store raw markup, because the last operation in a
+pass is a decode, so a title whose entity nesting outlasts the bound arrives at storage with a
+live-looking ``<script>`` in it. Refusing instead means the function is total on hostile input
+*and* every value it returns is a proven fixed point.
+
+Twelve is generous rather than tight, and deliberately so. Each nesting level of an
+entity-encoded ``<`` costs four characters (``&lt;`` -> ``&amp;lt;`` -> ``&amp;amp;lt;``), and
+``app.schemas.post.PostTitle`` bounds a title at 120 characters, so the deepest nesting a title can
+carry is around ten levels for a single tag - already below this bound, which is why a legitimate
+title can never be refused by exhaustion. Each pass is monotone in the sense that matters: the
+decode strictly shortens the value while any character reference remains, so convergence is
+guaranteed and the bound is a guard rather than the mechanism.
 """
+
+_TITLE_MARKUP_SURVIVED: Final[str] = (
+    "The title could not be reduced to plain text. Remove the markup and the character "
+    "references from it and submit it again."
+)
+"""Reported when :func:`_sanitize_title` cannot prove the value it holds is tag-free."""
 
 _FIELD_TITLE: Final[str] = "title"
 """The member name reported in ``errors`` when a title cannot be accepted.
@@ -548,6 +604,26 @@ name being rebound but nothing stops a mutable mapping being edited, and an entr
 runtime would widen error translation process-wide with no diff to review.
 """
 
+SLUG_ALLOCATION_ATTEMPTS: Final[int] = 4
+"""How many times :meth:`PostService.create` re-derives a slug and re-inserts after losing a race.
+
+Slug allocation is read-then-insert: :meth:`PostService._derive_slug` reads the taken members of a
+slug family and picks the first free suffix, and a concurrent create of the same title can take
+that suffix between the read and the ``INSERT``. Reporting the loser a ``409`` would break the
+promise the route publishes - that a colliding title is de-duplicated with an ascending suffix and
+succeeds - so the loser retries instead: it re-reads the family, sees the row that won, and takes
+the next suffix.
+
+Four attempts, and the number is a bound on *contention*, not on collisions. Each retry re-reads
+the family, so N concurrent creates of one title need at most N attempts between them and any single
+request needs one more attempt only if it loses again - which requires another writer to commit
+inside the window between this request's re-read and its re-insert. Four therefore covers three
+consecutive losses, and a request that loses four times is contending with a volume of identical
+titles that is no longer an allocation race; it receives the ``409`` the contract documents, which
+is honest rather than retried forever. The bound also guarantees the method terminates, which an
+unbounded ``while`` would not.
+"""
+
 _TRANSLATABLE_SQLSTATES: Final[frozenset[str]] = frozenset({"23505", "23503"})
 """``unique_violation`` and ``foreign_key_violation`` - the two classes that can be contention.
 
@@ -590,15 +666,28 @@ def _conflict_detail(error: IntegrityError) -> str | None:
         forgetting is visible rather than silent - a genuine slug race would answer ``500`` where
         the published contract promises ``409``.
     """
-    diagnostic = getattr(error.orig, "diag", None)
-    if diagnostic is None:
-        return None
-    if getattr(error.orig, "sqlstate", None) not in _TRANSLATABLE_SQLSTATES:
-        return None
-    constraint = getattr(diagnostic, "constraint_name", None)
-    if not isinstance(constraint, str):
+    constraint = integrity_constraint_name(error, sqlstates=_TRANSLATABLE_SQLSTATES)
+    if constraint is None:
         return None
     return _CONFLICT_CONSTRAINTS.get(constraint)
+
+
+def _is_slug_race(error: IntegrityError) -> bool:
+    """Report whether this failure is specifically the slug unique violation, and nothing else.
+
+    Narrower than :func:`_conflict_detail` on purpose, and the two are not interchangeable. A
+    category-filing race is also a conflict this service translates, but it is **not** retryable
+    here: retrying it would re-attempt the same filing against a taxonomy that has changed, so the
+    caller is told to reload. Only the slug race is resolved by trying again, because the retry
+    reads the family afresh and takes a suffix that is now free.
+
+    Args:
+        error: The failure SQLAlchemy raised.
+
+    Returns:
+        ``True`` when the driver reports a unique violation on :data:`_SLUG_UNIQUE_INDEX`.
+    """
+    return integrity_constraint_name(error, sqlstates=_TRANSLATABLE_SQLSTATES) == _SLUG_UNIQUE_INDEX
 
 
 # ---------------------------------------------------------------------------------------
@@ -653,6 +742,46 @@ def _normalise_scheme(scheme: str) -> str:
     return scheme.lower()
 
 
+def _decode_markdown_destination(destination: str) -> str:
+    """Resolve a destination to the characters a Markdown renderer will actually see.
+
+    **The scheme check must run on this, never on the source text.** CommonMark resolves both
+    backslash escapes and HTML character references inside a link destination before the URL is
+    handed to the renderer, so three spellings of one dangerous URL exist:
+
+    * ``javascript:alert(1)`` - the literal form;
+    * ``javascript&#58;alert(1)`` - a numeric character reference for the colon, which also has
+      the hexadecimal spelling ``&#x3A;`` and the named spelling ``&colon;``;
+    * ``javascript\\:alert(1)`` - a backslash escape of the colon.
+
+    All three become ``javascript:`` in the rendered document, and the second and third contain no
+    ``:`` at all in the source. A check that matched the source therefore concluded "this
+    destination names no scheme, so it is relative and safe" and stored the payload untouched -
+    which is precisely the bypass this function closes. The obfuscation is not limited to the
+    colon either: ``&#106;avascript:`` decodes to ``javascript:``, so the whole head is decoded
+    rather than only the delimiter.
+
+    Percent-encoding is deliberately **not** decoded. A browser does not resolve ``javascript%3A``
+    as a scheme - the value is a relative reference whose first path segment happens to contain an
+    encoded colon - so decoding it here would refuse links that are in fact inert.
+
+    Order matters: the backslash escapes are removed first, because ``\\&#58;`` is an escaped
+    ampersand and must *not* then be read as a character reference. Removing the escapes first
+    turns it into a literal ``&`` before ``html.unescape`` runs, so the reference is not
+    reconstituted by this function's own first step.
+
+    Args:
+        destination: A link, image, autolink or reference-definition destination as written, with
+            any surrounding angle brackets already removed.
+
+    Returns:
+        The destination with CommonMark backslash escapes resolved and HTML character references
+        decoded. Not a URL to store or emit - only a value to inspect.
+    """
+    unescaped = _MARKDOWN_BACKSLASH_ESCAPE_PATTERN.sub(r"\1", destination)
+    return html.unescape(unescaped)
+
+
 def _destination_scheme(destination: str) -> str | None:
     """Report the URL scheme a Markdown destination opens with, lower-cased.
 
@@ -668,6 +797,10 @@ def _destination_scheme(destination: str) -> str | None:
         site's own.
 
     Note:
+        The destination is decoded by :func:`_decode_markdown_destination` before the match, so an
+        entity-encoded or backslash-escaped colon is seen as the colon a renderer will see. That
+        decode is the whole reason this function is not a one-line regular expression match.
+
         The padding is removed *after* the match rather than being excluded by the pattern,
         because a browser resolves ``java\\tscript:x`` and ``jav\\nascript:x`` as
         ``javascript:``. Comparing the padded spelling against the allow-list would find no
@@ -675,7 +808,7 @@ def _destination_scheme(destination: str) -> str | None:
         :data:`_URL_STRIPPED_CHARACTERS` for which characters are stripped, and why a space is
         not one of them.
     """
-    match = _MARKDOWN_SCHEME_PATTERN.match(destination)
+    match = _MARKDOWN_SCHEME_PATTERN.match(_decode_markdown_destination(destination))
     if match is None:
         return None
     return _normalise_scheme(match.group("scheme"))
@@ -770,9 +903,16 @@ def _break_unsafe_link_syntax(text: str) -> str:
     """
 
     def defuse(match: re.Match[str]) -> str:
-        # Matched at a position in `text` rather than against a copy of its tail, so a document
-        # with many links stays linear - see `_MARKDOWN_TRAILING_SCHEME_PATTERN`.
-        scheme_match = _MARKDOWN_TRAILING_SCHEME_PATTERN.match(text, match.end())
+        # A bounded head rather than the whole tail, so a document with many links stays linear -
+        # see `_DESTINATION_HEAD_LIMIT`. It has to be a slice rather than a match at an offset,
+        # because the head is DECODED before the scheme is read: an entity-encoded or
+        # backslash-escaped colon contains no `:` in the source, so a matcher applied to the
+        # source would find no scheme and conclude the destination was relative - the same
+        # bypass `_decode_markdown_destination` closes for the structural pass.
+        head = _decode_markdown_destination(
+            text[match.end() : match.end() + _DESTINATION_HEAD_LIMIT]
+        )
+        scheme_match = _MARKDOWN_TRAILING_SCHEME_PATTERN.match(head)
         if scheme_match is None:
             # No scheme follows, so the destination is relative, a fragment, a query or
             # protocol-relative. All four resolve against this site's own document.
@@ -979,6 +1119,37 @@ def _sanitize_excerpt(raw: str) -> str | None:
     return cleaned.strip() or None
 
 
+def _strip_and_decode(value: str) -> str:
+    """Run one title-sanitisation pass: decode, strip every element, decode again, trim.
+
+    Factored out of :func:`_sanitize_title` because the pass is applied in two places for two
+    different reasons - once per iteration of the convergence loop, and once more afterwards to
+    *prove* the converged value is a fixed point - and a second copy of a five-line sanitisation
+    step is exactly the kind of duplication that comes to disagree with itself.
+
+    The leading decode is what lets the loop make progress on an encoded tag: ``&lt;b&gt;`` is
+    text to a stripper and only becomes an element once decoded. The trailing decode resolves the
+    references ``bleach.clean`` introduces while escaping, so ``Tips & Tricks`` is not stored as
+    ``Tips &amp; Tricks`` - the reason a title cannot simply reuse :func:`_sanitize_excerpt`.
+
+    Args:
+        value: The current candidate title.
+
+    Returns:
+        The candidate after one pass. Equal to its argument exactly when the argument is a fixed
+        point, which is the property the caller tests.
+    """
+    stripped: str = bleach.clean(
+        html.unescape(value),
+        tags=_NO_TAGS,
+        attributes=_bleach_attributes(_NO_ATTRIBUTES),
+        protocols=CONTENT_ALLOWED_PROTOCOLS,
+        strip=True,
+        strip_comments=True,
+    )
+    return html.unescape(stripped).strip()
+
+
 def _sanitize_title(raw: str) -> str:
     """Reduce a submitted title to the plain text it claims to be, or refuse it.
 
@@ -998,14 +1169,21 @@ def _sanitize_title(raw: str) -> str:
     title is a label, so the stored value has to be the text a reader typed.
 
     So each pass strips markup and then decodes the character references the strip introduced,
-    and the passes repeat until the value stops changing. Convergence is what closes the
+    and the passes repeat **until the value stops changing**. Convergence is what closes the
     entity-encoded form: ``&lt;script&gt;alert(1)&lt;/script&gt;`` survives one pass unchanged as
     escaped text, decodes to real markup, and is stripped on the next - so a single pass would
-    have stored a title containing a live-looking ``<script>`` element. The loop is bounded by
-    :data:`_TITLE_SANITISE_PASSES` rather than run to a fixed point, because a bound is what makes
-    this function total on hostile input; each pass is monotone in the sense that matters - it can
-    only remove markup - and the bound was chosen against the worst case actually reachable, a
-    doubly escaped tag, which settles in three.
+    have stored a title containing a live-looking ``<script>`` element.
+
+    A fixed point is the *guarantee*, and reaching one is a precondition for storing anything.
+    Because the last operation in a pass is a decode, a loop that simply ran a fixed number of
+    passes and kept the result could store raw markup: at depth *n* + 1 the final decode
+    reintroduces the ``<`` that the next pass would have removed. So the loop is bounded by
+    :data:`_TITLE_SANITISE_PASSES` and **fails closed** when it exhausts that bound without
+    converging, and the returned value is additionally proved tag-free by one further strip that
+    must change nothing. Convergence itself is guaranteed rather than hoped for - each decode
+    strictly shortens the value while any character reference remains - and the bound is far above
+    the deepest nesting a 120-character title can carry, so no legitimate title is ever refused
+    by exhaustion.
 
     Verified by execution on the pinned bleach 6.4.0: markup is removed
     (``<script>``/``<b>`` leave their text, ``<img>``/``<svg>``/``<iframe>`` leave nothing), while
@@ -1028,20 +1206,17 @@ def _sanitize_title(raw: str) -> str:
             character, so there is no value left to store, and the honest answer is the same one
             ``app.services.comment_service`` gives a body that sanitises to nothing: a ``422``
             naming the member, rather than a title silently replaced by something the author did
-            not write.
+            not write. Also if the value does not reach a fixed point within
+            :data:`_TITLE_SANITISE_PASSES` passes, or if the converged value still carries markup -
+            both fail closed, because storing a title this function cannot prove is plain text is
+            the one outcome it exists to prevent.
     """
     current = raw
+    converged = False
     for _ in range(_TITLE_SANITISE_PASSES):
-        stripped: str = bleach.clean(
-            html.unescape(current),
-            tags=_NO_TAGS,
-            attributes=_bleach_attributes(_NO_ATTRIBUTES),
-            protocols=CONTENT_ALLOWED_PROTOCOLS,
-            strip=True,
-            strip_comments=True,
-        )
-        candidate = html.unescape(stripped).strip()
+        candidate = _strip_and_decode(current)
         if candidate == current:
+            converged = True
             break
         current = candidate
 
@@ -1052,6 +1227,28 @@ def _sanitize_title(raw: str) -> str:
                 FieldError(
                     field=_FIELD_TITLE,
                     message="Write the title as plain text; the markup submitted was removed.",
+                    type=_FIELD_ERROR_TYPE,
+                )
+            ],
+        )
+
+    # The final guarantee, asserted rather than assumed, and in two parts because they can fail
+    # independently. `converged` says the loop reached a fixed point instead of running out of
+    # passes; the second test re-runs one pass on the value about to be returned and requires it to
+    # change nothing, which is what proves the value carries no element and no character reference
+    # that would decode into one. A value that fails either is refused, never trimmed and stored:
+    # the alternative is a title the author did not write, or markup in the field every consumer of
+    # this API is told is a plain-text label.
+    if not converged or _strip_and_decode(current) != current:
+        raise AppValidationError(
+            _TITLE_MARKUP_SURVIVED,
+            errors=[
+                FieldError(
+                    field=_FIELD_TITLE,
+                    message=(
+                        "Write the title as plain text. Deeply nested character references "
+                        "cannot be reduced to a stable value, so the title was not stored."
+                    ),
                     type=_FIELD_ERROR_TYPE,
                 )
             ],
@@ -1187,10 +1384,17 @@ def visible_statuses_for(
 ) -> tuple[PostStatus, ...]:
     """Report which lifecycle states a listing may include for this viewer.
 
-    The value passed as ``statuses`` to ``PostRepository.list_posts``, and therefore the
-    control that keeps a draft out of the public feed, out of a category-filtered result and
-    off a public profile. The repository takes the states as an argument and decides nothing;
-    this is where the decision is made.
+    The value passed as ``statuses`` to ``PostRepository.list_posts`` for an **author-scoped**
+    listing. The repository takes the states as an argument and decides nothing; this is where
+    the decision is made.
+
+    It is deliberately *not* consulted by the public feed. ``PostService.list_feed`` passes
+    :data:`PUBLIC_POST_STATUSES` unconditionally in its default mode, because a listing whose
+    scope depended on who was asking would give two callers different ``total`` values and
+    different page boundaries for one URL, and would put a draft in a category-filtered result
+    for a privileged reader - both of which AAP §0.9.4.4 forbids. This predicate serves the
+    listings that *are* scoped to one author: the private workspace mode of the feed, and the
+    profile listing, which passes a viewer of ``None``.
 
     Args:
         viewer: The resolved principal, or ``None`` for an anonymous caller.
@@ -1213,10 +1417,10 @@ def visible_statuses_for(
         suspended author would keep reading their own drafts through whichever of the three
         forgot.
 
-        An authenticated author browsing the *unscoped* feed gets the public set, not their own
-        drafts mixed in. That is deliberate: the home feed is a shared surface whose ``total``
-        and page boundaries would otherwise differ per caller, and an author's unpublished work
-        belongs on their workspace, which scopes itself with ``author_id``.
+        This predicate is never reached from the public feed at all, so no caller of that
+        surface - administrator included - can be shown an unpublished post through it. An
+        author's unpublished work belongs on their workspace, which asks for it explicitly
+        (``own=True``) and is scoped to the principal's own ``author_id``.
 
     Examples:
         >>> visible_statuses_for(None) == (PostStatus.PUBLISHED,)
@@ -1331,6 +1535,8 @@ class PostService:
         author_username: str | None = None,
         sort: PostSort | None = None,
         viewer: User | None = None,
+        own: bool = False,
+        status: PostStatus | None = None,
     ) -> Page[PostSummary]:
         """List posts for ``GET /api/v1/posts``: search, filter, order and window, in one query.
 
@@ -1338,6 +1544,24 @@ class PostService:
         feed, a category-filtered view and an author-filtered view are the same call with
         different arguments - which is what keeps one pagination control correct for all of
         them and keeps the index usage of all of them identical.
+
+        **The public feed is PUBLISHED-only for every caller, without exception.** Not "for
+        anonymous callers", not "unless the viewer is an administrator", and not "unless the
+        viewer happens to be filtering by their own username: every caller of the public mode
+        sees the same rows, the same ``total`` and the same page boundaries. That is what makes
+        the feed a shared, cacheable, crawlable surface, and it is the confidentiality rule
+        AAP §0.9.4.4 states - a draft never appears in the public feed, in a category-filtered
+        result or on a public profile. A feed that silently widened for a privileged reader
+        would also make ``total`` and ``pages`` differ per caller on a surface whose page
+        boundaries clients share.
+
+        **An author reads their own unpublished work by asking for it.** ``own=True`` is the
+        private author-workspace mode: it requires a resolved principal, scopes the listing to
+        that principal's own posts, and admits every lifecycle state. The widening is therefore
+        *requested* rather than *inferred from identity*, which is the whole difference - a
+        caller who did not ask can never be shown a draft, and a caller who did ask can only
+        ever be shown their own. ``status`` narrows that mode to one state, which is how the
+        author workspace groups by lifecycle without paging through the other two.
 
         Args:
             page: The 1-based page requested. A page beyond the last is not an error - it
@@ -1351,8 +1575,16 @@ class PostService:
                 here, because the wire speaks usernames and the query speaks identifiers.
             sort: ``"recent"`` or ``"relevance"``, or ``None`` to accept the default for the
                 request - see :func:`_default_sort_for`.
-            viewer: The resolved principal, or ``None`` for an anonymous caller. Decides which
-                lifecycle states are in scope, and nothing else.
+            viewer: The resolved principal, or ``None`` for an anonymous caller. Read **only** by
+                the ``own`` mode below; it decides nothing at all about the public feed, which is
+                the same for everybody.
+            own: Whether this is the private author-workspace listing rather than the public
+                feed. ``True`` scopes the result to ``viewer``'s own posts and admits every
+                lifecycle state; ``False`` - the default, and every anonymous or ordinary read -
+                answers published posts only.
+            status: A single lifecycle state to narrow to. Accepted only in the ``own`` mode,
+                because narrowing the public feed by state is either a no-op (``PUBLISHED``) or a
+                request for somebody else's unpublished work.
 
         Returns:
             A :class:`~app.core.pagination.Page` of :class:`~app.schemas.post.PostSummary`,
@@ -1364,6 +1596,11 @@ class PostService:
             NotFoundError: ``author_username`` names no account. Reported rather than silently
                 answered with an empty page, so a mistyped filter is distinguishable from an
                 author who has published nothing.
+            ValueError: ``own=True`` with no ``viewer``, or ``status`` outside the ``own`` mode.
+                Both are defects in a caller rather than caller-supplied conditions - the route
+                refuses each with a documented status before it gets here - so they fail loudly
+                instead of silently downgrading to a public read, which is the failure mode that
+                would leak.
 
         Note:
             **One composed statement, plus its one count.** The repository is asked exactly
@@ -1375,12 +1612,41 @@ class PostService:
             missing here that would be a column to add to the repository's projection, and
             never a reason to iterate.
 
-            Public callers see published posts only. That is not enforced by a filter written
-            here but by :func:`visible_statuses_for`, so the feed, a profile listing and a
-            comment thread all answer the question the same way.
+            The state scope is decided here and nowhere else on this path. The public mode passes
+            :data:`PUBLIC_POST_STATUSES` unconditionally; the ``own`` mode passes the states
+            :func:`visible_statuses_for` reports for a viewer reading their own work, which is the
+            single declaration of the draft rule that ``comment_service`` and ``like_service``
+            import rather than restate.
         """
+        if own and viewer is None:
+            message = (
+                "list_feed(own=True) needs a resolved principal: the private workspace listing "
+                "is scoped to the caller's own posts, so there is nobody to scope it to."
+            )
+            raise ValueError(message)
+        if status is not None and not own:
+            message = (
+                "list_feed(status=...) is accepted only with own=True. The public feed is "
+                "PUBLISHED-only for every caller, so narrowing it by lifecycle state is either "
+                "a no-op or a request for another author's unpublished work."
+            )
+            raise ValueError(message)
+
         author = await self._resolve_author(author_username)
         author_id = None if author is None else author.id
+
+        # `own and viewer is None` was refused above, so `own` implies a resolved principal and
+        # this condition is exactly `own` - written with the null test first so the narrowing is
+        # visible to a reader and to the type checker without an `assert` that `-O` would strip.
+        if viewer is not None and own:
+            # The scope is the principal's own identifier rather than whatever `?author=` carried,
+            # so this mode cannot be pointed at somebody else's drafts by adding a parameter.
+            author_id = viewer.id
+            statuses = visible_statuses_for(viewer, author_id) if status is None else (status,)
+        else:
+            # Unconditional, and deliberately not `visible_statuses_for`: the public feed asks
+            # nobody who is calling. See the paragraph in this method's docstring.
+            statuses = PUBLIC_POST_STATUSES
 
         # The window arithmetic has exactly one definition, in `PageParams`. Recomputing
         # `(page - 1) * page_size` inline is one off-by-one away from a feed that skips or
@@ -1393,7 +1659,7 @@ class PostService:
             q=_omit_blank(q),
             category_slug=_omit_blank(category_slug),
             author_id=author_id,
-            statuses=visible_statuses_for(viewer, author_id),
+            statuses=statuses,
             sort=_default_sort_for(q) if sort is None else sort,
             # The compact projection, named explicitly rather than inherited from the
             # repository's default: this listing serialises `PostSummary`, which carries neither
@@ -1599,7 +1865,10 @@ class PostService:
             relation. Resolving the collision before the ``INSERT`` is what makes a second post
             with the same title succeed with a suffixed slug rather than fail on the unique
             index; the index remains the backstop for the narrow race between reading the set
-            and inserting, which :meth:`create` translates into a conflict.
+            and inserting, which :meth:`create` **retries** rather than reports - see
+            :data:`SLUG_ALLOCATION_ATTEMPTS`. That is also why this method is called from inside
+            that retry loop rather than once above it: a retry that reused the slug the losing
+            attempt derived would collide again on every attempt.
         """
         stem = slugify_title(title)
         return unique_slug(stem, await self._posts.slugs_starting_with(stem))
@@ -1628,9 +1897,13 @@ class PostService:
             ForbiddenError: The principal holds ``READER``. Raised by ``ensure_can_author``.
             NotFoundError: A supplied category identifier names no category.
             AppValidationError: The title was nothing but markup, so sanitising it left no text to
-                store. Reported as a ``422`` naming ``title``.
-            ConflictError: The derived slug was taken between the moment the taken set was read
-                and the moment the row was inserted. See the note.
+                store, or it could not be reduced to a stable plain-text value. Reported as a
+                ``422`` naming ``title``.
+            ConflictError: A category this post was being filed under changed underneath the
+                insert, or the derived slug was claimed by another writer on every one of
+                :data:`SLUG_ALLOCATION_ATTEMPTS` attempts. A **single** lost slug race is not a
+                conflict - it is retried, because the route publishes collision suffixing as a
+                promise and the loser of a race is a perfectly valid request. See the note.
 
         Note:
             **A created post is always a draft, and there is no argument that changes that.**
@@ -1654,6 +1927,16 @@ class PostService:
             strength of that: the row has to be safe for every consumer of the API, not only for
             the one client in this repository. The title is cleaned *before* the slug is derived
             from it, so the canonical URL is built from the stored text rather than from markup.
+
+            **A lost slug race is retried, not reported.** Slug allocation reads the taken members
+            of a family and picks the first free suffix, so a concurrent create of the same title
+            can take that suffix in the window before this insert. The route promises
+            de-duplication - ``python``, ``python-2``, ``python-3`` - so refusing the loser would
+            break the contract for a request that is entirely valid. The loser re-reads the family,
+            sees the row that won, and takes the next suffix; only sustained contention across
+            :data:`SLUG_ALLOCATION_ATTEMPTS` attempts produces the documented ``409``. A
+            category-filing race is *not* retried, because re-attempting the same filing against a
+            taxonomy that has changed underneath cannot succeed.
 
             ``search_vector`` is never assigned. It is a generated column, so committing this
             insert is what derives it - there is no trigger to fire and no index to maintain.
@@ -1683,56 +1966,89 @@ class PostService:
         # built from the text that will actually be stored rather than from markup the author sent.
         title = _sanitize_title(payload.title)
 
-        post = Post(
-            author_id=author.id,
-            title=title,
-            slug=await self._derive_slug(title),
-            excerpt=excerpt,
-            content=content,
-            # `HttpUrl` validated the scheme and the host; the column is text, and the schema
-            # names `str(value)` as the coercion this layer owes it.
-            cover_image_url=(
-                None if payload.cover_image_url is None else str(payload.cover_image_url)
-            ),
-            # Stated explicitly rather than left to the column's server default, so that the
-            # one lifecycle guarantee this method makes is visible in this method.
-            status=PostStatus.DRAFT,
-            published_at=None,
-            categories=categories,
-        )
+        # Read ONCE, before the loop, and used everywhere below in place of `author.id`. This is
+        # not a micro-optimisation: `session.rollback()` expires every instance the session holds,
+        # including the principal `get_current_user` loaded, and touching an expired attribute
+        # afterwards makes the ORM issue a refresh from inside synchronous attribute access - which
+        # under an async session raises `MissingGreenlet` and answers 500. So nothing in this method
+        # reads an ORM attribute after the first attempt; the identifier is a plain UUID and cannot
+        # expire.
+        author_id = author.id
 
-        try:
-            # Insert, flush, and load the byline and badges the response needs - all inside the
-            # transaction, so the COMMIT below is the last database action this request takes.
-            # The ordering is the point: a load issued after the commit could fail on a post that
-            # is already durable, and the client would then see an error for a post that exists -
-            # and a retried create would collide with the slug the first attempt reserved.
-            persisted = await self._posts.add_with_relations(post)
-            await self._session.commit()
-        except IntegrityError as error:
-            # The slug is de-duplicated against the slugs that existed a moment ago, so two
-            # concurrent creates of the same title can still collide on `ix_posts_slug`. The
-            # unique index is the backstop and this is its translation: a conflict with the
-            # database's current state, which a retry resolves because the retry sees the row
-            # that won.
-            #
-            # Rolled back FIRST and unconditionally - the transaction is aborted either way, so
-            # anything else issued on this session would fail too - and only then is the failure
-            # classified. `_conflict_detail` recognises the slug race and the category-filing
-            # races and nothing else: a check violation, a dangling author or a missing required
-            # column is re-raised untouched, so a defect in this service surfaces as one instead
-            # of being reported to the author as somebody else's title.
-            await self._session.rollback()
-            detail = _conflict_detail(error)
-            if detail is None:
-                raise
-            raise ConflictError(detail) from error
+        # One attempt per iteration, and every step that depends on database state is INSIDE the
+        # loop. A retry after a lost slug race has to re-derive the slug - that is the whole point -
+        # and it has to re-resolve the categories too, for the expiry reason above: the rollback
+        # detached every `Category` the aborted transaction had loaded, and a detached instance
+        # cannot be filed against a new post. What is deliberately outside the loop is the
+        # sanitisation: it is pure CPU over the payload, its result cannot change between attempts,
+        # and re-parsing a 100 000-character body per retry would turn contention into a denial of
+        # service.
+        for attempt in range(SLUG_ALLOCATION_ATTEMPTS):
+            filed_under = (
+                categories if attempt == 0 else await self._resolve_categories(payload.category_ids)
+            )
+            post = Post(
+                author_id=author_id,
+                title=title,
+                slug=await self._derive_slug(title),
+                excerpt=excerpt,
+                content=content,
+                # `HttpUrl` validated the scheme and the host; the column is text, and the schema
+                # names `str(value)` as the coercion this layer owes it.
+                cover_image_url=(
+                    None if payload.cover_image_url is None else str(payload.cover_image_url)
+                ),
+                # Stated explicitly rather than left to the column's server default, so that the
+                # one lifecycle guarantee this method makes is visible in this method.
+                status=PostStatus.DRAFT,
+                published_at=None,
+                categories=filed_under,
+            )
+
+            try:
+                # Insert, flush, and load the byline and badges the response needs - all inside
+                # the transaction, so the COMMIT below is the last database action this request
+                # takes. The ordering is the point: a load issued after the commit could fail on a
+                # post that is already durable, and the client would then see an error for a post
+                # that exists.
+                persisted = await self._posts.add_with_relations(post)
+                await self._session.commit()
+            except IntegrityError as error:
+                # Rolled back FIRST and unconditionally - the transaction is aborted either way,
+                # so anything else issued on this session would fail too - and only then is the
+                # failure classified.
+                await self._session.rollback()
+
+                # The slug race, and the only failure this loop retries. `_derive_slug` reads the
+                # taken members of the family and picks the first free suffix, so a concurrent
+                # create of the same title can take that suffix in between. The route publishes
+                # de-duplication as a PROMISE - `python`, `python-2`, `python-3` - so answering the
+                # loser a 409 would break the contract for a request that is entirely valid. The
+                # retry re-reads the family, sees the row that won, and takes the next suffix.
+                if _is_slug_race(error) and attempt + 1 < SLUG_ALLOCATION_ATTEMPTS:
+                    continue
+
+                # Everything else. `_conflict_detail` recognises the exhausted slug race and the
+                # two category-filing races and nothing else: a check violation, a dangling author
+                # or a missing required column is re-raised untouched, so a defect in this service
+                # surfaces as one instead of being reported to the author as somebody else's title.
+                # A category-filing race is deliberately NOT retried - re-attempting the same
+                # filing against a taxonomy that has changed underneath would loop on a request
+                # that cannot succeed, so the caller is told to reload.
+                detail = _conflict_detail(error)
+                if detail is None:
+                    raise
+                raise ConflictError(detail) from error
+            else:
+                categories = filed_under
+                break
 
         get_logger(__name__).info(
             "post created",
             post_id=str(persisted.id),
             slug=log_safe_text(persisted.slug),
-            author_id=str(author.id),
+            # The hoisted value, for the expiry reason recorded above the loop.
+            author_id=str(author_id),
             category_count=len(categories),
         )
         return persisted

@@ -445,7 +445,7 @@ type PaginationProps = Pick<PaginationSource, 'page' | 'pages'> &
  * that page one keeps a single canonical address. `onPageChange` is optional
  * enhancement fired alongside navigation and never in place of it - and never a
  * second navigation; see the prop's own note. All page arithmetic - the window,
- * the bounds, the clamping - belongs to `@/lib/pagination`, reached through
+ * the bounds, the clamping - belongs to `@/lib/utils`, reached through
  * `@/hooks/use-pagination`, and is not duplicated here or in any consumer.
  *
  * Renders `null` when there is at most one page: a single-page result has nothing

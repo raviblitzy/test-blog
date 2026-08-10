@@ -105,10 +105,9 @@ import {
   type ProtectedRequestOptions,
   type PublicRequestOptions,
 } from '@/lib/api/client';
-import { encodePathSegment } from '@/lib/paths';
-
 import { pageOf, postSummarySchema, userMeSchema, userPublicSchema } from '@/lib/types';
 import type { Page, PostSummary, UserMe, UserPublic, UserUpdate } from '@/lib/types';
+import { encodePathSegment } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Paths

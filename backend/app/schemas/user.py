@@ -481,16 +481,19 @@ class UserMe(UserPublic):
         json_schema_extra={
             # The same account as UserPublic's example, extended rather than replaced, so a reader
             # comparing the two documents sees exactly which four members the self view adds. The
-            # role is the least-privileged one, which is what a freshly registered account holds.
+            # role is AUTHOR, which is what a freshly registered account holds: registration is
+            # what `app.services.auth_service._REGISTRATION_ROLE` sets, and it grants authoring so
+            # that signing up is enough to write a first post. READER exists for an account an
+            # administrator demotes.
             "example": {
                 "id": "3f1a9c74-6b0e-4d52-9a3f-71c2e8b45d10",
-                "username": "example-reader",
-                "display_name": "Example Reader",
+                "username": "example-author",
+                "display_name": "Example Author",
                 "bio": "Writes about Python, PostgreSQL and the parts of both that surprise me.",
-                "avatar_url": "https://example.com/avatars/example-reader.png",
+                "avatar_url": "https://example.com/avatars/example-author.png",
                 "created_at": "2026-01-15T09:30:00Z",
-                "email": "reader@example.com",
-                "role": "READER",
+                "email": "author@example.com",
+                "role": "AUTHOR",
                 "is_active": True,
                 "updated_at": "2026-02-02T18:05:00Z",
             }

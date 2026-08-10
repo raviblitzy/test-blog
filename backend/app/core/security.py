@@ -1,6 +1,6 @@
 """Password hashing and token handling: the cryptographic primitives the auth flow rests on.
 
-Four responsibilities, and deliberately nothing beyond them:
+Five responsibilities, and deliberately nothing beyond them:
 
 * **argon2id password hashing and verification**, through ``pwdlib``'s argon2 backend.
 * **Access-token issuance**, signed with the configured HMAC algorithm and carrying exactly
@@ -9,6 +9,10 @@ Four responsibilities, and deliberately nothing beyond them:
   under which it is stored. Only the digest is ever persisted.
 * **Decoding, with explicit expiry handling**, so that every possible decode failure leaves
   this module as a domain error and never as a ``PyJWT`` exception.
+* **The bounded worker-thread offload** every CPU-bound call in a request path goes
+  through - :func:`run_cpu_bound` and the :class:`~anyio.CapacityLimiter` that bounds it.
+  It lives here because the most expensive such call in the codebase, and the reason the
+  offload exists at all, is the argon2 hashing declared in this file.
 
 Primitives only
 ---------------
@@ -26,6 +30,9 @@ Consumers, all of them one layer up:
   issuance, refresh rotation and revocation.
 * ``app.core.dependencies`` - ``get_current_user`` decodes the bearer credential.
 * ``app.db.seed`` - hashes ``settings.SEED_ADMIN_PASSWORD`` for the seeded administrator.
+* ``app.services.post_service`` and ``app.services.comment_service`` - neither hashes nor
+  decodes anything; both reach :func:`run_cpu_bound` for their bleach sanitisation, because
+  one bound over the machine's CPU is the whole point of having one.
 
 Two forms of every argon2 primitive, and services must use the awaitable one
 ----------------------------------------------------------------------------
@@ -45,7 +52,7 @@ alternatives:
   hashes are sequential by nature, and the test factories. Offloading there would add a thread
   hop and a token acquisition to buy responsiveness nothing is waiting for.
 * The **awaitable** function is the only form a request path may use. It runs the primitive on
-  a bounded worker thread through ``app.core.concurrency.run_cpu_bound``, so the loop keeps
+  a bounded worker thread through :func:`run_cpu_bound` below, so the loop keeps
   serving while the CPU work happens elsewhere, and the bound stops a flood of sign-ins from
   becoming a flood of threads.
 
@@ -91,6 +98,92 @@ subject that is not a UUID - produces the same message on the wire, because tell
 *which* check failed tells an attacker which one to fix next. A client needs no distinction
 either way: it attempts one refresh on any 401 and falls back to sign-in if that is refused.
 
+The bounded offload, and why the bound is the load-bearing part
+--------------------------------------------------------------
+Every route in this service is an ``async def`` coroutine, and a coroutine runs on the one
+thread that also runs the event loop of its worker process. A synchronous call inside one does
+not merely make *that* request slow: it stops the loop, so every other request the same worker
+is serving - a feed read, a like, a health probe - waits for it to return. There is no
+pre-emption to rescue them, because there is nothing to pre-empt.
+
+Two kinds of genuinely expensive synchronous work exist in this codebase, and they are the only
+two: the argon2id hashing and verification declared below, reached from
+``app.services.auth_service`` on registration and on every sign-in; and HTML sanitisation with
+bleach, in ``app.services.post_service`` for a post's content and excerpt and in
+``app.services.comment_service`` for a comment's body. Both reach a worker thread through
+:func:`run_cpu_bound`, and both draw on the one :class:`~anyio.CapacityLimiter`
+:func:`cpu_bound_limiter` hands out.
+
+Moving the work to a thread is the easy half. An *unbounded* offload converts a request flood
+into a thread flood: a thousand concurrent sign-ins would start a thousand argon2 hashes, each
+asking for 64 MiB, and the worker would exhaust memory or collapse into scheduler thrash while
+the event loop - now free, and therefore accepting still more requests - kept feeding it. That
+is resource exhaustion by amplification, and it is a worse failure than the blocked loop it
+replaced, because a blocked loop at least applied back-pressure.
+:data:`CPU_BOUND_CONCURRENCY` is that back-pressure, expressed as a fixed number of tokens per
+worker process; requests beyond it wait for a token, which is exactly the queue a bounded
+resource should have.
+
+``2`` per worker process, derived from the deployment shape ``app.db.session`` already documents
+- ``MAX_WORKERS_PER_REPLICA`` Uvicorn workers per container, ``MAX_REPLICAS`` containers - and
+from what one unit of this work costs:
+
+* **CPU.** Four worker processes at two tokens each is eight CPU-bound threads per container.
+  A container sized to run four Uvicorn workers usefully has a few cores, so eight is a modest
+  oversubscription that keeps them busy without turning the run queue into the bottleneck.
+* **Memory.** The worst case is two concurrent argon2 hashes in one process: ``2 x 64`` MiB =
+  128 MiB of transient hashing memory per worker, 512 MiB across a four-worker container. Both
+  numbers are budgetable. Eight tokens per worker would be 2 GiB of the same, for throughput no
+  container of that size can deliver.
+* **Threads.** These tokens are additional to anyio's default thread limiter of 40, which
+  Starlette uses for synchronous route handlers and dependencies. Passing our own limiter means
+  this work cannot exhaust that shared allowance, and the two bounds add rather than compete:
+  at most 42 offloaded threads per worker, and at most 2 of them doing CPU-bound work.
+
+One consequence is deliberate and worth stating plainly: password hashing and sanitisation draw
+on the *same* two tokens, so a burst of sign-ins can make a comment's sanitisation wait. That is
+the correct trade, because both are contending for one physical resource - the CPU - and giving
+each its own generous allowance would only let them oversubscribe it separately. What matters is
+that the wait is a wait for a token rather than a stalled event loop: every request not doing CPU
+work continues to be served at full speed throughout. It is also the reason the offload lives in
+this module rather than in a module of its own: one bound over one resource is one declaration,
+and the most expensive claimant on it is declared here.
+
+What the offload buys, and what the GIL still costs
+--------------------------------------------------
+The two kinds of work do not benefit equally, and the difference is worth knowing before
+reading a latency graph:
+
+* **argon2 releases the GIL.** The hashing happens in argon2-cffi's C extension, so an offloaded
+  hash runs genuinely in parallel with the event loop. Measured on this codebase: four
+  sequential hashes on the loop stalled it for 161 ms; the same four offloaded left a worst-case
+  stall of 0.8 ms and finished sooner in wall-clock terms as well, because two of them ran at
+  once.
+* **bleach does not.** It is pure Python, so an offloaded sanitisation holds the GIL for its own
+  bytecode and the loop only runs in the gaps the interpreter's switch interval opens. Measured
+  the same way: four 68 KB documents stalled the loop for 305 ms inline, and offloaded left a
+  worst case of 40 ms with about 5 ms of typical lag - the switch interval, visible. Total wall
+  time was very slightly *worse*, because there is no parallelism to win and there is a thread
+  hop to pay.
+
+The second case is still the right trade, and the numbers say why: during the inline run the
+loop managed four scheduled ticks, and during the offloaded run it managed twenty-seven. Nothing
+was starved. A request that is not sanitising degrades from "frozen for a third of a second" to
+"a few milliseconds of jitter", which is the difference between a timeout and a slow response.
+
+A process pool would remove the GIL from that picture entirely, and it is deliberately not used:
+it would mean pickling documents up to 100 000 characters across a process boundary, another
+pool of processes per worker to size and supervise, and a second failure mode - for a saving
+this scope has no evidence of needing.
+
+Only pure functions of their arguments may be offloaded, and in particular **nothing that
+touches the database**: an :class:`~sqlalchemy.ext.asyncio.AsyncSession` is bound to the event
+loop that created it, and SQLAlchemy's async layer bridges to its synchronous core through a
+greenlet that only exists on that loop. Reading a lazily loaded attribute from a plain worker
+thread does not quietly issue a query - it raises ``MissingGreenlet``. So the shape every caller
+follows is: do the session work on the loop, hand the *values* to :func:`run_cpu_bound`, and use
+what it returns back on the loop.
+
 Configuration
 -------------
 Every tunable comes from :data:`~app.core.config.settings`: the signing key, the algorithm,
@@ -120,6 +213,7 @@ the *outcome* - "credential verification failed" - and never the input.
 
 import hashlib
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import cache
@@ -127,19 +221,22 @@ from typing import Any, Final
 from uuid import UUID
 
 import jwt
+from anyio import CapacityLimiter, to_thread
+from anyio.lowlevel import RunVar
 from pwdlib import PasswordHash
 from pwdlib.exceptions import UnknownHashError
 from pwdlib.hashers.argon2 import Argon2Hasher
 
-from app.core.concurrency import run_cpu_bound
 from app.core.config import settings
 from app.core.exceptions import InvalidTokenError, TokenExpiredError
 
 __all__ = [
+    "CPU_BOUND_CONCURRENCY",
     "REFRESH_TOKEN_ENTROPY_BYTES",
     "TOKEN_TYPE_ACCESS",
     "AccessTokenClaims",
     "access_token_expires_at",
+    "cpu_bound_limiter",
     "create_access_token",
     "decode_access_token",
     "dummy_password_hash",
@@ -149,11 +246,117 @@ __all__ = [
     "hash_password_async",
     "hash_refresh_token",
     "refresh_token_expires_at",
+    "run_cpu_bound",
     "verify_and_update_password",
     "verify_password",
     "verify_password_async",
     "verify_refresh_token",
+    "warm_password_hashing",
 ]
+
+
+# ---------------------------------------------------------------------------------------
+# The budget
+#
+# Exported because it is a deployment fact rather than an implementation detail: an
+# operator sizing a container needs it, and a test asserting that the offload is bounded
+# needs it. The module docstring records the arithmetic that produced the value.
+# ---------------------------------------------------------------------------------------
+
+CPU_BOUND_CONCURRENCY: Final[int] = 2
+"""How many CPU-bound offloads one worker process may run at the same time.
+
+Per *process*, not per container: with the ``MAX_WORKERS_PER_REPLICA`` workers
+``app.db.session`` documents, the container-wide ceiling is that many multiplied by this.
+
+Not configurable from the environment, and deliberately so. ``.env.example`` is the
+documented configuration contract, and this is not a knob an operator can set correctly in
+isolation - raising it raises transient memory use by 64 MiB per token per worker, which is a
+container-sizing decision rather than a per-deployment preference. A change here is a change
+to the deployment shape, reviewed as code.
+"""
+
+
+# ---------------------------------------------------------------------------------------
+# The limiter
+#
+# One per event loop, created on first use. `RunVar` is anyio's per-run storage - the same
+# mechanism anyio uses for its own default thread limiter - so the binding follows the loop
+# rather than the process.
+# ---------------------------------------------------------------------------------------
+
+_CPU_BOUND_LIMITER: Final[RunVar[CapacityLimiter]] = RunVar("app_cpu_bound_limiter")
+
+
+def cpu_bound_limiter() -> CapacityLimiter:
+    """Return this event loop's CPU-bound offload limiter, creating it on first use.
+
+    Callers normally have no reason to touch this: :func:`run_cpu_bound` applies the limiter
+    itself. It is public for the two cases that legitimately need the object rather than the
+    behaviour - a test asserting that the bound is what this module says it is, and an
+    operational probe reading :attr:`~anyio.CapacityLimiter.borrowed_tokens` to see how much of
+    the budget is in use.
+
+    Returns:
+        The limiter for the running loop, holding :data:`CPU_BOUND_CONCURRENCY` tokens. The same
+        object for every call within one loop, and a distinct object per loop.
+
+    Note:
+        Must be called from within a running event loop, because that is what identifies which
+        limiter is wanted. ``LookupError`` from the underlying storage is handled here - it is
+        how "this loop has not asked yet" is reported, not an error condition - so the first
+        caller creates the limiter and every later one finds it.
+    """
+    try:
+        return _CPU_BOUND_LIMITER.get()
+    except LookupError:
+        limiter = CapacityLimiter(CPU_BOUND_CONCURRENCY)
+        _CPU_BOUND_LIMITER.set(limiter)
+        return limiter
+
+
+# ---------------------------------------------------------------------------------------
+# The offload
+# ---------------------------------------------------------------------------------------
+
+
+async def run_cpu_bound[T, *PosArgsT](
+    func: Callable[[*PosArgsT], T],
+    *args: *PosArgsT,
+) -> T:
+    """Run a synchronous, CPU-bound function on a bounded worker thread and await its result.
+
+    The one way this codebase leaves the event loop. Every argon2 call in
+    ``app.core.security`` and every bleach call in ``app.services.post_service`` and
+    ``app.services.comment_service`` reaches its work through here, so there is a single place
+    where the bound is applied and a single place to look when asking what may run off the loop.
+
+    Args:
+        func: The function to run. Must be a pure function of its arguments: it may not touch
+            the database session, an ORM instance's lazily loaded attributes, or anything else
+            bound to the event loop - see the module docstring for why that raises rather than
+            merely being slow. Passed positionally to the worker, so a bound method, a plain
+            function and a :func:`~functools.partial` are all acceptable.
+        args: Positional arguments for ``func``. Keyword arguments are not accepted, because the
+            underlying primitive takes none; wrap the call in a
+            :func:`~functools.partial` if a keyword is genuinely needed. The type parameters
+            make the pairing exact, so passing an argument ``func`` does not accept is a static
+            error rather than a runtime one.
+
+    Returns:
+        Whatever ``func`` returned, with its type preserved.
+
+    Raises:
+        BaseException: Anything ``func`` raises, propagated unchanged with its traceback.
+
+    Examples:
+        Values in, value out - and the session work stays on the loop::
+
+            body = await run_cpu_bound(_sanitize_body, payload.body)
+            comment = Comment(post_id=post.id, author_id=author.id, body=body)
+            await self.comments.add(comment)
+    """
+    return await to_thread.run_sync(func, *args, limiter=cpu_bound_limiter())
 
 
 # ---------------------------------------------------------------------------------------
@@ -546,13 +749,42 @@ def dummy_password_hash() -> str:
     return _PASSWORD_HASHER.hash(secrets.token_urlsafe())
 
 
+def warm_password_hashing() -> None:
+    """Pay the dummy hash's argon2 cost now, before the first request can observe it.
+
+    **This closes a user-enumeration oracle that survived the stand-in hash itself.**
+    :func:`dummy_password_hash` is cached, which makes every unknown-email login after the first
+    one cost exactly what a known-email login costs. The *first* one is different: it computes a
+    real argon2id hash, so the very first attempt against an unregistered address pays a full
+    hash **plus** a verify, while the first attempt against a registered one pays only the verify.
+    That is a difference of the whole argon2 work factor - tens of milliseconds, not microseconds -
+    and it is measurable on a single request by anyone who gets to a freshly started process
+    first. Warming after startup made the asymmetry hard to see in a test suite rather than absent
+    from the service.
+
+    Called from ``app.main.lifespan`` so the cost lands in startup, where no client is waiting on
+    it and nothing is being timed. Synchronous and not offloaded on purpose: at startup there is
+    no event loop traffic to protect, and going through the bounded worker pool would mean
+    startup depended on that pool being ready.
+
+    Idempotent, because :func:`dummy_password_hash` is cached - a second call is a dictionary
+    lookup. Safe to call from a test that has cleared the cache, and safe to call twice.
+
+    Nothing is returned. The value is deliberately not exposed here: callers that need it use
+    :func:`dummy_password_hash_async`, and a warm-up that handed the hash back would invite a
+    caller to hold it in a variable of its own, where it would outlive the cache and stop being
+    the single stable value that makes two unknown-email attempts indistinguishable.
+    """
+    dummy_password_hash()
+
+
 # ---------------------------------------------------------------------------------------
 # Passwords, off the event loop
 #
 # The three primitives above, each wrapped in the bounded offload that a request path must
 # use. Thin on purpose: no rule, no branch and no error translation lives here that is not
 # already in the function being wrapped, so the awaitable form and the synchronous form
-# cannot come to disagree about what they do. `app.core.concurrency` records why the offload
+# cannot come to disagree about what they do. This module's docstring records why the offload
 # is bounded and what may not be sent through it.
 # ---------------------------------------------------------------------------------------
 

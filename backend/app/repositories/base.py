@@ -234,12 +234,18 @@ class BaseRepository[ModelT: Base]:
                 stmt = select(Post).order_by(Post.published_at.desc())
                 return await self.paginate(stmt, limit=limit, offset=offset)
 
-    Note which base that example names. Five of this service's six repositories extend
-    :class:`UUIDPrimaryKeyRepository`, which adds the three operations that presuppose a single
-    surrogate key, because their relations carry ``app.db.base.UUIDPrimaryKeyMixin``. Extend
+    Note which base that example names. Five of this service's six relation-bound repositories
+    extend :class:`UUIDPrimaryKeyRepository`, which adds the three operations that presuppose a
+    single surrogate key, because their relations carry ``app.db.base.UUIDPrimaryKeyMixin``. Extend
     **this** class directly only when the relation has no single-column identity, which in this
     schema means ``post_likes`` alone - see the module docstring for why that distinction is
     enforced by the class hierarchy rather than described in prose.
+
+    One repository extends neither, and it is the exception that proves the rule rather than a
+    counter-example to it: ``app.repositories.health_repository`` issues the readiness statement,
+    which reads no table, so it has no ``model`` to declare and not one helper here would apply to
+    it. Everything in this class is written for a mapped class; a repository without one has no
+    business inheriting it.
 
     Two invariants must not be violated, here or in any subclass:
 

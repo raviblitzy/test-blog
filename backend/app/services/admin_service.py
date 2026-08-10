@@ -6,6 +6,13 @@ posts, comments, and categories, plus aggregate counts for an overview screen". 
 service in the backend that composes across every entity, because the overview screen asks one
 question about four relations at once and no single relation can answer it.
 
+Where that requirement lands as *routes* is the surface the AAP freezes in §0.6.2: thirteen
+operations, comprising a listing for users, posts and comments, a state mutation and a deletion for
+each of the four families, and the overview counts. The taxonomy is the one family with no
+privileged listing, and it needs none - ``GET /api/v1/categories`` already returns the whole of it,
+ascending by name, with the same ``post_count`` a reader sees, so the management screen reads that
+array and the reader-facing filter control cannot disagree with it about what a category is.
+
 Authority is checked here, and that is not redundant by accident
 ---------------------------------------------------------------
 ``require_admin`` from ``app.core.dependencies`` is applied at **router level** on the whole
@@ -512,6 +519,19 @@ class AdminService:
             concurrently would otherwise both read the same role and both write, and the later
             write would silently discard the earlier decision. The lock serialises them, and it is
             released by the commit below or by the rollback ``get_db`` performs on its way out.
+
+            **That same lock is what makes the revocation above complete, and it is shared with
+            ``app.services.auth_service``.** A bulk ``UPDATE`` revokes the tokens it can see, and
+            the token that would defeat a suspension is the one a concurrent rotation is about to
+            insert - it does not exist yet, so no row lock over the current members excludes it.
+            Both services therefore take an exclusive lock on this ``users`` row *before* touching
+            any token row, and always in that order; ``AuthService._lock_account`` documents the
+            protocol and the interleaving it prevents. Acquiring it here first is not merely local
+            hygiene: a rotation arriving beside this suspension blocks on it, and because the
+            session runs at ``READ COMMITTED`` it then re-evaluates against the suspension this
+            method committed and refuses rather than minting a successor. Do not reorder the lock
+            after the sweep, and do not replace it with a lock over the token rows - either change
+            reopens a suspended account holding a live credential.
         """
         self._require_admin(actor)
 
@@ -568,7 +588,10 @@ class AdminService:
 
         # Ordered after the account write and before the commit, so the suspension and the
         # withdrawal are one atomic decision: an account cannot end up suspended with live tokens,
-        # nor have its tokens withdrawn while remaining active.
+        # nor have its tokens withdrawn while remaining active. Correct only because the `users`
+        # row was locked at the top of this method and every token writer in
+        # `app.services.auth_service` takes that same lock first - otherwise a rotation committing
+        # beside this sweep would leave a successor token live through the suspension.
         revoked = 0
         if previous_is_active and not user.is_active:
             revoked = await self._refresh_tokens.revoke_all_for_user(user.id)
@@ -1110,62 +1133,14 @@ class AdminService:
 
     # -----------------------------------------------------------------------------------
     # Categories - the whole lifecycle is delegated
+    #
+    # Three methods, matching the three routes the AAP declares: create, rename, delete. There is
+    # deliberately no administrative LISTING here. The taxonomy is small, bounded reference data
+    # and the public `GET /api/v1/categories` already returns it whole - ascending by name, each
+    # term carrying the same `post_count` a reader sees - so the management screen reads that
+    # array rather than a privileged duplicate of it, and there is one definition of "the
+    # taxonomy" instead of two that have to agree.
     # -----------------------------------------------------------------------------------
-
-    async def list_categories(
-        self,
-        *,
-        actor: User,
-        q: str | None = None,
-        page: int,
-        page_size: int,
-    ) -> Page[CategoryPublic]:
-        """Window the taxonomy for the administrative categories screen.
-
-        Behind ``GET /api/v1/admin/categories``, the fourth administrative listing, which completes
-        the administrative namespace: it now exposes listing, state mutation and deletion for users,
-        posts, comments *and* categories, which is what the plan requires of the dashboard. The
-        route adds a ``q`` filter the public collection deliberately withholds - searching a
-        taxonomy is a management affordance rather than a reading one - and is otherwise the same
-        windowed read, so a management grid and the reader-facing filter control cannot disagree
-        about what a category looks like or how many posts are filed under it.
-
-        Delegated to :meth:`~app.services.category_service.CategoryService.list_paginated` so an
-        administrative table and the public filter control would agree on what a category looks
-        like, down to the meaning of ``post_count``.
-
-        Args:
-            actor: The resolved principal. Must hold ``ADMIN``.
-            q: Optional search text matched case-insensitively against both the name and the slug,
-                so a term is findable by either spelling.
-            page: The 1-based page requested.
-            page_size: Rows per page.
-
-        Returns:
-            The one page envelope, carrying :class:`~app.schemas.category.CategoryPublic` items.
-
-        Raises:
-            ForbiddenError: The principal does not hold ``ADMIN``.
-            ValueError: Propagated from ``build_page`` if ``page_size`` is not positive.
-
-        Note:
-            **No administrative projection of a category exists, and none is needed.** A category
-            has no private member: there is no owner, no address, no credential and no moderation
-            state to withhold, so the public model already carries everything this screen shows.
-            Declaring an ``AdminCategory`` that duplicated it field for field would be a second
-            contract to keep in step with the first for no gain, which is why
-            ``app.schemas.admin`` re-exports the two category *inputs* and declares no category
-            *output*.
-
-            **``post_count`` counts published posts here too**, exactly as it does on the public
-            control, because it is the same documented model. A moderator reading this table is
-            reading the figure a reader would see - and a differently-meaning count under a name
-            clients have already been told the meaning of would be a contract that disagrees with
-            itself.
-        """
-        self._require_admin(actor)
-
-        return await self._category_service.list_paginated(q=q, page=page, page_size=page_size)
 
     async def create_category(self, payload: CategoryCreate, *, actor: User) -> CategoryPublic:
         """Create a category, letting the delegate derive its slug.
@@ -1224,13 +1199,22 @@ class AdminService:
         """
         self._require_admin(actor)
 
+        # Read BEFORE the delegate runs, and this is a correctness requirement rather than a
+        # style preference. `CategoryService.create` retries a lost slug race, and a retry begins
+        # with `session.rollback()` - which expires every instance this session holds, including
+        # the principal a dependency loaded. Reading `actor.id` afterwards would make the ORM
+        # refresh it from inside synchronous attribute access, which under an async session raises
+        # `MissingGreenlet` and turns a successful creation into a 500. The rule this follows:
+        # capture the scalars an audit line needs before calling anything that can roll back.
+        actor_id = str(actor.id)
+
         category = await self._category_service.create(payload)
 
         get_logger(__name__).info(
             "admin category created",
             category_id=str(category.id),
             slug=log_safe_text(category.slug),
-            actor_id=str(actor.id),
+            actor_id=actor_id,
         )
         return category
 
@@ -1328,10 +1312,21 @@ class AdminService:
             check and the delete. Calling ``CategoryRepository.is_in_use`` from here instead would
             reproduce the check without the lock, which is a guard in appearance only.
 
-            **One transaction, and this is the one category operation that commits it here.** The
-            delegate is asked not to, through ``commit=False``, because a ``204`` carries no
-            projection and this method still has its audit line to write - so the removal and the
-            record of it belong to the same transaction. Its two siblings are the other way round:
+            **One transaction, and this is the one category operation that owns its boundary
+            here.** The delegate is asked not to commit, through ``commit=False``, because a ``204``
+            carries no projection for it to materialise - so the boundary is this method's to close,
+            and it closes it once, after the delete and before anything is reported.
+
+            The audit line is *not* part of that transaction, and nothing here claims otherwise. A
+            process log is written to a stream, not to the database; it cannot be rolled back and it
+            is emitted after :meth:`~sqlalchemy.ext.asyncio.AsyncSession.commit` returns. That order
+            is the deliberate one: a line written before the commit would announce a removal that a
+            failing commit would then undo, leaving an audit trail that disagrees with the data.
+            Written after, it records only removals that actually happened - at the cost that a
+            crash between the commit and the write loses the line rather than the change, which is
+            the correct way round for an audit of a destructive operation.
+
+            Its two siblings are the other way round:
             ``CategoryService.create`` and ``CategoryService.update`` must read the tally their
             response declares before committing, so they own their boundary outright and expose no
             such flag, and this service issues no commit on top of theirs. Either way there is

@@ -199,14 +199,33 @@ Two bounds are therefore part of the statement itself, applied by PostgreSQL bef
 returned rather than by Python after the graph has been materialised:
 
 * :data:`MAX_THREAD_DEPTH` caps how far the recursive term descends.
-* :data:`MAX_THREAD_DESCENDANTS` caps how many descendant rows the whole page may carry.
+* :data:`MAX_THREAD_DESCENDANTS` caps how many descendant rows the whole page may carry, spent
+  **per root** through :func:`replies_per_root` rather than first-come.
+
+The per-root division is not a refinement of the bound but a correction to it. As a single ``LIMIT``
+over the descendants of every root on the page, the budget was a race between threads: one comment
+with three hundred replies consumed all of it, and because the ordering below is depth-major by
+``created_at``, the roots created after it received **nothing**. Their replies existed, were
+approved, were visible to the caller, and the response was indistinguishable from a page of threads
+nobody had answered. A window function ranking within each root gives every thread the same
+allowance, so no discussion can starve another, and ``page_size`` roots each drawing at most
+``MAX_THREAD_DESCENDANTS // page_size`` descendants keeps the total exactly as bounded as before.
+
+Truncation is also **visible and addressable**, which a bound has to be if it is not to be lossy.
+Every comment reports :attr:`~app.models.comment.Comment.reply_count` - its visible direct replies,
+counted under the caller's own moderation filter - and
+:attr:`~app.models.comment.Comment.has_more_replies`, so a prefix announces itself as one. The
+remainder is read through :meth:`CommentRepository.list_for_post`'s ``parent_id`` window, which
+pages one comment's replies as a collection with its own ``total``. So every accepted reply stays
+reachable however wide a discussion becomes.
 
 The row cap is ordered ``(depth, created_at, id)`` - **depth-major, and that is what makes
 truncation coherent rather than arbitrary.** Every node at a shallower depth is returned before any
 node at a deeper one, so if a node is retained its parent is retained too, and the retained set is
 always a valid forest: :func:`_attach_replies` can never be handed a reply whose parent is missing.
 Cutting on ``created_at`` alone could keep a grandchild while dropping its parent, and the reply
-would then be silently reparented or silently dropped.
+would then be silently reparented or silently dropped. That ordering is now applied inside each
+root's partition, so the property holds per tree as well as across the page.
 
 So the worst case a thread page can produce is ``page_size`` roots plus
 :data:`MAX_THREAD_DESCENDANTS` descendants, whatever shape the discussion has - and the ordinary
@@ -262,11 +281,16 @@ from sqlalchemy import ColumnElement, Select, func, literal, select
 from sqlalchemy.orm import QueryableAttribute, aliased, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 
-from app.models.comment import Comment, CommentStatus
+from app.models.comment import VISIBLE_REPLY_COUNT_KEY, Comment, CommentStatus
 from app.models.user import User
 from app.repositories.base import UUIDPrimaryKeyRepository
 
-__all__ = ["MAX_THREAD_DEPTH", "MAX_THREAD_DESCENDANTS", "CommentRepository"]
+__all__ = [
+    "MAX_THREAD_DEPTH",
+    "MAX_THREAD_DESCENDANTS",
+    "CommentRepository",
+    "replies_per_root",
+]
 
 
 MAX_THREAD_DEPTH: Final[int] = 8
@@ -297,13 +321,44 @@ fifty thousand direct replies is one level deep, and ``CommentPublic.replies`` w
 one of them. This is a cap on rows rather than on levels, applied as a ``LIMIT`` inside the
 statement, so PostgreSQL stops producing rows rather than Python discarding them afterwards.
 
-Two hundred against a default ``page_size`` of twenty is ten replies per root on average, and a
-worst case of two hundred bodies at ``app.schemas.comment.BODY_MAX_LENGTH`` characters each - a
-bounded payload for a page of a discussion, where the alternative was unbounded. A reader who
-reaches that ceiling on one page sees the shallowest replies, because the cap is applied under a
-depth-major ordering; the deeper tail is still moderable and still readable one page along, since
-paging the roots changes which trees are drawn from.
+Two hundred is a bounded payload for a page of a discussion - a worst case of two hundred bodies at
+``app.schemas.comment.BODY_MAX_LENGTH`` characters each - where the alternative was unbounded.
+
+**It is spent per root rather than first-come.** This used to be a single ``LIMIT`` over the
+descendants of every root on the page, which made the budget a race between threads: one comment
+with three hundred replies consumed all of it, and every other thread on that page was returned
+looking as though nobody had answered it. Nothing in the response distinguished that from the
+truth. The budget is now divided by :func:`replies_per_root`, so each root receives an equal share
+and no thread can starve another, and each comment reports
+:attr:`~app.models.comment.Comment.reply_count` and
+:attr:`~app.models.comment.Comment.has_more_replies` so a truncated collection is visible as
+truncated. The tail is reachable through the ``parent`` window - see :meth:`list_for_post`.
 """
+
+
+def replies_per_root(page_size: int) -> int:
+    """Divide the descendant budget evenly across the roots one page can carry.
+
+    The allocation that stops one busy thread from consuming a whole page's reply budget. Every root
+    on the page gets the same allowance, so ``total`` and the shape of the response no longer depend
+    on which discussion happens to be the most active.
+
+    The division is what keeps the payload bound intact: ``page_size`` roots each carrying at most
+    ``MAX_THREAD_DESCENDANTS // page_size`` descendants can never exceed
+    :data:`MAX_THREAD_DESCENDANTS` in total, so this is a fairer spend of the same budget rather
+    than a larger one.
+
+    Args:
+        page_size: How many roots this page may carry. Bounded to ``1..100`` by
+            ``app.core.dependencies`` before any caller reaches here, so the result runs from two
+            replies per root at the widest page to two hundred at the narrowest.
+
+    Returns:
+        The per-root allowance, never below one - a page so wide that the division floors to zero
+        would otherwise return a thread with no replies at all and no way to tell that from a
+        thread with none.
+    """
+    return max(1, MAX_THREAD_DESCENDANTS // max(1, page_size))
 
 
 _LIKE_ESCAPE: Final = "\\"
@@ -583,6 +638,7 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         post_id: uuid.UUID,
         *,
         statuses: Sequence[CommentStatus] | None = None,
+        parent_id: uuid.UUID | None = None,
         limit: int,
         offset: int,
     ) -> tuple[Sequence[Comment], int]:
@@ -688,9 +744,18 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         # `parent_id IS NULL` belongs to the PAGE, and only to the page. It is what makes a page
         # member a thread rather than a comment, so it goes into both statements below and into
         # neither half of the recursive descent.
+        # WHICH comments are this page's members. Top-level by default - a page of threads - and
+        # the direct replies of one comment when *parent_id* is given, which is the continuation
+        # window: a thread whose replies were truncated by the per-root allowance is re-entered
+        # here, with that comment's replies as the page members and their own `total`. One predicate
+        # rather than two code paths, so paging, counting, ordering and the moderation filter are
+        # shared and cannot drift apart.
+        parent_predicate: ColumnElement[bool] = (
+            Comment.parent_id.is_(None) if parent_id is None else Comment.parent_id == parent_id
+        )
         predicates: list[ColumnElement[bool]] = [
             Comment.post_id == post_id,
-            Comment.parent_id.is_(None),
+            parent_predicate,
             *status_criteria,
         ]
 
@@ -739,11 +804,24 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         # empty sequences, because it is a no-op there and a branch would be one more thing to
         # keep in step.
         descendants = (
-            await self._descendants_of([root.id for root in roots], statuses=statuses)
+            await self._descendants_of(
+                [root.id for root in roots],
+                statuses=statuses,
+                # Derived from the window rather than fixed, so the total payload stays inside
+                # `MAX_THREAD_DESCENDANTS` however wide the page is, while every root on it gets
+                # the same share.
+                per_root_limit=replies_per_root(limit),
+            )
             if roots
             else ()
         )
         _attach_replies(roots, descendants)
+
+        # Counted after the tree is assembled, over every node the response carries - roots and
+        # descendants alike - so each one can report whether its own reply collection is complete.
+        # This is what turns a bounded read into an honest one: without it a truncated thread is
+        # indistinguishable from a thread nobody answered.
+        await self._annotate_reply_counts((*roots, *descendants), statuses=statuses)
         return roots, total
 
     async def _descendants_of(
@@ -751,6 +829,7 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         root_ids: Sequence[uuid.UUID],
         *,
         statuses: Sequence[CommentStatus] | None,
+        per_root_limit: int,
     ) -> Sequence[Comment]:
         """Fetch the comments below *root_ids* in one statement, bounded by depth and by row count.
 
@@ -839,7 +918,15 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             a username, a display name and an avatar; it never shows an email address, a role or a
             password hash, so the batched ``selectin`` statement selects none of them.
         """
-        anchor = select(Comment, literal(1).label("depth")).where(
+        # `parent_id` on an anchor row IS the root it belongs to - the anchor selects the direct
+        # children of the roots - so the partition key is carried from here and propagated unchanged
+        # through every generation below. Labelled explicitly because the recursive term has to
+        # reference it by name.
+        anchor = select(
+            Comment,
+            literal(1).label("depth"),
+            Comment.parent_id.label("root_id"),
+        ).where(
             Comment.parent_id.in_(root_ids),
             *_status_criteria_on(Comment.status, statuses),
         )
@@ -847,7 +934,13 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
 
         reply = aliased(Comment, name="reply")
         descent = descent.union_all(
-            select(reply, (descent.c.depth + 1).label("depth")).where(
+            select(
+                reply,
+                (descent.c.depth + 1).label("depth"),
+                # Forwarded, never recomputed: a grandchild's root is its parent's root, and
+                # deriving it again from `parent_id` here would name the parent instead.
+                descent.c.root_id,
+            ).where(
                 reply.parent_id == descent.c.id,
                 *_status_criteria_on(reply.status, statuses),
                 # The depth bound, on the recursive term rather than on the final select: a
@@ -856,17 +949,125 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
             )
         )
 
-        node = aliased(Comment, descent, name="descendant")
+        # The per-root allocation, and the whole reason this is a window function rather than a
+        # `LIMIT`. A single `LIMIT` over the union spends one budget across every root, so the most
+        # active thread on the page takes all of it and the rest come back looking unanswered.
+        # Ranking WITHIN each root and keeping the first N gives every thread the same allowance,
+        # and because the ordering inside the partition is the same depth-major order the response
+        # is assembled in, what a truncated thread loses is its deepest tail rather than an
+        # arbitrary slice of the middle.
+        ranked = select(
+            descent,
+            func.row_number()
+            .over(
+                partition_by=descent.c.root_id,
+                order_by=(
+                    descent.c.depth.asc(),
+                    descent.c.created_at.asc(),
+                    descent.c.id.asc(),
+                ),
+            )
+            .label("rank"),
+        ).subquery("ranked_descendants")
+
+        node = aliased(Comment, ranked, name="descendant")
         result = await self.session.execute(
             select(node)
+            .where(ranked.c.rank <= per_root_limit)
             # Depth-major, then thread order, then the primary key - see the note above for why
-            # the leading key must be depth.
-            .order_by(descent.c.depth.asc(), node.created_at.asc(), node.id.asc())
-            .limit(MAX_THREAD_DESCENDANTS)
+            # the leading key must be depth. Repeated on the outer select because a subquery's
+            # internal ordering is not a guarantee the outer one inherits.
+            .order_by(ranked.c.depth.asc(), node.created_at.asc(), node.id.asc())
             .options(selectinload(node.author).load_only(*_PUBLIC_AUTHOR_COLUMNS))
             .execution_options(populate_existing=True)
         )
         return result.scalars().all()
+
+    async def visible_direct_reply_counts(
+        self,
+        parent_ids: Sequence[uuid.UUID],
+        *,
+        statuses: Sequence[CommentStatus] | None,
+    ) -> dict[uuid.UUID, int]:
+        """Count the direct replies to each of *parent_ids* under the caller's moderation filter.
+
+        The statement behind :attr:`~app.models.comment.Comment.reply_count`, and the reason a
+        truncated thread can say so. The bounded descent above returns as many replies as a root's
+        allowance permits; this returns how many there *are*, so the difference between the two is
+        what :attr:`~app.models.comment.Comment.has_more_replies` reports.
+
+        One statement for the whole page rather than one per comment. A count per node would be the
+        N+1 the recursive descent exists to avoid, and under an async session each of those lazy
+        loads would raise rather than merely being slow.
+
+        The same ``statuses`` filter the rows were read under is applied here, which is what makes
+        the number consistent with them: an anonymous reader is told how many *approved* replies a
+        comment has, and an administrator how many exist in every state. A count taken without the
+        filter would let a reader infer the existence of comments they may not see - the moderation
+        queue's contents leaking out through an integer.
+
+        Args:
+            parent_ids: Every comment the response will carry, roots and descendants alike. A
+                comment absent from the result simply has no visible reply.
+            statuses: The moderation states in scope, or ``None`` for every state.
+
+        Returns:
+            A mapping from comment identifier to its visible direct-reply count, containing only the
+            comments that have at least one. Empty when *parent_ids* is empty, without issuing a
+            statement - an empty ``IN`` list is a predicate no row can satisfy and a round trip
+            nobody needs.
+        """
+        if not parent_ids:
+            return {}
+
+        result = await self.session.execute(
+            select(Comment.parent_id, func.count().label("total"))
+            .where(
+                Comment.parent_id.in_(parent_ids),
+                *_status_criteria_on(Comment.status, statuses),
+            )
+            .group_by(Comment.parent_id)
+        )
+        # `parent_id` is non-NULL by construction here - it was matched against `parent_ids` - but
+        # the mapped type is optional, so the guard keeps this total rather than asserting.
+        return {parent_id: total for parent_id, total in result.all() if parent_id is not None}
+
+    async def _annotate_reply_counts(
+        self,
+        comments: Sequence[Comment],
+        *,
+        statuses: Sequence[CommentStatus] | None,
+    ) -> None:
+        """Attach each comment's visible direct-reply count to the instance, in one statement.
+
+        The bridge between :meth:`visible_direct_reply_counts` and
+        :attr:`~app.models.comment.Comment.reply_count`. Both callers that assemble a tree call this
+        last, after :func:`_attach_replies`, so every node in the returned structure can report
+        whether its own collection is whole.
+
+        The value is written into the instance ``__dict__`` under
+        :data:`~app.models.comment.VISIBLE_REPLY_COUNT_KEY` rather than set as an attribute, because
+        it is not a mapped one: SQLAlchemy's instrumentation iterates the mapper's own attributes
+        and ignores every other key, so this annotation is invisible to dirty-tracking and to
+        flushing and cannot be mistaken for a pending change. That module documents the key; this
+        is its only writer.
+
+        **Zero is written explicitly.** A comment with no visible reply is annotated with ``0``
+        rather than left un-annotated, so the property never falls back to counting a loaded
+        collection - the same answer here, but leaving it implicit is how "no replies" and "replies
+        not counted" become indistinguishable again.
+
+        Args:
+            comments: Every node the response will carry. Duplicates are harmless; the mapping is
+                built once and each instance is written once.
+            statuses: The moderation states in scope, passed straight through so the counts are
+                taken under the same filter as the rows.
+        """
+        counts = await self.visible_direct_reply_counts(
+            [comment.id for comment in comments], statuses=statuses
+        )
+        for comment in comments:
+            comment.__dict__[VISIBLE_REPLY_COUNT_KEY] = counts.get(comment.id, 0)
 
     async def reply_depth_for_parent(self, parent_id: uuid.UUID, *, max_depth: int) -> int | None:
         """Report how deep a reply to *parent_id* would sit, in one statement.
@@ -1130,8 +1331,18 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         """
         # One root, so the `IN` list is never empty and the call is never skipped - unlike
         # `list_for_post`, which has to guard against a page with no rows at all.
-        descendants = await self._descendants_of([root.id], statuses=statuses)
+        # The whole descendant budget goes to that single root, because there is no other root to
+        # share it with: a mutating route answers with one comment, so `MAX_THREAD_DESCENDANTS` is
+        # both the per-root allowance and the total.
+        descendants = await self._descendants_of(
+            [root.id], statuses=statuses, per_root_limit=MAX_THREAD_DESCENDANTS
+        )
         _attach_replies((root,), descendants)
+
+        # The same annotation the listing performs, for the same reason: this projection is the
+        # shape `CommentPublic` serialises, and a subtree truncated at the budget must say so here
+        # too or an edit would answer with a thread that looks complete and is not.
+        await self._annotate_reply_counts((root, *descendants), statuses=statuses)
         return root
 
     async def get_parent(

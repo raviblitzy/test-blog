@@ -44,10 +44,9 @@
 //      see the `images` block below for why that has to be the only copy.
 //
 // THIS MODULE READS NO ENVIRONMENT VARIABLE, and there is no fourth NEXT_PUBLIC_
-// key behind the host list. `.env.example` declares fifteen variables - eleven
-// backend fields, the three public values NEXT_PUBLIC_API_BASE_URL,
-// NEXT_PUBLIC_SITE_URL and NEXT_PUBLIC_SITE_NAME, and the server-only
-// API_INTERNAL_BASE_URL - and the host allow-list is
+// key behind the host list. `.env.example` declares fourteen variables - eleven
+// backend fields and the three public values NEXT_PUBLIC_API_BASE_URL,
+// NEXT_PUBLIC_SITE_URL and NEXT_PUBLIC_SITE_NAME - and the host allow-list is
 // deliberately not among them: it is declared in source, in src/lib/utils.ts,
 // which is the module every rendering component asks as well. The API origin
 // belongs to the client module that calls it and the canonical site origin

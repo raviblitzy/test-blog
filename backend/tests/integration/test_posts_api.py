@@ -83,6 +83,7 @@ from typing import Any, Final, NamedTuple
 
 import pytest
 from httpx import AsyncClient, Response
+from pydantic import HttpUrl, TypeAdapter
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -98,7 +99,13 @@ from app.models import (
     User,
     post_categories,
 )
-from app.schemas.post import MAX_CATEGORIES_PER_POST, TITLE_MAX_LENGTH
+from app.repositories import PostRepository
+from app.schemas.post import (
+    CONTENT_MAX_LENGTH,
+    EXCERPT_MAX_LENGTH,
+    MAX_CATEGORIES_PER_POST,
+    TITLE_MAX_LENGTH,
+)
 from tests import factories
 
 # =======================================================================================
@@ -235,11 +242,13 @@ ERROR_TYPE_UNAUTHORIZED: Final[str] = "/errors/unauthorized"
 ERROR_TYPE_FORBIDDEN: Final[str] = "/errors/forbidden"
 ERROR_TYPE_NOT_FOUND: Final[str] = "/errors/not-found"
 ERROR_TYPE_VALIDATION: Final[str] = "/errors/validation-error"
+ERROR_TYPE_CONFLICT: Final[str] = "/errors/conflict"
 
 ERROR_TITLE_UNAUTHORIZED: Final[str] = "Unauthorized"
 ERROR_TITLE_FORBIDDEN: Final[str] = "Forbidden"
 ERROR_TITLE_NOT_FOUND: Final[str] = "Not Found"
 ERROR_TITLE_VALIDATION: Final[str] = "Validation Error"
+ERROR_TITLE_CONFLICT: Final[str] = "Conflict"
 
 WWW_AUTHENTICATE_HEADER: Final[str] = "WWW-Authenticate"
 BEARER_CHALLENGE: Final[str] = "Bearer"
@@ -260,6 +269,85 @@ DRAFT_CONTENT: Final[str] = (
     "workers holding one each disagree about what exists."
 )
 DRAFT_COVER_IMAGE_URL: Final[str] = "https://cdn.example.com/covers/retiring-the-item-store.png"
+
+# ---------------------------------------------------------------------------------------
+# Boundary vocabulary
+#
+# Every value below is DERIVED from the constant that enforces it, never transcribed. A literal
+# `"x" * 121` stops being the title ceiling the moment `TITLE_MAX_LENGTH` moves, and it stops
+# without failing: 121 characters remains a perfectly sendable value, so the assertion quietly
+# becomes a test that long titles are accepted.
+# ---------------------------------------------------------------------------------------
+
+COVER_URL_MAX_LENGTH: Final[int] = int(TypeAdapter(HttpUrl).json_schema()["maxLength"])
+"""The ceiling on ``cover_image_url``, read from the type that enforces it.
+
+``app.schemas.post.OptionalCoverImageUrl`` declares no explicit bound because
+:class:`~pydantic.HttpUrl` carries one of its own and publishes it as ``maxLength`` in the
+generated schema - which is the value a client generating a form reads. Taking it from the same
+place the client does is what keeps this suite and that client agreeing; hard-coding 2083 here
+would be transcribing a number out of a dependency's implementation."""
+
+ASTRAL: Final[str] = "😀"
+"""One astral code point: U+1F600, outside the Basic Multilingual Plane.
+
+The reason it appears in these boundaries at all is that the three units a length limit might be
+counted in disagree about it. It is **one** code point - which is what
+``pydantic.StringConstraints`` counts, and therefore what this API's limits mean - but **two**
+UTF-16 code units, which is what a browser's ``String.length`` and a naive mirrored client-side
+check count, and **four** UTF-8 bytes, which is what a byte-bounded column would count. So a field
+filled to its exact ceiling with this character is accepted by a correct implementation and refused
+by either wrong one, and that is a distinction no ASCII test case can make."""
+
+#: Cover-image destinations that must never be stored, with the validator that must refuse each.
+#: The stored value is interpolated into an image source on every card and every post page, so the
+#: scheme allow-list is the control standing between an author-supplied field and a script vector -
+#: and `//host/path`, being scheme-relative, would inherit the page's own scheme and load anyway.
+HOSTILE_COVER_URLS: Final[tuple[tuple[str, str, str], ...]] = (
+    ("javascript:alert(1)", "url_scheme", "javascript-scheme"),
+    ("JavaScript:alert(1)", "url_scheme", "javascript-scheme-mixed-case"),
+    ("  javascript:alert(1)  ", "url_scheme", "javascript-scheme-padded-with-whitespace"),
+    (
+        "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+        "url_scheme",
+        "data-scheme-carrying-a-document",
+    ),
+    ("data:image/png;base64,iVBORw0KGgo=", "url_scheme", "data-scheme-carrying-an-image"),
+    ("vbscript:msgbox(1)", "url_scheme", "vbscript-scheme"),
+    ("file:///etc/passwd", "url_scheme", "file-scheme"),
+    ("ftp://example.com/cover.png", "url_scheme", "ftp-scheme"),
+    ("//example.com/cover.png", "url_parsing", "scheme-relative-reference"),
+    ("/covers/local.png", "url_parsing", "site-relative-path"),
+    ("covers/local.png", "url_parsing", "bare-relative-path"),
+    ("http://", "url_parsing", "scheme-with-no-host"),
+    ("definitely not a url", "url_parsing", "prose"),
+)
+
+
+def _cover_url_of_length(length: int) -> str:
+    """Return an absolute ``https`` URL of exactly *length* characters.
+
+    Args:
+        length: The total length the URL must have. Must leave room for the fixed prefix.
+
+    Returns:
+        A URL whose scheme and host are valid and whose path is padded to reach *length*.
+
+    Raises:
+        ValueError: If *length* is too small to hold the prefix, which would silently produce a URL
+            refused for being malformed rather than for being too long.
+    """
+    prefix = "https://cdn.example.com/covers/"
+    if length < len(prefix) + 1:
+        message = f"length must be at least {len(prefix) + 1}, got {length}"
+        raise ValueError(message)
+    return prefix + "a" * (length - len(prefix))
+
+
+def _filled(length: int, *, character: str = "x") -> str:
+    """Return *character* repeated to exactly *length* code points."""
+    return character * length
+
 
 SLUG_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 """The shape ``app.core.slug.slugify_title`` guarantees, and the canonical URL depends on.
@@ -312,6 +400,51 @@ SANITISATION_CASES: Final[tuple[_SanitisationCase, ...]] = (
         "shot",
     ),
     _SanitisationCase(
+        "numeric-character-reference-for-the-colon",
+        "See [trap](javascript&#58;alert(1)) here.",
+        "See trap here.",
+    ),
+    _SanitisationCase(
+        "hexadecimal-character-reference-for-the-colon",
+        "See [trap](javascript&#x3A;alert(1)) here.",
+        "See trap here.",
+    ),
+    _SanitisationCase(
+        "named-character-reference-for-the-colon",
+        "See [trap](javascript&colon;alert(1)) here.",
+        "See trap here.",
+    ),
+    _SanitisationCase(
+        "backslash-escaped-colon",
+        "See [trap](javascript\\:alert(1)) here.",
+        "See trap here.",
+    ),
+    _SanitisationCase(
+        "character-reference-inside-the-scheme-name",
+        "See [trap](&#106;avascript:alert(1)) here.",
+        "See trap here.",
+    ),
+    _SanitisationCase(
+        "encoded-scheme-on-an-image",
+        "![shot](JaVaScRiPt&#58;alert(1))",
+        "shot",
+    ),
+    _SanitisationCase(
+        "encoded-scheme-in-a-reference-definition",
+        "See [trap][ref] here.\n\n[ref]: javascript&#58;alert(1)",
+        "See [trap][ref] here.\n\n[ref]: #",
+    ),
+    _SanitisationCase(
+        "encoded-scheme-in-an-autolink",
+        "See <javascript&#58;alert(1)> here.",
+        "See javascript&#58;alert(1) here.",
+    ),
+    _SanitisationCase(
+        "encoded-ampersand-in-a-relative-query-is-kept",
+        "[docs](/docs/index.md?a=1&amp;b=2)",
+        "[docs](/docs/index.md?a=1&amp;b=2)",
+    ),
+    _SanitisationCase(
         "vbscript-scheme",
         "[trap](vbscript:msgbox(1))",
         "trap",
@@ -337,13 +470,25 @@ SANITISATION_CASES: Final[tuple[_SanitisationCase, ...]] = (
         "Inline `[trap](javascript:alert(1))` span.",
     ),
 )
-"""Every Markdown destination form the write-side policy has to decide about.
+"""Every Markdown destination form and spelling the write-side policy has to decide about.
 
-Both halves of the policy are represented deliberately. The first seven cases are destinations
-that must lose their link, one per syntactic form, because a scheme allow-list applied to only one
-form is no allow-list at all. The last three must be left **exactly** alone - a relative path, a
-permitted ``mailto:``, and a dangerous destination written inside code, which is documentation
-rather than a link. A sanitiser that failed those three would be safe and useless.
+Both halves of the policy are represented deliberately. Most cases are destinations that must lose
+their link, one per syntactic form *and* one per obfuscation, because an allow-list applied to only
+one form or only the literal spelling is no allow-list at all. The rest must be left **exactly**
+alone - a relative path, a permitted ``mailto:``, an encoded ampersand in a query string, and a
+dangerous destination written inside code, which is documentation rather than a link. A sanitiser
+that failed those would be safe and useless.
+
+The obfuscated spellings are the ones worth naming, because they are the ones that used to slip
+through. CommonMark resolves both HTML character references and backslash escapes inside a link
+destination, so ``javascript&#58;``, ``javascript&#x3A;``, ``javascript&colon;``,
+``javascript\\:`` and ``&#106;avascript:`` all become ``javascript:`` in the rendered document
+while carrying **no colon at all** in the source. A scheme check applied to the source text found
+no scheme in any of them, concluded "relative destination, therefore safe" and stored the payload
+untouched. The decode now happens before the check, on every one of the four forms.
+
+Percent-encoding is deliberately absent from this list, and its absence is a decision: a browser
+does not resolve ``javascript%3A`` as a scheme, so refusing it would break inert links.
 """
 
 PUBLISH_INSTANT_TOLERANCE: Final[timedelta] = timedelta(minutes=5)
@@ -882,13 +1027,25 @@ class TestCreatePost:
             pytest.param({"title": ...}, "title", "missing", id="title-omitted"),
             pytest.param({"title": "   "}, "title", "string_too_short", id="title-blank"),
             pytest.param(
-                {"title": "x" * (TITLE_MAX_LENGTH + 1)},
+                {"title": _filled(TITLE_MAX_LENGTH + 1)},
                 "title",
                 "string_too_long",
-                id="title-over-long",
+                id="title-one-over-the-ceiling",
+            ),
+            pytest.param(
+                {"excerpt": _filled(EXCERPT_MAX_LENGTH + 1)},
+                "excerpt",
+                "string_too_long",
+                id="excerpt-one-over-the-ceiling",
             ),
             pytest.param({"content": ...}, "content", "missing", id="content-omitted"),
             pytest.param({"content": "   "}, "content", None, id="content-whitespace-only"),
+            pytest.param(
+                {"content": _filled(CONTENT_MAX_LENGTH + 1)},
+                "content",
+                "string_too_long",
+                id="content-one-over-the-ceiling",
+            ),
             pytest.param(
                 {"category_ids": [str(uuid.uuid4())] * (MAX_CATEGORIES_PER_POST + 1)},
                 "category_ids",
@@ -994,6 +1151,89 @@ class TestCreatePost:
         assert created["slug"].startswith("sanitised-heading")
         assert SLUG_PATTERN.match(created["slug"]), created["slug"]
 
+    @pytest.mark.parametrize(
+        ("label", "submitted", "expected"),
+        [
+            ("plain-markup", "XSS <script>alert(1)</script> probe", "XSS alert(1) probe"),
+            ("entity-encoded", "&lt;script&gt;alert(1)&lt;/script&gt; probe", "alert(1) probe"),
+            (
+                "doubly-encoded",
+                "&amp;lt;script&amp;gt;alert(1)&amp;lt;/script&amp;gt; probe",
+                "alert(1) probe",
+            ),
+            (
+                "triply-encoded",
+                "&amp;amp;lt;b&amp;amp;gt;bold&amp;amp;lt;/b&amp;amp;gt;",
+                "bold",
+            ),
+            (
+                "quadruply-encoded",
+                "&amp;amp;amp;lt;i&amp;amp;amp;gt;italic",
+                "italic",
+            ),
+        ],
+        ids=lambda value: value if isinstance(value, str) and " " not in value else "",
+    )
+    async def test_a_nested_entity_encoded_title_is_reduced_to_plain_text(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        auth_headers_for: Any,
+        label: str,
+        submitted: str,
+        expected: str,
+    ) -> None:
+        """A title is stored only once it is a proven fixed point, at every nesting depth.
+
+        The stored value is what a card heading, an ``h1``, a ``meta`` title, a social card and a
+        slug are all built from, so a title is the one authored member that must contain no markup
+        and no character reference that decodes into any. Each pass of the sanitiser strips
+        elements and then decodes what the strip escaped, which means a *fixed number* of passes
+        can hand back raw markup at one nesting level deeper than the bound: the final operation
+        in a pass is a decode, so it reintroduces the ``<`` the next pass would have removed.
+
+        Nesting each case one level deeper is what pins that. The assertion is not merely that the
+        marker is gone - it is that no angle bracket and no ampersand-escape survives at all, and
+        that the value is a fixed point in the strict sense that submitting it again would change
+        nothing.
+        """
+        created = await _create_draft(client, auth_headers_for(author_user), title=submitted)
+
+        stored = created["title"]
+        assert stored == expected, f"{label}: {stored!r}"
+        for residue in ("<", ">", "&lt;", "&gt;", "&amp;"):
+            assert residue not in stored, f"{label}: {residue!r} survived in {stored!r}"
+
+        # The fixed-point property, asserted end to end: re-submitting the stored title has to
+        # produce the identical value, or the sanitiser is not converging and the first storage
+        # was a snapshot of a moving value rather than a settled one.
+        again = await _create_draft(client, auth_headers_for(author_user), title=stored)
+        assert again["title"] == stored
+
+    async def test_a_title_of_nothing_but_markup_is_refused(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        auth_headers_for: Any,
+    ) -> None:
+        """Nothing survives, so there is nothing to store and the answer is a 422 naming the field.
+
+        Refusing beats substituting. ``posts.title`` is ``NOT NULL`` and the schema requires a
+        character, so the alternatives are a title the author did not write or a 500 from the
+        column - and a client can act on neither.
+        """
+        response = await client.post(
+            POSTS_URL,
+            json={
+                "title": "<img src=x onerror=alert(1)>",
+                "content": "Body enough to satisfy the schema.",
+            },
+            headers=auth_headers_for(author_user),
+        )
+
+        problem = _assert_validation_problem(response, field="title")
+        assert problem["errors"][0]["field"] == "title"
+
 
 # =======================================================================================
 # The slug, as an addressing contract
@@ -1003,6 +1243,225 @@ class TestCreatePost:
 # sharing a title still get distinct addresses, that the address resolves case-insensitively
 # because the column is `citext`, and that it does not move when the title changes.
 # =======================================================================================
+
+
+# =======================================================================================
+# Field boundaries - the exact ceiling, one code point past it, and the URL allow-list
+# =======================================================================================
+
+
+class TestTextAndUrlBoundaries:
+    """Every numeric limit on a post's text, and every scheme its cover image may not name.
+
+    A bound is established by a **pair** of cases: the largest value that must be accepted and the
+    smallest that must be refused. Only one of the two is usually written, and it is the wrong one -
+    an obviously-oversized value proves the field is bounded *somewhere*, while the number a client
+    actually needs is the accepted maximum, because that is what goes in its own ``maxlength`` and
+    its own character counter. A client built against a guess refuses text this API would take, or
+    submits text it will not.
+
+    Acceptance is asserted against the **echoed** value, not merely against the status. All three
+    text members pass through ``app.services.post_service``'s sanitisation before storage, and a
+    ceiling enforced by truncation somewhere in that path would answer 201 exactly as a correctly
+    accepted value does. Comparing what came back, code point for code point, is what separates the
+    two.
+
+    The astral cases are not decoration - see :data:`ASTRAL` for why one emoji distinguishes three
+    different ways of counting a length, only one of which is this contract's.
+    """
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            pytest.param("title", _filled(TITLE_MAX_LENGTH), id="title-at-the-ceiling"),
+            pytest.param(
+                "title",
+                _filled(TITLE_MAX_LENGTH, character=ASTRAL),
+                id="title-at-the-ceiling-in-astral-code-points",
+            ),
+            pytest.param("excerpt", _filled(EXCERPT_MAX_LENGTH), id="excerpt-at-the-ceiling"),
+            pytest.param(
+                "excerpt",
+                _filled(EXCERPT_MAX_LENGTH, character=ASTRAL),
+                id="excerpt-at-the-ceiling-in-astral-code-points",
+            ),
+            pytest.param("content", _filled(CONTENT_MAX_LENGTH), id="content-at-the-ceiling"),
+        ],
+    )
+    async def test_a_text_member_exactly_at_its_ceiling_is_stored_verbatim(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        auth_headers_for: Any,
+        field: str,
+        value: str,
+    ) -> None:
+        """A member filled to its exact published maximum is accepted and echoed unchanged."""
+        response = await client.post(
+            POSTS_URL,
+            json=_draft_payload(**{field: value}),
+            headers=auth_headers_for(author_user),
+        )
+
+        assert response.status_code == 201, response.text[:400]
+        body = _assert_detail_shape(response.json())
+        assert body[field] == value, f"{field} was altered on the way in"
+        # Stated separately from the equality above so a truncation reports the length it produced
+        # rather than dumping a hundred thousand characters into the failure message.
+        assert len(body[field]) == len(value), (field, len(body[field]), len(value))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            pytest.param("title", _filled(TITLE_MAX_LENGTH + 1), id="title-one-over"),
+            pytest.param(
+                "title",
+                _filled(TITLE_MAX_LENGTH + 1, character=ASTRAL),
+                id="title-one-over-in-astral-code-points",
+            ),
+            pytest.param("excerpt", _filled(EXCERPT_MAX_LENGTH + 1), id="excerpt-one-over"),
+            pytest.param(
+                "excerpt",
+                _filled(EXCERPT_MAX_LENGTH + 1, character=ASTRAL),
+                id="excerpt-one-over-in-astral-code-points",
+            ),
+            pytest.param("content", _filled(CONTENT_MAX_LENGTH + 1), id="content-one-over"),
+        ],
+    )
+    async def test_a_text_member_one_code_point_over_its_ceiling_writes_nothing(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        auth_headers_for: Any,
+        field: str,
+        value: str,
+    ) -> None:
+        """One code point past a ceiling is a 422 naming the member, and creates no row.
+
+        The row count is the second half. A refusal that had already inserted would leave the author
+        a post they never successfully created, and - because the slug is derived at creation - it
+        would also consume the slug their next attempt wants.
+        """
+        before = await _count_rows(db_session, Post, Post.author_id == author_user.id)
+
+        response = await client.post(
+            POSTS_URL,
+            json=_draft_payload(**{field: value}),
+            headers=auth_headers_for(author_user),
+        )
+
+        _assert_validation_problem(response, field=field, error_type="string_too_long")
+        after = await _count_rows(db_session, Post, Post.author_id == author_user.id)
+        assert after == before, "a rejected creation still wrote a row"
+
+    @pytest.mark.parametrize(
+        ("url", "error_type"),
+        [pytest.param(url, kind, id=name) for url, kind, name in HOSTILE_COVER_URLS],
+    )
+    async def test_a_cover_image_url_outside_the_allow_list_is_refused(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        auth_headers_for: Any,
+        url: str,
+        error_type: str,
+    ) -> None:
+        """Only absolute ``http`` and ``https`` URLs may be stored as a cover image.
+
+        The single highest-value validation on this model. ``cover_image_url`` is written by an
+        author and read back into an image source on every card, every post page and every social
+        card, so a stored ``javascript:`` or ``data:`` destination is a script that runs in every
+        reader's browser. ``pydantic.HttpUrl``'s scheme allow-list is what stops it, and the
+        machine-readable ``type`` is asserted alongside the status so a client can tell a refused
+        *scheme* from an unparseable value and say which to a user.
+
+        The scheme-relative case belongs here for a different reason: ``//host/path`` names no
+        scheme at all, so a browser supplies the page's own and loads it regardless - it is not a
+        harmless relative path, and refusing it is not pedantry.
+        """
+        before = await _count_rows(db_session, Post, Post.author_id == author_user.id)
+
+        response = await client.post(
+            POSTS_URL,
+            json=_draft_payload(cover_image_url=url),
+            headers=auth_headers_for(author_user),
+        )
+
+        _assert_validation_problem(response, field="cover_image_url", error_type=error_type)
+        after = await _count_rows(db_session, Post, Post.author_id == author_user.id)
+        assert after == before, "a rejected cover image still wrote a row"
+
+    async def test_the_cover_image_url_ceiling_holds_at_the_exact_character(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        auth_headers_for: Any,
+    ) -> None:
+        """A URL at :data:`COVER_URL_MAX_LENGTH` is accepted; one character more is refused.
+
+        The bound is the URL type's own rather than one this schema declares, which is precisely
+        why it is worth pinning here: nothing in this project's source states it, so a change to it
+        would arrive with a dependency upgrade rather than with a code change. The accepted value is
+        compared as sent, because the type also *normalises* what it validates - a value that came
+        back re-encoded would break the canonical image source the pages build from it.
+        """
+        at_ceiling = _cover_url_of_length(COVER_URL_MAX_LENGTH)
+        over_ceiling = _cover_url_of_length(COVER_URL_MAX_LENGTH + 1)
+
+        accepted = await client.post(
+            POSTS_URL,
+            json=_draft_payload(cover_image_url=at_ceiling),
+            headers=auth_headers_for(author_user),
+        )
+        refused = await client.post(
+            POSTS_URL,
+            json=_draft_payload(cover_image_url=over_ceiling),
+            headers=auth_headers_for(author_user),
+        )
+
+        assert accepted.status_code == 201, accepted.text[:400]
+        assert accepted.json()["cover_image_url"] == at_ceiling
+        _assert_validation_problem(refused, field="cover_image_url", error_type="url_too_long")
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            pytest.param("title", _filled(TITLE_MAX_LENGTH), id="title-at-the-ceiling"),
+            pytest.param("excerpt", _filled(EXCERPT_MAX_LENGTH), id="excerpt-at-the-ceiling"),
+        ],
+    )
+    async def test_the_same_ceilings_apply_to_a_partial_update(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        auth_headers_for: Any,
+        field: str,
+        value: str,
+    ) -> None:
+        """``PostUpdate`` bounds each member exactly as ``PostCreate`` does, in both directions.
+
+        Asserted separately because the two models are separate declarations: ``PostUpdate`` makes
+        every member optional so a client may send one field, and an optional member is exactly
+        where a restated bound goes missing. A ceiling present on creation and absent on edit would
+        let an author write a value they could not have created.
+        """
+        headers = auth_headers_for(author_user)
+        created = await _create_draft(client, headers)
+
+        accepted = await client.patch(
+            _post_path(created["id"]), json={field: value}, headers=headers
+        )
+        refused = await client.patch(
+            _post_path(created["id"]),
+            json={field: value + _filled(1)},
+            headers=headers,
+        )
+
+        assert accepted.status_code == 200, accepted.text[:400]
+        assert accepted.json()[field] == value
+        _assert_validation_problem(refused, field=field, error_type="string_too_long")
 
 
 class TestPostSlug:
@@ -1090,6 +1549,94 @@ class TestPostSlug:
         assert updated["slug"] == original_slug
         # And the original address still resolves, which is the consequence that actually matters.
         assert (await _read_detail(client, original_slug))["id"] == str(post.id)
+
+    async def test_a_lost_slug_race_is_retried_rather_than_reported(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        auth_headers_for: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A concurrent create of the same title receives the next suffix, not a 409.
+
+        The route publishes collision suffixing as a **promise** - ``python``, ``python-2``,
+        ``python-3`` - so the loser of the narrow window between reading the taken slug family and
+        inserting is a perfectly valid request and must not be refused. It used to be: the service
+        read the family, picked a suffix, lost the row to a concurrent writer and reported the
+        unique violation as a conflict.
+
+        The race is reproduced deterministically rather than by running two requests at once, and
+        the substitution is the minimum that makes it happen: ``slugs_starting_with`` is made to
+        answer *once* as though the family were empty, which is exactly what a reader sees when the
+        competing row is committed after its snapshot. The real unique index then refuses the
+        insert, and the retry - which calls the unpatched method - sees the row that won. So the
+        assertion exercises the genuine constraint and the genuine retry, with only the visibility
+        of one read altered.
+        """
+        headers = auth_headers_for(author_user)
+        first = await _create_draft(client, headers, title="Slug Race Title")
+        assert first["slug"] == "slug-race-title"
+
+        original = PostRepository.slugs_starting_with
+        calls = {"count": 0}
+
+        async def stale_family(self: PostRepository, prefix: str) -> set[str]:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                # The snapshot a losing writer had: nothing in the family yet.
+                return set()
+            return await original(self, prefix)
+
+        monkeypatch.setattr(PostRepository, "slugs_starting_with", stale_family)
+
+        second = await _create_draft(client, headers, title="Slug Race Title")
+
+        assert calls["count"] >= 2, (
+            "the first attempt did not lose the race, so nothing was retried"
+        )
+        assert second["slug"] == "slug-race-title-2"
+        assert second["id"] != first["id"]
+
+    async def test_sustained_slug_contention_is_reported_as_a_conflict(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        auth_headers_for: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When every attempt loses, the answer is the documented 409 rather than a loop.
+
+        The other half of the bound. Retrying is what keeps the suffixing promise, and a bound is
+        what keeps the method total: a request that loses on every attempt is contending with a
+        volume of identical titles that is no longer an allocation race, and it is told so. Held to
+        the same standard as the success path - the family read is made to answer as though empty
+        *every* time, which is contention that never resolves.
+        """
+        headers = auth_headers_for(author_user)
+        await _create_draft(client, headers, title="Permanently Contended Title")
+
+        async def always_stale(self: PostRepository, prefix: str) -> set[str]:
+            return set()
+
+        monkeypatch.setattr(PostRepository, "slugs_starting_with", always_stale)
+
+        response = await client.post(
+            POSTS_URL,
+            json={
+                "title": "Permanently Contended Title",
+                "content": "Body enough to satisfy the schema.",
+            },
+            headers=headers,
+        )
+
+        _assert_problem_document(
+            response,
+            status=409,
+            error_type=ERROR_TYPE_CONFLICT,
+            title=ERROR_TITLE_CONFLICT,
+        )
 
 
 # =======================================================================================
@@ -1812,12 +2359,19 @@ NON_PUBLIC_STATUS_IDS: Final[list[str]] = [status.value.lower() for status in NO
 """Case identifiers for the confidentiality sweep, so a failure names the state that leaked."""
 
 SCOPE_WIDENING_ATTEMPTS: Final[tuple[dict[str, str], ...]] = (
-    {"status": PostStatus.DRAFT.value},
     {"statuses": PostStatus.DRAFT.value},
     {"include_drafts": "true"},
-    {"status": PostStatus.ARCHIVED.value},
+    {"visibility": "all"},
+    {"mine": "false", "statuses": PostStatus.ARCHIVED.value},
 )
-"""Query strings a client might try in order to widen the feed's lifecycle scope."""
+"""Query strings a client might try in order to widen the public feed's lifecycle scope.
+
+Every one is either undeclared - and therefore ignored by the framework - or declared and
+answered with the public scope anyway. ``status`` is deliberately **not** in this tuple: it is a
+declared parameter of the workspace mode and the public feed refuses it outright with ``422``, so
+its behaviour is pinned by
+:meth:`TestAuthorWorkspace.test_status_is_refused_on_the_public_feed` rather than swept here.
+"""
 
 
 class TestDraftConfidentiality:
@@ -1937,10 +2491,10 @@ class TestDraftConfidentiality:
     ) -> None:
         """The scope is decided in the service from the credential, never from the query string.
 
-        The feed declares ``q``, ``category``, ``author`` and ``sort`` and nothing else, so an
-        unrecognised parameter is simply ignored rather than honoured. The assertion is that it is
-        ignored *and* that the request still succeeds - a 500 on an unexpected parameter would be
-        its own defect.
+        The public feed's scope is a constant, so no query string can widen it. An unrecognised
+        parameter is ignored rather than honoured, and the assertion is that it is ignored *and*
+        that the request still succeeds - a 500 on an unexpected parameter would be its own
+        defect.
         """
         draft = await factories.create_post(db_session, author=author_user)
         archived = await factories.create_post(
@@ -1949,7 +2503,13 @@ class TestDraftConfidentiality:
             status=PostStatus.ARCHIVED,
         )
 
-        listed = await _collect_feed_ids(client, **attempt)
+        # Widened to `Any` at the point of unpacking, and only here. `_collect_feed_ids` also
+        # declares a keyword-only `headers: dict[str, str] | None`, so unpacking a
+        # `dict[str, str]` into it is a type error even though no attempt below names `headers`:
+        # mypy has to assume the mapping could. The local restates the intent - these are opaque
+        # query parameters - without loosening the parametrised cases, which stay `str`-valued.
+        filters: dict[str, Any] = dict(attempt)
+        listed = await _collect_feed_ids(client, **filters)
 
         assert str(draft.id) not in listed
         assert str(archived.id) not in listed
@@ -2015,28 +2575,106 @@ class TestDraftConfidentiality:
         assert body["content"] == hidden.content
 
     @pytest.mark.parametrize("status", NON_PUBLIC_STATUSES, ids=NON_PUBLIC_STATUS_IDS)
-    async def test_an_administrator_sees_unpublished_posts_in_the_feed(
+    @pytest.mark.parametrize("viewer", ["administrator", "author", "reader"])
+    async def test_the_public_feed_hides_unpublished_posts_from_every_caller(
         self,
         client: AsyncClient,
         db_session: AsyncSession,
         author_user: User,
         admin_user: User,
+        reader_user: User,
+        auth_headers_for: Any,
+        viewer: str,
+        status: PostStatus,
+    ) -> None:
+        """AAP §0.9.4.4 applied to the caller with the most authority, and to the owner.
+
+        The scope of the public feed is a **constant**, not a function of the credential, and this
+        is the test that says so for the two principals a role-aware filter would have widened for:
+        an administrator, who may read any unpublished post through
+        ``GET /api/v1/posts/{slug}``, and the post's own author, who may read it there too. Both
+        still see the public feed here, because a listing whose membership depended on who asked
+        would give one URL two different ``total`` values and two different page boundaries, and
+        would put a draft in a category-filtered result. The workspace mode below is where an
+        author's own unpublished work is read.
+        """
+        hidden = await factories.create_post(db_session, author=author_user, status=status)
+        principal = {
+            "administrator": admin_user,
+            "author": author_user,
+            "reader": reader_user,
+        }[viewer]
+
+        listed = await _collect_feed_ids(client, headers=auth_headers_for(principal))
+
+        assert str(hidden.id) not in listed
+
+    @pytest.mark.parametrize("status", NON_PUBLIC_STATUSES, ids=NON_PUBLIC_STATUS_IDS)
+    async def test_the_author_filter_never_widens_the_public_feed(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
         auth_headers_for: Any,
         status: PostStatus,
     ) -> None:
-        """The complement of every negative above: the scope is role-aware, not a blanket filter.
+        """``?author=<my own username>`` is still the public feed, so it is still published-only.
 
-        Without this, a feed hard-wired to published posts would satisfy the whole confidentiality
-        sweep while making the administrative surface impossible to build.
+        This was the widening the review found: an author naming themselves in a *public* filter
+        used to be handed their own drafts, which made ``total`` caller-dependent and let a
+        category-filtered public result carry unpublished rows. Reading one's own unpublished work
+        is now an explicit request - ``mine=true`` - rather than an inference from the credential.
         """
-        hidden = await factories.create_post(db_session, author=author_user, status=status)
+        own = await factories.create_post(db_session, author=author_user, status=status)
 
-        listed = await _collect_feed_ids(client, headers=auth_headers_for(admin_user))
+        listed = await _collect_feed_ids(
+            client,
+            headers=auth_headers_for(author_user),
+            author=author_user.username,
+        )
 
-        assert str(hidden.id) in listed
+        assert str(own.id) not in listed
+
+
+# =======================================================================================
+# The private author workspace - GET /api/v1/posts?mine=true
+#
+# The other half of the confidentiality rule above. Because the public feed is published-only for
+# EVERY caller, an author needs an explicit way to read their own unpublished work, and this is it:
+# the same operation, switched into a private mode by a parameter the caller sends, scoped to the
+# principal rather than to whatever `?author=` says, and admitting every lifecycle state.
+#
+# The three refusals below are the load-bearing part. `mine=true` with no credential is a 401 and
+# not a silent fallback to the public feed, because a dashboard answered with somebody else's
+# published posts looks to its owner like their drafts were deleted. `mine=true&author=someone` is a
+# 422 and not "ignore the author", because a request that names another account is asking a question
+# this mode must never answer. And `status=` without `mine=true` is a 422 rather than an ignored
+# parameter, because a client that believed it had filtered would read a published-only page as the
+# whole truth.
+# =======================================================================================
+
+
+class TestAuthorWorkspace:
+    """``?mine=true``: whose posts, which states, and what the three refusals are."""
 
     @pytest.mark.parametrize("status", NON_PUBLIC_STATUSES, ids=NON_PUBLIC_STATUS_IDS)
-    async def test_an_author_sees_their_own_unpublished_posts_when_filtering_by_themselves(
+    async def test_an_author_reads_their_own_unpublished_posts(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        auth_headers_for: Any,
+        status: PostStatus,
+    ) -> None:
+        """Every state of the caller's own work is in scope, which is what the dashboard lists."""
+        own = await factories.create_post(db_session, author=author_user, status=status)
+
+        listed = await _collect_feed_ids(client, headers=auth_headers_for(author_user), mine="true")
+
+        assert str(own.id) in listed
+
+    @pytest.mark.parametrize("status", NON_PUBLIC_STATUSES, ids=NON_PUBLIC_STATUS_IDS)
+    async def test_the_workspace_never_carries_another_authors_post(
         self,
         client: AsyncClient,
         db_session: AsyncSession,
@@ -2045,30 +2683,103 @@ class TestDraftConfidentiality:
         auth_headers_for: Any,
         status: PostStatus,
     ) -> None:
-        """An author may see every state of their own work - and only of their own.
+        """The scope is the principal, so nobody else's work can appear - published or not.
 
-        This is the boundary the negatives are drawn around, and it is what makes the author
-        workspace possible: the same feed route, called with the author's own username, is how a
-        dashboard lists drafts. The second assertion pins the other side of the boundary, so a
-        predicate that widened the scope for any authenticated caller would fail here.
+        The other side of the boundary the previous test opens. A mode that widened for *any*
+        authenticated caller, rather than to that caller's own rows, would fail here.
         """
-        own = await factories.create_post(db_session, author=author_user, status=status)
-        someone_elses = await factories.create_post(
-            db_session,
-            author=other_author_user,
-            status=status,
+        mine = await factories.create_post(db_session, author=author_user, status=status)
+        theirs = await factories.create_post(db_session, author=other_author_user, status=status)
+        published_by_other = await factories.create_published_post(
+            db_session, author=other_author_user
         )
+
+        listed = await _collect_feed_ids(client, headers=auth_headers_for(author_user), mine="true")
+
+        assert str(mine.id) in listed
+        assert str(theirs.id) not in listed
+        assert str(published_by_other.id) not in listed
+
+    async def test_status_narrows_the_workspace_to_one_lifecycle_state(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        auth_headers_for: Any,
+    ) -> None:
+        """``status=DRAFT`` returns the drafts and nothing else - how the workspace groups."""
+        draft = await factories.create_post(db_session, author=author_user)
+        archived = await factories.create_post(
+            db_session, author=author_user, status=PostStatus.ARCHIVED
+        )
+        published = await factories.create_published_post(db_session, author=author_user)
         headers = auth_headers_for(author_user)
 
-        mine = await _collect_feed_ids(client, headers=headers, author=author_user.username)
-        theirs = await _collect_feed_ids(
-            client,
-            headers=headers,
-            author=other_author_user.username,
+        drafts = await _collect_feed_ids(
+            client, headers=headers, mine="true", status=PostStatus.DRAFT.value
         )
 
-        assert str(own.id) in mine
-        assert str(someone_elses.id) not in theirs
+        assert str(draft.id) in drafts
+        assert str(archived.id) not in drafts
+        assert str(published.id) not in drafts
+
+    async def test_the_workspace_has_no_anonymous_form(self, client: AsyncClient) -> None:
+        """``mine=true`` with no credential is 401, never a quiet fall back to the public feed."""
+        response = await client.get(POSTS_URL, params={"mine": "true"})
+
+        _assert_problem_document(
+            response,
+            status=401,
+            error_type=ERROR_TYPE_UNAUTHORIZED,
+            title=ERROR_TITLE_UNAUTHORIZED,
+        )
+
+    async def test_author_cannot_be_combined_with_the_workspace_mode(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        other_author_user: User,
+        auth_headers_for: Any,
+    ) -> None:
+        """Naming another account alongside ``mine=true`` is refused, not silently ignored."""
+        response = await client.get(
+            POSTS_URL,
+            params={"mine": "true", "author": other_author_user.username},
+            headers=auth_headers_for(author_user),
+        )
+
+        problem = _assert_problem_document(
+            response,
+            status=422,
+            error_type=ERROR_TYPE_VALIDATION,
+            title=ERROR_TITLE_VALIDATION,
+        )
+        assert [item["field"] for item in problem["errors"]] == ["author"]
+
+    async def test_status_is_refused_on_the_public_feed(
+        self,
+        client: AsyncClient,
+        author_user: User,
+        auth_headers_for: Any,
+    ) -> None:
+        """``status=`` outside the workspace mode is a 422, so a client cannot believe it filtered.
+
+        The one query parameter a client might plausibly expect to widen the public feed, refused
+        by name. :data:`SCOPE_WIDENING_ATTEMPTS` covers the undeclared spellings, which the
+        framework ignores; this covers the declared one, which is answered rather than dropped.
+        """
+        for headers in (None, auth_headers_for(author_user)):
+            response = await client.get(
+                POSTS_URL, params={"status": PostStatus.DRAFT.value}, headers=headers
+            )
+
+            problem = _assert_problem_document(
+                response,
+                status=422,
+                error_type=ERROR_TYPE_VALIDATION,
+                title=ERROR_TITLE_VALIDATION,
+            )
+            assert [item["field"] for item in problem["errors"]] == ["status"]
 
 
 # =======================================================================================

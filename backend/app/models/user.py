@@ -375,7 +375,8 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             #
             # The name is spelled out rather than left to the `ix_%(column_0_label)s` convention,
             # which would derive `ix_users_created_at` - a name describing only the first of two
-            # columns. Built by revision 0004.
+            # columns. Built by revision 0001, where every B-tree index in this schema
+            # lives.
             "ix_users_created_at_id",
             text("created_at DESC"),
             text("id DESC"),

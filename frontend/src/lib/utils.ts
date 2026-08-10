@@ -1,7 +1,9 @@
 // Shared, dependency-free utilities for the presentation tier.
 //
-// Three concerns live here, and all three are here for the same reason: more than one layer of the
+// Five concerns live here, and all five are here for the same reason: more than one layer of the
 // frontend needs them, and each must have exactly ONE definition or the layers silently disagree.
+// AAP §0.4.5.3 names four modules under `src/lib/` - `types`, `utils`, `seo`, `format` - so this is
+// the only home a cross-cutting helper has, and the sections below are the concerns that earned one.
 //
 // 1. CLASS-NAME COMPOSITION — `cn()`. Every primitive under `src/components/ui/` routes its
 //    variant classes and its caller-supplied `className` through it: the nine authored over raw
@@ -20,20 +22,66 @@
 //    therefore read this module's policy, and `next.config.ts` derives its `remotePatterns` from
 //    it, so there is one list and not two.
 //
-// 3. HOW LONG A STRING IS - `codePointLength()`. Every length bound this tier enforces mirrors one
-//    the service enforces, and the two count in different units unless something makes them agree:
-//    JavaScript's `String.prototype.length` counts UTF-16 code units, Python's `len` counts code
-//    points, so one emoji is 2 to the browser and 1 to the API. All four modules under
-//    `src/lib/validation/` measure through this function for that reason, and none of them may
-//    reach for `.length` or for zod's own `.min`/`.max` on a bound the service also declares.
-//    Four copies of a one-line function would be four chances for one of them to drift.
+// 3. HOW LONG A STRING IS, AND WHERE TO CUT IT - `codePointLength()` and `sliceByCodePoints()`.
+//    Every length bound this tier enforces mirrors one the service enforces, and the two count in
+//    different units unless something makes them agree: JavaScript's `String.prototype.length`
+//    counts UTF-16 code units, Python's `len` counts code points, so one emoji is 2 to the browser
+//    and 1 to the API. All four modules under `src/lib/validation/` measure through
+//    `codePointLength` for that reason, and none of them may reach for `.length` or for zod's own
+//    `.min`/`.max` on a bound the service also declares. Four copies of a one-line function would
+//    be four chances for one of them to drift.
 //
-// The module carries no `'use client'` directive, so Server and Client Components can both call
-// into it. Its only package imports are `clsx` and `tailwind-merge`, and it READS NO ENVIRONMENT
-// VARIABLE: the host policy below is source code, for the reasons set out above its declaration.
+//    The same arithmetic governs truncation, which is why the cut belongs beside the count. Cutting
+//    at a UTF-16 index can land BETWEEN the two halves of a surrogate pair, and the result is a
+//    string ending in an unpaired surrogate: not valid UTF-8 when serialised, rendered as a
+//    replacement character, and published in a meta description or a social card that a reader and
+//    a crawler both see. `@/lib/seo` is the one caller that cuts, and it cuts through
+//    `sliceByCodePoints` so that cannot happen. The two API wrappers that guard a search term -
+//    `@/lib/api/posts` and `@/lib/api/admin` - only measure, so they call `codePointLength` alone.
+//
+// 4. ONE PATH SEGMENT AT A TIME - `encodePathSegment()`. Every wrapper under `@/lib/api` and every
+//    canonical-URL builder in `@/lib/seo` interpolates a caller-supplied identifier - a UUID, a
+//    slug, a handle - into a request path or a public URL. `@/lib/api/client` interpolates the
+//    composed path verbatim, and it is right to: encoding a whole path would destroy its
+//    separators. Encoding each SEGMENT is therefore the composing module's job, and each composer
+//    used to do it slightly differently. Five percent-encoded and stopped there, which contains a
+//    stray `/`, `?` or `#` but leaves `.` and `..` intact - and those two are not characters to
+//    escape, they are instructions the URL grammar itself acts on. `encodeURIComponent('..')`
+//    returns `'..'`, so a path built as `/posts/../users/me` addresses a different endpoint than
+//    the one the call site names, on a route the caller may hold a credential for; the request
+//    succeeds, nothing reports an error, and the call site's own text still reads as though it
+//    addressed a post. One rule, seven call sites.
+//
+// 5. PAGE ARITHMETIC - `toPageNumber()`, `derivePagination()` and `formatResultRange()`. Three
+//    surfaces window results - the home feed, an author's profile, and all four administrative
+//    tables - and AAP §0.1.3 lists "a uniform pagination contract" as a prerequisite precisely so
+//    they cannot disagree. `@/hooks/use-pagination` was that single implementation and very nearly
+//    worked: being a hook, it is reachable only from a client component, so
+//    `components/blog/post-list.tsx` - a Server Component, deliberately, because the feed's rows
+//    must be in the initial HTML for the SEO requirement - could not call it and grew its own
+//    private range calculation, while `components/admin/data-table.tsx` grew a second copy of the
+//    range sentence. Two copies of one rule is how "Showing 37-47 of 47 results" and
+//    "Showing 37-48 of 47 results" end up on two pages of the same product.
+//
+// THE DIRECTIVE IS THE CONSTRAINT THAT TIES ALL FIVE TOGETHER. This module carries no
+// `'use client'`, and that is load-bearing rather than tidy. Concern 5 in particular is called
+// DURING SERVER RENDER by `components/blog/post-list.tsx`; a directive here would turn every export
+// below into a client-reference proxy, and calling one of those from a Server Component fails at
+// run time rather than at build time. Concern 4 is called by the API wrappers, which both tiers of
+// component reach. So nothing here may ever import React, `next/navigation`, or anything that
+// carries the directive transitively, and nothing here may become a hook. These functions take
+// numbers and strings and return numbers and strings.
+//
+// Its only VALUE imports are `clsx` and `tailwind-merge`, both of which concern 1 alone uses;
+// `Page` is a TYPE-only import from `@/lib/types`, erased at compile time, so the page arithmetic
+// adds no runtime edge to the module graph and no cycle (`types.ts` imports only `zod`). The module
+// READS NO ENVIRONMENT VARIABLE: the host policy below is source code, for the reasons set out
+// above its declaration.
 
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+
+import type { Page } from '@/lib/types';
 
 /**
  * Composes Tailwind class names, then resolves conflicts between them deterministically.
@@ -306,7 +354,19 @@ export function allowedImageUrl(
 }
 
 /* -------------------------------------------------------------------------------------------------
- * String length, counted the way the service counts
+ * String length, counted the way the service counts - and truncation on the same unit
+ *
+ * The two belong together because they are the same arithmetic used twice: a count that disagrees
+ * with the service rejects text it would have accepted, and a cut taken on the wrong unit publishes
+ * a broken character. Both functions count and cut CODE POINTS, because that is the unit every
+ * `StringConstraints` bound in `backend/app/schemas/` is expressed in, and matching the service is
+ * the entire point.
+ *
+ * A code point is not always a user-perceived character: a flag, a skin-toned emoji or a combining
+ * sequence spans several, and {@link sliceByCodePoints} may divide one such cluster. What it will
+ * never do is leave an unpaired surrogate. Grapheme segmentation (`Intl.Segmenter`) is deliberately
+ * not used - it would introduce a THIRD notion of length, disagreeing with the service, and having
+ * exactly one unit is the whole reason these two are declared here rather than at each call site.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -347,4 +407,586 @@ export function allowedImageUrl(
  */
 export function codePointLength(value: string): number {
   return [...value].length;
+}
+
+/**
+ * The first `limit` code points of a string, never splitting a surrogate pair.
+ *
+ * Iterating by code point and accumulating each one's UTF-16 width gives a cut index that is always
+ * on a code-point boundary, so the returned string is always well-formed. Text already within the
+ * limit is returned unchanged, and the function performs no whitespace handling and appends nothing
+ * - a caller that wants an ellipsis or a word boundary layers that on top, which is what
+ * `@/lib/seo` does.
+ *
+ * @param value - The text to shorten.
+ * @param limit - The maximum number of code points to keep. Zero or negative yields `''`.
+ * @returns A prefix of `value` at most `limit` code points long.
+ */
+export function sliceByCodePoints(value: string, limit: number): string {
+  if (limit <= 0) {
+    return '';
+  }
+
+  let kept = 0;
+  let index = 0;
+
+  for (const codePoint of value) {
+    if (kept >= limit) {
+      break;
+    }
+
+    // `codePoint.length` is 2 for an astral character and 1 otherwise, so the running index only
+    // ever lands on a boundary between whole code points.
+    index += codePoint.length;
+    kept += 1;
+  }
+
+  return index >= value.length ? value : value.slice(0, index);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * One path segment at a time
+ *
+ * What this section is NOT, stated plainly because each line is a rule someone will otherwise be
+ * tempted to add:
+ *
+ *   - Not a format check. Whether an identifier names a real record, and whether it is a well-formed
+ *     UUID or a legal slug, is decided by the service and reported as `404` or `422`. A second copy
+ *     of that rule here would be the copy that has to be found when identity changes.
+ *   - Not a normaliser. Case is never folded: the service's `citext` columns resolve `Alice` and
+ *     `alice` through their own unique index, and folding here would duplicate a guarantee it could
+ *     then drift from. Whitespace is trimmed only where a caller asks for it - see
+ *     {@link SegmentWhitespacePolicy}.
+ *   - Not transport. No request is issued, no status is interpreted, no error is mapped.
+ *
+ * This rule was authored as a module of its own precisely so the transport wrappers would not have
+ * to import anything, and that independence is preserved in substance rather than in file layout:
+ * the three exports below reach nothing outside this file, and `clsx` and `tailwind-merge` are
+ * referenced by `cn()` alone. What changed is only which module the seven call sites name. The cost
+ * of naming this one is bounded rather than assumed: `tailwind-merge` publishes `sideEffects: false`
+ * so a bundle that never calls `cn()` can drop it, and `clsx` is a few hundred bytes. Any module
+ * that renders a UI primitive already has this file in its graph regardless, because every one of
+ * the fifteen primitives routes its classes through `cn()`.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The two relative-path instructions of RFC 3986 §3.3, which percent-encoding does not touch.
+ *
+ * Matched against the trimmed value so ` .. ` is refused too: surrounding whitespace is discarded
+ * by neither the URL grammar nor a server's path normaliser, and a segment that is a dot segment
+ * once its padding is ignored is a dot segment.
+ */
+const DOT_SEGMENT_PATTERN = /^\.{1,2}$/;
+
+/**
+ * Whether the value a caller hands in is sent as given or with its padding removed.
+ *
+ * `'verbatim'` is the default because it never repairs a caller's value: a handle or slug carrying
+ * stray whitespace reaches the service intact and is answered with an honest `404`, rather than
+ * being quietly turned into a different, existing record. `'trim'` exists for the one place where
+ * the value is not a lookup key but published output - a canonical URL must not carry `%20`
+ * padding, because that URL is what a crawler records as the address of the page.
+ */
+export type SegmentWhitespacePolicy = 'verbatim' | 'trim';
+
+/**
+ * What the thrown message needs in order to name the mistake precisely.
+ *
+ * A rejection that says which argument of which call was wrong is the difference between a one-line
+ * fix and a search, which matters here because the values reaching this boundary come from route
+ * parameters and search parameters - both typed `string` and both legitimately `undefined` in fact.
+ */
+export interface PathSegmentContext {
+  /** The calling export, e.g. `'likePost'`. Named first in the message. */
+  readonly operation: string;
+  /** The offending parameter, e.g. `'postId'`. */
+  readonly parameterName: string;
+  /**
+   * One sentence telling the caller where a correct value comes from, appended verbatim. Omit it
+   * only when no such sentence can be written.
+   */
+  readonly hint?: string;
+  /** Whitespace handling; defaults to `'verbatim'`. */
+  readonly whitespace?: SegmentWhitespacePolicy;
+}
+
+/**
+ * Compose the message once, so all seven call sites report an unusable segment identically.
+ */
+function segmentMessage(context: PathSegmentContext, value: unknown, problem: string): string {
+  const hint = context.hint === undefined ? '' : ` ${context.hint}`;
+
+  return (
+    `${context.operation}: ${context.parameterName} ${problem}, received ` +
+    `${JSON.stringify(value)}. A request path cannot be composed from it.${hint}`
+  );
+}
+
+/**
+ * Percent-encode one path segment, refusing the values that would address something else.
+ *
+ * Three outcomes, and only the first is a value:
+ *
+ * 1. A usable value is returned percent-encoded. For a canonical UUID that is a no-op, and for a
+ *    slug or a handle very nearly one, since both are URL-safe by construction. It is applied
+ *    regardless, so a value that is not what it claims to be - a raw title passed where a slug was
+ *    expected - stays inside its own segment and produces an honest `404` instead of restructuring
+ *    the request.
+ * 2. An absent, empty or whitespace-only value throws. It would compose `/posts//like` or
+ *    `/comments/`, which addresses a collection rather than a member: the answer is a different
+ *    shape entirely, and reading a member off it yields `undefined` rather than an error.
+ * 3. A dot segment throws. This is the case percent-encoding cannot cover, because `.` and `..`
+ *    are already URL-safe: they are resolved by the URL grammar before the server ever sees a
+ *    path, so they silently retarget the request at a sibling route.
+ *
+ * @param value - The candidate segment, as the caller supplied it. Typed `string` but validated at
+ * run time, because these values arrive from URLs where the type is an assertion rather than a fact.
+ * @param context - How to name the mistake, and whether to trim. See {@link PathSegmentContext}.
+ * @returns The percent-encoded segment, ready to interpolate between two slashes.
+ * @throws {TypeError} When the value is not a usable string, is blank, or is `.` or `..`. Callers
+ * whose exports are `async` surface this as a rejected promise, which is why those exports are
+ * declared `async` even when their body is a single expression - one error channel, not two.
+ */
+export function encodePathSegment(value: string, context: PathSegmentContext): string {
+  if (typeof value !== 'string') {
+    throw new TypeError(segmentMessage(context, value, 'must be a string'));
+  }
+
+  const trimmed = value.trim();
+
+  if (trimmed === '') {
+    throw new TypeError(segmentMessage(context, value, 'must be a non-blank identifier'));
+  }
+
+  if (DOT_SEGMENT_PATTERN.test(trimmed)) {
+    throw new TypeError(
+      segmentMessage(
+        context,
+        value,
+        'must not be a relative-path segment ("." or ".."), which the URL grammar resolves ' +
+          'against the surrounding path instead of treating as a name',
+      ),
+    );
+  }
+
+  return encodeURIComponent(context.whitespace === 'trim' ? trimmed : value);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Page arithmetic
+ *
+ * Pure, URL-free, and reachable from either kind of component - which is the property the whole
+ * section exists for:
+ *
+ *   - `@/hooks/use-pagination` derives from these and adds the concerns that genuinely need a client
+ *     boundary: reading the current query, building each page's href, and imperative navigation.
+ *   - A Server Component calls {@link derivePagination} and {@link formatResultRange} directly,
+ *     during server render, so the feed's rows and its range label are in the initial HTML.
+ *
+ * What this section will never contain: a hook, a React import, a `next/navigation` import, a fetch,
+ * a class name. It takes numbers and returns numbers.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The first page of any collection, 1-based. Named so the arithmetic reads as intent. */
+export const FIRST_PAGE = 1;
+
+/**
+ * How many pages are rendered either side of the current one in the bounded window.
+ *
+ * Exported because `@/components/ui/pagination` reasons about the window's width when it narrows the
+ * control on a small viewport, and restating the number there would let the two drift.
+ */
+export const PAGE_WINDOW_SIBLING_COUNT = 1;
+
+/**
+ * Matches a bare run of ASCII digits, and nothing else.
+ *
+ * A `page` read from a URL is untrusted input, so it is tested against this before `Number` is allowed
+ * near it. `Number` is far more permissive than a page number ought to be - it accepts `'0x2'` as 2,
+ * `'1e3'` as 1000, `'+2'`, `'2.0'` and `''` (as `0`) - and none of those is a form any link in this
+ * application produces. Surrounding whitespace is trimmed before the test rather than rejected by it,
+ * so a hand-typed `?page=%202` still resolves to page 2: trimming cannot admit an invalid value,
+ * because the pattern still has to match afterwards.
+ */
+const DIGITS_ONLY = /^\d+$/;
+
+/**
+ * An en dash for a numeric range, written as an escape rather than as a literal.
+ *
+ * The escape is deliberate: an en dash and a hyphen-minus are visually near-identical in a diff, a
+ * code review and most terminals, so spelling it `\u2013` is what makes it unmistakable that the
+ * range separator is the typographic dash the copy calls for and not a minus sign someone typed.
+ */
+const EN_DASH = '\u2013';
+
+/* -------------------------------------------------------------------------------------------------
+ * Untrusted-input guards
+ *
+ * Every number reaching this section is untrusted, and from two different directions: an envelope
+ * field is typed `number` but a fixture or a partially-populated first render can carry `0`, a
+ * negative, a fraction, `NaN` or an infinity; and a page read from a URL is a caller-typed string.
+ * AAP §0.9.4.4 requires an out-of-range page to answer an empty window rather than an error, so every
+ * guard here clamps or falls back and none throws.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Coerce a reported count into a non-negative integer that is safe to do arithmetic with.
+ *
+ * Applied to `total`, `page_size` and `pages` on the way in. Nothing this returns can be `NaN`,
+ * `Infinity`, negative, fractional, or negative zero: `Math.max(0, ...)` resolves `-0` to `+0`, which
+ * matters because `-0` stringifies as `"0"` but is not `0` under `Object.is` and would leak a phantom
+ * difference into a memo comparison upstream.
+ *
+ * The upper bound is not decoration either. JavaScript switches to exponent notation when stringifying
+ * at `1e21` and above, so a page count that large would put a literal `page=1e+21` into an href - a
+ * parameter the service answers with `422`. Capping at the largest exactly representable integer keeps
+ * every number derived here a plain run of digits.
+ */
+function toCount(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Math.min(Math.max(0, Math.trunc(value)), Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * Whether a number is a page position worth working with.
+ *
+ * `Number.isInteger` is the finite-and-integer test in one call: it is `false` for `NaN` and for both
+ * infinities, so no comparison is ever performed against a value whose comparisons are all false. The
+ * upper bound matters for the same reason as in {@link toCount}: a 21-digit path segment parses to a
+ * finite, integral `1e21` that would sail past a naive `> 0` check and then poison every offset
+ * derived from it.
+ */
+function isUsablePageNumber(value: number): boolean {
+  return Number.isInteger(value) && value >= FIRST_PAGE && value <= Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Read a page number from a value that may be a number, a URL string, or neither.
+ *
+ * `Number('abc')` is `NaN` and every `NaN` comparison is false, so the check is explicit rather than
+ * relational. A string is required to be digits only, which rejects `'1.5'`, `'1e3'`, `'-5'` and
+ * `' 1 '`-with-padding-plus-junk in one rule.
+ *
+ * @param value - A candidate page: an envelope field, a search parameter, or `null`/`undefined`.
+ * @returns The page, or `null` when the value cannot name one.
+ */
+export function toPageNumber(value: number | string | null | undefined): number | null {
+  if (typeof value === 'number') {
+    return isUsablePageNumber(value) ? value : null;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!DIGITS_ONLY.test(trimmed)) {
+    return null;
+  }
+
+  const parsed = Number(trimmed);
+
+  return isUsablePageNumber(parsed) ? parsed : null;
+}
+
+/**
+ * Resolve how many pages the collection actually occupies.
+ *
+ * The service's own `pages` is preferred over recomputing it, deliberately:
+ * `backend/app/core/pagination.py` owns that arithmetic, and a client that re-derived it could round
+ * differently and offer a page the service will not serve. A reported `0` is *accepted* rather than
+ * repaired when the collection is genuinely empty, because that is the documented answer for
+ * `total: 0`.
+ *
+ * The recomputation is a repair path for two situations the service cannot produce but a caller can: a
+ * `pages` that did not survive as a usable number, and a `pages` of `0` alongside a non-zero `total`.
+ * It sits behind the `windowSize > 0` guard, which is the only reason no division by zero is
+ * reachable in this section.
+ */
+function resolvePageCount(reportedPages: number, total: number, windowSize: number): number {
+  const reported = toCount(reportedPages);
+  if (reported > 0) {
+    return reported;
+  }
+
+  if (total === 0 || windowSize <= 0) {
+    return 0;
+  }
+
+  return Math.ceil(total / windowSize);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Input and output shapes
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The facts about a result window that the arithmetic needs.
+ *
+ * Deliberately **derived from {@link Page}** with `Pick` rather than restated. The five wire names are
+ * snake_case because there is no camelCase mapping layer anywhere in this tier, and a hand-typed copy
+ * of `page_size` could be misspelled as `pageSize` in a way that compiles perfectly and reads
+ * `undefined` at run time. Deriving the type makes that impossible: if the envelope's contract ever
+ * moves, this stops compiling instead of quietly returning the wrong numbers.
+ *
+ * Every `Page<T>` is accepted with no cast - `Page<PostSummary>` from the feed, `Page<AdminUser>` and
+ * `Page<AdminComment>` from the administrative tables, `Page<CommentPublic>` from a post's thread - and
+ * so is a bare object of just the four numeric fields, which is what makes the arithmetic exercisable
+ * without inventing rows to go with it.
+ *
+ * `items` is read for its **length only**, never for its contents, and only as a cross-check on
+ * emptiness. Typing it as `readonly unknown[]` rather than generically keeps this free of a type
+ * parameter it would otherwise have to thread through purely to ignore.
+ */
+export type PaginationSource = Pick<Page<unknown>, 'total' | 'page' | 'page_size' | 'pages'> & {
+  readonly items?: readonly unknown[];
+};
+
+/** One page in the rendered window: a real destination, without the href a client adds. */
+export interface PageWindowPageSlot {
+  /** Discriminant. Switch on this rather than probing for the presence of a field. */
+  readonly kind: 'page';
+  /** The 1-based page this slot navigates to. Also the label a control should render. */
+  readonly page: number;
+  /** Whether this is the page currently on screen - render `aria-current="page"` when it is. */
+  readonly isCurrent: boolean;
+}
+
+/**
+ * A collapsed run of pages that the window omits.
+ *
+ * A typed sentinel rather than a magic string: a consumer switches on `kind` and never parses a label.
+ * `side` distinguishes the two possible gaps - the run between the first page and the window
+ * (`'start'`) and the run between the window and the last page (`'end'`) - which gives each slot a
+ * stable, unique React key without anything having to mint one. A gap conveys no destination, so a
+ * control renders it as inert, decorative text hidden from assistive technology.
+ */
+export interface PageWindowGapSlot {
+  /** Discriminant. Switch on this rather than probing for the presence of a field. */
+  readonly kind: 'gap';
+  /** Which side of the current page the omitted run falls on. */
+  readonly side: 'start' | 'end';
+}
+
+/** One entry in the bounded page window: a page, or a gap standing in for a run of omitted pages. */
+export type PageWindowSlot = PageWindowPageSlot | PageWindowGapSlot;
+
+/**
+ * Everything derivable about a result window from the window alone - no URL, no navigation.
+ *
+ * `@/hooks/use-pagination` returns this plus the href and navigation members; a Server Component uses
+ * it directly.
+ */
+export interface PaginationDerivation {
+  /**
+   * The page currently on screen, 1-based and always within `1 .. pages`.
+   *
+   * Taken from the envelope in preference to any other source, because the envelope is the page the
+   * rows on screen actually belong to: mid-transition a URL may already name the next page while the
+   * previous page's rows are still rendered, and describing the rows the reader can see is the honest
+   * answer. A page beyond the end is clamped rather than rejected.
+   */
+  readonly page: number;
+  /**
+   * How many pages a control should offer, floored at `1`.
+   *
+   * The service reports `pages: 0` for an empty collection; this reads `1` there instead, so no
+   * consumer has to reason about a zero-length page range. Guard on `isEmpty` (or on `pages <= 1`) to
+   * render nothing - do not treat a `0` here as the empty signal, because it never appears.
+   */
+  readonly pages: number;
+  /** The true page count, which IS `0` for an empty collection. Rarely needed; `pages` usually is. */
+  readonly pageCount: number;
+  /** Total matching rows, ignoring the window - the "of N" in a results label. `0` when empty. */
+  readonly total: number;
+  /**
+   * Whether this window has no rows to render.
+   *
+   * True in both of the ways the service produces an empty window: the collection is empty, or the
+   * requested page ran off the end of it. Taken from `items.length` when `items` was supplied, and
+   * inferred from `total` and `isOutOfRange` when only the numeric facts were.
+   */
+  readonly isEmpty: boolean;
+  /**
+   * Whether the requested page was past the last one - a hand-edited or stale URL.
+   *
+   * `page` has already been clamped, so this is the only way to tell that the reader asked for
+   * somewhere that does not exist. `false` for an empty collection, which is not an out-of-range
+   * request but simply nothing to page through.
+   */
+  readonly isOutOfRange: boolean;
+  /** Whether a previous page exists. `false` on page one and on an empty collection. */
+  readonly hasPrevious: boolean;
+  /** Whether a following page exists. `false` on the last page and on an empty collection. */
+  readonly hasNext: boolean;
+  /** 1-based index of the first row in this window, for a range label. `0` when empty. */
+  readonly firstItem: number;
+  /**
+   * 1-based index of the last row in this window. On a partial final page this is `total`, never
+   * `page * page_size`. `0` when empty.
+   */
+  readonly lastItem: number;
+  /**
+   * The bounded window to render: first page, current page and its siblings, last page, with a
+   * {@link PageWindowGapSlot} standing in for each omitted run. Never longer than
+   * `2 * PAGE_WINDOW_SIBLING_COUNT + 5` entries.
+   */
+  readonly pageWindow: readonly PageWindowSlot[];
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The derivation
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Build the bounded window of pages to render.
+ *
+ * First page, the current page with its siblings, last page - and a sentinel for each run left out.
+ * A run of exactly one page is rendered rather than elided: an ellipsis promises a run of hidden
+ * pages, and standing in for a single one costs the same width while telling the reader less.
+ */
+function buildPageWindow(page: number, pages: number): readonly PageWindowSlot[] {
+  const windowStart = Math.max(FIRST_PAGE, page - PAGE_WINDOW_SIBLING_COUNT);
+  const windowEnd = Math.min(pages, page + PAGE_WINDOW_SIBLING_COUNT);
+
+  // A Set drops the duplicates that arise when the window touches either end, and preserves insertion
+  // order - which is already ascending here, because `FIRST_PAGE <= windowStart` and
+  // `windowEnd <= pages` both hold by construction. No sort is therefore needed, and none is done.
+  const numbers = new Set<number>([FIRST_PAGE]);
+  for (let candidate = windowStart; candidate <= windowEnd; candidate += 1) {
+    numbers.add(candidate);
+  }
+  numbers.add(pages);
+
+  const pageSlot = (candidate: number): PageWindowPageSlot => ({
+    kind: 'page',
+    page: candidate,
+    isCurrent: candidate === page,
+  });
+
+  const built: PageWindowSlot[] = [];
+  let previous: number | null = null;
+
+  for (const candidate of numbers) {
+    if (previous !== null) {
+      const omitted = candidate - previous - 1;
+
+      if (omitted === 1) {
+        built.push(pageSlot(previous + 1));
+      } else if (omitted > 1) {
+        // At most two runs are ever omitted - one below the window and one above it - which is why
+        // the two sides are always distinct and each one makes a unique React key.
+        built.push({ kind: 'gap', side: previous < page ? 'start' : 'end' });
+      }
+    }
+
+    built.push(pageSlot(candidate));
+    previous = candidate;
+  }
+
+  return built;
+}
+
+/**
+ * Derive every page fact from one result window.
+ *
+ * Never throws. An empty collection, a zero window size, a fractional total and a page past the end
+ * are all ordinary inputs with defined answers (AAP §0.9.4.4), and no returned field is ever `NaN`,
+ * `Infinity` or `-0`.
+ *
+ * @param source - The result window: a whole `Page<T>`, or just its four numeric fields.
+ * @param fallbackPage - The page to use when the envelope's own `page` did not survive as a usable
+ *   number. `@/hooks/use-pagination` passes the page it read from the URL here; a Server Component
+ *   usually omits it and gets page one.
+ * @returns The derived facts, all clamped and coherent with one another.
+ */
+export function derivePagination(
+  source: PaginationSource,
+  fallbackPage?: number | string | null,
+): PaginationDerivation {
+  const total = toCount(source.total);
+  const windowSize = toCount(source.page_size);
+
+  // The true page count, which may legitimately be 0 for an empty collection...
+  const pageCount = resolvePageCount(source.pages, total, windowSize);
+  // ...and the count a control renders against, floored at one so no consumer has to handle a
+  // zero-length range. `isEmpty` carries the "render nothing" signal instead.
+  const pages = Math.max(pageCount, FIRST_PAGE);
+
+  // The envelope's page wins: it is the page the rendered rows belong to, and it is already correct on
+  // the first paint because it arrives with them. The fallback covers only the case where that value
+  // did not survive as a usable number.
+  const requestedPage = toPageNumber(source.page) ?? toPageNumber(fallbackPage) ?? FIRST_PAGE;
+
+  // Clamped for display. The service echoes an out-of-range page back verbatim; a control that
+  // highlighted page 99 of 3 would be describing a window that does not exist.
+  const page = Math.min(requestedPage, pages);
+
+  // An empty collection is not an out-of-range request - there is simply nothing to page through - so
+  // this stays false when there are no pages at all.
+  const isOutOfRange = pageCount > 0 && requestedPage > pageCount;
+
+  // The observed row count is authoritative when the caller supplied rows, because it is what is on
+  // screen; the two numeric paths agree on every real envelope, since the service returns an empty
+  // `items` array in exactly those cases.
+  const rowCount = source.items === undefined ? null : source.items.length;
+  const isEmpty = rowCount === null ? total === 0 || isOutOfRange : rowCount === 0;
+
+  // Rows before this window. `page` is at least 1 and `windowSize` at least 0, so this is a
+  // non-negative finite integer for every input.
+  const rowsBefore = (page - FIRST_PAGE) * windowSize;
+  const firstItem = isEmpty ? 0 : Math.min(rowsBefore + 1, Math.max(total, 1));
+
+  // The last index is capped at `total` rather than at `page * page_size`, which is what makes a range
+  // label correct on a partial final page. When the caller supplied rows, their count is preferred:
+  // it is the only source that stays right if a zeroed `page_size` is paired with real rows, which a
+  // fixture can do even though the service cannot.
+  const observedLast = rowCount === null ? 0 : rowsBefore + rowCount;
+  const windowLast = rowCount === null ? rowsBefore + windowSize : observedLast;
+  const lastItem = isEmpty
+    ? 0
+    : Math.max(firstItem, Math.min(windowLast, Math.max(total, firstItem)));
+
+  return {
+    page,
+    pages,
+    pageCount,
+    total,
+    isEmpty,
+    isOutOfRange,
+    hasPrevious: page > FIRST_PAGE,
+    hasNext: page < pages,
+    firstItem,
+    lastItem,
+    pageWindow: buildPageWindow(page, pages),
+  };
+}
+
+/**
+ * The one "Showing X-Y of N results" sentence in the product.
+ *
+ * Every windowed surface phrases its range identically because every windowed surface calls this: the
+ * feed through `components/blog/post-list.tsx`, an author's profile through the same component, and
+ * the four administrative tables through `components/admin/data-table.tsx`. It used to be written out
+ * twice, once in each of those files, with a note in each acknowledging the duplication.
+ *
+ * `null` for an empty window, where a range would say nothing the empty panel beside it has not
+ * already said - which is also why the caller does not have to guard before calling.
+ *
+ * @param derivation - The result of {@link derivePagination} for the window being labelled.
+ * @returns The sentence, or `null` when there is nothing to summarise.
+ */
+export function formatResultRange(derivation: PaginationDerivation): string | null {
+  if (derivation.isEmpty) {
+    return null;
+  }
+
+  const { firstItem, lastItem, total } = derivation;
+
+  return `Showing ${String(firstItem)}${EN_DASH}${String(lastItem)} of ${String(total)} ${
+    total === 1 ? 'result' : 'results'
+  }`;
 }

@@ -77,17 +77,14 @@
  * an unversioned path.
  *
  * The prefix is composed **idempotently**, and that detail is contractual rather than defensive
- * habit. It applies to whichever base URL the context resolved - the public one in a browser, or
- * `API_INTERNAL_BASE_URL` on a server where that is set. `.env.example` documents
- * `NEXT_PUBLIC_API_BASE_URL` as *including* the `/api/v1` prefix
+ * habit. `.env.example` documents `NEXT_PUBLIC_API_BASE_URL` as *including* the `/api/v1` prefix
  * (`http://localhost:8000/api/v1`), because "the prefix lives here and only here". So
  * {@link resolveApiBaseUrl} appends the prefix only when the configured base does not already carry
  * it: a base URL of `http://localhost:8000/api/v1` is used as it stands, and a bare origin such as
- * the `http://backend:8000` a container network resolves is completed to
- * `http://backend:8000/api/v1`. Either configuration produces the prefix exactly once, never twice.
- * A caller that passes a path already carrying the prefix is a defect in that caller and is
- * rejected loudly rather than silently repaired - two coexisting conventions is the state this rule
- * exists to prevent.
+ * `http://api.example.com` is completed to `http://api.example.com/api/v1`. Either configuration
+ * produces the prefix exactly once, never twice. A caller that passes a path already carrying the
+ * prefix is a defect in that caller and is rejected loudly rather than silently repaired - two
+ * coexisting conventions is the state this rule exists to prevent.
  *
  * ## Governing standards
  *
@@ -100,8 +97,8 @@
  * | Layered separation of concerns  | Sole HTTP module; imports only `@/lib/types`; no inward import; no `'use client'`; no navigation                 |
  * | Explicit API contracts          | {@link ProblemDetail} is the one error shape; every JSON call carries a {@link ResponseDecoder} checked at runtime |
  * | API versioning                  | `/api/v1` composed here once, idempotently; no caller can emit an unversioned path                              |
- * | Secure-by-default authentication | Bearer attachment, one single-flight rotation guarded by a generation counter, browser-only credential store    |
- * | Configuration from environment  | Two keys, read lazily and per context - `NEXT_PUBLIC_API_BASE_URL`, and `API_INTERNAL_BASE_URL` on a server      |
+ * | Secure-by-default authentication | Bearer attachment, one single-flight rotation guarded by a generation counter, browser-only credential store; the cross-document credential is an `HttpOnly` cookie this module can ask about but never read |
+ * | Configuration from environment  | One key, `NEXT_PUBLIC_API_BASE_URL`, read lazily at call time rather than captured at module scope               |
  * | Blocking quality gates          | Compiles under `tsc --noEmit`, lints at `--max-warnings=0`, explicit return type on every exported function      |
  * | No secrets in the repository    | No credential is written to `console`, to a thrown message, to a query string or onto a serialised error         |
  *
@@ -130,7 +127,10 @@ import type { ProblemDetail, TokenPair, ValidationErrorItem } from '@/lib/types'
  * **THE COOKIE CARRIES THE ROLE LITERAL AND NEVER A CREDENTIAL**, which is why this module writes
  * no cookie at all. A cookie written by client-side script cannot be `HttpOnly`, so putting the
  * access token in it publishes a reusable bearer to every script on the origin (CWE-1004,
- * CWE-922) - and the middleware never needed the token, only the role. This module sees token
+ * CWE-922) - and the middleware never needed the token, only the role. The credential that DOES
+ * survive a document is {@link DURABLE_SESSION_COOKIE_NAME}, and the difference is exactly the one
+ * this paragraph is about: it is written by a server, so it can be `HttpOnly`, and this module can
+ * only ask the session route to act on it rather than read it. This module sees token
  * pairs and never a principal, so it could not write the marker even if it should: the role is
  * knowable only from `GET /auth/me`, which is the provider's request. Presence and role are a
  * client-tier signal and nothing more: the API authenticates from the `Authorization` header
@@ -147,17 +147,6 @@ const API_VERSION_PREFIX = '/api/v1';
 
 /** Spelled out for diagnostics; the read itself is a static member access, see {@link resolveApiBaseUrl}. */
 const API_BASE_URL_ENV_KEY = 'NEXT_PUBLIC_API_BASE_URL';
-
-/**
- * The server-only endpoint, preferred while rendering on the server. See
- * {@link resolveApiBaseUrl} for why one URL cannot serve both execution contexts.
- *
- * Deliberately **not** `NEXT_PUBLIC_`-prefixed: the framework inlines only that prefix into the
- * browser bundle, so this value is readable on the server and structurally absent in the browser -
- * which is the guarantee, not an accident. An internal container hostname must never be shipped to
- * a reader's browser, where it does not resolve.
- */
-const API_INTERNAL_BASE_URL_ENV_KEY = 'API_INTERNAL_BASE_URL';
 
 /**
  * Rotation endpoint, stated here rather than imported from `@/lib/api/auth` to keep this module free
@@ -833,51 +822,41 @@ function parseRetryAfterSeconds(response: Response): number | null {
  *    URL fixed at module evaluation cannot be intercepted at the network boundary at all. The
  *    component suite runs Mock Service Worker with `onUnhandledRequest: 'error'`, so that failure
  *    surfaces as every component test failing for an unrelated-looking reason.
- * 2. `docker-compose.yml` resolves the value against the internal service hostname, which is only
- *    meaningful at run time inside the container network.
+ * 2. A deployment supplies the address at run time - an orchestrator's environment, a container's
+ *    `--env-file` - and a module-scope capture in a server process would freeze whatever was set
+ *    when the module was first imported rather than what the deployment configured.
  *
- * Both keys are written as static member accesses rather than computed ones because the framework
+ * The key is written as a static member access rather than a computed one because the framework
  * inlines `process.env.NEXT_PUBLIC_*` textually at build time; an indexed read would not be
  * substituted and would resolve to `undefined` in the browser bundle.
  *
- * ## Two contexts, two URLs, and why one value cannot serve both
+ * ## One key, two execution contexts, and why that is a deployment decision
  *
- * This module runs in two places, and the address of the API is not the same in each. A browser
- * reaches the service across the public network at whatever origin a reader can resolve. A Server
- * Component or route handler reaches it from inside the deployment, where that public origin may be
- * unroutable, may traverse a load balancer for no reason, or may not exist at all: under
- * `docker-compose` the service is `http://backend:8000`, a name that resolves on the container
- * network and nowhere else, while the browser must be told `http://localhost:8000`.
+ * This module runs in two places - a browser fetching from a client island, and the Next.js server
+ * process rendering a Server Component, a route handler or the generated sitemap - and both resolve
+ * the same single value. That is deliberate: `.env.example` is a closed fifteen-key contract, and a
+ * second server-only address would grow it to sixteen in order to encode a routing decision as
+ * configuration.
  *
- * A single build-inlined `NEXT_PUBLIC_API_BASE_URL` therefore cannot be correct for both, and
- * whichever way it is set the other context fails in a way that looks like something else - a Server
- * Component whose fetch is refused, or a browser aimed at a hostname it cannot resolve.
+ * The obligation it places on a deployment is therefore explicit: `NEXT_PUBLIC_API_BASE_URL` must be
+ * an address that resolves from **both** contexts. Publishing the API at one hostname and routing it
+ * - an ingress, a shared hostname, a reverse proxy in front of both tiers - satisfies that, and it
+ * is what a deployment serving a browser over the public network already has to do. Local
+ * development satisfies it too, because `http://localhost:8000/api/v1` is reachable from the browser
+ * and from the Next.js process on the same host.
  *
- * So: **on the server, `API_INTERNAL_BASE_URL` is preferred when it is set**; everywhere else, and
- * whenever it is not set, `NEXT_PUBLIC_API_BASE_URL` is used. The internal key deliberately carries
- * no `NEXT_PUBLIC_` prefix, so it is structurally absent from the browser bundle rather than merely
- * unused there - an internal hostname is not something to ship to a reader. Setting it is optional:
- * a single-origin deployment where both contexts share one URL configures only the public key and
- * this resolves to it in both.
- *
- * @throws Error when neither variable yields a value. Deliberately loud: a silent default origin
- * would turn a missing deployment variable into requests quietly aimed at the wrong service.
+ * @throws Error when the variable yields no value. Deliberately loud: a silent default origin would
+ * turn a missing deployment variable into requests quietly aimed at the wrong service.
  */
 function resolveApiBaseUrl(): string {
-  // The server-only value first, and only on the server. `isBrowser()` rather than a check on the
-  // variable alone, because a bundler that ever did inline it must still not let a browser use it.
-  const internal = isBrowser() ? undefined : process.env.API_INTERNAL_BASE_URL;
-  const configured =
-    internal !== undefined && internal.trim() !== ''
-      ? internal
-      : process.env.NEXT_PUBLIC_API_BASE_URL;
+  const configured = process.env.NEXT_PUBLIC_API_BASE_URL;
   if (configured === undefined || configured.trim() === '') {
     throw new Error(
       `${API_BASE_URL_ENV_KEY} is not set, so the presentation tier has no API to call. ` +
         `Copy the NEXT_PUBLIC_ block of .env.example into frontend/.env.local; the documented ` +
-        `value is http://localhost:8000${API_VERSION_PREFIX}. On a server, ` +
-        `${API_INTERNAL_BASE_URL_ENV_KEY} may be set instead to reach the service on an internal ` +
-        `network.`,
+        `value is http://localhost:8000${API_VERSION_PREFIX}. It must resolve from a reader's ` +
+        `browser and from the Next.js server process alike, so a deployment publishes the API at ` +
+        `one routable address rather than configuring a second one here.`,
     );
   }
   const base = configured.trim().replace(TRAILING_SLASHES_PATTERN, '');
@@ -1009,14 +988,37 @@ function isBrowser(): boolean {
   return typeof window !== 'undefined';
 }
 
+/** Options of {@link setCredentials}. */
+export interface AdoptCredentialsOptions {
+  /**
+   * Whether to mirror the adopted refresh token into the durable session store.
+   *
+   * `true` by default, which is right for every ordinary adoption - a sign-in or a rotation produces
+   * a token the next document will need. Pass `false` from {@link recoverDurableSession} alone: the
+   * session route has already written that pair's refresh token into its own cookie, so mirroring it
+   * back would be a request writing the value that is already there.
+   *
+   * Only consulted when the mirror is armed at all; see {@link setDurableSessionMirror}.
+   */
+  readonly persist?: boolean;
+}
+
 /**
  * Adopt a credential pair: sign-in, rotation and session restore all land here.
  *
- * Writes **no cookie**. The session marker `src/middleware.ts` reads is the provider's to write,
- * because it carries the principal's role and this module never sees a principal - only a token
- * pair. See {@link AUTH_COOKIE_NAME} for why the marker is not the token.
+ * Writes **no cookie itself**, and that distinction is worth keeping precise now that two cookies
+ * exist. The session marker `src/middleware.ts` reads is the provider's to write, because it carries
+ * the principal's role and this module never sees a principal - only a token pair. The durable
+ * refresh cookie is written by `src/app/api/session/route.ts`, on the server, because it is
+ * `HttpOnly` and therefore not writable from a document at all; this function asks that route to
+ * update it and never touches `document.cookie`. See {@link AUTH_COOKIE_NAME} for why the marker is
+ * not the token, and the durable-session section for why the credential is not in a script-readable
+ * store.
+ *
+ * @param tokens - The pair to adopt.
+ * @param options - See {@link AdoptCredentialsOptions}.
  */
-export function setCredentials(tokens: TokenPair): void {
+export function setCredentials(tokens: TokenPair, options?: AdoptCredentialsOptions): void {
   // Inert outside a browser. A server has no single reader to hold a credential for, and the store
   // is a module global shared by every concurrent render - see the section header. A server-side
   // caller that has a token uses `RequestOptions.bearer`, which is scoped to one request.
@@ -1026,6 +1028,12 @@ export function setCredentials(tokens: TokenPair): void {
   accessToken = tokens.access_token;
   refreshToken = tokens.refresh_token;
   credentialGeneration += 1;
+
+  // AFTER the store is updated, never before: this document's own requests must be able to proceed on
+  // the new bearer whether or not the mirror write lands. Inert unless the provider has armed it.
+  if (options?.persist !== false) {
+    persistDurableSession(tokens.refresh_token);
+  }
 }
 
 /**
@@ -1039,6 +1047,11 @@ export function setCredentials(tokens: TokenPair): void {
 export function clearCredentials(): void {
   accessToken = null;
   refreshToken = null;
+  // The durable copy goes with the in-memory one, so a session that has ended cannot be recovered by
+  // the next document. Inert unless the provider has armed the mirror, and it deliberately runs even
+  // when there was nothing in the store to clear - the intent is what matters, and a document that
+  // never held a token in memory can still be the one that ends the session.
+  forgetDurableSession();
   // Bumped even when there was nothing to clear, and deliberately: an in-flight rotation must be
   // superseded by the *intent* to end the session, not merely by a token having changed. A sign-out
   // that lands while a rotation is in flight is exactly the case, and it is the one where adopting
@@ -1111,6 +1124,281 @@ function abandonSession(): void {
     return;
   }
   queueMicrotask(handler);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The durable session, and the one same-origin route in this module
+ *
+ * WHAT PROBLEM THIS SOLVES
+ *
+ * The credential store above is a module global, so it dies with the JavaScript context. A full page
+ * reload, a middle-click into a new tab, or following an external link back into the site therefore
+ * arrived with no access token and no refresh token - while the session marker cookie
+ * `src/middleware.ts` reads was still there, because it is a cookie. The route protection admitted
+ * the navigation on the strength of that marker and the new document then had nothing to
+ * authenticate with, so the provider cleared the marker and presented an anonymous session. The
+ * reader was signed out by every full navigation, having done nothing.
+ *
+ * WHY THE CREDENTIAL CANNOT SIMPLY BE PERSISTED HERE
+ *
+ * Everything a browser script can write, a browser script can read. `localStorage`,
+ * `sessionStorage` and a script-written cookie are all readable by every same-origin script the page
+ * will ever load - an analytics snippet, a transitive dependency, anything reflected into the page -
+ * and a cookie written by script CANNOT be `HttpOnly`, because that flag exists precisely to hide a
+ * cookie from script. Putting a refresh token in any of them publishes a long-lived credential to
+ * all of them (CWE-522, CWE-1004, CWE-922). The session marker is safe to write from script for
+ * exactly the opposite reason: it authenticates nothing.
+ *
+ * SO THE CREDENTIAL IS HELD BY A SERVER THIS APPLICATION ALREADY RUNS
+ *
+ * `src/app/api/session/route.ts` is a Next.js Route Handler on this application's OWN origin. It
+ * writes the refresh token into a cookie that is `HttpOnly`, `SameSite=Strict`, path-scoped to that
+ * route and `Secure` wherever the request arrived over https. No script in the document can read it,
+ * it is not attached to any other request, and a cross-site request cannot carry it. The three
+ * operations below are the whole of this tier's view of it:
+ *
+ *   {@link persistDurableSession}  hand the token over after adoption
+ *   {@link recoverDurableSession}  ask the route to rotate and hand back a usable pair
+ *   {@link forgetDurableSession}   drop it at the end of the session
+ *
+ * The token is still held in memory here as well, and that is not a weakening: memory is where the
+ * bearer is attached from, and rotation revokes and replaces both halves at once. The durable copy
+ * exists so that the NEXT document has something to rotate.
+ *
+ * THE MIRROR IS ARMED, NOT UNCONDITIONAL
+ *
+ * `setCredentials` and `clearCredentials` are the two funnels every credential transition passes
+ * through - sign-in, single-flight rotation, sign-out, an abandoned session - so mirroring from them
+ * is what makes the durable copy incapable of holding a token the store has already replaced. But
+ * they are also called directly by tests that have no interest in a session route, and by a component
+ * spec whose request mocking fails the test on any unhandled request. So the mirror is switched on by
+ * the provider that owns the session lifecycle - see {@link setDurableSessionMirror} - exactly as the
+ * unauthorised handler is registered by it. Nothing else in the tier may arm it.
+ *
+ * WHAT THIS SECTION DELIBERATELY DOES NOT DO
+ *
+ *   * **It does not rotate.** {@link recoverDurableSession} asks the ROUTE to rotate, because the
+ *     durable copy is the only token a fresh document holds and the route is the only thing that can
+ *     read it. In-document rotation stays where it belongs, in the single-flight path above.
+ *   * **It does not decide who the reader is.** No principal is resolved and no marker is touched;
+ *     that is the provider's, which reads `GET /auth/me` once a credential exists.
+ *   * **It does not report its own failures to the caller of an ordinary request.** A mirror write
+ *     that fails costs recoverability on the next document and nothing else, so it is swallowed
+ *     rather than allowed to fail a sign-in that has already succeeded.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Path of the session route, on this application's own origin.
+ *
+ * Relative and absolute-from-root, never composed onto {@link resolveApiBaseUrl}: this is NOT the
+ * API. It is a route in this Next.js application, and the two live at different origins in every
+ * deployment where the service is a separate container.
+ *
+ * Exported so `src/app/api/session/route.ts` can scope its cookie's `Path` to the same literal it is
+ * served at - one declaration, so the cookie cannot end up scoped to a path the route does not
+ * occupy, which would fail silently by simply never being sent.
+ */
+export const DURABLE_SESSION_ROUTE = '/api/session';
+
+/**
+ * Name of the cookie the session route owns.
+ *
+ * Declared here beside {@link AUTH_COOKIE_NAME} so the two names that make up this tier's session are
+ * visible together, and so the difference between them is stated once: `blog_session` is a
+ * script-written ROLE MARKER that authenticates nothing, and `blog_refresh` is an `HttpOnly`
+ * CREDENTIAL that no script in this tier can read - not even this module, which only ever asks the
+ * route to act on it.
+ */
+export const DURABLE_SESSION_COOKIE_NAME = 'blog_refresh';
+
+/**
+ * Whether credential transitions are mirrored into the durable store. See the section header.
+ *
+ * `false` by default, so a module imported without a provider - a Server Component, a unit test, a
+ * component spec that seeds the store directly - issues no same-origin request it did not ask for.
+ */
+let durableSessionArmed = false;
+
+/**
+ * Arm or disarm the durable session mirror for this document.
+ *
+ * Called once by `src/providers/auth-provider.tsx`, which is the single owner of the session
+ * lifecycle: `true` on mount, `false` from the effect's cleanup. Idempotent, and inert outside a
+ * browser - there is no single reader to hold a session for on a server, and the credential store is
+ * inert there for the same reason.
+ *
+ * @param enabled - `true` to mirror adoption and clearing into the session route.
+ */
+export function setDurableSessionMirror(enabled: boolean): void {
+  durableSessionArmed = enabled && isBrowser();
+}
+
+/**
+ * Issue one request to the session route.
+ *
+ * Written against `fetch` directly rather than through {@link dispatch}, and the separation is
+ * deliberate: `dispatch` composes the API base URL, attaches the bearer, and rotates on a `401`.
+ * Every one of those is wrong here. This route is on a different origin from the API, it
+ * authenticates from its own cookie rather than from a bearer, and a `401` from it MEANS the session
+ * is over - rotating in response would be the recursion this module is otherwise careful to make
+ * impossible.
+ *
+ * `credentials: 'same-origin'` is explicit rather than relied upon as the default: the cookie is the
+ * entire point of the request, and a default that changed would disable the feature silently.
+ *
+ * @param method - `PUT` to adopt, `POST` to rotate, `DELETE` to clear.
+ * @param body - The JSON body, or `undefined` for the two operations that carry none.
+ * @returns The raw response. Status interpretation belongs to each caller, which is why nothing is
+ * thrown here.
+ */
+async function requestDurableSession(
+  method: 'PUT' | 'POST' | 'DELETE',
+  body?: Readonly<Record<string, string>>,
+): Promise<Response> {
+  return fetch(DURABLE_SESSION_ROUTE, {
+    method,
+    credentials: 'same-origin',
+    ...(body === undefined
+      ? {}
+      : { body: JSON.stringify(body), headers: { [CONTENT_TYPE_HEADER]: JSON_MEDIA_TYPE } }),
+  });
+}
+
+/**
+ * Hand a freshly adopted refresh token to the session route, so the next document can use it.
+ *
+ * Fire-and-forget by design, with every failure swallowed. It runs immediately after a sign-in or a
+ * rotation that has already succeeded, and the only thing a failure costs is recoverability on the
+ * next document - the in-memory pair is intact and this document continues to work. Failing the
+ * sign-in over it would turn a recovery aid into a new way to be unable to sign in.
+ *
+ * The window this leaves is named honestly rather than papered over: a rotation whose mirror write
+ * has not landed when the document is destroyed leaves a spent token in the cookie, and the next
+ * document's recovery is refused. That degrades to a sign-in - the behaviour before any of this
+ * existed - and never to a wrong or resurrected session, because the service revokes a presented
+ * refresh token as it issues the replacement.
+ */
+function persistDurableSession(refreshCredential: string): void {
+  if (!durableSessionArmed) {
+    return;
+  }
+  void requestDurableSession('PUT', { [REFRESH_TOKEN_FIELD]: refreshCredential }).catch(() => {
+    // Deliberately empty: see the docblock. There is no caller to report to and nothing to retry
+    // against, and a rejected promise left unhandled here would surface as an unrelated error.
+  });
+}
+
+/**
+ * Tell the session route to drop the durable credential.
+ *
+ * Fire-and-forget for the same reason as {@link persistDurableSession}: it runs on a transition that
+ * has already happened locally. A failure leaves a cookie whose token the service has revoked -
+ * `POST /auth/logout` revokes it, and a refused recovery clears the cookie on the way out - so the
+ * next document's recovery is refused and the reader signs in, which is the correct outcome for
+ * somebody who signed out.
+ */
+function forgetDurableSession(): void {
+  if (!durableSessionArmed) {
+    return;
+  }
+  void requestDurableSession('DELETE').catch(() => {
+    // Deliberately empty: see the docblock.
+  });
+}
+
+/**
+ * Recover this document's session from the durable credential, or report that there is none.
+ *
+ * The FIRST thing a new document does when the session marker says a session existed. It asks the
+ * session route to rotate: the route reads its own `HttpOnly` cookie, presents it to
+ * `POST /api/v1/auth/refresh`, writes the replacement back into the cookie, and returns the new pair.
+ * The pair is then adopted here, so the bearer is armed before `GET /auth/me` is ever called - which
+ * is why the provider can treat a `401` from that read as a real answer rather than as the expected
+ * consequence of having no credential.
+ *
+ * Rotation-before-validation is the correct order and not merely convenient. A refresh token is
+ * single-use, so presenting the stored one is also what PROVES the session is still live: a token the
+ * service has revoked, expired or seen twice is refused, and the session is over with no further
+ * question to ask.
+ *
+ * Adopted with `persist: false`, because the route has already written the rotated token into the
+ * cookie; mirroring it straight back would be a second request writing the value that is already
+ * there.
+ *
+ * @param signal - Cancellation from the caller's effect, so an unmounted provider releases the
+ * request rather than leaving it to run to completion.
+ * @returns The adopted pair.
+ * @throws {@link ApiError} for every failure, classified so the caller can tell the two apart that
+ * matter: a `401` means there is no usable durable credential and the session is genuinely over,
+ * while a transport failure or a `5xx` means the question could not be asked and the session must be
+ * left exactly as it was.
+ */
+export async function recoverDurableSession(signal?: AbortSignal): Promise<TokenPair> {
+  let response: Response;
+  try {
+    response = await fetch(DURABLE_SESSION_ROUTE, {
+      method: 'POST',
+      credentials: 'same-origin',
+      ...(signal === undefined ? {} : { signal }),
+    });
+  } catch (cause) {
+    // No response at all: offline, aborted, or the route unreachable. Says nothing about the
+    // credential, so it is reported as a transport failure and the caller leaves the session alone.
+    throw new ApiError(
+      synthesiseProblemDetail({
+        type: isAbortError(cause) ? ERROR_TYPE_ABORTED : ERROR_TYPE_NETWORK,
+        title: isAbortError(cause) ? 'Request cancelled' : 'Network error',
+        status: NO_RESPONSE_STATUS,
+        detail: isAbortError(cause)
+          ? 'The session could not be restored because the request was cancelled.'
+          : 'The session could not be restored because the application could not be reached.',
+        instance: DURABLE_SESSION_ROUTE,
+      }),
+    );
+  }
+
+  if (!response.ok) {
+    throw new ApiError(
+      synthesiseProblemDetail({
+        type: ERROR_TYPE_HTTP,
+        title: response.status === HTTP_UNAUTHORIZED ? 'Session expired' : 'Session not restored',
+        status: response.status,
+        detail:
+          response.status === HTTP_UNAUTHORIZED
+            ? 'The stored session could not be renewed. Sign in again to continue.'
+            : 'The stored session could not be renewed.',
+        instance: DURABLE_SESSION_ROUTE,
+      }),
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+
+  let recovered: TokenPair;
+  try {
+    recovered = tokenPairDecoder.parse(payload);
+  } catch {
+    // A body that is not a token pair must never be STORED as one - that failure mode makes every
+    // later request fail instead of this one. Reported as a malformed answer, which the caller
+    // classifies as a defect rather than as a dead session.
+    throw new ApiError(
+      synthesiseProblemDetail({
+        type: ERROR_TYPE_MALFORMED_RESPONSE,
+        title: 'Malformed response',
+        status: response.status,
+        detail: 'The session route did not answer with a credential pair.',
+        instance: DURABLE_SESSION_ROUTE,
+      }),
+    );
+  }
+
+  setCredentials(recovered, { persist: false });
+  return recovered;
 }
 
 /* -------------------------------------------------------------------------------------------------

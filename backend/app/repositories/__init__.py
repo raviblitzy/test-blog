@@ -1,8 +1,9 @@
 """The data-access layer's public surface: every repository the service layer may reach for.
 
-Six modules sit beside this one - the generic base and the five that own a relation apiece - and
-together they are the only place in the backend that builds a SQL statement. This file is what
-makes them a single named surface rather than six addresses each caller has to learn separately:
+Seven modules sit beside this one - the generic base, the five that own a relation apiece, and the
+one that owns the readiness statement and no relation at all - and together they are the only place
+in the backend that builds a SQL statement. This file is what
+makes them a single named surface rather than seven addresses each caller has to learn separately:
 ``app.services`` imports the repositories it needs from here, so the classes listed at the foot of
 this module *are* the contract between the layer that decides business rules and the layer that
 runs queries. A service reaching past this surface into a deep module path has not broken
@@ -12,7 +13,7 @@ exists to prevent.
 What every module in this package is, and is not
 -----------------------------------------------
 The uniformity is the whole value of naming the layer, so it is stated once here rather than
-rediscovered six times below.
+rediscovered seven times below.
 
 * **Queries and only queries.** A module in this package composes statements - predicates, joins,
   ordering, relevance ranking, windowing - and does nothing else. It settles no business rule,
@@ -34,12 +35,16 @@ rediscovered six times below.
 
 The import direction runs one way
 ---------------------------------
-This file imports its six siblings. **No sibling imports this package.** Every concrete
-repository reaches its base class at the module that declares it, naming whichever of the two
-matches its relation's key shape::
+This file imports its seven siblings. **No sibling imports this package.** Every concrete
+repository that owns a relation reaches its base class at the module that declares it, naming
+whichever of the two matches its relation's key shape::
 
     from app.repositories.base import UUIDPrimaryKeyRepository  # five id-keyed relations
     from app.repositories.base import BaseRepository  # post_likes, keyed on a pair
+
+``health_repository`` names neither, because it reads no table: every helper on both bases
+presupposes a mapped class, and it has none to declare. Its own module docstring explains why
+that is the correct shape rather than a gap to be filled.
 
 Spelling that ``from app.repositories import BaseRepository`` instead would be a genuine circular
 import rather than a matter of taste. Resolving this package means running the import block below,
@@ -50,7 +55,7 @@ the package.
 
 No import-time side effects
 ---------------------------
-Beyond the six imports there is nothing here. Nothing builds a connection pool or a session
+Beyond the seven imports there is nothing here. Nothing builds a connection pool or a session
 factory, nothing issues a schema-creation or DDL call, nothing configures a log handler, nothing
 reads the environment, and there is no constant and no convenience factory - nor any import of
 ``app.core.config``, of ``app.db.session`` or of the application module. Importing this package
@@ -74,6 +79,7 @@ from __future__ import annotations
 from app.repositories.base import BaseRepository, ModelT, UUIDPrimaryKeyRepository
 from app.repositories.category_repository import CategoryRepository
 from app.repositories.comment_repository import CommentRepository
+from app.repositories.health_repository import HealthRepository
 from app.repositories.like_repository import LikeRepository
 from app.repositories.post_repository import PostRepository, PostSort
 from app.repositories.user_repository import RefreshTokenRepository, UserRepository
@@ -94,6 +100,7 @@ __all__ = [
     "BaseRepository",
     "CategoryRepository",
     "CommentRepository",
+    "HealthRepository",
     "LikeRepository",
     "ModelT",
     "PostRepository",

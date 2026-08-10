@@ -28,8 +28,8 @@
 // effect, NO ref, NO event handler and NO browser API in this file. Nothing here
 // needs one, and anything that did would belong in a client island that wraps
 // this component rather than inside it. The constraint extends to what this file
-// IMPORTS: `@/components/ui/badge-link` carries no directive of its own for
-// exactly this reason, and the `next/link` it renders is the one hook-bearing
+// IMPORTS: `@/components/ui/badge` carries no directive of its own for exactly
+// this reason, and the `next/link` its `BadgeLink` renders is the one hook-bearing
 // element in the tree - Link's own, which is fine, because a Server Component may
 // render a Client Component and Next.js server-renders it into the same initial
 // HTML.
@@ -140,7 +140,7 @@ import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
 import remarkGfm from 'remark-gfm';
 
-import { BadgeLink } from '@/components/ui/badge-link';
+import { BadgeLink } from '@/components/ui/badge';
 import { Table } from '@/components/ui/table';
 import { categoryFeedPath } from '@/lib/seo';
 import type { CategorySummary } from '@/lib/types';
@@ -826,7 +826,7 @@ export function PostContent({
          * Each pill is `BadgeLink`, the design system's own pill-shaped link, and NOT a class list
          * assembled here: the appearance, the wrapping behaviour for a long category name, the 24px
          * minimum target, the hover step and the focus ring are all declared once in
-         * src/components/ui/badge-link.tsx, so this row and the feed card's footer cannot drift apart
+         * src/components/ui/badge.tsx, so this row and the feed card's footer cannot drift apart
          * the way two hand-rolled copies did. It renders one real crawlable anchor, which is the point
          * of rendering the row server-side at all - a category is discoverable from a post without
          * executing any client JavaScript. The href comes from `categoryFeedPath`, never from a

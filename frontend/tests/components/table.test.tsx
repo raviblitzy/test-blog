@@ -63,6 +63,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import type { AdminUser } from '@/lib/types';
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                   */
@@ -92,54 +93,89 @@ type AdminUserRole = 'READER' | 'AUTHOR' | 'ADMIN';
 interface AdminUserRow {
   /** Server-generated identifier. Used here as the row key, as a real grid does. */
   readonly id: string;
-  /** Public handle, and the segment the author's profile is addressed by. */
-  readonly username: string;
   /** Login address. Rendered on the administrative grid and on no public surface. */
   readonly email: string;
+  /** Public handle, and the segment the author's profile is addressed by. */
+  readonly username: string;
+  /**
+   * Human-readable name for the grid's name column.
+   *
+   * NON-NULLABLE, mirroring a `TEXT NOT NULL` column the service derives from the username when an
+   * account supplies none - so a fixture typing it as nullable would describe a payload the API
+   * cannot send and would license a cell renderer that guards against a value it never receives.
+   */
+  readonly display_name: string;
   /** The account's authority. */
   readonly role: AdminUserRole;
   /** Whether the account may authenticate. `false` is a deactivated account. */
   readonly is_active: boolean;
-  /** How many posts the account has authored - a count, and deliberately not a monetary amount. */
-  readonly post_count: number;
   /** Instant the account was created, as an ISO-8601 string, exactly as the API sends it. */
   readonly created_at: string;
+  /** Instant the account was last modified, as an ISO-8601 string. Its own column on the grid. */
+  readonly updated_at: string;
 }
+
+/**
+ * Compile-time conformance between the row above and the real wire type, in BOTH directions.
+ *
+ * The first alias proves the local interface demands nothing the API does not send - the failure mode
+ * this fixture actually had, where an invented `post_count` column was rendered and asserted while
+ * `AdminUser` has no such member and never sends one. The second proves it omits nothing the API DOES
+ * send, which is the other half: `display_name` and `updated_at` were both absent, so the grid was
+ * exercised against seven-ninths of the record an administrator really sees.
+ *
+ * `Readonly<AdminUser>` rather than `AdminUser`, because the row is declared `readonly` field by field
+ * and mutability is not part of what is being compared.
+ *
+ * A TYPE-ONLY import, which is the one thing this spec takes from the contract layer. The file header's
+ * rule against reaching into `@/lib/*` is about a primitive's spec not failing for a reason unrelated to
+ * the primitive; a type erased at compile time cannot do that, and the alternative - a hand-written
+ * shape nothing checks - is what produced the invented column in the first place.
+ */
+type RowCoversWire = Readonly<AdminUser> extends AdminUserRow ? true : never;
+type WireCoversRow = AdminUserRow extends Readonly<AdminUser> ? true : never;
+const ROW_MATCHES_WIRE: readonly [RowCoversWire, WireCoversRow] = [true, true];
 
 /** An author with posts to their name. The record every row-scoped assertion below targets. */
 const authorRow: AdminUserRow = {
   id: '11111111-1111-4111-8111-111111111111',
-  username: 'alice',
   email: 'alice@example.com',
+  username: 'alice',
+  display_name: 'Alice Nakamura',
   role: 'AUTHOR',
   is_active: true,
-  post_count: 4,
   created_at: '2024-01-15T09:30:00Z',
+  updated_at: '2024-04-02T11:15:00Z',
 };
 
 /** An administrator, so the grid is never single-role and row isolation is testable. */
 const adminRow: AdminUserRow = {
   id: '13333333-3333-4333-8333-333333333333',
-  username: 'dana',
   email: 'dana@example.com',
+  username: 'dana',
+  display_name: 'Dana Osei',
   role: 'ADMIN',
   is_active: true,
-  post_count: 2,
   created_at: '2024-02-02T14:05:00Z',
+  updated_at: '2024-02-02T14:05:00Z',
 };
 
 /**
- * A deactivated reader with no posts, present so both states of `is_active` and a
- * zero count are rendered. Zero is the value a naive cell renderer drops.
+ * A deactivated reader, present so both states of `is_active` are rendered.
+ *
+ * Its `display_name` is the username, which is what the service writes when an account supplies no
+ * name of its own - so this row is the one that shows the name column carrying a derived value rather
+ * than a chosen one, and it is never blank or absent.
  */
 const deactivatedReaderRow: AdminUserRow = {
   id: '14444444-4444-4444-8444-444444444444',
-  username: 'erin',
   email: 'erin@example.com',
+  username: 'erin',
+  display_name: 'erin',
   role: 'READER',
   is_active: false,
-  post_count: 0,
   created_at: '2024-03-21T18:45:00Z',
+  updated_at: '2024-03-22T08:00:00Z',
 };
 
 /** The grid's records, in the order the administrative listing returns them. */
@@ -150,7 +186,15 @@ const adminUserRows: readonly AdminUserRow[] = [authorRow, adminRow, deactivated
  * this list and from `adminUserRows`, so adding a column or a record cannot leave
  * a stale expected number behind.
  */
-const columnHeadings = ['Username', 'Email', 'Role', 'Status', 'Posts', 'Joined'] as const;
+const columnHeadings = [
+  'Name',
+  'Username',
+  'Email',
+  'Role',
+  'Status',
+  'Joined',
+  'Updated',
+] as const;
 
 /** The <caption> the grid is named by, and the expected accessible name. */
 const GRID_CAPTION = 'Registered users';
@@ -212,12 +256,13 @@ function renderUsersGrid(options: UsersGridOptions = {}): void {
       <TableBody>
         {rows.map((row) => (
           <TableRow key={row.id}>
+            <TableCell label="Name">{row.display_name}</TableCell>
             <TableCell label="Username">{row.username}</TableCell>
             <TableCell label="Email">{row.email}</TableCell>
             <TableCell label="Role">{row.role}</TableCell>
             <TableCell label="Status">{statusLabel(row.is_active)}</TableCell>
-            <TableCell label="Posts">{row.post_count}</TableCell>
             <TableCell label="Joined">{row.created_at}</TableCell>
+            <TableCell label="Updated">{row.updated_at}</TableCell>
           </TableRow>
         ))}
       </TableBody>
@@ -281,6 +326,21 @@ describe('Table', () => {
     }
   });
 
+  it('renders rows whose shape is the administrative wire record, not an invented one', () => {
+    // The runtime home of the two compile-time aliases above, so the proof is referenced rather than
+    // floating: `tsc --noEmit` is what actually enforces it, and this assertion is what makes a reader
+    // of the suite aware the enforcement exists.
+    expect(ROW_MATCHES_WIRE).toEqual([true, true]);
+
+    renderUsersGrid();
+
+    // And the seven columns are the seven the record can fill. `AdminUser` declares exactly eight
+    // members and `id` is the row key rather than a column, so a grid with a different count is either
+    // rendering something the API does not send or dropping something it does.
+    expect(columnHeadings).toHaveLength(7);
+    expect(screen.getAllByRole('columnheader')).toHaveLength(columnHeadings.length);
+  });
+
   it("groups a record's values into its own row, and no other record's", () => {
     renderUsersGrid();
 
@@ -288,27 +348,36 @@ describe('Table', () => {
 
     expect(within(row).getAllByRole('cell')).toHaveLength(columnHeadings.length);
 
+    expect(within(row).getByText(authorRow.display_name)).toBeInTheDocument();
     expect(within(row).getByText(authorRow.username)).toBeInTheDocument();
     expect(within(row).getByText(authorRow.email)).toBeInTheDocument();
     expect(within(row).getByText(authorRow.role)).toBeInTheDocument();
     expect(within(row).getByText(statusLabel(authorRow.is_active))).toBeInTheDocument();
-    expect(within(row).getByText(String(authorRow.post_count))).toBeInTheDocument();
     expect(within(row).getByText(authorRow.created_at)).toBeInTheDocument();
+    expect(within(row).getByText(authorRow.updated_at)).toBeInTheDocument();
+
+    // The two instants are DISTINCT on this record, and rendered into distinct cells. Equal fixture
+    // values would let a grid that rendered one of them twice pass, which is exactly the mistake a
+    // seven-column row invites.
+    expect(authorRow.updated_at).not.toBe(authorRow.created_at);
 
     // Row isolation. Without it every assertion above would still pass against a
-    // single flattened row holding all eighteen values.
+    // single flattened row holding all twenty-one values.
     expect(within(row).queryByText(adminRow.username)).toBeNull();
     expect(within(row).queryByText(deactivatedReaderRow.email)).toBeNull();
 
-    // The deactivated record renders the other side of the flag, and its zero count
-    // is rendered rather than dropped.
+    // The deactivated record renders the other side of the flag, and its derived display name - which
+    // equals its username - is rendered rather than collapsed away as a duplicate.
     const readerRow = rowFor(deactivatedReaderRow);
     expect(
       within(readerRow).getByText(statusLabel(deactivatedReaderRow.is_active)),
     ).toBeInTheDocument();
-    expect(
-      within(readerRow).getByText(String(deactivatedReaderRow.post_count)),
-    ).toBeInTheDocument();
+
+    // Its display name IS its username, because that is what the service writes for an account that
+    // supplied none - so the value appears in two cells rather than one, and the grid renders both
+    // rather than treating the second as a duplicate to elide.
+    expect(deactivatedReaderRow.display_name).toBe(deactivatedReaderRow.username);
+    expect(within(readerRow).getAllByText(deactivatedReaderRow.display_name)).toHaveLength(2);
   });
 
   it('takes its accessible name from a caption', () => {

@@ -75,9 +75,8 @@
 
 import { z } from 'zod';
 
-import { codePointLength } from '@/lib/text';
-
 import type { CategoryCreate, CategoryUpdate } from '@/lib/types';
+import { codePointLength } from '@/lib/utils';
 
 /**
  * Upper bound on a category name, in characters, measured after surrounding whitespace is removed.
@@ -139,7 +138,7 @@ type AssertAssignableTo<TActual extends TContract, TContract> = TActual;
  * reader who writes in one of those scripts is told their perfectly valid comment, title or category
  * name is too long, by a check whose only job was to save them a round trip. `@/lib/validation/auth`
  * already measured this way for its own bounds and recorded two observed cases against the running
- * service; `@/lib/text#codePointLength` is now that measurement, shared by all four validators and by
+ * service; `@/lib/utils#codePointLength` is now that measurement, shared by all four validators and by
  * `@/lib/seo`'s truncation, so one notion of length governs the tier.
  *
  * `abort: true` matches the convention in this tier: once a length has failed, later checks on the
@@ -159,7 +158,7 @@ type AssertAssignableTo<TActual extends TContract, TContract> = TActual;
  * over-length name is measured after trimming, and `'   '` reaches `.min(1)` as `''` and is
  * rejected rather than being stored as a name that renders as a blank filter chip.
  *
- * The ceiling is measured with `codePointLength` from `@/lib/text` inside a `.refine()` rather than
+ * The ceiling is measured with `codePointLength` from `@/lib/utils` inside a `.refine()` rather than
  * with zod's `.max()`, because `.max()` reads `String.prototype.length` - UTF-16 code units - while
  * the service's `max_length=80` counts Python code points. Without it an eighty-character name
  * written in emoji or an astral script measures 160 here and is refused locally at half the bound

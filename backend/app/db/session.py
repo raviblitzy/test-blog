@@ -113,8 +113,8 @@ its headroom.
 
 Every connection speaks UTC
 ---------------------------
-:data:`CONNECT_ARGS` pins the PostgreSQL session time zone to UTC on every connection this
-engine opens, and that is part of the API's wire contract rather than a local preference.
+:func:`safe_connect_args` pins the PostgreSQL session time zone to UTC on every connection
+this engine opens, and that is part of the API's wire contract rather than a local preference.
 Every timestamp column in this schema is ``TIMESTAMP WITH TIME ZONE``, and psycopg loads
 such a value as an *aware* :class:`~datetime.datetime` carrying the offset of the
 **session** time zone - not necessarily UTC. Pydantic then serialises whatever offset it
@@ -135,8 +135,8 @@ characters of one would silently read the wrong calendar day either side of midn
 
 Pinning it here also means no other layer has to normalise: no response serialiser
 converting on the way out, no ``astimezone`` in a schema validator, and no per-connection
-event listener - one entry of :data:`CONNECT_ARGS`, applied before the first statement, and
-the values are already UTC by the time anything reads them.
+event listener - one entry of :func:`safe_connect_args`, applied before the first statement,
+and the values are already UTC by the time anything reads them.
 
 Reaching the database is bounded in time
 ----------------------------------------
@@ -161,11 +161,12 @@ into hung user requests instead of fast failures.
 
 :data:`CONNECT_TIMEOUT_SECONDS` and :data:`POOL_TIMEOUT_SECONDS` are therefore both set
 explicitly, and both are availability requirements rather than tuning knobs. Together they
-bound what any caller can observe at roughly ten seconds - one wait for a slot plus one
-connection attempt - so ``/readyz`` fails fast enough to be actionable and a slot is
-returned to the pool about twenty-six times sooner than before. ``/healthz`` is unaffected
-either way, because it touches no database at all; that separation is the whole reason the
-two probes exist.
+bound **connection acquisition** - one wait for a slot plus one connection attempt - at
+roughly ten seconds, so ``/readyz`` fails fast enough to be actionable and a slot is
+returned to the pool about twenty-six times sooner than before. That bound is about getting
+a connection and nothing else; what happens to a statement once one is established is the
+next section's subject. ``/healthz`` is unaffected either way, because it touches no
+database at all; that separation is the whole reason the two probes exist.
 
 Measured after the change, against the same listener: a single ``/readyz`` on a fresh pool
 answered 503 in **5.01 seconds**, and a burst of six ``/readyz`` plus four feed requests -
@@ -176,6 +177,55 @@ any change here: a connect timeout must not turn a fast refusal into a full wait
 does not, because a refused socket reports itself immediately and the deadline is only ever
 reached by a peer that stays silent.
 
+A statement that stalls is bounded too, and by a different mechanism
+--------------------------------------------------------------------
+The two values above bound *reaching* the database. They say nothing about a server that
+accepts a connection, answers normally, and only then goes silent **mid-session** - a
+statement stalling rather than a connection failing, which neither a connect timeout nor a
+checkout timeout applies to. :data:`POOL_PRE_PING` covers the common form of it, since a
+connection the server has actually closed is detected on checkout and replaced, but a wedged
+backend or a partition that holds the socket open is not that.
+
+Three things bound it now, each covering what the others cannot, and the distinction between
+them matters because they fail in different places:
+
+:data:`STATEMENT_TIMEOUT_SECONDS`
+    A server-side ceiling, set through libpq's ``options`` so it is established before the
+    first statement. PostgreSQL itself cancels a statement that exceeds it and the caller
+    receives ``57014 query_canceled`` - measured through this engine at its configured value:
+    ``SHOW statement_timeout`` reports ``10s`` and ``pg_sleep(30)`` is cancelled at 10.011 s as
+    ``QueryCanceled``, after which the next checkout from the pool answers normally. This is
+    what bounds a *wedged backend*: a query the server is still nominally running. It is
+    deliberately generous rather than tight, for the reason recorded at that constant's own
+    definition below.
+:data:`TCP_KEEPALIVE_ARGS`
+    A transport-level probe, because a server-side ceiling is useless when the *path* to the
+    server is gone: PostgreSQL cancels the statement and the cancellation never arrives. TCP
+    keepalives make the kernel probe the peer and fail the socket when those probes go
+    unacknowledged, which turns an indefinite wait into a bounded one for every caller. They
+    bound an unreachable *host*, not a reachable host that answers nothing - the peer's kernel
+    acknowledges a keepalive whatever its server process is doing.
+A caller-side deadline, where a caller needs a promise
+    Neither mechanism above is instant, and an orchestrator's probe timeout is a hard number.
+    So ``app.api.v1.routers.health.readiness`` wraps its own statement in an explicit
+    ``asyncio.timeout`` and invalidates the connection if it elapses. That is the only place
+    in this service that does, and it is deliberate: readiness is the one operation whose
+    *whole point* is to answer inside a fixed window, while a feed request would rather take
+    a slow answer than none. The bound a caller can rely on therefore lives at the call site
+    that needs it, and the two engine-wide values below are the floor under everything else.
+
+The honest summary, which supersedes any claim that "ten seconds" is a total: **acquiring** a
+connection is bounded at roughly ten seconds (one wait for a slot plus one connect attempt),
+a **statement** is bounded by the server-side ceiling and, when the host itself becomes
+unreachable, by the keepalive budget, and the one caller that must not exceed its own probe
+window enforces that window itself.
+
+One case remains outside all three, and it is named rather than papered over: a transport that
+keeps acknowledging packets while carrying no application data - a black-holing middlebox, or a
+server frozen instead of merely slow - defeats each of them, because the server cannot run its own
+timer, the kernel sees a healthy socket, and a cancellation has to travel the same dead path as
+the query it is cancelling. ``app.api.v1.routers.health.READINESS_TIMEOUT_SECONDS`` documents what
+that means for the one caller with a hard window, and what the backstop is.
 What these two values do **not** bound, stated so that the section title is not read wider
 than it is: a server that accepts a connection, answers normally, and only then goes silent
 *mid-session*. That is a statement stalling rather than a connection failing, and neither a
@@ -185,8 +235,40 @@ replaced - but a silent network partition holding the socket open is bounded onl
 keepalive or by a server-side statement timeout. No statement timeout is configured here on
 purpose: it would apply to every query this service runs, including the seeder's bulk
 inserts, and choosing one number for all of them is a decision this module has no basis to
-make. If that mode ever needs bounding, it belongs in ``CONNECT_ARGS`` as a documented
-libpq ``keepalives`` group or in the specific call that needs it, not as a blanket ceiling.
+make. If that mode ever needs bounding, it belongs in :func:`safe_connect_args` as a
+documented libpq ``keepalives`` group or in the specific call that needs it, not as a
+blanket ceiling.
+
+Three processes open connections to this database, and all three get these guarantees
+---------------------------------------------------------------------------------------
+The engine below is one of **three** engine owners in this project, and the two others are
+not application code:
+
+* ``backend/migrations/env.py`` opens a synchronous :class:`~sqlalchemy.pool.NullPool`
+  engine for every ``alembic upgrade``, ``downgrade``, ``check`` and ``revision`` run - and
+  in the container that run happens on the startup path, before the service answers
+  anything;
+* ``backend/tests/conftest.py`` opens an asynchronous ``NullPool`` engine for the test
+  session.
+
+Two of the guarantees above are properties of a *connection*, not of a pool, so leaving
+them to the application engine alone would have meant the two guarantees that matter most
+when a database is misbehaving applied to the one caller least likely to meet it first. A
+hung server would have held a migration - and with it a container start - for libpq's full
+130 seconds while the application next door failed in five, and a statement logged by
+Alembic or by the suite would have carried its bound values in full while the same
+statement logged by a route carried a marker. That asymmetry is what
+:func:`safe_connect_args` and :data:`HIDE_PARAMETERS` exist to remove: they are pure,
+environment-independent values, they name no pool, and each of the three owners applies
+them to whatever engine it builds.
+
+What deliberately does **not** travel with them is every pool setting -
+:data:`POOL_SIZE`, :data:`MAX_OVERFLOW`, :data:`POOL_RECYCLE_SECONDS`,
+:data:`POOL_PRE_PING` and :data:`POOL_TIMEOUT_SECONDS`. Those describe how a long-lived
+worker *retains* connections between requests, and both other owners use ``NullPool``,
+which retains none: passing a pool size to a pool that holds nothing would be
+configuration that reads as meaningful and is not, and :func:`_assert_within_connection_budget`
+counts one pooled engine per process precisely because the other two hold no pool to count.
 
 Isolation level: PostgreSQL's default, and what that means for a reader
 ----------------------------------------------------------------------
@@ -218,8 +300,10 @@ callers depend on that. ``app.main`` imports :data:`engine` at import time,
 drives the application in-process over an httpx ASGI transport with no live server at all,
 and ``alembic check`` imports the ``app`` package before it has been asked to touch a
 database. Importing this module with PostgreSQL stopped therefore has to succeed, and it
-does. Connectivity is proved where it belongs: ``app.api.v1.routers.health`` backs
-``/readyz`` with a trivial query on request, while ``/healthz`` touches no database at all.
+does. Connectivity is proved where it belongs: ``app.services.health_service`` backs
+``/readyz`` with a trivial query on request - issued by
+``app.repositories.health_repository``, like every other statement in the service - while
+``/healthz`` touches no database at all.
 
 No schema, no queries, no helpers
 ---------------------------------
@@ -277,8 +361,8 @@ from app.core.config import settings
 
 __all__ = [
     "ASSUMED_MAX_CONNECTIONS",
-    "CONNECT_ARGS",
     "CONNECT_TIMEOUT_SECONDS",
+    "HIDE_PARAMETERS",
     "MAX_OVERFLOW",
     "MAX_REPLICAS",
     "MAX_WORKERS_PER_REPLICA",
@@ -290,9 +374,13 @@ __all__ = [
     "REQUIRED_MAX_CONNECTIONS",
     "RESERVED_CONNECTIONS",
     "SESSION_TIME_ZONE",
+    "STATEMENT_TIMEOUT_MILLISECONDS",
+    "STATEMENT_TIMEOUT_SECONDS",
+    "TCP_KEEPALIVE_ARGS",
     "WORKER_CONNECTION_CEILING",
     "AsyncSessionLocal",
     "engine",
+    "safe_connect_args",
 ]
 
 
@@ -514,19 +602,147 @@ fast applies back-pressure and frees the caller; queueing it for thirty seconds 
 database problem into a pile of stalled requests.
 """
 
-CONNECT_ARGS: Final[dict[str, str]] = {
-    # A libpq `options` string, passed through by psycopg to the server at connection time,
-    # so the setting is established before the first statement and costs no extra round
-    # trip. `-c timezone=UTC` is the same thing as `SET TIME ZONE 'UTC'` without needing a
-    # statement, an event listener or a checkout hook to issue it.
-    "options": f"-c timezone={SESSION_TIME_ZONE}",
-    # A libpq connection parameter, spelled as a string because that is how libpq receives
-    # every keyword; psycopg parses it back to an integer itself. Not tuning - the default
-    # it replaces is 130 seconds, and leaving it in place is what made a hung database an
-    # outage rather than a fast failure. See :data:`CONNECT_TIMEOUT_SECONDS`.
-    "connect_timeout": str(CONNECT_TIMEOUT_SECONDS),
+STATEMENT_TIMEOUT_SECONDS: Final[int] = 10
+"""Server-side ceiling on how long any one statement may run before PostgreSQL cancels it.
+
+The bound on a *stalled statement*, which :data:`CONNECT_TIMEOUT_SECONDS` and
+:data:`POOL_TIMEOUT_SECONDS` cannot reach - see "A statement that stalls is bounded too" in
+the module docstring. Applied through libpq's ``options``, so the server enforces it and a
+caller receives ``57014 query_canceled`` rather than waiting on a backend that will never
+answer.
+
+Ten seconds is deliberately **generous**, and the generosity is the point. One number governs
+every statement this engine runs, including ``app.db.seed``'s inserts, so it has to sit far
+above the slowest legitimate one rather than near it: every query in this service is a short
+unit of work - the feed is two statements plus two batched loaders, and each mutation is one
+transaction that commits and ends - and the whole 1370-test suite, seeding included, runs
+under this ceiling with no statement coming close to it. A tight ceiling would convert an
+ordinary slow moment into a failed request; this one converts an *indefinite* wait into a
+bounded failure, which is the actual defect being closed. A caller that needs a promise
+tighter than this imposes its own deadline, as ``app.api.v1.routers.health.readiness`` does.
+
+It does **not** apply to migrations. ``backend/migrations/env.py`` builds its own synchronous
+engine and passes no connect arguments, so a long ``CREATE INDEX`` is unaffected by a value
+chosen for request-time statements - which is exactly why this belongs here and not in a
+server-wide setting.
+"""
+
+STATEMENT_TIMEOUT_MILLISECONDS: Final[int] = STATEMENT_TIMEOUT_SECONDS * 1000
+"""The same ceiling in the unit PostgreSQL applies to a bare integer.
+
+Derived rather than restated, so the two can never disagree: ``SET statement_timeout = 10``
+means ten *milliseconds*, and writing the seconds value straight into the ``options`` string
+would silently impose a bound a thousand times tighter than the one documented above. ``SHOW
+statement_timeout`` reports the result as ``10s``.
+"""
+
+TCP_KEEPALIVE_ARGS: Final[dict[str, str]] = {
+    # Enable kernel keepalive probes on the connection socket.
+    "keepalives": "1",
+    # Idle seconds before the first probe. Short, because this is a request path: ten seconds
+    # of silence on a connection that is supposed to be answering a query is already wrong.
+    "keepalives_idle": "10",
+    # Seconds between probes once one has gone unanswered.
+    "keepalives_interval": "5",
+    # Unanswered probes before the socket is declared dead. 10 + 3x5 gives a worst case of
+    # roughly 25 seconds to abandon a connection whose peer has stopped answering entirely.
+    "keepalives_count": "3",
 }
-"""The connect arguments passed to psycopg for every connection. See :data:`engine`."""
+"""libpq keepalive parameters, spelled as strings because that is how libpq receives every
+keyword.
+
+The complement to :data:`STATEMENT_TIMEOUT_SECONDS`, and needed because that value is enforced
+by the *server*: if the path to the server is gone, PostgreSQL cancels the statement and the
+cancellation never arrives, so a client-side mechanism is the only thing that can end the wait.
+These four make the kernel probe the peer and fail the socket when the probes go
+**unacknowledged**, which is what bounds a partition rather than a slow query.
+
+Precision matters about what that covers. A keepalive probe is answered by the peer's *kernel*,
+so this ends a connection whose host has gone - crashed, partitioned away, or had its route
+withdrawn - and it does not end one whose kernel still acknowledges while the server process
+answers nothing. That case is bounded by the server-side ceiling above when the server is running
+its own timer, and is discussed honestly in
+``app.api.v1.routers.health.READINESS_TIMEOUT_SECONDS`` for the case where nothing on the client
+can bound it.
+
+Values are chosen for a request path rather than for a long-lived analytics connection: a
+worst case of about twenty-five seconds to declare an unreachable peer dead, against libpq's own
+default of no keepalives at all and the operating system's much longer defaults when they are
+enabled without tuning.
+"""
+
+
+HIDE_PARAMETERS: Final[bool] = True
+"""Whether bound parameter values are withheld from anything an engine logs or raises.
+
+Shared by all three engine owners - see "Three processes open connections to this database"
+in the module docstring - because it is a property of what a *statement* may reveal and not
+of how a pool behaves. SQLAlchemy otherwise interpolates the bound values into the line it
+logs and into the message it attaches to a wrapped ``DBAPIError``, and in this schema those
+values are the data itself: an email address, a password hash, a refresh-token digest, the
+body of an unpublished draft. With this on the statement is still reported whole and the
+values are replaced by a fixed marker.
+
+It is deliberately not staged on ``ENVIRONMENT``. "Development" is a laptop attached to a
+real database at least as often as it is a throwaway one, and a migration run or a test
+session is exactly where a developer pipes output to a file and forgets it.
+"""
+
+
+def safe_connect_args() -> dict[str, str]:
+    """Return the libpq connect arguments every engine in this project must open with.
+
+    A pure function of module constants: it reads no environment variable, opens nothing,
+    and depends on no pool, which is what lets the two non-application engine owners -
+    ``backend/migrations/env.py`` and ``backend/tests/conftest.py`` - call it as freely as
+    the engine below does. A **fresh** dictionary is returned on every call rather than one
+    shared module-level mapping, so an engine that mutates what it is handed (or a caller
+    that adds a key of its own) cannot reach into another engine's configuration.
+
+    Every entry is a requirement rather than tuning:
+
+    ``options``
+        A libpq options string, forwarded by psycopg at connection time, so both settings are
+        established before the first statement and cost no extra round trip.
+        ``-c timezone=UTC`` is ``SET TIME ZONE 'UTC'`` without needing a statement, an event
+        listener or a checkout hook to issue it, and ``-c statement_timeout`` is
+        ``SET statement_timeout`` on the same terms. See "Every connection speaks UTC" and
+        "A statement that stalls is bounded too" in the module docstring for the
+        measurements, :data:`SESSION_TIME_ZONE` for the one value and
+        :data:`STATEMENT_TIMEOUT_MILLISECONDS` for the other - which is why the ceiling is
+        derived in milliseconds rather than written in seconds.
+
+    ``connect_timeout``
+        A libpq connection parameter, spelled as a string because that is how libpq
+        receives every keyword; psycopg parses it back to an integer itself. The default it
+        replaces is 130 seconds, and leaving that in place is what turns a *hung* database
+        into an outage rather than a fast failure - for a migration on a container's startup
+        path just as much as for a request. See :data:`CONNECT_TIMEOUT_SECONDS`.
+
+    the keepalive group
+        Bounds the one failure neither timeout above can reach: an already-established
+        connection whose peer has stopped acknowledging at all. See
+        :data:`TCP_KEEPALIVE_ARGS`, which is explicit about what that does and does not
+        cover.
+
+    Nothing else is passed. There is no connection pooler in front of PostgreSQL in this
+    deployment, so prepared-statement or statement-cache tuning would be speculative.
+
+    Returns:
+        A new mapping suitable for ``connect_args=`` on either
+        :func:`~sqlalchemy.ext.asyncio.create_async_engine` or
+        :func:`~sqlalchemy.create_engine`. Both reach the same psycopg 3 driver, because
+        AAP §0.5.6 excludes ``asyncpg`` and this project has exactly one driver, so one
+        mapping serves the asynchronous application, the synchronous migration side and the
+        test harness alike.
+    """
+    return {
+        "options": (
+            f"-c timezone={SESSION_TIME_ZONE} -c statement_timeout={STATEMENT_TIMEOUT_MILLISECONDS}"
+        ),
+        "connect_timeout": str(CONNECT_TIMEOUT_SECONDS),
+        **TCP_KEEPALIVE_ARGS,
+    }
 
 
 # ---------------------------------------------------------------------------------------
@@ -544,9 +760,10 @@ engine: AsyncEngine = create_async_engine(
     # of somebody's draft. With this on, the statement is still logged in full and the
     # values are replaced by a fixed marker, so a statement log keeps its diagnostic value -
     # which query, against which table, with how many parameters - and stops being a copy of
-    # the data. It is set unconditionally, in every environment, because "development" is a
-    # laptop with a real database attached at least as often as it is a throwaway one.
-    hide_parameters=True,
+    # the data. Taken from the shared invariant rather than spelled here, because the
+    # migration and test engines must open with the same guarantee - see
+    # :data:`HIDE_PARAMETERS`.
+    hide_parameters=HIDE_PARAMETERS,
     # `echo` is deliberately NOT set, in any environment.
     #
     # Two reasons, and the second is the one that matters. Passing `echo=True` makes
@@ -571,13 +788,16 @@ engine: AsyncEngine = create_async_engine(
     # decides how long a caller waits for a slot once the pool is fully committed - which is
     # exactly the state a database outage produces. See :data:`POOL_TIMEOUT_SECONDS`.
     pool_timeout=POOL_TIMEOUT_SECONDS,
-    # Two connect arguments, and both are requirements rather than tuning: the session time
-    # zone is part of the wire contract ("Every connection speaks UTC") and the connect
-    # timeout bounds a failure mode whose default is 130 seconds ("Every failure mode is
-    # bounded in time"). Nothing else is passed: there is no connection pooler in front of
-    # PostgreSQL in this deployment (docker-compose.yml defines db, backend and frontend and
-    # nothing else), so prepared-statement or statement-cache tuning would be speculative.
-    connect_args=CONNECT_ARGS,
+    # Every connect argument is a requirement rather than tuning. The session time zone is
+    # part of the wire contract ("Every connection speaks UTC"); the connect timeout bounds a
+    # failure mode whose default is 130 seconds ("Reaching the database is bounded in time");
+    # and the statement timeout plus the keepalive group bound the mode neither of those can
+    # reach, a statement that stalls on an established connection ("A statement that stalls is
+    # bounded too"). Nothing further is passed: this deployment puts no connection pooler in
+    # front of PostgreSQL, so prepared-statement or statement-cache tuning would be
+    # speculative. Called rather than referenced, so this engine holds its own mapping and the
+    # migration and test engines - which call the same function - hold theirs.
+    connect_args=safe_connect_args(),
 )
 """The one engine this process owns, and the pool behind every session it hands out.
 

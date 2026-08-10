@@ -124,9 +124,8 @@
 
 import { z } from 'zod';
 
-import { codePointLength } from '@/lib/text';
-
 import type { CommentCreate, CommentUpdate } from '@/lib/types';
+import { codePointLength } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Bounds

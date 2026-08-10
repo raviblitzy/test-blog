@@ -74,12 +74,11 @@
  * placement.
  */
 
-import { useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { JSX, RefObject } from 'react';
 
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import type { QueryClient } from '@tanstack/react-query';
 import { CircleAlert, LoaderCircle, Plus, Save, Trash2 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useForm } from 'react-hook-form';
@@ -99,6 +98,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
+import { invalidateForAdminMutation } from '@/lib/admin-cache';
 import { createAdminCategory, deleteAdminCategory, updateAdminCategory } from '@/lib/api/admin';
 import { isApiError } from '@/lib/api/client';
 import { cn } from '@/lib/utils';
@@ -112,48 +112,25 @@ import type { CategoryCreateFormValues, CategoryUpdateFormValues } from '@/lib/v
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The key every administrative category listing is registered under.
+ * Cache invalidation lives in `@/lib/admin-cache`, not here.
  *
- * The `(admin)` screens register their lists as `['admin', <entity>, params]` and their counts as
- * `['admin', 'stats']`. Invalidating the two-segment prefix therefore reaches every page and filter
- * combination of the category table at once, which is the point: an administrator who creates a
- * category from a filtered page still expects the row to appear.
+ * This file's three mutations name their edge in that module's dependency graph rather than composing
+ * a key list of their own. That is where the
+ * cascades that justify each edge are recorded, and it is why the four admin components can no longer
+ * disagree about what a given write staled.
+ *
+ * The three edges this file uses are unchanged in effect: a create and a delete refresh the category
+ * table and the overview counts, because both change how many categories exist; a rename refreshes the
+ * table alone, because it moves no count. A successful delete needs no posts refresh either - the
+ * service refuses to delete a category any post is still filed under.
+ *
+ * The public category list - the one the home feed's filter is drawn from - is a Server Component's
+ * own read rather than an entry in this cache, so there is nothing here to invalidate for it.
+ *
+ * Every call is awaited, which keeps the mutation pending until the refetch settles: the submit
+ * control stays disabled until the table the operator is looking at actually reflects the change,
+ * which is what stops a doubled create.
  */
-const ADMIN_CATEGORIES_QUERY_KEY = ['admin', 'categories'] as const;
-
-/**
- * The key the administrative overview's aggregate counts are registered under.
- *
- * Invalidated after a create and after a delete - the two mutations that change how many categories
- * exist - and deliberately **not** after a rename, which moves no count.
- */
-const ADMIN_STATS_QUERY_KEY = ['admin', 'stats'] as const;
-
-/**
- * Refresh the administrative views a category mutation has just invalidated.
- *
- * The public category list - the one the home feed's filter is drawn from - is a separate query
- * owned by another surface and is deliberately not reached into from here.
- *
- * Awaited by each mutation's success handler, which keeps the mutation in its pending state until
- * the refetch settles. That is intentional: the submit control stays disabled until the table the
- * operator is looking at actually reflects the change, which is what stops a doubled create.
- *
- * @param queryClient - The client resolved from the provider that owns the tier's default options.
- * @param options - `includeStats` adds the overview counts, for the two mutations that move them.
- */
-async function invalidateAdminCategoryQueries(
-  queryClient: QueryClient,
-  options: { readonly includeStats: boolean },
-): Promise<void> {
-  const pending = [queryClient.invalidateQueries({ queryKey: ADMIN_CATEGORIES_QUERY_KEY })];
-
-  if (options.includeStats) {
-    pending.push(queryClient.invalidateQueries({ queryKey: ADMIN_STATS_QUERY_KEY }));
-  }
-
-  await Promise.all(pending);
-}
 
 /* -------------------------------------------------------------------------------------------------
  * Failure interpretation
@@ -180,11 +157,29 @@ type CategoryFieldErrorSetter = (field: CategoryFieldName, message: string) => v
  * `ProblemDetail.type` for every conflict the service raises.
  *
  * The service uses one URI for all of them, so `type` alone cannot say *which* conflict occurred -
- * but the operation can, and does. Reading the service's raise sites: every conflict from creating
- * or updating a category reports a taken name or a taken derived slug, and the only conflict from
- * deleting one is the in-use guard. So a conflict on submit is attributable to the name field, and a
- * conflict on delete is not a field error at all. That is why {@link applySubmitFailureToFields} is
- * used on the submit path only, and why the delete flow renders its refusal in place instead.
+ * but the operation can, and does. Reading `CategoryService`'s raise sites:
+ *
+ *   * **On submit, the conflict is a taken NAME.** `categories.name` is uniquely constrained, and
+ *     both `create` and `update` pre-check it and raise "A category with that name already exists."
+ *     The remedy is to change the name, so the message belongs on the name field.
+ *   * **A slug collision is NOT a submit conflict**, and this is the correction worth stating,
+ *     because the opposite reads plausibly. The slug is not submitted at all: the service derives it
+ *     from the name and then hands it to `unique_slug`, which appends a deterministic suffix until it
+ *     does not collide. So filing a second "Machine Learning" after a `machine-learning` already
+ *     exists SUCCEEDS, with a suffixed slug, and the resolved value comes back in the response - it
+ *     is not something the operator is asked to resolve. `update` does not re-derive the slug at all:
+ *     a rename retains the address the taxonomy is linked and crawled under.
+ *
+ *     One residual case does name both columns - `_DETAIL_NAME_OR_SLUG_TAKEN` - and it is a RACE
+ *     rather than a rule: two concurrent writers that both passed the pre-check, reported by the
+ *     database instead of by the service. The remedy is identical (choose another name), which is why
+ *     it lands on the same field and needs no branch of its own here.
+ *   * **On delete, the only conflict is the in-use guard**: "Posts are still filed under this
+ *     category. Re-file them before deleting it." That is not a field error at all - no control on
+ *     this form caused it and none can fix it.
+ *
+ * Hence {@link applySubmitFailureToFields} is used on the submit path only, and the delete flow
+ * renders its refusal in place instead.
  */
 const CONFLICT_PROBLEM_TYPE = '/errors/conflict';
 
@@ -604,34 +599,35 @@ function CategoryFacts({ category }: { readonly category: CategoryPublic }): JSX
 }
 
 /**
- * Return focus to a control that the pending state disabled out from under the reader.
+ * Put focus back somewhere useful once a request settles.
  *
  * Disabling the submit control while a request is in flight is what stops a doubled submission, but
  * a disabled element cannot hold focus - so the moment it is disabled the browser drops focus to
  * `<body>`, and a keyboard reader who pressed Enter loses their place. This puts them back once the
- * control is interactive again.
+ * form is interactive again.
+ *
+ * Where "back" is depends on how the request ended, which is why the destination is the caller's to
+ * decide rather than a single ref: after a refusal that named a field it is that field, so the reader
+ * lands on the control they have to change; after a successful rename it cannot be the submit button,
+ * because re-seeding the form clears the dirty state and the button correctly goes inert. That second
+ * case is the one this hook used to give up on, leaving focus on `<body>` after a save that worked.
  *
  * The restoration is deliberately conservative, and each guard removes a way it could misbehave:
  *
  *   - it runs in an effect keyed on the pending flag, so the DOM has already been repainted and the
- *     control is genuinely re-enabled by the time `focus()` is called - no timer, no polling;
+ *     controls are genuinely re-enabled by the time anything is focused - no timer, no polling;
  *   - it acts only on the true-to-false edge, so a re-render for any other reason cannot move focus;
  *   - it acts only while focus is still on `<body>`, so it never steals focus from a reader who
- *     moved on, nor from the field that `shouldFocusError` just focused after a failed validation;
- *   - it skips a control that is still disabled, which is the successful-rename case: saving clears
- *     the dirty state and the button correctly goes inert, so there is nothing to focus and a toast
- *     reports the outcome instead.
+ *     moved on, nor from the field that `shouldFocusError` just focused after a failed validation.
  *
  * Because the focus is programmatic, Chrome matches `:focus-visible` only when the reader was
  * already navigating by keyboard - so a ring reappears for them and not for someone who clicked.
  *
  * @param pending - Whether the mutation is in flight.
- * @param target - The control to restore focus to.
+ * @param restore - Called on the settling edge, with focus still on `<body>`. Must be stable, so
+ * wrap it in `useCallback`: it is an effect dependency.
  */
-function useFocusRestoredAfterPending(
-  pending: boolean,
-  target: RefObject<HTMLButtonElement | null>,
-): void {
+function useFocusRestoredAfterPending(pending: boolean, restore: () => void): void {
   const wasPending = useRef(pending);
 
   useEffect(() => {
@@ -642,12 +638,54 @@ function useFocusRestoredAfterPending(
       return;
     }
 
-    const control = target.current;
+    restore();
+  }, [pending, restore]);
+}
+
+/**
+ * Build the restoration a settled request should perform, for either mode.
+ *
+ * The order is a preference list, and each step exists for a case that actually happens:
+ *
+ *   1. **The first field the service objected to**, when it named one. `setError` alone leaves the
+ *      message beside a control nobody is looking at; `setFocus` puts the reader on it. It is not
+ *      done at `setError` time - `shouldFocus` would fire while every control is still `disabled` by
+ *      the in-flight request, and focusing a disabled element is a no-op.
+ *   2. **The submit control**, when it is still enabled. That is the create form after any outcome,
+ *      and the rename form after a refusal, where the values are still dirty. It is where the reader
+ *      pressed Enter, so it is the least surprising place to be.
+ *   3. **The name field**, which is always enabled once the request has settled. This is the
+ *      successful-rename case: the submit button is inert by design, and landing on the first
+ *      control of the form is both stable and useful, rather than being dumped at the top of the
+ *      document.
+ *
+ * @param setFocus - `useForm().setFocus`, which reaches a field through its registered ref.
+ * @param submit - The submit control, which may be disabled by the time this runs.
+ * @param invalidField - The first field a refusal named, or `null`.
+ * @returns The restoration to hand to {@link useFocusRestoredAfterPending}.
+ */
+function focusRestorer(
+  setFocus: (name: CategoryFieldName) => void,
+  submit: RefObject<HTMLButtonElement | null>,
+  invalidField: CategoryFieldName | null,
+): () => void {
+  return (): void => {
+    if (invalidField !== null) {
+      setFocus(invalidField);
+
+      return;
+    }
+
+    const control = submit.current;
 
     if (control !== null && !control.disabled) {
       control.focus();
+
+      return;
     }
-  }, [pending, target]);
+
+    setFocus('name');
+  };
 }
 
 /**
@@ -743,8 +781,10 @@ function DeleteCategoryDialog({
   const deletion = useMutation({
     mutationFn: (): Promise<void> => deleteAdminCategory(category.id),
     onSuccess: async (): Promise<void> => {
-      // A delete changes how many categories exist, so the overview counts move with the list.
-      await invalidateAdminCategoryQueries(queryClient, { includeStats: true });
+      // A delete changes how many categories exist, so the overview counts move with the list. No
+      // posts refresh is needed: the service refuses to delete a category any post is still filed
+      // under, so a delete that succeeded unfiled nothing.
+      await invalidateForAdminMutation(queryClient, 'category.delete');
       toast.success(`Category “${category.name}” deleted.`);
       setFailure(null);
       setOpen(false);
@@ -850,6 +890,13 @@ function CreateCategoryForm({
   const queryClient = useQueryClient();
   const idBase = useId();
   const [failure, setFailure] = useState<unknown>(null);
+  /**
+   * The first field the service objected to, held until the form is interactive enough to focus it.
+   *
+   * Cleared as each submission starts, so a message from the previous attempt cannot pull focus after
+   * a later one succeeded.
+   */
+  const [invalidField, setInvalidField] = useState<CategoryFieldName | null>(null);
 
   const form = useForm<CategoryCreateFormValues>({
     resolver: zodResolver(categoryCreateSchema),
@@ -861,24 +908,31 @@ function CreateCategoryForm({
       createAdminCategory({ name: values.name, description: values.description }),
     onSuccess: async (created: CategoryPublic): Promise<void> => {
       // A create changes how many categories exist, so the overview counts move with the list.
-      await invalidateAdminCategoryQueries(queryClient, { includeStats: true });
+      await invalidateForAdminMutation(queryClient, 'category.create');
       toast.success(`Category “${created.name}” created.`);
       form.reset(CREATE_DEFAULT_VALUES);
       onSuccess?.(created);
     },
     onError: (error: Error): void => {
+      let first: CategoryFieldName | null = null;
       const attached = applySubmitFailureToFields(error, (field, message) => {
+        first ??= field;
         form.setError(field, { type: SERVER_ERROR_TYPE, message });
       });
 
+      setInvalidField(first);
       setFailure(attached ? null : error);
     },
   });
 
   const pending = creation.isPending;
   const submitRef = useRef<HTMLButtonElement>(null);
+  const { setFocus } = form;
 
-  useFocusRestoredAfterPending(pending, submitRef);
+  useFocusRestoredAfterPending(
+    pending,
+    useCallback(() => focusRestorer(setFocus, submitRef, invalidField)(), [invalidField, setFocus]),
+  );
 
   return (
     <form
@@ -888,6 +942,7 @@ function CreateCategoryForm({
       onSubmit={(event): void => {
         void form.handleSubmit((values) => {
           setFailure(null);
+          setInvalidField(null);
           creation.mutate(values);
         })(event);
       }}
@@ -984,6 +1039,29 @@ function RenameCategoryForm({
   const queryClient = useQueryClient();
   const idBase = useId();
   const [failure, setFailure] = useState<unknown>(null);
+  /** See {@link CreateCategoryForm}'s copy of this: the first field the service objected to. */
+  const [invalidField, setInvalidField] = useState<CategoryFieldName | null>(null);
+  /**
+   * The stored category this form is editing - the single authority for everything OUTSIDE the
+   * controls.
+   *
+   * Seeded from the prop and replaced by every successful response, because the response is what was
+   * actually stored: the service trims the name, and it is the only thing that knows the filed-post
+   * count after a concurrent change. The form's editable values are re-seeded from the same object in
+   * the same commit, so the input, the form's accessible name, the read-only facts, the delete
+   * confirmation and the delete toast can never disagree about which category is on screen.
+   *
+   * Before this existed they could, and did: the values came from the response while every surrounding
+   * label still read the original prop. `onSuccess` is optional, so a consumer that renders this form
+   * inline - rather than closing a panel over it - showed the new name in the field while the heading
+   * and the delete dialog still named the old one.
+   *
+   * Prop changes for the SAME row are deliberately not adopted here. The public entry point keys this
+   * component by identifier, so pointing it at a different category remounts it and re-seeds
+   * everything; adopting a refetch of the same row instead would discard an edit in progress, which is
+   * the trade this file already documents at its `key`.
+   */
+  const [persisted, setPersisted] = useState<CategoryPublic>(category);
 
   const form = useForm<CategoryUpdateFormValues>({
     resolver: zodResolver(categoryUpdateSchema),
@@ -992,19 +1070,25 @@ function RenameCategoryForm({
 
   const update = useMutation({
     mutationFn: (payload: CategoryUpdate): Promise<CategoryPublic> =>
-      updateAdminCategory(category.id, payload),
+      updateAdminCategory(persisted.id, payload),
     onSuccess: async (updated: CategoryPublic): Promise<void> => {
       // A rename moves no count, so the overview stats are deliberately left alone.
-      await invalidateAdminCategoryQueries(queryClient, { includeStats: false });
+      await invalidateForAdminMutation(queryClient, 'category.update');
       toast.success(`Category “${updated.name}” saved.`);
+      // Both authorities move together, from the same object: what the form holds, and what every
+      // label around it reads.
+      setPersisted(updated);
       form.reset(toRenameDefaultValues(updated));
       onSuccess?.(updated);
     },
     onError: (error: Error): void => {
+      let first: CategoryFieldName | null = null;
       const attached = applySubmitFailureToFields(error, (field, message) => {
+        first ??= field;
         form.setError(field, { type: SERVER_ERROR_TYPE, message });
       });
 
+      setInvalidField(first);
       setFailure(attached ? null : error);
     },
   });
@@ -1012,23 +1096,28 @@ function RenameCategoryForm({
   const pending = update.isPending;
   const submitHintId = `${idBase}-submit-hint`;
   const submitRef = useRef<HTMLButtonElement>(null);
+  const { setFocus } = form;
 
-  useFocusRestoredAfterPending(pending, submitRef);
+  useFocusRestoredAfterPending(
+    pending,
+    useCallback(() => focusRestorer(setFocus, submitRef, invalidField)(), [invalidField, setFocus]),
+  );
 
   return (
     <form
-      aria-label={`Edit the category ${category.name}`}
+      aria-label={`Edit the category ${persisted.name}`}
       className={cn(FORM_CLASSES, className)}
       noValidate
       onSubmit={(event): void => {
         void form.handleSubmit((values) => {
           setFailure(null);
+          setInvalidField(null);
           update.mutate(toChangedFields(values, form.formState.dirtyFields));
         })(event);
       }}
     >
       {failure === null ? null : <FailureAlert failure={failure} />}
-      <CategoryFacts category={category} />
+      <CategoryFacts category={persisted} />
       <CategoryFields
         descriptionError={form.formState.errors.description?.message}
         descriptionRegistration={form.register('description')}
@@ -1056,7 +1145,9 @@ function RenameCategoryForm({
             {RENAME_SUBMIT_HINT}
           </p>
         </div>
-        <DeleteCategoryDialog category={category} disabled={pending} onDeleted={onDeleted} />
+        {/* The same authority the labels and facts read, so the confirmation names the category as it
+            is stored now rather than as it was when this form mounted. */}
+        <DeleteCategoryDialog category={persisted} disabled={pending} onDeleted={onDeleted} />
       </div>
     </form>
   );

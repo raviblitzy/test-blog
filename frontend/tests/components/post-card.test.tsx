@@ -401,14 +401,25 @@ describe('PostCard', () => {
 
       const href = screen.getByRole('link', { name: publishedPost.title }).getAttribute('href');
 
-      // Parsed rather than string-matched, so the assertion holds whether or not the builder ever
-      // returns an absolute URL. Root-relative is what `next/link` needs to keep client routing,
-      // prefetch and scroll restoration; an absolute URL would be treated as an external
-      // destination.
+      // THE RAW STRING FIRST, because that is the only thing that can prove "root-relative". Parsing
+      // against a base cannot: `new URL('https://evil.example/blog/x', base)` yields the same pathname
+      // as `/blog/x` while being an absolute, cross-origin destination - so a base-URL parse alone
+      // would have accepted the exact value this assertion exists to refuse. Root-relative is what
+      // `next/link` needs to keep client routing, prefetch and scroll restoration; an absolute URL is
+      // treated as an external destination and loses all three.
       expect(href).not.toBeNull();
+      expect(href?.startsWith('/')).toBe(true);
+      // And not protocol-relative, which also begins with a slash and is also cross-origin.
+      expect(href?.startsWith('//')).toBe(false);
+      expect(href).not.toMatch(/^[a-z][a-z0-9+.-]*:/i);
+
+      // Then the parse, for the parts a string comparison reads badly: the path is exactly the post's,
+      // and no query string or fragment has been appended to it.
       const parsed = new URL(href ?? '', HREF_PARSE_BASE);
+      expect(parsed.origin).toBe(HREF_PARSE_BASE);
       expect(parsed.pathname).toBe(`/blog/${publishedPost.slug}`);
       expect(parsed.search).toBe('');
+      expect(parsed.hash).toBe('');
     });
 
     it('composes the author byline rather than reimplementing it', () => {
@@ -445,14 +456,44 @@ describe('PostCard', () => {
     });
 
     it('omits the excerpt slot when the author wrote none', () => {
+      const withExcerpt = render(<PostCard post={publishedPost} />);
+      const paragraphsWithExcerpt = withExcerpt.container.querySelectorAll('p').length;
+      withExcerpt.unmount();
+
       render(<PostCard post={sparsePost} />);
 
-      // Still a complete card: the title and byline are there, the excerpt simply is not, and the
-      // card closes cleanly rather than carrying an empty paragraph's worth of padding.
+      // STRUCTURAL, not a text-absence proxy. Checking that another post's excerpt string is missing
+      // proves almost nothing - it was never in this card - and it would pass just as happily against
+      // a card rendering an empty `<p>`, which is the actual defect: an empty paragraph carries the
+      // excerpt slot's line-height and padding, so the card would close with a band of blank space and
+      // look broken rather than compact. Counting the paragraphs is what distinguishes "no slot" from
+      // "an empty slot".
+      const paragraphsWithoutExcerpt = screen.getByRole('article').querySelectorAll('p').length;
+      expect(paragraphsWithoutExcerpt).toBe(paragraphsWithExcerpt - 1);
+
+      // The fixture's premise, so the count above cannot be satisfied by a card that renders no
+      // paragraph in either case.
+      expect(sparsePost.excerpt).toBeNull();
+      expect(publishedPost.excerpt).not.toBeNull();
+      expect(paragraphsWithExcerpt).toBeGreaterThan(0);
+
+      // Still a complete card: the title and the byline are there, the excerpt simply is not.
       expect(screen.getByRole('heading', { name: sparsePost.title })).toBeVisible();
-      expect(screen.getByRole('article').textContent).not.toContain(
-        publishedPost.excerpt ?? 'unreachable',
-      );
+      expect(screen.getByRole('link', { name: sparsePost.author.display_name })).toBeVisible();
+    });
+
+    it('omits the excerpt slot for an excerpt that is only whitespace', () => {
+      // A blankness guard rather than a null guard, which `post-card.tsx` records: `excerpt` is typed
+      // `string | null` and `string` still admits `'   '`. The service stores what it is given, so a
+      // whitespace excerpt is a value this card can genuinely receive - and it must produce no slot,
+      // for the same reason a null one must not.
+      render(<PostCard post={{ ...publishedPost, excerpt: '   \n  ' }} />);
+
+      const paragraphs = screen.getByRole('article').querySelectorAll('p');
+      for (const paragraph of paragraphs) {
+        expect(paragraph.textContent?.trim()).not.toBe('');
+      }
+      expect(screen.getByRole('heading', { name: publishedPost.title })).toBeVisible();
     });
 
     it('renders the publication date for a published post and none for a draft', () => {
@@ -691,7 +732,27 @@ describe('PostCard', () => {
         expect(() => render(<PostCard post={{ ...publishedPost, slug: '   ' }} />)).toThrow(
           /non-blank/,
         );
+
+        // WHAT WAS SILENCED IS ASSERTED, inside the same `try` so the spy is still installed. A bare
+        // `mockImplementation(() => undefined)` is a blanket suppression: it would equally swallow a
+        // React warning about a key, an invalid prop or a hydration mismatch arising from this render,
+        // and the gate would stay green while hiding a second, unrelated defect. Every message that
+        // WAS logged therefore has to be one this render explains.
+        //
+        // MEASURED on the pinned stack (react-dom 19.2.8, @testing-library/react 16.3.2): the count is
+        // ZERO. The throw propagates straight out of `render` and React logs nothing, so the spy
+        // currently silences nothing at all - it is a guard against a React that reports differently
+        // rather than a suppression of output seen today. The assertion is written as a constraint on
+        // whatever is logged rather than as an expected count, so it stays correct either way: an empty
+        // set passes, React's own report of this throw passes, and an unrelated warning fails.
+        for (const call of consoleError.mock.calls) {
+          const message = call.map((argument) => String(argument)).join(' ');
+          expect(message).toMatch(/non-blank|PostCard/);
+        }
       } finally {
+        // Restored in `finally`, so a failed assertion above cannot leave `console.error` stubbed for
+        // every case that follows in this file - which would silence real warnings suite-wide and turn
+        // one failure into an unexplained set of passes.
         consoleError.mockRestore();
       }
     });

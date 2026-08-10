@@ -10,7 +10,10 @@ Two routes asking two deliberately different questions:
 ``GET /readyz``
     *Should this process be sent traffic?* It proves the database is reachable by issuing one
     trivial statement per request, and answers 503 when it cannot, so an orchestrator drops
-    the instance out of rotation rather than routing requests it has no way to serve.
+    the instance out of rotation rather than routing requests it has no way to serve. It holds
+    that interaction to :data:`READINESS_TIMEOUT_SECONDS` - a probe that outlives its caller's
+    timeout answers nobody - and it answers 503 only for a failure of the database, never for a
+    defect in this service, which reaches the 500 owner with its traceback instead.
 
 Collapsing the two into one route is the classic mistake, and it fails in both directions. A
 liveness probe that touches the database restarts a perfectly healthy process every time
@@ -36,15 +39,22 @@ each asymmetry is intentional rather than an inconsistency to be tidied away:
    infrastructure rather than product: an orchestrator has to probe both before anything has
    told it which API version to speak, and a probe that moved with the version would have to
    be reconfigured by every deployment that bumped it.
-3. **It runs the one sanctioned in-handler query.** Layering elsewhere is absolute - a route
-   delegates to a service, the service delegates to a repository, and the repository owns
-   every statement. :func:`readiness` issues ``SELECT 1`` inline instead, and that is a narrow,
-   documented exception rather than a precedent: the statement reads no table, touches no
-   mapped model and returns no domain data, so there is nothing for a service to decide and
-   nothing for a repository to own. Wrapping one round trip in two layers of indirection would
-   add a ``ReadinessService`` and a ``HealthRepository`` whose combined behaviour is the
-   statement itself. ``app.repositories`` is deliberately not imported here, which is what
-   keeps the exception confined to this file.
+3. **It is the one router with an asymmetric pair of handlers.** :func:`readiness` delegates,
+   exactly as every other route in the service does: it calls
+   :meth:`~app.services.health_service.HealthService.check_readiness` and constructs its response
+   model, and the statement, the failure classification, the log record and the 503 all live behind
+   that one call. :func:`liveness` delegates to nothing at all and resolves no dependency, because
+   a dependency is something that can fail and a liveness probe that can fail for a reason outside
+   the process is indistinguishable from a process that needs restarting. One router, one handler
+   that must reach the database and one that must never touch it.
+
+   There is **no** layering exemption here, and an earlier revision of this file claimed one: it
+   issued ``SELECT 1`` inline and argued in prose that one round trip was too small to be worth a
+   service and a repository. A code review rejected that, correctly. AAP §0.2.3 makes the rule
+   unconditional - "Route handlers contain no data-access logic" - and an exemption that has to be
+   argued is a precedent, whatever its prose says: the next handler that needs "just one query" had
+   this file to point at. ``app.repositories`` is still not imported here, but now for the ordinary
+   reason rather than a special one - a router never imports it.
 
 Why the response models are declared here
 -----------------------------------------
@@ -56,7 +66,7 @@ them because a probe is not an aggregate: neither shape has a database column be
 repository that returns it or a service that assembles it. Declaring them where they are
 served keeps the contract layer describing the domain and keeps this module readable on its
 own. The single failure shape this file declares comes from
-:func:`~app.api.v1.responses.problem_response` rather than being described here, because a
+:func:`~app.schemas.common.problem_response` rather than being described here, because a
 readiness failure must be indistinguishable on the wire - body *and* media type - from every
 other error the API reports.
 
@@ -66,35 +76,43 @@ figure. Every one of those is a gift to somebody fingerprinting an unauthenticat
 and none of them helps the only two callers that exist - a container health check and an
 orchestrator - both of which decide on the status code alone.
 
-Exactly one line is logged here, and only on failure
-----------------------------------------------------
+Nothing is logged in this file
+------------------------------
 ``app.middleware.request_context`` already emits one structured access record per request, and
 it treats these two paths specifically: ``QUIET_ACCESS_LOG_PATHS`` downgrades them to ``debug``
 **only** while they neither fail nor answer badly, so a readiness probe answering 503 is logged
 at ``error`` with its status, its path, its duration and the bound ``request_id``.
 
-That record says the probe failed. It cannot say **why**, and the difference matters
-operationally: a refused connection, an unresolvable host, a rejected password, an exhausted
-pool and a statement failure all produce ``/readyz returned 503`` and nothing else, so an
-operator watching an instance drop out of rotation cannot tell a database that is down from a
-credential that was rotated without telling this deployment. The reason is not recoverable
-later either - :func:`readiness` chains the caught exception into a domain error, and the
-registered ``AppError`` handler renders that as a problem document without frames, so the
-middleware never sees an exception at all.
+That record says the probe failed; it cannot say **why**, and the difference matters
+operationally. The classified failure record that closes the gap - a five-way classification, the
+exception class name, the originating driver class name and the SQLSTATE where the driver supplied
+one, and deliberately never the driver's own message - is emitted by
+``app.services.health_service``, immediately before it raises, because that is the layer that
+catches the exception and therefore the only layer that can still see the cause. "Exactly one
+record is logged" in that module's docstring is the full account of what it carries and what it
+omits.
 
-:func:`readiness` therefore emits **one** record of its own, at ``error``, immediately before
-raising: :func:`_readiness_failure_fields` reduces the caught exception to a fixed
-classification, the exception class name, the originating driver class name and the SQLSTATE
-where the driver supplied one. Every one of those is a closed vocabulary or a type name.
+This module logs nothing, obtains no logger, and imports ``app.core.logging`` not at all. Both
+handlers below either return a constructed response model or let a raised domain error be rendered
+by the registered ``AppError`` handler.
 
-What is deliberately **not** on that line is the exception's own text. ``app.core.exceptions``
-documents exactly why: psycopg's connection-failure message names the host, the port, the
-database and the user it tried, which is a topology and credential disclosure. The record is
-built from attributes rather than from a message, and it is emitted with ``logger.error``
-rather than ``logger.exception`` so no traceback and no driver text is attached. The
-correlation identifier is not passed either - ``structlog.contextvars.merge_contextvars`` is
-the first processor in the configured chain, so the ``request_id`` the middleware bound is
-already on the line, and this record and the access record can be read together.
+That record is emitted for a **failure of the database**, and for nothing else. The handler
+catches ``SQLAlchemyError`` and ``OSError`` rather than ``Exception``, so an
+``AttributeError``, a ``TypeError`` or any other defect in this service's own code is never
+classified, never renamed as a dependency outage and never answered 503. It propagates instead,
+and ``app.core.exceptions`` answers it with the standard 500 problem document *and* logs it with
+``logger.exception``, so the frames that identify the defect survive - redacted, because
+``app.core.logging`` reduces addresses and strips credentials from the rendered traceback. The
+two outcomes are therefore distinguishable at a glance: a 503 on ``/readyz`` means the database
+could not serve a trivial statement, a 500 on ``/readyz`` means this file has a bug.
+
+One member of that classification vocabulary is not a fault at all. ``query_timeout`` is
+reported when the interaction outlived :data:`READINESS_TIMEOUT_SECONDS` - this route's own
+deadline, not a diagnosis - or when PostgreSQL cancelled the statement at the server-side
+ceiling ``app.db.session`` sets. It is logged like the others because it has the same
+operational consequence, and it is named separately because the remedy is different: a
+connection that was refused needs the database brought back, a connection that answered
+nothing needs the network path or a saturated server looked at.
 
 Governing standards
 -------------------
@@ -105,174 +123,27 @@ one that discharges and which requires two separate probes with genuinely differ
 semantics; *explicit API contracts*, which is why both routes declare a ``response_model``
 and why the failure path emits the same problem document as every other route; *API
 versioning*, which these two paths are the single documented exception to; *layered
-separation of concerns*, which is why the inline statement above is scoped as narrowly as it
-is; and *blocking quality gates*, which is why ``ruff``, ``mypy`` and
-``backend/tests/integration/test_health.py`` all have to pass on it.
+separation of concerns*, which is why :func:`readiness` delegates to a service rather than
+querying and which this file no longer claims any exemption from; and *blocking quality gates*,
+which is why ``ruff``, ``mypy`` and ``backend/tests/integration/test_health.py`` all have to pass
+on it.
 """
 
-import re
 from typing import Final, Literal
 
 from fastapi import APIRouter, status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
-from sqlalchemy.exc import (
-    DBAPIError,
-    InterfaceError,
-    OperationalError,
-    TimeoutError as PoolTimeoutError,
-)
 
-from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import DbSession
-from app.core.exceptions import AppError
-from app.core.logging import get_logger
+from app.schemas.common import ProblemResponses, problem_response
+from app.services import HealthService
 
-__all__ = ["LivenessResponse", "ReadinessResponse", "router"]
+# Re-exported rather than restated: the deadline is the service's, because the service is what
+# applies it, and this module publishes the name so the probe documentation and
+# `backend/tests/integration/test_health.py` can both refer to one number.
+from app.services.health_service import READINESS_TIMEOUT_SECONDS
 
-
-# ---------------------------------------------------------------------------------------
-# The 503 problem document
-#
-# `app.core.exceptions` defines the error contract and five domain members of it - 404, 409,
-# 403, 422 and 401 - and deliberately no 503, because a service unavailability is not a
-# domain failure any service raises. Its `(type, title)` pair for the status nevertheless
-# already exists, as private constants behind the `_STATUS_PROBLEM` table that renders a
-# framework-raised 503. Private means they cannot be imported, so the two strings are
-# restated below and MUST stay identical to that table's 503 entry character-for-character:
-# a client branching on `type` has to see one value for the status whether the 503 came from
-# this probe or from anywhere else, and that is the entire purpose of a stable type field.
-# ---------------------------------------------------------------------------------------
-
-_ERROR_TYPE_SERVICE_UNAVAILABLE: Final[str] = "/errors/service-unavailable"
-"""``type`` of the readiness failure document: a URI reference, kebab-case, as the contract
-requires. Mirrors ``app.core.exceptions``'s 503 entry."""
-
-_TITLE_SERVICE_UNAVAILABLE: Final[str] = "Service Unavailable"
-"""``title`` of the readiness failure document. Stable per status, so it is safe to use as a
-log dimension or a dashboard label. Mirrors ``app.core.exceptions``'s 503 entry."""
-
-_DETAIL_NOT_READY: Final[str] = "The service is not ready to accept traffic."
-"""``detail`` of the readiness failure document, and a fixed sentence rather than the caught
-exception's message.
-
-This is the field an unauthenticated caller reads, and the exception behind it is a database
-connection failure whose message names the host, the port, the database and the user that
-was tried - a topology and credential disclosure, which ``app.core.exceptions`` calls out as
-the concrete hazard of a probe passing its error text through. A fixed sentence also keeps
-the document stable: two readiness failures for two different underlying reasons produce the
-same ``detail``, so nothing downstream starts parsing it.
-
-It states the verdict rather than the cause on purpose. The verdict is what the caller acts
-on; the cause is an operator's concern and reaches them through the two log records this
-response produces - the access record ``app.middleware.request_context`` emits at ``error``,
-and the classified failure record :func:`readiness` emits beside it."""
-
-
-# ---------------------------------------------------------------------------------------
-# The readiness failure record
-#
-# A closed vocabulary and three type-derived fields. Nothing here is composed from an
-# exception's message, because a driver's message names the host, the port, the database and
-# the user it tried - see `_DETAIL_NOT_READY` above and `app.core.exceptions`.
-#
-# The classifications are the operational distinctions an operator acts on differently, and
-# no finer: a pool that ran out needs a capacity or leak investigation, a connection that
-# could not be made needs the database or the network looked at, a driver-level fault needs
-# the client library or the socket state looked at, and anything else needs a person. Adding
-# a member here is adding a distinction somebody would act on; anything else belongs in the
-# SQLSTATE, which is already carried.
-# ---------------------------------------------------------------------------------------
-
-ReadinessFailureClass = Literal[
-    "pool_timeout",
-    "connection_failure",
-    "driver_interface_failure",
-    "database_error",
-    "unexpected_failure",
-]
-"""The fixed vocabulary of readiness failure classifications.
-
-A named alias rather than an inline annotation so that the values a dashboard or an alert rule
-groups by are declared in one place, and so mypy rejects a classification this module never
-published.
-"""
-
-_READINESS_FAILURE_EVENT: Final[str] = "readiness_probe_failed"
-"""Event name of the failure record. Stable, so it is safe to alert on."""
-
-_LOG_FIELD_FAILURE_CLASS: Final[str] = "failure_class"
-_LOG_FIELD_EXCEPTION_TYPE: Final[str] = "exception_type"
-_LOG_FIELD_DRIVER_EXCEPTION_TYPE: Final[str] = "driver_exception_type"
-_LOG_FIELD_SQLSTATE: Final[str] = "sqlstate"
-
-_SQLSTATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9]{5}\Z")
-"""A SQLSTATE is exactly five alphanumeric characters - ``28P01``, ``08006``, ``53300``.
-
-Validated rather than trusted even though it arrives from the driver, because it is read off an
-arbitrary exception object through ``getattr`` and is about to become a log field. Anything that
-is not the documented shape is dropped rather than rendered: a five-character code is worth a
-field, and something else in its place is worth nothing at all.
-"""
-
-
-def _readiness_failure_fields(exc: BaseException) -> dict[str, str]:
-    """Reduce a caught database failure to the safe fields the failure record carries.
-
-    Built entirely from types and from one validated driver attribute. No message, no argument,
-    no statement, no parameters, no connection URL: the four things an operator needs to
-    distinguish one readiness failure from another are *which class of failure it was*, *which
-    exception SQLAlchemy raised*, *which driver exception it wrapped* and *what the database
-    server called it*.
-
-    ``sqlstate`` is where the real precision lives, and it costs nothing to carry: ``28P01`` is
-    an invalid password, ``08006`` a failed connection, ``3D000`` a missing database, ``53300``
-    too many clients. Those are exactly the cases that used to be indistinguishable, and the code
-    itself discloses nothing - it names a condition, not a host, a credential or a row.
-
-    Args:
-        exc: The exception :func:`readiness` caught. Any type, including one this module has
-            never heard of, which is what ``unexpected_failure`` exists for.
-
-    Returns:
-        A mapping of log fields. ``failure_class`` and ``exception_type`` are always present;
-        ``driver_exception_type`` and ``sqlstate`` appear only when the driver supplied them.
-    """
-    failure_class: ReadinessFailureClass
-    if isinstance(exc, PoolTimeoutError):
-        # Checked FIRST, and it must stay first: this is a pool-level failure raised without any
-        # connection attempt being made, so it carries no driver exception and no SQLSTATE, and
-        # it is the one classification whose remedy (capacity, or a session that is not being
-        # released) has nothing to do with the database being reachable.
-        failure_class = "pool_timeout"
-    elif isinstance(exc, OperationalError):
-        failure_class = "connection_failure"
-    elif isinstance(exc, InterfaceError):
-        failure_class = "driver_interface_failure"
-    elif isinstance(exc, DBAPIError):
-        failure_class = "database_error"
-    else:
-        failure_class = "unexpected_failure"
-
-    fields = {
-        _LOG_FIELD_FAILURE_CLASS: failure_class,
-        _LOG_FIELD_EXCEPTION_TYPE: type(exc).__name__,
-    }
-
-    # `DBAPIError.orig` is the driver's own exception, and its class name is the more specific
-    # of the two - SQLAlchemy's `OperationalError` wraps psycopg's `OperationalError`,
-    # `ConnectionTimeout` or `InvalidPassword` alike, and only the inner name says which.
-    driver_error = getattr(exc, "orig", None)
-    if driver_error is not None:
-        fields[_LOG_FIELD_DRIVER_EXCEPTION_TYPE] = type(driver_error).__name__
-        # psycopg 3 exposes `sqlstate`; the attribute is read defensively because `orig` is
-        # whatever the configured driver raised, and a driver that does not publish one simply
-        # contributes no field.
-        sqlstate = getattr(driver_error, "sqlstate", None)
-        if isinstance(sqlstate, str) and _SQLSTATE_PATTERN.match(sqlstate):
-            fields[_LOG_FIELD_SQLSTATE] = sqlstate
-
-    return fields
+__all__ = ["READINESS_TIMEOUT_SECONDS", "LivenessResponse", "ReadinessResponse", "router"]
 
 
 # ---------------------------------------------------------------------------------------
@@ -352,37 +223,6 @@ class ReadinessResponse(BaseModel):
     )
 
 
-class _DatabaseUnavailableError(AppError):
-    """503 - the readiness statement did not complete, so this instance cannot serve traffic.
-
-    A subclass rather than a bare :class:`~app.core.exceptions.AppError`, because that base's
-    ``__init__`` accepts a ``detail``, ``headers`` and field ``errors`` but no status: the
-    class documents ``status_code``, ``error_type``, ``title`` and ``detail`` as ordinary
-    per-subclass attributes for exactly this reason, and the five domain members of the
-    hierarchy configure their statuses the same way. Declaring one here is what lets the
-    single registered ``AppError`` handler render this failure, since Starlette dispatches by
-    walking ``type(exc).__mro__``: the document, its ``instance`` path, its ``request_id``,
-    its ``X-Request-ID`` header and its ``application/problem+json`` media type all come from
-    that one handler, so a readiness failure is byte-for-byte the same kind of object as a 404
-    from a post lookup.
-
-    It lives in this module rather than in ``app.core.exceptions`` because it is not a domain
-    error. No service raises it, no ownership or lifecycle rule produces it, and nothing but
-    this one probe can detect the condition, so the hierarchy of failures the *domain* reports
-    stays exactly the five it declares.
-
-    Private because it is the vehicle for one raise site rather than part of this module's
-    contract. The public surface is :data:`router` and the two response models; a caller that
-    needs to recognise this failure branches on the ``type`` field of the document, which is
-    the field the error contract publishes for that purpose.
-    """
-
-    status_code: int = status.HTTP_503_SERVICE_UNAVAILABLE
-    error_type: str = _ERROR_TYPE_SERVICE_UNAVAILABLE
-    title: str = _TITLE_SERVICE_UNAVAILABLE
-    detail: str = _DETAIL_NOT_READY
-
-
 # ---------------------------------------------------------------------------------------
 # The router
 #
@@ -403,14 +243,15 @@ these two paths must not have."""
 
 
 # One entry, declared as a constant so the annotation is explicit rather than inferred from a
-# literal nested in a decorator argument, and built by `app.api.v1.responses.problem_response`
+# literal nested in a decorator argument, and built by `app.schemas.common.problem_response`
 # - the single place in the API tier that names the problem document as a response model and
 # the single place its published media type is decided. Without a model the failure mode is
 # undocumented and a client generator emits no type for it, which is precisely the gap the
 # "every route declares its shapes" standard closes.
 _READINESS_FAILURE_RESPONSES: Final[ProblemResponses] = {
     status.HTTP_503_SERVICE_UNAVAILABLE: problem_response(
-        "The database could not be reached, so this instance is not ready to serve "
+        "The database could not be reached, or did not answer inside this route's five-second "
+        "deadline, so this instance is not ready to serve "
         "traffic. The body is the same problem document every other failure in this API "
         "returns, served as `application/problem+json` with `type` set to "
         "`/errors/service-unavailable`. An orchestrator should stop routing to this instance "
@@ -462,76 +303,46 @@ async def liveness() -> LivenessResponse:
     description=(
         "Reports whether this instance can serve traffic, by issuing one trivial statement "
         "against the database on every request. Answers 200 while the database is reachable "
-        "and 503 with a problem document when it is not. Nothing is cached, because a cached "
-        "readiness answer is a stale one."
+        "and 503 with a problem document when it is not, and answers within five seconds "
+        "either way - a database that accepts the connection and then goes silent is treated "
+        "as unavailable rather than waited on. Nothing is cached, because a cached readiness "
+        "answer is a stale one."
     ),
 )
 async def readiness(db: DbSession) -> ReadinessResponse:
-    """Prove the database is reachable, or answer 503.
+    """Ask the readiness service for a verdict, and shape the answer for the wire.
 
-    ``SELECT 1`` and nothing more: no table, no mapped model, no row count and no
-    migration-version check. Each of those would make readiness fail for a reason that is not
-    unreachability - a table not yet created by a migration that is still running, a revision
-    the deployment is mid-way through applying - and an instance pulled out of rotation by its
-    own schema check is an outage the probe invented. Reachability is the one question this
-    route is here to answer, so it asks exactly that.
+    One call and one construction, which is the whole of a route's job here.
+    :meth:`~app.services.health_service.HealthService.check_readiness` owns everything a verdict
+    actually requires - the statement, the five-way classification of whatever went wrong, the one
+    classified log record and the 503 domain error - and this handler owns only what belongs to the
+    API tier: resolving the session dependency, and turning "returned normally" into the declared
+    response model.
 
-    The statement is issued inline rather than through a service and a repository. See point 3
-    of the module docstring for why that exception is correct here and why it does not
-    generalise: ``app.repositories`` is not imported by this file.
-
-    Why the ``try`` is where the failure surfaces:
-        ``app.db.session`` constructs its engine and its session factory lazily and opens no
-        connection at import time, and ``app.core.dependencies.get_db`` only enters the
-        session's context manager - so an unreachable database does not fail while FastAPI is
-        resolving :data:`~app.core.dependencies.DbSession`. The first thing that needs a live
-        connection is the ``execute`` below, which is inside the ``try``. Were it otherwise,
-        dependency resolution would raise before this function was ever called and the route
-        would answer 500 through the handler of last resort instead of a deliberate 503.
-
-    ``Exception`` is caught deliberately broadly: a refused connection, a DNS failure, a
-    timeout, an exhausted pool, an authentication rejection and a statement error are all the
-    same answer to the only question being asked, and enumerating driver exception classes
-    here would turn a new failure mode into a 500. It is not, however, bare - ``BaseException``
-    is not caught, so ``asyncio.CancelledError`` from a client that disconnected mid-request
-    still propagates and is not misreported as a database outage.
+    Nothing is cached, because a cached readiness answer is a stale one and an instance kept in
+    rotation by a stale answer is an outage. Nothing is caught either: the service's
+    :class:`~app.services.health_service.DatabaseUnavailableError` propagates to the registered
+    ``AppError`` handler, which renders the 503 problem document with its ``instance`` path, its
+    ``request_id`` and its ``application/problem+json`` media type - the same treatment every other
+    failure in this API receives.
 
     Args:
         db: A request-scoped session, from the one dependency in the service that yields one.
-            Constructed lazily, so obtaining it proves nothing about connectivity; the
-            statement below is what proves it.
+            Constructed lazily, so obtaining it proves nothing about connectivity; the statement
+            the service issues through it is what proves it. Passed straight through - this handler
+            executes nothing against it, which is the point of the delegation.
 
     Returns:
-        The readiness document, with ``database`` true, when the statement completed.
+        The readiness document, with ``database`` true. Reaching this line means the service
+        returned rather than raised, and the two fields are constants for the reason
+        :class:`ReadinessResponse` documents: the failure case is a problem document at 503, never
+        a 200 carrying ``false``.
 
     Raises:
-        _DatabaseUnavailableError: When the statement did not complete, for any reason. The
-            registered ``AppError`` handler renders it as a 503 problem document carrying a
-            fixed detail - the caught exception's own message names the host, the port, the
-            database and the user, and never reaches the response. One classified failure record
-            is written first; see "Exactly one line is logged here" in the module docstring for
-            what it carries and what it deliberately omits.
+        ~app.services.health_service.DatabaseUnavailableError: Raised by the service when the
+            readiness statement did not complete, for any reason. Declared here because it is part
+            of this route's published contract - see :data:`_READINESS_FAILURE_RESPONSES` - and not
+            re-raised or translated in this file.
     """
-    try:
-        # The result is deliberately unused: a completed round trip is the whole assertion,
-        # and reading a row from it would prove nothing further. Nothing is committed either,
-        # because nothing was written - transaction boundaries belong to the service layer,
-        # and this route has no unit of work to close.
-        await db.execute(select(1))
-    except Exception as exc:
-        # ONE record, immediately before the raise, and this is the only place the cause can be
-        # described at all: the domain error below is rendered by the registered `AppError`
-        # handler, which reports a status and a fixed detail and never sees this exception, so
-        # after this line the reason is gone from the process. `logger.error` rather than
-        # `logger.exception` on purpose - no frames and no driver text, only the classified
-        # fields `_readiness_failure_fields` derives - and the logger is obtained here rather
-        # than at module scope because one built during import would memoise structlog's
-        # unconfigured defaults, `configure_logging` running in the application lifespan after
-        # every import has completed.
-        get_logger(__name__).error(_READINESS_FAILURE_EVENT, **_readiness_failure_fields(exc))
-        # Chained rather than swallowed, so the cause is preserved on the traceback for
-        # anything that inspects it, while the rendered document carries only the fixed
-        # detail. `from exc` is also what keeps this raise honest about its origin.
-        raise _DatabaseUnavailableError from exc
-
+    await HealthService(db).check_readiness()
     return ReadinessResponse(status="ready", database=True)

@@ -260,39 +260,33 @@ class Category(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # uq_categories_name and the unique index ix_categories_slug - and those serve the lookups
     # that resolve a slug from a URL and detect a duplicate name on create.
     #
-    # The two declared here serve the two PATTERN predicates in
-    # app.repositories.category_repository, neither of which an equality-oriented b-tree can
-    # answer:
+    # The two declared here serve PATTERN matching over these columns, which an
+    # equality-oriented b-tree cannot answer:
     #
-    #   containment   CategoryRepository.list_paginated takes a `?q=` term and matches it
-    #                 against name and slug together with a leading wildcard, which no b-tree
-    #                 can use. (That surface is reached from the service layer; no route
-    #                 publishes it - see the method's own docstring.)
     #   slug family   slug de-duplication runs `slug LIKE 'base%'` before every category insert
-    #                 and rename. Anchoring the pattern means the query is not PREVENTED from
-    #                 using an index, but the default operator class over a citext column does
-    #                 not provide one, so it was a sequential scan regardless.
+    #                 and rename - CategoryRepository.slugs_starting_with. Anchoring the pattern
+    #                 means the query is not PREVENTED from using an index, but the default
+    #                 operator class over a citext column does not provide one, so it was a
+    #                 sequential scan regardless.
+    #   containment   a `%term%` match against name or slug, which no b-tree can use at all. No
+    #                 route publishes one today - the AAP's surface gives this relation a single
+    #                 bare-array read and three mutations - and the index is declared here rather
+    #                 than deferred because it is the pair `gin_trgm_ops` needs on this table and
+    #                 the slug half of it is load-bearing for the family scan above.
     #
-    # The two spellings differ because the two column types do. `name` is TEXT, so the operator
-    # class goes straight on the column. `slug` is CITEXT, and gin_trgm_ops is defined over
-    # `text` while citext's own `~~`/`~~*` operators are not in that operator family - so an
-    # index declared directly on it is accepted and then never chosen by the planner. It
-    # therefore indexes the text cast, and category_repository writes the matching predicate as
+    # `slug` is CITEXT, and gin_trgm_ops is defined over `text` while citext's own `~~`/`~~*`
+    # operators are not in that operator family - so an index declared directly on it is accepted
+    # and then never chosen by the planner. It therefore indexes the text cast, and
+    # category_repository writes the matching predicate as
     # `cast(Category.slug, Text).ilike(...)`: ILIKE rather than LIKE, because casting away citext
     # also casts away the case-folding that made `News-2` rule out a proposed `news-2`.
     #
     # The expression is a LABELLED literal_column with its operator class in `postgresql_ops`
     # rather than one `text("(slug::text) gin_trgm_ops")` string: both render the same DDL, but
     # Alembic warns on the inline form and then stops comparing the index, leaving it unguarded
-    # by the drift gate. Revision 0002 builds both, where every GIN index in this schema lives.
+    # by the drift gate. Revision 0002 builds it, where every GIN index in this schema lives.
     # ---------------------------------------------------------------------------------
     __table_args__ = (
-        Index(
-            "ix_categories_name_trgm",
-            "name",
-            postgresql_using="gin",
-            postgresql_ops={"name": "gin_trgm_ops"},
-        ),
         Index(
             "ix_categories_slug_trgm",
             literal_column("(slug::text)").label("slug_text"),

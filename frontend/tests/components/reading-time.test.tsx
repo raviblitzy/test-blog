@@ -98,6 +98,30 @@ function buildMarkdownBody(paragraphCount: number): string {
   return [HEADING, ...paragraphs].join('\n\n');
 }
 
+/**
+ * A body of exactly `wordCount` single-token words.
+ *
+ * One space between one-word tokens, so the estimator's whitespace collapsing counts exactly what was
+ * asked for and the boundary cases below are about ROUNDING rather than about parsing.
+ */
+function buildBodyOfWordCount(wordCount: number): string {
+  return Array.from({ length: wordCount }, (_unused, index) => `word${String(index)}`).join(' ');
+}
+
+/**
+ * Literal labels at the four boundaries where the documented arithmetic decides the answer.
+ *
+ * Worked out by hand from the contract in `@/lib/format`: 200 words a minute, `Math.ceil`, floored at
+ * one whole minute so a very short post never advertises "0 min read". Nothing here calls the
+ * estimator, which is the entire point - see the case that consumes this table.
+ */
+const INDEPENDENT_BOUNDARIES: readonly (readonly [string, number])[] = [
+  ['1 min read', 1],
+  ['1 min read', 200],
+  ['2 min read', 201],
+  ['2 min read', 400],
+];
+
 describe('ReadingTime', () => {
   it('renders the label the format module produces for a full-length body', () => {
     const content = buildMarkdownBody(6);
@@ -165,6 +189,62 @@ describe('ReadingTime', () => {
     const { container } = render(<ReadingTime content="" />);
 
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it.each(INDEPENDENT_BOUNDARIES)(
+    'renders the literal label %s for a body of the stated length',
+    (expectedLabel, wordCount) => {
+      // AN INDEPENDENT ORACLE, and the one group of cases in this file that does not call
+      // `formatReadingTime` to decide what it expects. The label is a literal a person worked out from
+      // the documented contract - 200 words a minute, rounded UP, floored at one whole minute - so
+      // these cases disagree with the estimator if the estimator changes, which is precisely what the
+      // derived cases above cannot do.
+      //
+      // The tension with the header's rule is deliberate and worth stating: comparing against the
+      // library keeps the two layers free to move together, and that is right for the DISPLAY contract
+      // this file mostly tests. But it also means a silent change to the reading speed - a retune from
+      // 200 to 250 - would pass every case here while every published article's estimate moved. These
+      // four literals are the tripwire for that, sited at the boundaries where rounding decides the
+      // answer: one word and exactly 200 both round to a single minute, 201 crosses into two, and 400
+      // lands exactly on two rather than tipping into three.
+      const content = buildBodyOfWordCount(wordCount);
+
+      render(<ReadingTime content={content} />);
+
+      expect(screen.getByText(expectedLabel)).toBeVisible();
+    },
+  );
+
+  it('renders nothing for a body that is only whitespace', () => {
+    // Newlines, spaces and tabs, which is what an author leaves behind after clearing a draft body -
+    // and a case the empty-string test does not reach, because the estimator's guard is a word count
+    // taken AFTER collapsing whitespace rather than a length check on the raw string. Zero words means
+    // no estimate, and no estimate must mean no markup rather than "0 min read" or a bare clock.
+    const { container } = render(<ReadingTime content={'  \n\t \r\n  '} />);
+
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByText(/min read/)).toBeNull();
+  });
+
+  it('hides the decorative clock from assistive technology directly', () => {
+    const content = buildMarkdownBody(2);
+    const { container } = render(<ReadingTime content={content} />);
+
+    // The neighbouring case asserts the CONSEQUENCE - that the icon contributes no text. This one
+    // asserts the MECHANISM, because the consequence holds for a reason that would survive the
+    // mechanism being lost: an `<svg>` contributes no characters either way, so a clock that started
+    // announcing itself through a `role` or a `<title>` would still leave `textContent` unchanged and
+    // would still be announced to a screen reader as an unlabelled graphic beside the estimate.
+    const glyphs = container.querySelectorAll('svg');
+    expect(glyphs).toHaveLength(1);
+    for (const glyph of glyphs) {
+      expect(glyph).toHaveAttribute('aria-hidden', 'true');
+      // No accessible name of its own, from any source: `role`, `aria-label` and an inner `<title>`
+      // are the three ways one would arrive, and a decorative glyph must have none of them.
+      expect(glyph).not.toHaveAttribute('role');
+      expect(glyph).not.toHaveAttribute('aria-label');
+      expect(glyph.querySelector('title')).toBeNull();
+    }
   });
 
   it('keeps the decorative clock out of the rendered text', () => {

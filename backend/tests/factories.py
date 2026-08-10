@@ -96,6 +96,8 @@ After the refresh every column on the returned object is populated from the row.
 from __future__ import annotations
 
 import itertools
+import os
+import re
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -128,6 +130,7 @@ from app.models import (
 __all__ = [
     "DEFAULT_PASSWORD",
     "FAKER_SEED",
+    "UNSET",
     "create_admin",
     "create_author",
     "create_category",
@@ -151,6 +154,44 @@ __all__ = [
 # counter would not be a counter at all.
 # ---------------------------------------------------------------------------------------
 
+
+class _UnsetType:
+    """The type of :data:`UNSET`. Private, so the sentinel is the only reachable instance.
+
+    A dedicated class rather than ``object()`` or a string, because a parameter annotated
+    ``str | None | _UnsetType`` narrows correctly under strict type checking: ``isinstance``
+    against this class removes the sentinel from the union, leaving ``str | None`` in the
+    branch that writes the column. A bare ``object()`` sentinel would widen every such
+    parameter to ``object`` and lose the very distinction it exists to make.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        """Return ``UNSET``, so a failed assertion or a traceback names the sentinel."""
+        return "UNSET"
+
+
+UNSET: Final[_UnsetType] = _UnsetType()
+""""Not supplied", as distinct from the SQL ``NULL`` that ``None`` means.
+
+Two of the columns this module writes are nullable *and* have a generated default:
+``categories.description`` and ``posts.excerpt``. Before this sentinel existed, both
+parameters defaulted to ``None`` and treated ``None`` as "generate something", so a caller had
+no way to ask for the ``NULL`` the column actually permits - a test needing a category with no
+description or a post with no summary could not construct the row, and any test that *thought*
+it had constructed one was asserting against Faker prose.
+
+The sentinel separates the two meanings. Omit the argument, or pass :data:`UNSET` explicitly,
+to get the generated default; pass ``None`` to write SQL ``NULL``; pass a string, including
+``""``, to write it verbatim. Exported so a test can state the intent at the call site::
+
+    generated = await create_category(session)                       # Faker description
+    explicit = await create_category(session, description=UNSET)     # identical, stated
+    nulled = await create_category(session, description=None)        # description IS NULL
+    empty = await create_post(session, author=author, excerpt="")     # excerpt = ''
+"""
+
 DEFAULT_PASSWORD: Final[str] = "Factory-Passw0rd-1"
 """The plaintext every factory-created account is given, unless a test asks for another.
 
@@ -162,7 +203,7 @@ once per user is the cheap path, and a test asserting on a login failure needs a
 be sure is the *correct* one before it perturbs it.
 
 Obviously fake, and deliberately never a real credential. It nonetheless satisfies the
-project's own password policy from :mod:`app.core.password_policy` - at least twelve
+project's own password policy from :mod:`app.schemas.auth` - at least twelve
 characters and at least three of the five character classes - so a test may also submit it to
 the registration endpoint, where a policy violation would otherwise come back as a ``422``
 that had nothing to do with what the test was checking.
@@ -203,9 +244,57 @@ Faker.seed(FAKER_SEED)
 # duplicate under any future concurrency is, and this costs nothing to rule out.
 _counter: Final[itertools.count[int]] = itertools.count(1)
 
+#: Characters kept when a process-identity tag is sanitised; everything else is dropped.
+#: Lowercase alphanumeric only, which is the intersection of what a slug (`[a-z0-9-]`), a
+#: username (`app.schemas.auth.USERNAME_PATTERN`) and an email local part all admit, so one
+#: tag can be embedded in all three without making any of them invalid.
+_TAG_ALLOWED: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
 
-def _next_n() -> int:
-    """Return the next value of the module's monotonic uniqueness counter.
+#: How much of a sanitised tag is kept. Short, because it is a prefix on values that also
+#: carry a counter and, for a slug, have to fit `app.core.slug.DEFAULT_MAX_LENGTH`.
+_MAX_TAG_LENGTH: Final[int] = 8
+
+
+def _process_tag() -> str:
+    """Return a short token identifying this process among any that share one database.
+
+    Defence in depth for the uniqueness :func:`_next_n` provides, and deliberately the *second*
+    line rather than the first. The primary isolation is ``backend/tests/conftest.py`` giving
+    each clone and each ``pytest-xdist`` worker its own database, so two processes normally
+    cannot see each other's rows at all. This exists for the case that survives that: two
+    processes pointed at one database by an explicit ``TEST_DATABASE_URL``. The counter here is
+    process-local - it advances atomically within one interpreter and knows nothing about a
+    second - so without a per-process token both would generate ``user1@example.com`` and the
+    loser would fail on a ``CITEXT`` unique index, in whichever unrelated test happened to run
+    second.
+
+    Read from the same two variables ``conftest.py`` reads, and sanitised the same way, but
+    computed here rather than imported. That duplication is deliberate and is the cheaper of
+    two costs: ``conftest.py`` resolves its copy during a bootstrap that runs *before* any
+    ``app.*`` import can succeed, and this module reaches ``app.core.security`` on its first
+    line, so importing the value from there would invert the one-way dependency the tests tree
+    is built on (``conftest`` imports ``factories``, never the reverse).
+
+    Returns:
+        A lowercase alphanumeric token of at most :data:`_MAX_TAG_LENGTH` characters, or ``""``
+        when neither variable is set - which is the ordinary single-process case, and which
+        leaves every generated value byte-identical to what it was before this existed.
+    """
+    for variable in ("CLONE_INDEX", "PYTEST_XDIST_WORKER"):
+        tag = _TAG_ALLOWED.sub("", os.environ.get(variable, "").strip().casefold())
+        if tag:
+            return tag[:_MAX_TAG_LENGTH]
+    return ""
+
+
+#: This process's identity token, resolved once at import. A constant rather than a call per
+#: value: the environment does not change under a running suite, and a stable token keeps a
+#: generated value reproducible for the whole session.
+_PROCESS_TAG: Final[str] = _process_tag()
+
+
+def _next_n() -> str:
+    """Return the next discriminator: this process's tag followed by a monotonic count.
 
     Load-bearing rather than cosmetic. Five columns this module writes are UNIQUE, four of
     them ``CITEXT`` and therefore case-insensitively unique, and Faker's own generators
@@ -219,10 +308,17 @@ def _next_n() -> int:
     ``conftest.py`` rolls each test back rather than truncating, and a rollback does not
     rewind a Python counter.
 
+    :data:`_PROCESS_TAG` is prefixed to the count so that the value is unique across
+    *processes* as well as within one - see :func:`_process_tag`. With no clone or worker
+    identity in the environment the tag is empty and the result is the decimal count on its
+    own, exactly as it was before, so nothing about a single-process run changes.
+
     Returns:
-        A positive integer, strictly greater than every value previously returned.
+        A string safe to embed in an email local part, a username and a slug alike: lowercase
+        alphanumeric, never empty, and never equal to a value previously returned by this
+        process.
     """
-    return next(_counter)
+    return f"{_PROCESS_TAG}{next(_counter)}"
 
 
 async def _persist[EntityT: Base](session: AsyncSession, instance: EntityT) -> EntityT:
@@ -295,7 +391,7 @@ async def _identity_of(session: AsyncSession, entity: Base, label: str) -> uuid.
     return identity
 
 
-def _unique_slug(source: str, discriminator: int) -> str:
+def _unique_slug(source: str, discriminator: str) -> str:
     """Derive a slug from ``source`` and make it unique with ``discriminator``.
 
     ``posts.slug`` and ``categories.slug`` are ``CITEXT`` behind unique indexes, so the
@@ -310,7 +406,8 @@ def _unique_slug(source: str, discriminator: int) -> str:
     Args:
         source: Human-readable text to derive the stem from; may be any string, including one
             with no sluggable character at all.
-        discriminator: A value from :func:`_next_n`.
+        discriminator: A value from :func:`_next_n`. Lowercase alphanumeric, so it needs no
+            slugifying of its own and survives into the slug unchanged.
 
     Returns:
         A lowercase, hyphen-separated slug ending in ``-<discriminator>``, no longer than
@@ -422,10 +519,16 @@ async def create_reader(session: AsyncSession, **kwargs: Any) -> User:
 async def create_author(session: AsyncSession, **kwargs: Any) -> User:
     """Create an :attr:`~app.models.UserRole.AUTHOR` account.
 
-    The role a post's owner holds. Note that authoring is not gated on it - ``POST
-    /api/v1/posts`` requires only a bearer token, and ownership is decided by comparing
-    ``posts.author_id`` - so a test about ownership can legitimately use any role. This helper
-    exists to make the intent of the *typical* case obvious.
+    The role a post's owner holds, and a role that is genuinely required rather than merely
+    conventional. Every post mutation declares ``AuthorUser``, so
+    ``app.core.dependencies.require_author`` admits only ``AUTHOR`` and ``ADMIN``: an account
+    created by :func:`create_reader` is refused ``POST /api/v1/posts`` with 403 and can never own a
+    post through the API at all.
+
+    Ownership is a second, separate comparison on ``posts.author_id`` made in
+    ``app.services.post_service``. A test about ownership therefore needs a principal that clears
+    the role gate first, which is what this helper supplies - use :func:`create_reader` when the
+    role gate itself is the subject.
 
     Args:
         session: The session under test.
@@ -470,7 +573,7 @@ async def create_category(
     *,
     name: str | None = None,
     slug: str | None = None,
-    description: str | None = None,
+    description: str | _UnsetType | None = UNSET,
 ) -> Category:
     """Create a ``categories`` row and return it, persisted and reloaded.
 
@@ -489,18 +592,22 @@ async def create_category(
             ``Factory Category <n>`` when omitted.
         slug: URL-safe identifier, ``CITEXT`` behind a unique index. Derived from ``name`` and
             the counter when omitted, so it is unique even if two callers pass the same name.
-        description: Optional prose. Generated from Faker when omitted, because the admin
-            editor and the category listing both render it and an always-null column would
-            leave those surfaces untested.
+        description: Optional prose, and the one parameter here where ``None`` is a *value*
+            rather than an omission. Omitted or :data:`UNSET`, a Faker sentence is generated,
+            because the admin editor and the category listing both render it and an
+            always-null column would leave those surfaces untested. Pass ``None`` to write SQL
+            ``NULL`` - the column is nullable and a test about the no-description case has to
+            be able to say so.
 
     Returns:
         The persisted :class:`~app.models.Category`.
 
     Examples:
-        Anonymous, and named for a filter assertion::
+        Anonymous, named for a filter assertion, and one with no description at all::
 
             other = await create_category(session)
             python = await create_category(session, name="Python", slug="python")
+            bare = await create_category(session, description=None)
     """
     discriminator = _next_n()
     resolved_name = name if name is not None else f"Factory Category {discriminator}"
@@ -509,7 +616,11 @@ async def create_category(
         # Derived from the resolved name so an explicit name still yields a matching slug,
         # and suffixed so two calls passing the same name do not collide on the CITEXT index.
         slug=slug if slug is not None else _unique_slug(resolved_name, discriminator),
-        description=description if description is not None else fake.sentence(nb_words=12),
+        # The sentinel, not `None`, selects the generated default - which is what lets an
+        # explicit `None` reach the column as SQL NULL.
+        description=(
+            fake.sentence(nb_words=12) if isinstance(description, _UnsetType) else description
+        ),
     )
     return await _persist(session, category)
 
@@ -525,7 +636,7 @@ async def create_post(
     author: User,
     title: str | None = None,
     slug: str | None = None,
-    excerpt: str | None = None,
+    excerpt: str | _UnsetType | None = UNSET,
     content: str | None = None,
     cover_image_url: str | None = None,
     status: PostStatus = PostStatus.DRAFT,
@@ -561,10 +672,12 @@ async def create_post(
         slug: Canonical URL segment, ``CITEXT`` behind a unique index. Derived from the title
             and the counter when omitted; an explicit value is used as given, which is what
             lets a test address ``GET /api/v1/posts/{slug}`` by a name it chose.
-        excerpt: Optional summary, weighted ``'B'``. Used verbatim when supplied; generated as
-            a short Faker passage otherwise. Pass ``""`` for the empty-summary case - the
-            generating expression wraps this column in ``coalesce``, so a null or empty excerpt
-            still yields a usable vector.
+        excerpt: Optional summary, weighted ``'B'``, and the one parameter here where ``None``
+            is a *value* rather than an omission. Omitted or :data:`UNSET`, a short Faker
+            passage is generated; a string is used verbatim; ``None`` writes SQL ``NULL``. Both
+            of the latter two are reachable on purpose - the generating expression wraps this
+            column in ``coalesce``, so a null *and* an empty excerpt each still yield a usable
+            search vector, and a test about either case has to be able to construct it.
         content: Body Markdown, weighted ``'C'``. Used verbatim when supplied. Generated as
             several Faker paragraphs otherwise, rather than a single word, so that a search
             test ranking against the generated vector has real text to rank.
@@ -614,7 +727,9 @@ async def create_post(
         author_id=author_id,
         title=resolved_title,
         slug=slug if slug is not None else _unique_slug(resolved_title, discriminator),
-        excerpt=excerpt if excerpt is not None else fake.paragraph(nb_sentences=2),
+        # The sentinel, not `None`, selects the generated default - which is what lets an
+        # explicit `None` reach the column as SQL NULL.
+        excerpt=(fake.paragraph(nb_sentences=2) if isinstance(excerpt, _UnsetType) else excerpt),
         # Four paragraphs rather than a word, so the generated tsvector has enough lexemes for
         # `ts_rank` to order by and for a trigram fallback to match against.
         content=content if content is not None else "\n\n".join(fake.paragraphs(nb=4)),

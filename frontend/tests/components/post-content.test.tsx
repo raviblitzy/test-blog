@@ -86,6 +86,10 @@
  */
 
 import { render, screen } from '@testing-library/react';
+import Markdown from 'react-markdown';
+import rehypeSanitize from 'rehype-sanitize';
+import remarkGfm from 'remark-gfm';
+import type { PluggableList } from 'unified';
 import { describe, expect, it } from 'vitest';
 
 import { PostContent } from '@/components/blog/post-content';
@@ -226,6 +230,128 @@ const PLAIN_CONTENT = `Just a paragraph of ordinary prose.
 `;
 
 /* -------------------------------------------------------------------------------------------------
+ * Fixtures that REACH the sanitiser, and why the ones above do not
+ *
+ * The three raw-HTML fixtures above are neutralised before `rehype-sanitize` ever sees them, and that
+ * is worth stating plainly because it decides what the group at the end of this file has to do.
+ * `rehype-raw` is deliberately absent from the pipeline, so react-markdown never parses `<script>`,
+ * `<iframe>` or an `onerror` attribute into tree nodes at all: they are text, and the sanitiser has
+ * nothing to remove. Those cases therefore prove the *pipeline posture* - that raw HTML is not
+ * rendered - and they would keep passing with the sanitiser deleted. They are necessary and they are
+ * not sufficient.
+ *
+ * What DOES reach the sanitiser is a Markdown-native construct whose URL react-markdown's own
+ * `urlTransform` admits and whose element the sanitiser's schema does not. The two lists disagree on
+ * exactly one axis, verified against the installed packages:
+ *
+ *   react-markdown urlTransform  http, https, irc, ircs, mailto, xmpp - for EVERY url property
+ *   sanitiser schema, href       http, https, irc, ircs, mailto, xmpp - identical, so no disagreement
+ *   sanitiser schema, src        http, https ONLY
+ *
+ * So `![alt](mailto:someone@example.com)` is Markdown - no raw HTML anywhere - and it produces an
+ * `img` whose `src` react-markdown keeps and the sanitiser strips. That is the input the sanitiser is
+ * the sole remover of, and it is what the boundary group at the end of this file is built on.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * An image address in a scheme react-markdown admits and the sanitiser's `src` list does not.
+ *
+ * `mailto:` rather than something exotic, because it is the case a real author can produce by
+ * accident - pasting a contact address into image syntax - and because it is admitted by every URL
+ * check in the pipeline except the one under test.
+ */
+const SANITISER_ONLY_IMAGE_SRC = 'mailto:someone@example.com';
+
+/** The same disagreement in a second scheme, so the case is a class rather than a single value. */
+const SANITISER_ONLY_IMAGE_SRC_ALTERNATE = 'xmpp:someone@example.com';
+
+/**
+ * The four spellings of that construct, each a different mdast path to the same hast `img`.
+ *
+ * Inline, reference-style, nested in a list item and nested inside a link. All four are Markdown, and
+ * a sanitiser wired into the pipeline cleans every one of them; a sanitiser applied at only one of
+ * these paths - which is what a hand-rolled cleanup at the component boundary would be - would miss
+ * three.
+ */
+const SANITISER_REACHING_FIXTURES: readonly (readonly [string, string])[] = [
+  ['an inline image', `![A diagram](${SANITISER_ONLY_IMAGE_SRC})`],
+  [
+    'a reference-style image',
+    `![A diagram][ref]\n\n[ref]: ${SANITISER_ONLY_IMAGE_SRC_ALTERNATE}\n`,
+  ],
+  ['an image inside a list item', `- ![A diagram](${SANITISER_ONLY_IMAGE_SRC})\n`],
+  ['an image inside a link', `[![A diagram](${SANITISER_ONLY_IMAGE_SRC})](${EXTERNAL_LINK_HREF})`],
+];
+
+/**
+ * A raw-HTML payload behind a four-space indent, which is a DIFFERENT CommonMark path again.
+ *
+ * Four leading spaces open an indented code block, so the payload is neither an element nor stripped
+ * text: it is the literal contents of a code block, escaped and displayed. That distinction is the
+ * reason `@/lib/validation/post` refuses to trim the content field - trimming this body would turn a
+ * code sample into a paragraph and change what a reader is shown - and it is the reason this fixture
+ * exists: the raw-HTML-block case above asserts `alert(1)` is ABSENT from the text, and this one
+ * asserts it is PRESENT as text, so a change that started stripping code-block contents would be
+ * caught rather than looking like better sanitisation.
+ */
+const INDENTED_RAW_HTML_CONTENT = `Prose above the sample.
+
+    <script>alert(1)</script>
+    <img src=x onerror="alert(2)">
+`;
+
+/**
+ * Whitespace that is significant inside a fenced block: a blank first line and a deeper indent.
+ *
+ * Fenced blocks are the one place the renderer must preserve what it is given byte for byte, because
+ * indentation carries meaning in most of the languages an author would paste.
+ */
+const FENCE_WHITESPACE_CONTENT = `\`\`\`text
+
+    indented inside the fence
+\`\`\`
+`;
+
+/**
+ * A fence whose info string is a raw-HTML payload rather than a language name.
+ *
+ * The info string becomes a `className` on `code`, and the sanitiser's schema permits `className`
+ * there only when it matches \`/^language-./\`. react-markdown always writes the `language-` prefix, so
+ * the interesting property is not that the class is dropped - it is not - but that a payload in that
+ * position stays a CLASS TOKEN and produces no element and no attribute of its own.
+ */
+const FENCE_HOSTILE_INFO_CONTENT = `\`\`\`<img src=x onerror=alert(1)>
+body text inside the fence
+\`\`\`
+`;
+
+/** A fence with a real language name, and the false-positive half of the class rule. */
+const FENCE_LANGUAGE_CONTENT = `\`\`\`js
+const answer = 1;
+\`\`\`
+`;
+
+/** A fence with no info string at all, which must therefore carry no class. */
+const FENCE_NO_INFO_CONTENT = `\`\`\`
+plain fence, no language
+\`\`\`
+`;
+
+/**
+ * A GFM footnote, which is the one Markdown construct that puts an author-influenced value into an
+ * `id` attribute.
+ *
+ * That makes it the only content this product can store which exercises the sanitiser's *clobber*
+ * rule - `id` and `name` rewritten behind a `user-content-` prefix - and therefore the only
+ * sanitiser effect observable in `PostContent`'s own rendered output rather than only at the plugin
+ * boundary. The label after the caret is author-written, which is precisely the point.
+ */
+const FOOTNOTE_CONTENT = `A claim that needs a source.[^src]
+
+[^src]: Measured on the pinned toolchain.
+`;
+
+/* -------------------------------------------------------------------------------------------------
  * Category fixture
  *
  * Typed as the SLIM projection with no cast. `CategorySummary` is exactly `id`, `name` and `slug` -
@@ -352,6 +478,55 @@ function eventHandlerAttributes(container: HTMLElement): readonly string[] {
       .filter((attribute) => attribute.toLowerCase().startsWith('on'))
       .map((attribute) => `${element.tagName.toLowerCase()}[${attribute}]`),
   );
+}
+
+/**
+ * Render one Markdown body through the component's remark half with the rehype half supplied, and
+ * report every `src` that survived.
+ *
+ * This is the instrument that makes the sanitiser's boundary observable. `PostContent` declares
+ * `remarkPlugins={[remarkGfm]}` and `rehypePlugins={[rehypeSanitize]}` and exports neither array, so
+ * the pair is restated here - and the restatement is the point rather than a workaround: passing `[]`
+ * as the rehype half renders the SAME content with the sanitiser removed, which is the only way to
+ * show that a given input reaches it and that it is the sole remover of what disappears.
+ *
+ * The remark half is not varied: `remark-gfm` decides which constructs parse, and swapping it would
+ * change what reaches the comparison rather than what the comparison measures.
+ *
+ * The container is detached before returning so two renders in one test cannot be confused by a
+ * document-wide query; the returned values are already materialised strings.
+ */
+function renderThroughPipeline(content: string, rehypePlugins: PluggableList): HTMLElement {
+  const { container } = render(
+    <Markdown rehypePlugins={rehypePlugins} remarkPlugins={[remarkGfm]}>
+      {content}
+    </Markdown>,
+  );
+  // Detached before returning so two renders in one test cannot be confused by a document-wide query.
+  // jsdom keeps the subtree intact, so every query below still resolves against it.
+  container.remove();
+  return container;
+}
+
+/** Every `id` present anywhere in a rendered subtree, in document order. */
+function renderedIds(container: HTMLElement): readonly string[] {
+  return Array.from(container.querySelectorAll('[id]')).map((element) => element.id);
+}
+
+/**
+ * The one `pre > code` pair a fenced or indented block renders, proven present.
+ *
+ * Thrown rather than asserted so a caller reading `.className` cannot be handed `null` and report a
+ * confusing type failure instead of the structural one that actually happened.
+ */
+function codeBlockIn(container: HTMLElement): HTMLElement {
+  const code = container.querySelector('pre > code');
+
+  if (!(code instanceof HTMLElement)) {
+    throw new Error('Expected the rendered output to contain one pre/code pair.');
+  }
+
+  return code;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -550,6 +725,178 @@ describe('PostContent', () => {
       // The residue is ordinary paragraph text, so the reader sees it and the browser does nothing
       // with it.
       expect(screen.getByText(/raw bold/)).toBeInTheDocument();
+    });
+  });
+
+  /* -----------------------------------------------------------------------------------------------
+   * The sanitiser's own boundary
+   *
+   * Every case in the group above would still pass with `rehype-sanitize` deleted from the pipeline,
+   * because `rehype-raw` is absent and react-markdown therefore never turns raw HTML into nodes for a
+   * sanitiser to clean. Those cases prove the pipeline posture. This group proves the second line of
+   * defence is real: it feeds the pipeline a Markdown-native construct that reaches the sanitiser, and
+   * asserts BOTH sides of the comparison - present without it, absent with it - so the case cannot
+   * pass because nothing was ever there.
+   *
+   * That two-sided form is what makes these tests fail if the sanitiser is removed, replaced with a
+   * no-op, or configured with a schema widened to admit `mailto:`/`xmpp:` in `src`. The header of the
+   * component names removing the render pass as the change that turns defence in depth into a single
+   * point of failure; this is the group that would object to it.
+   * -------------------------------------------------------------------------------------------- */
+  describe('the sanitiser is load-bearing, not decorative', () => {
+    it.each(SANITISER_REACHING_FIXTURES)(
+      'strips the src of %s, and is the only pass that does',
+      (_description, content) => {
+        // WITHOUT the sanitiser the address survives every other check in the pipeline: it is
+        // Markdown rather than raw HTML, so `rehype-raw`'s absence is no help, and its scheme is on
+        // react-markdown's own admitted list, so `urlTransform` passes it through.
+        expect(renderedSrcs(renderThroughPipeline(content, []))).toHaveLength(1);
+
+        // WITH the sanitiser the `src` attribute is gone, because the schema admits only http and
+        // https there. Same content, same remark half, one plugin apart.
+        expect(renderedSrcs(renderThroughPipeline(content, [rehypeSanitize]))).toEqual([]);
+      },
+    );
+
+    it('applies the clobber prefix to every author-reachable id in the article', () => {
+      const { container } = render(<PostContent content={FOOTNOTE_CONTENT} />);
+
+      // GFM footnotes are the one Markdown construct that puts an author-influenced value into an
+      // `id`, and the sanitiser's schema clobbers `id` and `name` behind a `user-content-` prefix for
+      // exactly that reason: an unprefixed author-reachable id is a DOM-clobbering surface, where an
+      // element named `body`, `head` or after a form control shadows the property scripts read.
+      const ids = renderedIds(container);
+      expect(ids.length).toBeGreaterThan(0);
+      for (const id of ids) {
+        expect(id.startsWith('user-content-')).toBe(true);
+      }
+
+      // THIS is the assertion that ties the guarantee to the component rather than to the plugin:
+      // removing `rehypeSanitize` from the component's own `rehypePlugins` leaves these ids
+      // unprefixed, and this case is what objects. Verified by making that change.
+      const reference = container.querySelector('[aria-describedby]');
+      expect(reference).not.toBeNull();
+      expect(reference?.getAttribute('aria-describedby')).toBe('user-content-footnote-label');
+
+      // And the accessible relationship it names resolves, so the prefix did not orphan it: the
+      // reference describes itself by the footnotes heading, and that heading is present under exactly
+      // that id.
+      const label = container.querySelector('#user-content-footnote-label');
+      expect(label).not.toBeNull();
+      expect(label?.textContent).toBe('Footnotes');
+
+      // WHAT THIS CASE DELIBERATELY DOES NOT ASSERT, and why the reader should know: the sanitiser
+      // applies its `user-content-` prefix on top of the one `mdast-util-to-hast` has already applied,
+      // so a footnote's `id` arrives doubly prefixed while the `href` that points at it keeps a single
+      // prefix. The in-page jump between a reference and its note therefore does not resolve in the
+      // shipped pipeline. That is a rendering defect in its own right rather than a sanitisation
+      // property, it is outside the scope this file was changed for, and it is left untouched and
+      // unasserted here so that neither the defect nor a future correction of it is written into a
+      // security test as though it were the contract.
+    });
+
+    it('emits no image and makes no subresource request for such a body', () => {
+      for (const [description, content] of SANITISER_REACHING_FIXTURES) {
+        const { container } = render(<PostContent content={content} />);
+
+        // The product-level guarantee, stated where the product delivers it. Two independent guards
+        // reach this outcome - the sanitiser removed the address, and the `img` override's host policy
+        // would have refused it anyway - and the guarantee is that BOTH have to fail for a request to
+        // be made, which is what defence in depth means here.
+        expect(container.querySelectorAll('img'), description).toHaveLength(0);
+        expect(renderedSrcs(container), description).toEqual([]);
+        expect(eventHandlerAttributes(container), description).toEqual([]);
+
+        // The author's alt text stands in, so the reader is told something was meant to be here.
+        expect(container.textContent, description).toContain('A diagram');
+        container.remove();
+      }
+    });
+  });
+
+  /* -----------------------------------------------------------------------------------------------
+   * Leading whitespace, which is content rather than noise
+   *
+   * Four leading spaces open an indented code block, and that is a third CommonMark path distinct from
+   * both raw-HTML forms above: the payload is neither an element nor stripped text but the literal
+   * contents of a code block, escaped and displayed. It is also the reason `@/lib/validation/post`
+   * refuses to trim the content field - a trim would silently turn a code sample into a paragraph.
+   * -------------------------------------------------------------------------------------------- */
+  describe('significant leading whitespace', () => {
+    it('renders an indented raw-HTML payload as inert code-block text', () => {
+      const { container } = render(<PostContent content={INDENTED_RAW_HTML_CONTENT} />);
+
+      // No element and no attribute, exactly as for the unindented forms.
+      expect(container.querySelectorAll('script')).toHaveLength(0);
+      expect(container.querySelectorAll('img')).toHaveLength(0);
+      expect(eventHandlerAttributes(container)).toEqual([]);
+      expect(renderedSrcs(container)).toEqual([]);
+
+      // But here the payload's TEXT is deliberately retained, and that is the opposite of the
+      // raw-HTML-block case, which drops the text with the tags. An author who pastes a script tag
+      // into a code sample is showing it to a reader, and a renderer that swallowed it would be
+      // corrupting the article rather than protecting anyone. Both outcomes are correct for their own
+      // input, and asserting only one of them would let the other regress unnoticed.
+      const code = codeBlockIn(container);
+      expect(code.textContent).toContain('<script>alert(1)</script>');
+      expect(code.textContent).toContain('onerror="alert(2)"');
+      // Inside a `code` element, which is what makes it inert: the browser parses none of it.
+      expect(code.closest('pre')).not.toBeNull();
+      // And the prose above it is still a paragraph, so the indent - not the payload - is what made
+      // this a code block.
+      expect(screen.getByText('Prose above the sample.').tagName).toBe('P');
+    });
+
+    it('preserves a blank first line and a deeper indent inside a fenced block', () => {
+      const { container } = render(<PostContent content={FENCE_WHITESPACE_CONTENT} />);
+
+      // Byte-for-byte, because indentation carries meaning in most of what an author would paste. A
+      // renderer that collapsed either would change the sample's meaning without saying so.
+      expect(codeBlockIn(container).textContent).toBe('\n    indented inside the fence\n');
+    });
+  });
+
+  /* -----------------------------------------------------------------------------------------------
+   * The language class on a fenced block
+   *
+   * The sanitiser's schema permits `className` on `code` only when it matches `/^language-./`, and
+   * react-markdown always writes that prefix - so the rule's interesting consequences are that a
+   * legitimate language name SURVIVES (the component's header claims the schema needs no widening, and
+   * this is where that claim is checked) and that a payload written where a language name belongs stays
+   * a class token rather than becoming markup.
+   * -------------------------------------------------------------------------------------------- */
+  describe('fenced-block language class', () => {
+    it('keeps a legitimate language class, so the schema needs no widening', () => {
+      const { container } = render(<PostContent content={FENCE_LANGUAGE_CONTENT} />);
+
+      // No syntax highlighter is declared in the dependency set, so this class is the whole of the
+      // language signal: it is preserved precisely so a highlighter can be introduced later without
+      // touching the component. A schema tightened to drop it would break that quietly.
+      expect(codeBlockIn(container)).toHaveClass('language-js');
+      expect(codeBlockIn(container).textContent).toBe('const answer = 1;\n');
+    });
+
+    it('leaves a hostile fence info string as an inert class token', () => {
+      const { container } = render(<PostContent content={FENCE_HOSTILE_INFO_CONTENT} />);
+
+      const code = codeBlockIn(container);
+      // The payload is confined to the `class` attribute, under the `language-` prefix react-markdown
+      // writes - so it is a class token and nothing else.
+      expect(code.className.startsWith('language-')).toBe(true);
+      // And nothing was constructed from it: no element, no attribute, no request.
+      expect(container.querySelectorAll('img')).toHaveLength(0);
+      expect(eventHandlerAttributes(container)).toEqual([]);
+      expect(renderedSrcs(container)).toEqual([]);
+      // The fence's own body still renders, so the hostile info string cost the author nothing.
+      expect(code.textContent).toBe('body text inside the fence\n');
+    });
+
+    it('emits no class at all for a fence with no info string', () => {
+      const { container } = render(<PostContent content={FENCE_NO_INFO_CONTENT} />);
+
+      // Absent rather than empty: an empty `language-` class would match nothing a highlighter looks
+      // for and would be a value invented by the renderer.
+      expect(codeBlockIn(container).getAttribute('class')).toBeNull();
     });
   });
 

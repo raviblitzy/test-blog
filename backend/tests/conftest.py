@@ -44,7 +44,7 @@ enterprise standards, four of which this file discharges directly.
 1. Why the environment bootstrap has to come first
 --------------------------------------------------
 ``app.core.config`` builds its ``settings`` singleton **at import time**, and six of its
-eleven variables have no default at all: ``DATABASE_URL``, ``JWT_SECRET_KEY``,
+twelve variables have no default at all: ``DATABASE_URL``, ``JWT_SECRET_KEY``,
 ``CORS_ALLOW_ORIGINS``, ``ENVIRONMENT``, ``SEED_ADMIN_EMAIL`` and ``SEED_ADMIN_PASSWORD``.
 ``JWT_SECRET_KEY`` is additionally held to a per-algorithm byte floor - 32 for ``HS256``,
 48 for ``HS384``, 64 for ``HS512`` - because that is the length PyJWT itself measures
@@ -59,47 +59,162 @@ Hence the shape of this file: a bootstrap block of plain module-level statements
 deliberate - ``E402`` is exactly right in general and exactly wrong here, and the sibling
 ``backend/pyproject.toml`` is not modified to accommodate one file.
 
-Defaults are installed with :meth:`os.environ.setdefault`, so CI, a ``Makefile`` target or a
-developer's shell can override any of them; the resolved ``DATABASE_URL`` is the single
-exception and is **assigned**, for the reason in section 2.
+The bootstrap has **two halves**, and which half a variable belongs to is a decision about
+what a test run is allowed to inherit rather than a convenience.
 
-``ENVIRONMENT=test`` is functional, not cosmetic
+:data:`_ENVIRONMENT_OVERRIDES` is **assigned**, unconditionally, so an ambient value cannot
+survive into the suite. Four names are in it - the deployment stage and the three
+credentials - because an inherited value for any of them stops the run being a test run:
+
+``ENVIRONMENT=test`` is functional, and it is not negotiable
     ``app.core.rate_limit`` constructs its limiter with ``enabled=settings.ENVIRONMENT !=
     "test"``. Without this value the authentication suite - which registers, logs in,
     refreshes and logs out repeatedly - trips the five-per-minute limit and returns ``429``
     intermittently, which is precisely the flakiness a blocking gate cannot tolerate. It also
     keeps the documentation routes served: ``app.main`` withdraws ``/docs`` and ``/redoc``
     only when ``settings.is_production``, so under ``test`` the OpenAPI surface the contract
-    test asserts against is still mounted, as AAP §0.9.4.3 requires.
+    test asserts against is still mounted, as AAP §0.9.4.3 requires. And it selects the
+    logging profile, the HSTS decision and the credential-placeholder gate. A shell or a CI
+    job that happened to export ``ENVIRONMENT=production`` or ``staging`` - from a deployment
+    step earlier in the same pipeline, say - would silently turn every one of those into a
+    deployment behaviour, so this value is **written over** whatever arrived rather than
+    defaulted. The same reasoning covers ``JWT_SECRET_KEY``, ``SEED_ADMIN_EMAIL`` and
+    ``SEED_ADMIN_PASSWORD``: a suite that signed its tokens with, or seeded, a deployment
+    credential would both be non-deterministic and be handling a real secret, and neither is
+    acceptable in a test process. The three values used instead are the obviously fake
+    placeholders declared below.
 
-``LOG_LEVEL=WARNING``
-    Quiet on purpose. ``migrations/env.py`` routes Alembic through ``structlog``, so at
-    ``INFO`` every session begins with a dozen JSON records before the first test; at
-    ``WARNING`` a failing assertion is the first thing in the transcript.
+The remaining seven are installed with :meth:`os.environ.setdefault`, so CI, a ``Makefile``
+target or a developer's shell can still tune them. None of them selects a profile or carries
+a credential - they are the algorithm, the two token lifetimes, the origin list, the log
+threshold, the rate-limit expression and the request-body ceiling - so an inherited value
+changes what a test measures without changing what it is:
 
-2. The test database is derived, never reused
----------------------------------------------
-``.env.example`` is a closed contract, and adding a fifteenth documented variable would
+The resolved ``DATABASE_URL`` is neither: it is **assigned**, from a value that has been
+authorised first, for the reason in section 2.
+
+2. The test database is derived, authorised, and only then used
+--------------------------------------------------------------
+``.env.example`` is a closed contract, and adding a further documented variable would
 desynchronise it from ``README.md``, ``docker-compose.yml`` and ``.github/workflows/ci.yml``.
 So the target database is resolved in two steps instead:
 
-* if ``TEST_DATABASE_URL`` is set in the environment, it is used verbatim. It is not declared
+* if ``TEST_DATABASE_URL`` is set in the environment, it names the candidate - but it is
+  **never taken verbatim**; it is held to every rule the derivation is held to. It is not declared
   on ``Settings``, and because ``pydantic-settings`` looks up declared field names rather
   than enumerating the environment, an undeclared key in :data:`os.environ` passes the
   model's ``extra="forbid"`` untouched. (That tolerance covers the *environment* only - the
   name must never be written into a ``.env`` file, where the dotenv source would enumerate
   it and the model would refuse to start.)
 * otherwise ``DATABASE_URL`` is parsed with :func:`sqlalchemy.engine.make_url` and a sibling
-  database name is derived by appending ``_test``, idempotently: a name that already ends in
-  ``_test`` is left alone, so a re-run cannot produce ``blog_test_test``.
+  database name is derived by appending ``_test`` and this process's isolation tags,
+  idempotently: a name that already carries them is left alone, so a re-run cannot produce
+  ``blog_test_test``. See section 2.2 for the tags.
 
-The resolved URL is then **assigned** to ``os.environ["DATABASE_URL"]``, and that single
+**Neither candidate is trusted.** A candidate is a string from the environment, and this
+suite is about to create a database from it, run every migration against it, write to it, and
+- on request - drop it. So :func:`_authorise_test_target` runs *before* the value is assigned
+anywhere and before any connection is opened, and it fails the run rather than proceeding on
+anything it cannot prove is a disposable test database:
+
+* the URL must parse, and its driver must be exactly ``postgresql+psycopg`` - the project's
+  single driver;
+* it must name a database at all, and that name must contain :data:`_TEST_DATABASE_MARKER`,
+  which is the coarse half of the rule and gives the friendlier diagnosis;
+* the name must **end in** :data:`TEST_DATABASE_SUFFIX`, optionally followed by the isolation
+  tags - :func:`_is_dedicated_test_database`. A *suffix* rather than a substring: ``latest``,
+  ``contest`` and ``latest_events`` all contain ``test`` and are perfectly ordinary database
+  names, so a containment check is no guard on its own;
+* the name must match :data:`_IDENTIFIER_PATTERN`, a conservative unquoted-identifier grammar,
+  and must be at most 63 bytes - PostgreSQL's own limit, past which it truncates silently,
+  which would make an authorised name and the created database two different things. That
+  grammar is also what makes the two ``DATABASE`` maintenance statements safe to build
+  (section 2a);
+* the host must be one this file recognises as local - the loopback spellings, the empty
+  Unix-socket host, and the ``db``/``database``/``postgres``/``postgresql`` service names this
+  project's own Compose file and CI workflow use. Anything else is refused unless
+  ``TEST_DATABASE_ALLOW_REMOTE_HOST`` is set, which is the explicit opt-in for the one
+  legitimate case: a managed test database that really is elsewhere.
+
+An override is held to two further rules, because it is the only value that can point this
+suite somewhere the derivation never would:
+
+* it may not name the database ``DATABASE_URL`` itself names, when that database is not
+  already a dedicated one. Exporting ``TEST_DATABASE_URL`` equal to the working URL "to just
+  run it against my data" is the mistake that actually happens, and it is refused by name
+  rather than by a naming rule;
+* and it may only redirect the **database**, never the server. Its host and port must equal
+  the ones ``DATABASE_URL`` already names, so the only server this suite can reach is the one
+  the surrounding configuration already points at. Pointing the suite at a different server is
+  done the way ``.env.example`` documents - by setting ``DATABASE_URL`` to that server - which
+  keeps one value in charge of *where* and leaves ``TEST_DATABASE_URL`` in charge only of
+  *which database there*, unless the remote opt-in above says otherwise.
+
+Every one of those checks is reported without quoting the URL, because a connection URL
+carries a password, and every one of them names the action it refused.
+
+The authorised URL is then **assigned** to ``os.environ["DATABASE_URL"]``, and that single
 assignment redirects both consumers at once: the engine this file opens, and
 ``migrations/env.py``, because ``backend/alembic.ini`` deliberately declares no
 ``sqlalchemy.url`` and the environment script reads ``settings.DATABASE_URL`` instead.
 
-Deriving rather than reusing is a safety property, not a convenience. It is what guarantees
-the suite cannot migrate, truncate or drop the database a developer is actually working in.
+Deriving rather than reusing is a safety property, not a convenience, and authorising rather
+than deriving-and-hoping is what makes the property hold when the derivation is overridden.
+Together they are what guarantees the suite cannot create, migrate, write to or drop
+anything but a dedicated ``*_test`` database on a server it was authorised to reach.
+
+2a. The same gate governs create, migrate, use and drop
+-------------------------------------------------------
+One authorised answer is not enough, because four separate paths act on the database and each
+reads ``settings.DATABASE_URL`` when it runs: :func:`_ensure_test_database_exists` issues
+``CREATE DATABASE``, :func:`_upgrade_to_head` runs every revision, :func:`engine` opens the
+connections the tests write through, and :func:`_drop_test_database` issues ``DROP DATABASE
+... WITH (FORCE)``. So each of them calls :func:`_authorise_test_target` first, which
+re-applies the identical checks to the value in force at that moment. ``settings`` is
+deliberately not frozen, so a test that mutated the setting, a fixture ordering that changed,
+or a future edit that assigned it again cannot route any of the four at an unvetted target.
+
+The two ``DATABASE`` statements need a further step, because a database name cannot be a bind
+parameter - it is an identifier, so it has to be written into the statement text. It is
+therefore quoted by the PostgreSQL dialect's own identifier preparer rather than by wrapping
+it in double quotes here. The grammar above already makes a quote character unrepresentable,
+so this is the second of two independent guards rather than the only one: with both in place,
+an environment-derived value cannot terminate the identifier and append SQL of its own to an
+``AUTOCOMMIT`` maintenance connection.
+
+2.2 One database per clone, per worker
+--------------------------------------
+``<base>_test`` alone is not an isolated name, it is a *shared* one. This platform runs
+independent clones of the repository in parallel against one PostgreSQL server and documents
+``CLONE_INDEX`` as the discriminator for every host-global resource; a database is exactly
+such a resource. Two clones landing on one name do not fail cleanly - they race
+``alembic upgrade head`` against each other, collide on the deterministic case-insensitive
+values ``tests.factories`` generates, share one transaction's worth of visibility, and either
+one can ``DROP DATABASE … WITH (FORCE)`` the other's live session out from under it.
+
+So the derived name carries two tags, both sanitised to ``[a-z0-9]`` and both omitted when
+absent:
+
+* ``CLONE_INDEX`` - this checkout's identity on the shared host;
+* ``PYTEST_XDIST_WORKER`` - the per-process identity ``pytest-xdist`` exports (``gw0``,
+  ``gw1``, …). ``xdist`` is not currently a dependency, so this is normally absent; it is
+  read anyway because the day it is added, the name has to change on its own rather than
+  after a day of debugging duplicate-key failures.
+
+With no tags set the name is ``blog_test``, exactly as before, so a single developer's
+workflow is unchanged. ``TEST_DATABASE_URL`` still wins outright, because a caller naming a
+database explicitly has already decided the question - it is only *authorised*, never
+rewritten. The naming rule accepts the tags: a name must end in ``_test`` optionally followed
+by those lowercase-alphanumeric groups, which is why ``blog_test_w037`` is a dedicated test
+database and ``latest_events`` is not.
+
+Tagging the name is what makes two clones independent; it is not what makes the lifecycle
+safe when they start at the same instant. Creating a database, and running a migration chain
+against one that may have just been created, both need a single owner. So
+:func:`_database_lifecycle_lock` wraps create-and-migrate and the optional drop in an
+:mod:`fcntl` advisory lock on a file named for the resolved database, in the system temporary
+directory. Processes targeting *different* databases never contend; processes targeting the
+*same* one serialise, and the second finds the schema already at head and applies nothing.
 
 3. Alembic builds the schema; ``create_all()`` cannot
 ----------------------------------------------------
@@ -114,8 +229,8 @@ this schema:
 So the session-scoped :func:`database_schema` fixture creates the database if it is absent
 and then runs ``alembic upgrade head`` programmatically, with ``script_location`` set
 explicitly from :data:`__file__` so the run does not depend on the working directory. The
-chain is currently ``0001 → 0002 → 0003 → 0004``; the fixture asks for ``head`` and never
-names a revision, so a fifth revision is picked up with no change here.
+chain is currently ``0001 → 0002 → 0003``; the fixture asks for ``head`` and never names a
+revision, so a fourth revision is picked up with no change here.
 
 **The database is never empty.** Revision ``0003_seed_reference_categories`` inserts eight
 reference categories - Engineering, Architecture, Backend, Frontend, Databases, DevOps,
@@ -126,7 +241,16 @@ as "the database is empty" or "there is exactly one category".
 
 Teardown leaves the database in place, which makes a re-run fast. Dropping it is opt-in
 through ``TEST_DATABASE_DROP``, and the drop refuses to run unless the resolved database name
-contains ``test``, so no configuration mistake can point it at a working database.
+**ends with** ``_test`` - the same rule, through the same predicate, that admitted the URL in
+the first place - so no configuration mistake can point a ``DROP DATABASE ... WITH (FORCE)`` at
+a working database.
+
+The schema fixture is **not** autouse, and that too is a correctness property rather than a
+preference: every module under ``tests/unit/`` declares that it touches neither the database nor
+the network, and autouse would have every one of them create a database and run the revision
+chain before its first assertion. ``pytest -m unit`` therefore needs no PostgreSQL at all, and
+every fixture that does reach the database declares :func:`database_schema` through
+:func:`engine`.
 
 4. The rollback contract, and the one setting it turns on
 ---------------------------------------------------------
@@ -172,13 +296,23 @@ connection out of it. Two engines, one database, and no shared pool to reason ab
 
 5. The client, and the override that ties it to the test's session
 ------------------------------------------------------------------
-:func:`client` installs ``app.dependency_overrides[get_db]`` with a generator that yields
-**the very same session object the test holds**. That identity is the point: a row the test
-creates through a factory is visible to the request, a row the request creates is visible to
-the test afterwards, and the single rollback undoes both. The override is removed in a
-``finally`` block, because ``dependency_overrides`` is mutable state on a module-level
-application object and a leaked entry would silently redirect a later test that expected the
-real dependency.
+:func:`client` installs ``app.dependency_overrides[get_db]`` with the generator
+:func:`_request_scoped_get_db` builds, which yields **the very same session object the test
+holds**. That identity is the point: a row the test creates through a factory is visible to
+the request, a row the request creates is visible to the test afterwards, and the single
+rollback undoes both. The override is removed in a ``finally`` block, because
+``dependency_overrides`` is mutable state on a module-level application object and a leaked
+entry would silently redirect a later test that expected the real dependency.
+
+Sharing the object is not the same as sharing its *work*, and the difference is what the
+override adds on top. Production ``get_db`` opens a session per request and rolls it back when
+the request raises; a bare ``yield`` of one shared session does neither, so a request that
+autoflushed and then failed - a service writing before raising ``Conflict``, a route reaching
+an ownership check after a write - left that work, and any lock it held, in the session for
+whatever the same test did next. So each request runs inside its own ``SAVEPOINT``, released
+when the request succeeds and rolled back when it raises, which reproduces production's
+per-request boundary without giving up the shared identity a separate session would have
+cost.
 
 The client is built as ``AsyncClient(transport=ASGITransport(app=...))``. httpx 0.28.1
 removed the ``AsyncClient(app=...)`` shortcut, so the transport is constructed explicitly -
@@ -186,14 +320,18 @@ and this in-process transport is what lets the suite run with no server listenin
 as AAP §0.4.4.5 requires.
 
 ``ASGITransport`` does not run lifespan events, and that is desirable rather than a gap:
-skipping the lifespan skips ``configure_logging()`` (already applied at import) and the
-disposal of an engine this suite never opens. No fixture here depends on a lifespan side
-effect, and none should be added.
+skipping the lifespan skips ``configure_logging()`` (already applied at import), the disposal
+of an engine this suite never opens, and ``warm_password_hashing()`` - whose effect is a
+*timing* property rather than a behavioural one, so a lazily computed dummy hash produces the
+same value and the same answers, only more slowly on the first unknown-email login. No fixture
+here depends on a lifespan side effect, and none should be added; the one test that asserts on
+the warm-up drives the lifespan itself rather than asking a fixture to run it.
 
 Driving ``/readyz`` to its 503
     ``GET /readyz`` answers 503 when its ``SELECT 1`` fails, and the failure has to happen
-    **inside the route** - an override that raises would fail during dependency resolution
-    and surface as a 500 instead. So :func:`unavailable_database` installs an override that
+    **after dependency resolution**, inside the readiness service - an override that raises
+    would fail while the session is being resolved and surface as a 500 instead. So
+    :func:`unavailable_database` installs an override that
     yields a session-shaped stand-in whose ``execute`` raises, and :func:`override_get_db` is
     the general form for any other substitution, restoring the previous entry even when the
     test fails.
@@ -232,12 +370,19 @@ universal pagination.
 
 from __future__ import annotations
 
+import fcntl
 import os
+import re
 import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, Literal
 
-from sqlalchemy.engine import make_url
+from sqlalchemy.dialects.postgresql.base import PGDialect
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.sql.compiler import IdentifierPreparer
 
 # ---------------------------------------------------------------------------------------
 # Filesystem anchors
@@ -292,14 +437,24 @@ _ensure_app_package_is_importable()
 # ---------------------------------------------------------------------------------------
 # The environment the suite runs under
 #
-# The ten names below are the backend variables .env.example documents, minus DATABASE_URL,
+# The eleven names below are the backend variables .env.example documents, minus DATABASE_URL,
 # which is resolved separately. Every value is an obviously fake placeholder: nothing here is
 # a real credential, a deployment host or a working connection string (AAP §0.10.1 #13).
 #
-# Installed with setdefault, so CI or a shell export wins. Two of the ten are functional
-# rather than decorative and are called out in the module docstring: ENVIRONMENT selects the
-# `test` profile that disables the authentication rate limiter, and LOG_LEVEL keeps the
-# transcript readable.
+# They are installed in TWO groups, and the split is a decision about what a test run may
+# inherit - see "The bootstrap has two halves" in the module docstring:
+#
+#   _ENVIRONMENT_OVERRIDES  assigned unconditionally. The deployment stage and the three
+#                           credentials. An inherited ENVIRONMENT=production or =staging
+#                           would re-enable the rate limiter, withdraw the documentation
+#                           routes the contract test reads, switch the logging profile and
+#                           turn on HSTS, and an inherited signing key or seed credential
+#                           would make the suite both non-deterministic and a handler of a
+#                           real secret. None of the four may survive into a test process.
+#   _ENVIRONMENT_DEFAULTS   setdefault, so CI or a shell export still wins. The algorithm,
+#                           the two token lifetimes, the origin list, the log threshold, the
+#                           rate-limit expression and the body ceiling: tuning, none of which
+#                           decides whether this is a test run.
 # ---------------------------------------------------------------------------------------
 
 #: Obviously fake HMAC signing key, 70 bytes - comfortably above the 64-byte floor `HS512`
@@ -309,52 +464,97 @@ TEST_JWT_SECRET_KEY: Final[str] = (
 )
 
 #: Obviously fake seeded-administrator password. Twelve characters minimum, at most 128, and
-#: at least three of the five character classes `app.core.password_policy` counts - the same
+#: at least three of the five character classes `app.schemas.auth` counts - the same
 #: policy `POST /api/v1/auth/register` applies - and deliberately not one of the placeholders
 #: `.env.example` publishes, nor a variation on one, because those are refused in every stage.
 TEST_SEED_ADMIN_PASSWORD: Final[str] = "Fixture-Adm1n-Never-Deployed"
 
-_ENVIRONMENT_DEFAULTS: Final[tuple[tuple[str, str], ...]] = (
-    # Functional: `app.core.rate_limit` builds its limiter with
-    # `enabled=settings.ENVIRONMENT != "test"`, so this value is what stops repeated
+#: Obviously fake seeded-administrator address. example.com is reserved by RFC 2606 §3, so it
+#: can never reach a real mailbox, and it is still a valid `EmailStr`, which the field requires.
+TEST_SEED_ADMIN_EMAIL: Final[str] = "seed-admin@example.com"
+
+#: The deployment stage this suite runs as, and the only one it may run as.
+TEST_ENVIRONMENT: Final[str] = "test"
+
+_ENVIRONMENT_OVERRIDES: Final[tuple[tuple[str, str], ...]] = (
+    # Functional, and assigned rather than defaulted. `app.core.rate_limit` builds its limiter
+    # with `enabled=settings.ENVIRONMENT != "test"`, so this value is what stops repeated
     # authentication flows returning 429. It also keeps /openapi.json, /docs and /redoc
-    # mounted, because app.main withdraws them only under `production`.
-    ("ENVIRONMENT", "test"),
+    # mounted (app.main withdraws them under `production`), selects the human-readable or JSON
+    # logging profile, decides whether HSTS is applied, and opens the gate that otherwise
+    # rejects the .env.example credential placeholders. An ambient `production` or `staging` -
+    # exported by a shell, or left behind by an earlier step of the same CI job - would turn
+    # every one of those into deployment behaviour inside a test process.
+    ("ENVIRONMENT", TEST_ENVIRONMENT),
+    # The three credentials, likewise assigned. A suite that signed its tokens with a
+    # deployment signing key, or seeded a deployment administrator, would be handling a real
+    # secret and would stop being reproducible; and `test_security` mints and verifies tokens
+    # against whatever `settings.JWT_SECRET_KEY` holds, so an inherited key of a different
+    # length or algorithm class changes what those tests exercise.
     ("JWT_SECRET_KEY", TEST_JWT_SECRET_KEY),
+    ("SEED_ADMIN_EMAIL", TEST_SEED_ADMIN_EMAIL),
+    ("SEED_ADMIN_PASSWORD", TEST_SEED_ADMIN_PASSWORD),
+)
+
+_ENVIRONMENT_DEFAULTS: Final[tuple[tuple[str, str], ...]] = (
     ("JWT_ALGORITHM", "HS256"),
     ("ACCESS_TOKEN_EXPIRE_MINUTES", "15"),
     ("REFRESH_TOKEN_EXPIRE_DAYS", "7"),
     # Both loopback spellings a browser treats as distinct origins, matching .env.example.
     ("CORS_ALLOW_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"),
-    # Functional: migrations/env.py routes Alembic through structlog, so INFO would prefix
-    # every session with a dozen JSON records before the first test runs.
-    ("LOG_LEVEL", "WARNING"),
+    # Functional, and INFO rather than a quieter level on purpose. A test that asserts on what a
+    # log record CONTAINS - `tests/unit/test_security.py`'s redaction suite asserts that a secret
+    # does not survive into one - needs the record it emits to reach the buffer, and the level it
+    # emits at is `info`. At WARNING that buffer is empty and the test fails with an `IndexError`
+    # that says nothing about redaction, which is a harness artefact masquerading as a defect in
+    # the module under test. It is also the level .env.example publishes, so the suite runs at the
+    # threshold the service documents rather than at one invented here. The rule this file holds
+    # itself to: a harness may set a shared global, but it may not NARROW one in a way only some
+    # suites survive.
+    #
+    # The reason a quieter level was chosen originally still stands and is still honoured, just
+    # not by muting the whole session: migrations/env.py routes Alembic through structlog, so INFO
+    # would otherwise prefix every run with a dozen JSON records before the first test. That noise
+    # is suppressed at its source instead - `_upgrade_to_head` pins `settings.LOG_LEVEL` to
+    # `_MIGRATION_LOG_LEVEL` for the duration of the upgrade and restores it afterwards - so the
+    # transcript stays as readable as it was while the records a test needs are no longer thrown
+    # away. Those records are emitted inside a session-scoped fixture in any case, and pytest
+    # prints fixture output only when something in that scope fails.
+    ("LOG_LEVEL", "INFO"),
     # Mirrors .env.example. The limiter is disabled under `test`, so this value is never
     # enforced - it is set because Settings validates the expression's syntax at startup.
     ("AUTH_RATE_LIMIT", "5/minute"),
-    # example.com is reserved by RFC 2606 §3, so this address can never reach a real mailbox,
-    # and it is still a valid `EmailStr`, which the field requires.
-    ("SEED_ADMIN_EMAIL", "seed-admin@example.com"),
-    ("SEED_ADMIN_PASSWORD", TEST_SEED_ADMIN_PASSWORD),
+    # Pinned to the documented default rather than left to the field's, so the ceiling the
+    # body-limit tests generate a body against is a known number here and not whatever a shell
+    # export happened to set. Deliberately NOT lowered to make those tests cheaper: a ceiling
+    # under 100 000 characters would refuse the largest post content the schema accepts, and the
+    # tests that assert on that bound would start failing with 413 for a reason unrelated to them.
+    ("MAX_REQUEST_BODY_BYTES", "1048576"),
 )
 
 
-def _apply_environment_defaults() -> None:
-    """Populate the ten documented backend variables that are not already set.
+def _apply_environment() -> None:
+    """Pin the test profile and its credentials, then fill in the seven tunable variables.
 
-    :meth:`os.environ.setdefault` throughout, so an exported value or a CI ``env:`` block
-    always wins over the placeholder. This runs before any ``app`` import, which is the whole
-    reason it is a module-level statement rather than a fixture: ``app.core.config``
-    constructs and validates its ``settings`` singleton while it is being imported, and six
-    of its eleven fields have no default to fall back on.
+    Two loops, and the difference between them is the whole of this function's purpose.
+    :data:`_ENVIRONMENT_OVERRIDES` is **assigned**, so an ambient ``ENVIRONMENT=production``,
+    signing key or seed credential cannot survive into the suite - what runs is a test profile
+    with fake credentials, whatever the surrounding shell or pipeline exported.
+    :data:`_ENVIRONMENT_DEFAULTS` uses :meth:`os.environ.setdefault`, so a deliberate export
+    or a CI ``env:`` block still wins for the seven values that only tune what a test measures.
+
+    This runs before any ``app`` import, which is the whole reason it is a module-level
+    statement rather than a fixture: ``app.core.config`` constructs and validates its
+    ``settings`` singleton while it is being imported, and six of its twelve fields have no
+    default to fall back on.
     """
+    for name, value in _ENVIRONMENT_OVERRIDES:
+        os.environ[name] = value
     for name, value in _ENVIRONMENT_DEFAULTS:
         os.environ.setdefault(name, value)
 
 
-_apply_environment_defaults()
-
-
+_apply_environment()
 # ---------------------------------------------------------------------------------------
 # The database this suite is allowed to touch
 # ---------------------------------------------------------------------------------------
@@ -369,15 +569,95 @@ TEST_DATABASE_URL_ENV_VAR: Final[str] = "TEST_DATABASE_URL"
 #: because keeping the schema makes a re-run fast.
 TEST_DATABASE_DROP_ENV_VAR: Final[str] = "TEST_DATABASE_DROP"
 
-#: Appended to the configured database name to derive a sibling for the suite.
+#: Environment variable that authorises a target on a server this file does not recognise as
+#: the configured local one. Absent by default, which is what makes the host policy fail
+#: closed: the one legitimate remote case - a managed test database that really is elsewhere -
+#: has to be declared, and a mistyped or copy-pasted staging host cannot be reached by
+#: accident. Environment-only and undeclared on `Settings`, exactly like the two names above.
+TEST_DATABASE_ALLOW_REMOTE_HOST_ENV_VAR: Final[str] = "TEST_DATABASE_ALLOW_REMOTE_HOST"
+
+#: Appended to the configured database name to derive a sibling for the suite, and - far more
+#: importantly - the suffix a database name must carry before this suite will create, migrate,
+#: seed or drop it. See `_is_dedicated_test_database`.
 TEST_DATABASE_SUFFIX: Final[str] = "_test"
 
-#: Substring the resolved database name must contain before teardown will drop it. A working
-#: database called `blog` cannot match, so a misconfiguration cannot destroy one.
-_DROP_GUARD_MARKER: Final[str] = "test"
+#: Environment variable naming this checkout among the clones sharing one PostgreSQL server.
+#: The platform documents it as the discriminator for every host-global resource; a database
+#: is one. See section 2.2 of the module docstring.
+CLONE_INDEX_ENV_VAR: Final[str] = "CLONE_INDEX"
 
-#: Values `TEST_DATABASE_DROP` accepts as "yes". Anything else, including an empty string,
-#: leaves the database in place.
+#: Environment variable `pytest-xdist` exports per worker process (`gw0`, `gw1`, ...). Read
+#: even though xdist is not a current dependency, so that adding it changes the database name
+#: on its own instead of producing duplicate-key failures nobody can place.
+XDIST_WORKER_ENV_VAR: Final[str] = "PYTEST_XDIST_WORKER"
+
+#: Substring the resolved database name MUST contain before this suite will touch it at all.
+#: A working database called `blog` cannot match, so a misconfiguration cannot have a schema
+#: created over it, cannot be migrated, cannot be written to and cannot be dropped.
+#:
+#: One marker, checked on every path, and that is the point. It used to guard the drop only, so
+#: `TEST_DATABASE_URL` was accepted verbatim and `CREATE DATABASE` plus `alembic upgrade head`
+#: ran against whatever it named - a typo aimed the whole suite at a real database, migrated it,
+#: and only the teardown it never reached would have objected. `_require_test_database` now
+#: applies the same rule at resolution time, before any statement exists to be issued.
+#:
+#: The marker is the coarse half of the naming rule and gives the friendlier diagnosis; the
+#: exact half is `_is_dedicated_test_database`, which is what refuses `contest` and `latest`.
+_TEST_DATABASE_MARKER: Final[str] = "test"
+
+#: The one driver this project has. `app.core.config` requires exactly this scheme of
+#: DATABASE_URL, and the check is repeated here because this module authorises its candidate
+#: BEFORE that model is constructed - see `_authorise_test_target`.
+_REQUIRED_DRIVERNAME: Final[str] = "postgresql+psycopg"
+
+#: PostgreSQL's identifier limit. A longer name is silently truncated by the server, which
+#: would quietly merge two clones onto one database - the exact failure the tags prevent - so
+#: it is enforced here instead.
+_MAX_IDENTIFIER_LENGTH: Final[int] = 63
+
+#: The only shape a database name may take on any path in this file. Deliberately narrower
+#: than PostgreSQL's quoted-identifier grammar: it admits nothing that could terminate a
+#: string, open a comment or end a statement, so the DDL below is safe at the grammar level
+#: and not only at the quoting level.
+_IDENTIFIER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z_][A-Za-z0-9_$]*\Z")
+
+#: The exact naming rule: `TEST_DATABASE_SUFFIX`, optionally followed by the isolation tags
+#: `_isolation_suffix` appends. Matched against a casefolded name.
+#:
+#: A *suffix* rather than a substring, and that difference is the whole point - `contest`,
+#: `latest`, `testing`, `latest_events` and `contest_prod` all contain `test` and not one of
+#: them is a database this suite may migrate or force-drop. The optional trailing groups are
+#: what admits a per-clone name such as `blog_test_w037` or `blog_test_w037_gw0`, which a bare
+#: `endswith('_test')` would refuse and which parallel isolation requires.
+_DEDICATED_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"_test(?:_[a-z0-9]+)*\Z")
+
+#: Characters kept when a tag is sanitised; everything else is dropped. Lowercase alphanumeric
+#: only, so a tag can never introduce a character `_IDENTIFIER_PATTERN` would then reject.
+_TAG_ALLOWED: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
+
+#: The longest a single sanitised tag may contribute, so two tags plus the base name and the
+#: suffix cannot approach `_MAX_IDENTIFIER_LENGTH`.
+_MAX_TAG_LENGTH: Final[int] = 12
+
+#: Hosts this file treats as local. Loopback in the spellings libpq accepts, plus the service
+#: names this project's own Compose file and CI workflow use, plus the empty host that means a
+#: Unix domain socket. Anything else needs `TEST_DATABASE_ALLOW_REMOTE_HOST`.
+_LOCAL_HOSTS: Final[frozenset[str]] = frozenset(
+    {
+        "",
+        "localhost",
+        "localhost.localdomain",
+        "127.0.0.1",
+        "::1",
+        "db",
+        "database",
+        "postgres",
+        "postgresql",
+    }
+)
+
+#: Values `TEST_DATABASE_DROP` and `TEST_DATABASE_ALLOW_REMOTE_HOST` accept as "yes". Anything
+#: else, including an empty string, is "no".
 _TRUTHY: Final[frozenset[str]] = frozenset({"1", "true", "t", "yes", "y", "on"})
 
 #: The local placeholder .env.example publishes, used only when nothing else supplies a URL -
@@ -388,53 +668,445 @@ _FALLBACK_DATABASE_URL: Final[str] = "postgresql+psycopg://blog:blog@localhost:5
 #: neither can be issued from inside the database it names.
 _MAINTENANCE_DATABASE: Final[str] = "postgres"
 
+#: Threshold in force only while `_upgrade_to_head` runs, so the fourteen `info` records the
+#: migration chain emits against a fresh database do not open every session. High enough to hide
+#: them, low enough that a migration warning is still heard.
+#:
+#: Typed as the literal rather than as `str`, because `Settings.LOG_LEVEL` is a closed `Literal`
+#: and assigning a plain `str` to it would need a suppression at the assignment - which would then
+#: hide a genuine typo here.
+_MIGRATION_LOG_LEVEL: Final[Literal["WARNING"]] = "WARNING"
 
-def _resolve_test_database_url() -> str:
-    """Return the URL of the database this suite may create, migrate and write to.
+#: PostgreSQL's own identifier-quoting rules, taken from the dialect rather than reimplemented.
+#:
+#: `IdentifierPreparer.quote_identifier` always quotes and escapes an embedded quote by doubling
+#: it, which is exactly PostgreSQL's rule and exactly what an f-string wrapped in literal double
+#: quotes fails to do. Built once at module scope: constructing a dialect is not free and the two
+#: DDL statements below are issued once per session each.
+#:
+#: `quote_identifier` rather than `quote`, which quotes only when the name requires it. Always
+#: quoting keeps the emitted DDL identical in shape whatever the name looks like, and it preserves
+#: the previous behaviour for a mixed-case name, which the hand-written quotes also protected.
+#:
+#: `PGDialect`, the base PostgreSQL dialect, rather than a driver-specific one: identifier quoting
+#: is a rule of the server, not of psycopg, and `_REQUIRED_DRIVERNAME` already guarantees that
+#: every engine this file opens speaks that dialect - so the preparer used here is the one on the
+#: wire. The suppression is narrow and named because SQLAlchemy annotates no dialect `__init__` -
+#: every one takes `**kwargs` - and the alternative, reimplementing
+#: `'"' + name.replace('"', '""') + '"'` here, is precisely the hand-rolled escaping this
+#: constant exists to avoid.
+_PG_DIALECT: Final[PGDialect] = PGDialect()  # type: ignore[no-untyped-call]
 
-    ``TEST_DATABASE_URL`` wins verbatim when it is set. Otherwise ``DATABASE_URL`` is parsed
-    and a sibling name is derived by appending :data:`TEST_DATABASE_SUFFIX`, which is why the
-    suite can never act on the database a developer is working in. The derivation is
-    idempotent: a name that already carries the suffix is returned unchanged, so re-running
-    with a ``DATABASE_URL`` this function previously produced does not yield ``..._test_test``.
+_IDENTIFIER_PREPARER: Final[IdentifierPreparer] = _PG_DIALECT.identifier_preparer
+
+
+def _quote_identifier(name: str) -> str:
+    """Return *name* as a safely quoted PostgreSQL identifier.
+
+    A DDL identifier cannot be a bind parameter, so the only two defences available are a
+    grammar that admits nothing dangerous and an escaper that is the server's own. Both are
+    used: every caller has already passed the name through :func:`_authorise_test_target`,
+    which rejects anything outside :data:`_IDENTIFIER_PATTERN`, and this function then renders
+    it with the dialect's preparer, which quotes the name and doubles any embedded quote.
+    Surrounding an unescaped string with quote characters - which is what an
+    ``f'CREATE DATABASE "{name}"'`` does - is not identifier binding and is not used here.
+
+    Args:
+        name: A database name, taken from the resolved URL.
 
     Returns:
-        A ``postgresql+psycopg://`` URL naming the test database. Not validated here beyond
-        being parseable - ``app.core.config`` applies the real contract (scheme, host, port
-        range, database name) when ``settings`` is constructed a few lines below.
+        The name wrapped in double quotes with any embedded quote doubled, ready to interpolate
+        into DDL where a bind parameter is not permitted.
+    """
+    return _IDENTIFIER_PREPARER.quote_identifier(name)
+
+
+def _is_truthy(name: str) -> bool:
+    """Report whether the environment variable ``name`` is set to one of :data:`_TRUTHY`.
+
+    Args:
+        name: The variable to read. An absent variable is false, as is an empty one.
+
+    Returns:
+        ``True`` only for an explicit affirmative spelling.
+    """
+    return os.environ.get(name, "").strip().casefold() in _TRUTHY
+
+
+def _sanitised_tag(name: str) -> str:
+    """Return the value of environment variable ``name`` reduced to a safe identifier fragment.
+
+    Lowercased, stripped of everything outside ``[a-z0-9]`` and truncated to
+    :data:`_MAX_TAG_LENGTH`. The reduction is deliberately lossy and total: whatever a
+    platform, a CI matrix or a shell puts in these variables, what reaches a database name is
+    a fragment that cannot change the name's grammar. ``w-037`` becomes ``w037`` and ``gw3``
+    stays ``gw3``.
+
+    Args:
+        name: The environment variable to read.
+
+    Returns:
+        The sanitised fragment, or ``""`` when the variable is absent, empty, or consists
+        entirely of characters that are dropped.
+    """
+    return _TAG_ALLOWED.sub("", os.environ.get(name, "").strip().casefold())[:_MAX_TAG_LENGTH]
+
+
+def _isolation_suffix() -> str:
+    """Return the tags that make this process's database name its own, or ``""`` for none.
+
+    Two sources, in a fixed order so the name is reproducible across runs of the same
+    process: :data:`CLONE_INDEX_ENV_VAR` then :data:`XDIST_WORKER_ENV_VAR`. See section 2.2 of
+    the module docstring for why a shared ``<base>_test`` is a collision rather than a name.
+
+    Returns:
+        Either the empty string, or ``_`` followed by each present tag joined by ``_``.
+    """
+    candidates = (
+        _sanitised_tag(CLONE_INDEX_ENV_VAR),
+        _sanitised_tag(XDIST_WORKER_ENV_VAR),
+    )
+    tags = [tag for tag in candidates if tag]
+    return f"_{'_'.join(tags)}" if tags else ""
+
+
+def _is_dedicated_test_database(url: URL) -> bool:
+    """Report whether ``url`` names a database this suite is allowed to act destructively on.
+
+    One rule, applied identically wherever the question is asked: the database name must carry
+    :data:`TEST_DATABASE_SUFFIX`, optionally followed by the isolation tags this file appends -
+    that is, it must match :data:`_DEDICATED_NAME_PATTERN`. An exact suffix rather than a
+    substring, and that difference is the whole point: ``contest``, ``latest``, ``testing`` and
+    ``latest_events`` all *contain* ``test`` and none of them is a database this suite may
+    migrate or force-drop.
+
+    Case-insensitive, because PostgreSQL folds an unquoted identifier to lower case, so
+    ``BLOG_TEST`` and ``blog_test`` are one database and a case-sensitive comparison would
+    accept one spelling and refuse the other.
+
+    Args:
+        url: The parsed candidate URL.
+
+    Returns:
+        ``True`` only when the URL names a database whose name carries the suffix.
+    """
+    database = (url.database or "").casefold()
+    return _DEDICATED_NAME_PATTERN.search(database) is not None
+
+
+def _same_server(left: URL, right: URL) -> bool:
+    """Report whether two URLs address the same PostgreSQL server.
+
+    Host and port only. The driver, the user and the password may all differ between two
+    spellings of one server, and a guard that compared rendered strings would be defeated by
+    any of those differences.
+
+    Args:
+        left: One parsed URL.
+        right: The other.
+
+    Returns:
+        ``True`` when both name the same host and port.
+    """
+    return ((left.host or "").casefold(), left.port) == ((right.host or "").casefold(), right.port)
+
+
+def _same_database_target(left: URL, right: URL) -> bool:
+    """Report whether two URLs address the same database on the same server.
+
+    Compares host, port and database name and nothing else, for the reason given in
+    :func:`_same_server`.
+
+    Args:
+        left: One parsed URL.
+        right: The other.
+
+    Returns:
+        ``True`` when both name the same database on the same host and port.
+    """
+    return _same_server(left, right) and (left.database or "").casefold() == (
+        (right.database or "").casefold()
+    )
+
+
+def _parse_or_refuse(url: str, *, action: str) -> URL:
+    """Parse ``url``, or refuse the action naming what could not be read.
+
+    Args:
+        url: The candidate connection URL, as the environment supplied it.
+        action: What the caller was about to do, quoted back in the failure.
+
+    Returns:
+        The parsed URL.
 
     Raises:
-        ValueError: If the URL cannot be parsed, or carries no database name at all. Raising
-            during import is the intended outcome: a suite that cannot name its database must
-            not go on to create one from a partial URL.
+        RuntimeError: If SQLAlchemy cannot parse it. Raised rather than allowed to surface as
+            an ``ArgumentError`` deep inside the engine, because the actionable fact is which
+            variable is wrong. The URL itself is never echoed - it carries a password.
     """
+    try:
+        return make_url(url)
+    # Broad on purpose: `make_url` raises whatever the value provoked - `ArgumentError` for a
+    # malformed URL, `ValueError` for an unparseable port - and every one of them is the same
+    # refusal here. Nothing is swallowed: each is re-raised as a RuntimeError naming the action.
+    except Exception as error:
+        message = (
+            f"Refusing to {action}: the connection URL could not be parsed "
+            f"({type(error).__name__}). Expected the form {_FALLBACK_DATABASE_URL!r}. The value "
+            "is not echoed here because a connection URL carries a password."
+        )
+        raise RuntimeError(message) from error
+
+
+def _authorise_test_target(url: str, *, action: str) -> URL:
+    """Return ``url`` parsed, having proved it names a database this suite may act on.
+
+    The single gate every path in this file passes through - the bootstrap below, and then each
+    of create, migrate, open and drop - and it is called again on each of those rather than
+    once, because it reads the value **actually in force** (``settings.DATABASE_URL``) instead
+    of trusting an earlier verdict on a mutable singleton. Every one of those paths is
+    destructive or long-lived, so each states its own reason and gets its own answer.
+
+    Six requirements, all checked before any connection exists, and all fail-closed. See
+    sections 2 and 2a of the module docstring for the reasoning; in short: the URL must parse,
+    it must name this project's driver, it must name a database at all, that name must be
+    marked as a test database *and* carry the dedicated suffix, it must be a conservative
+    identifier PostgreSQL will not truncate, and the host must be one this file recognises
+    unless the run has explicitly said otherwise.
+
+    Args:
+        url: The candidate connection URL.
+        action: What the caller is about to do, quoted back in any failure so the message
+            names the operation that was refused rather than only the value.
+
+    Returns:
+        The parsed :class:`~sqlalchemy.engine.URL`, so a caller needs no second parse.
+
+    Raises:
+        RuntimeError: If the URL cannot be parsed, names another driver, names no database,
+            names a database that is not marked as or not shaped like a dedicated test
+            database, names one that is not a conservative identifier or is longer than
+            PostgreSQL will keep, or names a host that is neither recognised as local nor
+            authorised by :data:`TEST_DATABASE_ALLOW_REMOTE_HOST_ENV_VAR`. Refusing loudly is
+            the point: a suite that cannot prove where it is pointed must not go on to
+            migrate it.
+    """
+    parsed = _parse_or_refuse(url, action=action)
+
+    if parsed.drivername != _REQUIRED_DRIVERNAME:
+        raise RuntimeError(
+            f"Refusing to {action}: the URL names the driver {parsed.drivername!r}, and this "
+            f"project installs exactly one - {_REQUIRED_DRIVERNAME!r}. A URL written for "
+            "another driver was written for another project."
+        )
+
+    database = parsed.database or ""
+    if not database:
+        raise RuntimeError(
+            f"Refusing to {action}: the connection URL names no database. Expected the form "
+            f"{_FALLBACK_DATABASE_URL!r}, or set {TEST_DATABASE_URL_ENV_VAR} to an explicit "
+            f"URL naming a database whose name ends in {TEST_DATABASE_SUFFIX!r}."
+        )
+
+    if _TEST_DATABASE_MARKER not in database.casefold():
+        raise RuntimeError(
+            f"Refusing to {action} {database!r}: this suite creates, migrates and writes to "
+            f"the database it is pointed at, so the name must contain "
+            f"{_TEST_DATABASE_MARKER!r} to mark it as dedicated to testing. Point "
+            f"{TEST_DATABASE_URL_ENV_VAR} at such a database, or unset it and let the name be "
+            f"derived by appending {TEST_DATABASE_SUFFIX!r}."
+        )
+
+    if not _is_dedicated_test_database(parsed):
+        raise RuntimeError(
+            f"Refusing to {action} {database!r}: the name must END WITH "
+            f"{TEST_DATABASE_SUFFIX!r}, optionally followed by this run's isolation tags. A "
+            "name that merely contains 'test' - 'contest', 'latest', 'latest_events' - is an "
+            f"ordinary database name. Point {TEST_DATABASE_URL_ENV_VAR} at a dedicated "
+            f"database, or unset it and let one be derived from DATABASE_URL by appending "
+            f"{TEST_DATABASE_SUFFIX!r}."
+        )
+
+    if not _IDENTIFIER_PATTERN.match(database):
+        raise RuntimeError(
+            f"Refusing to {action} {database!r}: a database name reaches DDL as an identifier "
+            "and cannot be a bind parameter, so only a conservative shape is accepted - a "
+            "letter or underscore followed by letters, digits, underscores or dollar signs."
+        )
+
+    if len(database.encode()) > _MAX_IDENTIFIER_LENGTH:
+        raise RuntimeError(
+            f"Refusing to {action} {database!r}: it is {len(database.encode())} bytes, and "
+            f"PostgreSQL truncates an identifier at {_MAX_IDENTIFIER_LENGTH}. A truncated "
+            "name would silently merge two targets into one."
+        )
+
+    host = (parsed.host or "").strip().casefold().strip("[]")
+    if host not in _LOCAL_HOSTS and not _is_truthy(TEST_DATABASE_ALLOW_REMOTE_HOST_ENV_VAR):
+        raise RuntimeError(
+            f"Refusing to {action} {database!r} on host {host!r}: this suite runs the whole "
+            "migration chain against its target, so a host it does not recognise as local is "
+            f"refused by default. Set {TEST_DATABASE_ALLOW_REMOTE_HOST_ENV_VAR}=1 to "
+            "authorise a test database that is genuinely remote."
+        )
+
+    return parsed
+
+
+def _authorise_override(candidate: URL, configured: URL) -> None:
+    """Apply the two further rules that govern an explicit override and nothing else.
+
+    Both exist because ``TEST_DATABASE_URL`` is the one value that can point this suite
+    somewhere the derivation never would, and both are stated before the generic gate so the
+    mistake that actually happens gets diagnosed by name rather than by a naming rule.
+
+    1. **Not the application's own working database.** Exporting ``TEST_DATABASE_URL`` equal to
+       ``DATABASE_URL`` "to just run it against my data" is the mistake, and the answer is a
+       sentence that says so. Carved out when the configured database is *itself* dedicated,
+       because that is how CI is configured - ``DATABASE_URL`` already ends in ``_test``, the
+       derivation is idempotent, and refusing there would be a false positive.
+    2. **The configured server, never another.** An override may redirect this suite to another
+       *database* and never to another *server*: reaching a different server is done by pointing
+       ``DATABASE_URL`` at it, which is what ``.env.example`` documents, and which keeps one
+       variable in charge of where this project connects. Released by the same explicit opt-in
+       that authorises a remote host, since a genuinely managed test database is exactly the
+       case where the two must differ.
+
+    Args:
+        candidate: The parsed override URL.
+        configured: ``DATABASE_URL`` as it stood before this module reassigned it, parsed.
+
+    Raises:
+        RuntimeError: If the override names the application's own working database, or moves
+            the run to a server ``DATABASE_URL`` does not name.
+    """
+    if _same_database_target(candidate, configured) and not _is_dedicated_test_database(configured):
+        raise RuntimeError(
+            f"Refusing to use {TEST_DATABASE_URL_ENV_VAR}: it points this suite at the database "
+            f"DATABASE_URL already names ({candidate.database!r}), which is the application's "
+            "own working database. The suite migrates, seeds and may force-drop its target, so "
+            "it refuses to share one with the application. Point "
+            f"{TEST_DATABASE_URL_ENV_VAR} at a dedicated database whose name ends in "
+            f"{TEST_DATABASE_SUFFIX!r}, or unset it and let the sibling be derived."
+        )
+
+    if not _same_server(candidate, configured) and not _is_truthy(
+        TEST_DATABASE_ALLOW_REMOTE_HOST_ENV_VAR
+    ):
+        raise RuntimeError(
+            f"Refusing to use {TEST_DATABASE_URL_ENV_VAR}: it names a different server from "
+            "DATABASE_URL. It may redirect this suite to another database on the configured "
+            "server, never to another server - run the suite against a different host by "
+            "pointing DATABASE_URL at that host, so one variable stays in charge of where this "
+            f"project connects, or set {TEST_DATABASE_ALLOW_REMOTE_HOST_ENV_VAR}=1 if the test "
+            "database really is elsewhere."
+        )
+
+
+def _resolve_test_database_url() -> str:
+    """Return the authorised URL of the database this suite may create, migrate and write to.
+
+    ``TEST_DATABASE_URL`` names the target when it is set; it is authorised, never rewritten,
+    because a caller naming a database explicitly has already made that decision - and it is
+    additionally held to :func:`_authorise_override`. Otherwise ``DATABASE_URL`` is parsed and
+    a sibling name is derived by appending :data:`TEST_DATABASE_SUFFIX` and this process's
+    isolation tags, which is why the suite can never act on the database a developer is working
+    in and why two clones sharing one server do not share one database.
+
+    The derivation is idempotent in both parts: a name already ending in the suffix keeps it
+    rather than gaining a second, and a name already ending in the tags keeps those, so
+    re-running with a ``DATABASE_URL`` this function previously produced yields the same name
+    rather than ``..._test_w037_test_w037``.
+
+    Returns:
+        A ``postgresql+psycopg://`` URL naming an authorised test database.
+
+    Raises:
+        RuntimeError: If the resolved target fails :func:`_authorise_test_target`, or an
+            override fails :func:`_authorise_override`. Raising during import is the intended
+            outcome - the failure arrives before a connection exists, before ``CREATE
+            DATABASE`` and before the first revision.
+    """
+    configured = _parse_or_refuse(
+        os.environ.get("DATABASE_URL") or _FALLBACK_DATABASE_URL,
+        action="read DATABASE_URL",
+    )
+
     override = os.environ.get(TEST_DATABASE_URL_ENV_VAR)
     if override:
+        # Authorised, not rewritten: no suffix and no tag is appended to a name a caller chose.
+        candidate = _parse_or_refuse(override, action=f"use {TEST_DATABASE_URL_ENV_VAR}")
+        _authorise_override(candidate, configured)
+        _authorise_test_target(override, action=f"use {TEST_DATABASE_URL_ENV_VAR}")
         return override
 
-    url = make_url(os.environ.get("DATABASE_URL") or _FALLBACK_DATABASE_URL)
-    if not url.database:
-        message = (
-            "DATABASE_URL names no database, so no sibling test database can be derived "
-            f"from it. Expected the form {_FALLBACK_DATABASE_URL!r}, or set "
-            f"{TEST_DATABASE_URL_ENV_VAR} to an explicit URL."
+    if not configured.database:
+        raise RuntimeError(
+            "Refusing to derive a test database: DATABASE_URL names no database. Expected the "
+            f"form {_FALLBACK_DATABASE_URL!r}, or set {TEST_DATABASE_URL_ENV_VAR} to an "
+            "explicit URL."
         )
-        raise ValueError(message)
 
-    if url.database.endswith(TEST_DATABASE_SUFFIX):
-        return url.render_as_string(hide_password=False)
+    suffix = f"{TEST_DATABASE_SUFFIX}{_isolation_suffix()}"
+    name = configured.database
+    database = name if name.casefold().endswith(suffix.casefold()) else f"{name}{suffix}"
+    derived = configured.set(database=database).render_as_string(hide_password=False)
+    _authorise_test_target(derived, action="derive a test database")
+    return derived
 
-    derived = url.set(database=f"{url.database}{TEST_DATABASE_SUFFIX}")
-    return derived.render_as_string(hide_password=False)
+
+def _require_test_database(url: str) -> str:
+    """Refuse the URL unless it names a database this suite is allowed to destroy.
+
+    The preflight, and it runs before anything else can: at import, on the single value every
+    later operation is derived from. That placement is the guarantee - the engine, the maintenance
+    URL, ``CREATE DATABASE``, ``alembic upgrade head``, every write a test makes and the optional
+    ``DROP DATABASE`` all follow ``settings.DATABASE_URL``, so a target refused here cannot be
+    reached by any of them. Checking inside :func:`database_schema` instead would already be too
+    late in principle and useless in practice, because a module-level import in a unit test can
+    open a connection first.
+
+    The derived path satisfies this by construction, since it appends
+    :data:`TEST_DATABASE_SUFFIX`. The path that needs guarding is the ``TEST_DATABASE_URL``
+    override, which was previously honoured verbatim: a single mistyped character was enough to
+    aim ``CREATE DATABASE``, the whole migration chain and every test write at a real database.
+
+    The rules themselves live in :func:`_authorise_test_target`, which the create, migrate,
+    open and drop paths each call again on the value in force at the moment they run. This
+    wrapper exists so the resolution can be *enclosed* by the gate at its single assignment
+    site rather than checked beside it, and so the returned value is the URL itself.
+
+    Deliberately **not** also refusing a URL equal to ``DATABASE_URL`` on the derived path.
+    That looks like a tightening and is in fact a false positive: :func:`_resolve_test_database_url`
+    is idempotent, so a ``DATABASE_URL`` already ending in ``_test`` - which is exactly how CI is
+    configured - resolves to itself. The override path *is* held to that rule, by
+    :func:`_authorise_override`, because there the equality is a decision somebody made.
+
+    Args:
+        url: The resolved test-database URL, from either the override or the derivation.
+
+    Returns:
+        *url* unchanged, so this reads as a gate at its one call site rather than as a separate
+        statement somebody could reorder or drop.
+
+    Raises:
+        RuntimeError: If the URL names no database, or names one this suite is not authorised to
+            create, migrate, write to and drop. Raised during collection, before a single
+            connection is opened, and the message names the variable to change.
+    """
+    _authorise_test_target(url, action="run the suite against")
+    return url
 
 
 # Assignment, not setdefault, and this is the one line that redirects everything. The engine
 # below reads settings.DATABASE_URL, and so does migrations/env.py - because
 # backend/alembic.ini deliberately declares no sqlalchemy.url - so both the application side
 # and the migration side follow this single value to the same test database.
-os.environ["DATABASE_URL"] = _resolve_test_database_url()
-
-
+#
+# The resolution is wrapped in the preflight rather than checked afterwards, so there is no
+# window in which an unauthorised URL is the configured one: nothing downstream can act on a
+# target `_require_test_database` refused, because it never becomes `DATABASE_URL` at all.
+os.environ["DATABASE_URL"] = _require_test_database(_resolve_test_database_url())
 # ---------------------------------------------------------------------------------------
 # Imports that must not run any earlier
 #
@@ -448,23 +1120,24 @@ os.environ["DATABASE_URL"] = _resolve_test_database_url()
 # pyproject.toml is weakened to accommodate one file.
 # ---------------------------------------------------------------------------------------
 import inspect  # noqa: E402
-from collections.abc import AsyncIterator, Callable, Iterator  # noqa: E402
+from collections.abc import AsyncIterator, Callable  # noqa: E402
 from contextlib import asynccontextmanager  # noqa: E402
-from typing import Any  # noqa: E402
 
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
-from sqlalchemy import create_engine, text  # noqa: E402
-from sqlalchemy.exc import ProgrammingError  # noqa: E402
+from sqlalchemy import Engine, create_engine, text  # noqa: E402
+from sqlalchemy.exc import DBAPIError, ProgrammingError  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from app.core.config import settings  # noqa: E402
 from app.core.dependencies import get_db  # noqa: E402
+from app.core.logging import configure_logging  # noqa: E402
 from app.core.security import create_access_token  # noqa: E402
+from app.db.session import HIDE_PARAMETERS, safe_connect_args  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.models import User  # noqa: E402
 from tests import factories  # noqa: E402
@@ -486,12 +1159,17 @@ sys.modules.setdefault("factories", factories)
 DEFAULT_PASSWORD: Final[str] = factories.DEFAULT_PASSWORD
 
 __all__ = [
+    "CLONE_INDEX_ENV_VAR",
     "DEFAULT_PASSWORD",
+    "TEST_DATABASE_ALLOW_REMOTE_HOST_ENV_VAR",
     "TEST_DATABASE_DROP_ENV_VAR",
     "TEST_DATABASE_SUFFIX",
     "TEST_DATABASE_URL_ENV_VAR",
+    "TEST_ENVIRONMENT",
     "TEST_JWT_SECRET_KEY",
+    "TEST_SEED_ADMIN_EMAIL",
     "TEST_SEED_ADMIN_PASSWORD",
+    "XDIST_WORKER_ENV_VAR",
     "admin_client",
     "admin_user",
     "app",
@@ -561,6 +1239,32 @@ def pytest_collection_modifyitems(
 # outside the event-loop question that governs everything below it.
 # ---------------------------------------------------------------------------------------
 
+#: SQLSTATE PostgreSQL returns for `CREATE DATABASE` against a name that already exists -
+#: `duplicate_database`, surfaced by psycopg as `psycopg.errors.DuplicateDatabase` and reachable
+#: as `error.orig.sqlstate`. A code rather than a message: the message is localised by the
+#: server's `lc_messages` and reworded between releases, so matching its text both rejects the
+#: race it is meant to tolerate on a non-English server and swallows any unrelated failure whose
+#: wording happens to contain the same phrase.
+_SQLSTATE_DUPLICATE_DATABASE: Final[str] = "42P04"
+
+
+def _sqlstate_of(error: DBAPIError) -> str | None:
+    """Return the SQLSTATE the driver published on *error*, or ``None`` if it published none.
+
+    ``DBAPIError.orig`` is the driver's own exception, and psycopg 3 exposes the five-character
+    condition code on it as ``sqlstate``. Read through :func:`getattr` because ``orig`` is
+    whatever the configured driver raised and a client-side failure - one the driver refused
+    before the statement reached the server - carries no code at all.
+
+    Args:
+        error: The wrapped driver failure.
+
+    Returns:
+        The SQLSTATE, or ``None`` when there is not one to read.
+    """
+    sqlstate = getattr(error.orig, "sqlstate", None)
+    return sqlstate if isinstance(sqlstate, str) else None
+
 
 def _maintenance_url() -> str:
     """Return the resolved URL with its database swapped for the maintenance database.
@@ -569,14 +1273,92 @@ def _maintenance_url() -> str:
     database they name, so both statements are sent to ``postgres`` on the same host, port and
     credentials.
 
+    The target is authorised again here rather than taken on trust from the bootstrap, because
+    ``settings`` is deliberately not frozen: the value in force when a maintenance connection
+    opens need not be the value that was in force at import.
+
     Returns:
         A synchronous-usable ``postgresql+psycopg://`` URL pointing at ``postgres``. The
         driver is unchanged because psycopg 3 is the project's only driver - AAP §0.5.6
         excludes ``asyncpg`` - and it serves the synchronous side here exactly as it serves the
         asynchronous application.
+
+    Raises:
+        RuntimeError: If the configured target is not an authorised test database.
     """
-    maintenance = make_url(settings.DATABASE_URL).set(database=_MAINTENANCE_DATABASE)
+    authorised = _authorise_test_target(
+        settings.DATABASE_URL, action="reach the maintenance database"
+    )
+    maintenance = authorised.set(database=_MAINTENANCE_DATABASE)
     return maintenance.render_as_string(hide_password=False)
+
+
+def _maintenance_engine() -> Engine:
+    """Open an AUTOCOMMIT engine on the maintenance database, for the two ``DATABASE`` statements.
+
+    ``isolation_level="AUTOCOMMIT"`` is required rather than convenient: PostgreSQL refuses both
+    statements inside a transaction block, and SQLAlchemy opens one implicitly otherwise.
+
+    ``hide_parameters=True`` matches ``app.db.session``'s engine: nothing here binds a parameter
+    today, and the setting is what keeps that true of anything added later, since a failed
+    statement otherwise renders its bound values into the pytest transcript. No connect
+    arguments are passed - this engine exists to issue one DDL statement against ``postgres``
+    and is disposed immediately, so the session-level options the application engine sets have
+    nothing to govern here.
+
+    Returns:
+        The engine. The caller owns it and must dispose of it.
+
+    Raises:
+        RuntimeError: If the configured target is not an authorised test database.
+    """
+    return create_engine(
+        _maintenance_url(),
+        isolation_level="AUTOCOMMIT",
+        hide_parameters=True,
+        future=True,
+    )
+
+
+@contextmanager
+def _database_lifecycle_lock(database: str) -> Iterator[None]:
+    """Hold an advisory lock naming ``database`` for the duration of the block.
+
+    Creating a database, and migrating one that may have just been created, need a single
+    owner. With one clone that is automatic; with several starting together it is not, and the
+    failures are the confusing kind - two ``CREATE DATABASE`` statements racing, or two
+    ``alembic upgrade head`` runs interleaving on one ``alembic_version`` row.
+
+    The lock is an :func:`fcntl.flock` on a file in the system temporary directory named for
+    the resolved database, so it is *per target*: processes pointed at different databases
+    never contend, and processes pointed at the same one serialise, with the second finding the
+    schema already at head and applying nothing. An advisory file lock is chosen over a
+    PostgreSQL advisory lock because it also covers the window in which the database does not
+    exist yet - there is nothing to connect to in order to take a lock inside it.
+
+    The lock is released when the file descriptor closes, which the ``with`` statement
+    guarantees on every path including an exception, so a crashed run cannot leave a stale lock
+    behind. A file lock cannot be taken on some non-POSIX platforms; this project targets Linux
+    containers and :mod:`fcntl` is imported unconditionally, so an absent implementation would
+    be a broken environment rather than a case to degrade into silently.
+
+    Args:
+        database: The resolved, already-authorised database name. Used only to name the lock
+            file, and safe to embed in a path because the authorisation gate has restricted it
+            to :data:`_IDENTIFIER_PATTERN`.
+
+    Yields:
+        ``None``. The caller runs with the lock held.
+    """
+    lock_path = Path(tempfile.gettempdir()) / f"blog-test-db-{database}.lock"
+    # `a` rather than `w`: the file is a lock holder and never carries content, and truncating
+    # it would be a write another process could be blocked on for no reason.
+    with lock_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _ensure_test_database_exists() -> None:
@@ -584,29 +1366,42 @@ def _ensure_test_database_exists() -> None:
 
     ``isolation_level="AUTOCOMMIT"`` is required, not merely convenient: PostgreSQL refuses
     ``CREATE DATABASE`` inside a transaction block, and SQLAlchemy opens one implicitly
-    otherwise.
+    otherwise. :func:`_maintenance_engine` supplies both that and parameter hiding.
+
+    The target is authorised again here rather than taken on trust from the bootstrap, because
+    this is the first of the three destructive paths and it reads ``settings.DATABASE_URL`` -
+    the value in force - rather than the value that was in force at import.
 
     The already-exists case is treated as success rather than checked for in advance. Testing
     ``pg_database`` first and creating afterwards is a race - two suites starting together
-    would both see it absent - whereas letting the statement fail and inspecting the failure
-    is correct under any interleaving. A :class:`~sqlalchemy.exc.ProgrammingError` whose text
-    reports the database already exists is swallowed; anything else - refused connection, bad
-    credentials, insufficient privilege - propagates, because those are the failures a
-    developer needs to see rather than a mysterious absence of tables later on.
+    would both see it absent - whereas letting the statement fail and inspecting the failure is
+    correct under any interleaving. The failure is identified by **SQLSTATE**
+    :data:`_SQLSTATE_DUPLICATE_DATABASE`, read off the wrapped driver error, because that code
+    is part of the wire protocol whereas the message it arrives with is prose a server locale or
+    a driver release can reword - matching the text was one PostgreSQL translation away from
+    turning the ordinary idempotent path into a suite-wide failure. Anything else - refused
+    connection, bad credentials, insufficient privilege - propagates, because those are the
+    failures a developer needs to see rather than a mysterious absence of tables later on.
 
     Raises:
+        RuntimeError: If the resolved target is not an authorised test database.
         sqlalchemy.exc.SQLAlchemyError: If the maintenance database is unreachable or the
             statement fails for any reason other than the database already existing.
     """
-    database = make_url(settings.DATABASE_URL).database
-    engine = create_engine(_maintenance_url(), isolation_level="AUTOCOMMIT", future=True)
+    database = _authorise_test_target(settings.DATABASE_URL, action="create").database or ""
+    engine = _maintenance_engine()
     try:
         with engine.connect() as connection:
-            # The identifier is quoted rather than parameterised because a DDL identifier
-            # cannot be a bind parameter. It comes from the resolved URL, not from a request.
-            connection.execute(text(f'CREATE DATABASE "{database}"'))
+            # Quoted through the dialect's own preparer rather than by wrapping the name in
+            # literal double quotes. A DDL identifier cannot be a bind parameter, so quoting is
+            # the only protection available, and hand-written quotes provide none against a name
+            # that contains one - `blog"; DROP ...` closes the pair and the rest is statement
+            # text. `quote_identifier` escapes an embedded quote by doubling it, which is what
+            # PostgreSQL's own rule requires, and it sits on top of the grammar the authorisation
+            # gate already enforced, so this is the second of two independent guards.
+            connection.execute(text(f"CREATE DATABASE {_quote_identifier(database)}"))
     except ProgrammingError as error:
-        if "already exists" not in str(error).casefold():
+        if _sqlstate_of(error) != _SQLSTATE_DUPLICATE_DATABASE:
             raise
     finally:
         engine.dispose()
@@ -626,63 +1421,107 @@ def _upgrade_to_head() -> None:
 
     ``head`` is requested rather than a named revision, so the chain - ``0001`` initial schema,
     ``0002`` generated search vector and its GIN and trigram indexes, ``0003`` the eight
-    reference categories, ``0004`` the administrative listing indexes - is applied in full, and
-    a revision added later needs no change here. The URL is not passed either: the environment
-    script reads ``settings.DATABASE_URL``, which the bootstrap has already pointed at the test
-    database.
+    reference categories - is applied in full, and a revision added later needs no change here.
+    The URL is not passed either: the environment script reads ``settings.DATABASE_URL``, which
+    the bootstrap has already pointed at the test database.
+
+    That last point is exactly why the target is authorised once more before the chain runs.
+    This function does not choose where the migrations land - ``migrations/env.py`` reads the
+    same mutable settings object - so the check has to be made against the value in force at
+    the moment of the run, and applying a migration chain is the single most consequential
+    thing this module does to a database it did not create.
+
+    The threshold is pinned to ``WARNING`` for the duration and restored afterwards, and that is
+    what lets :data:`_ENVIRONMENT_DEFAULTS` run the rest of the suite at ``INFO``. Against a fresh
+    database this one call emits fourteen ``alembic.runtime.migration`` records at ``info`` -
+    ``Context impl``, ``Will assume transactional DDL``, and one ``Running upgrade`` per revision -
+    which is exactly the noise a session-wide ``WARNING`` used to suppress, at the cost of throwing
+    away every other record a test might assert on. Pinning it here confines the quiet to the one
+    operation that is noisy. ``WARNING`` rather than silence, so a migration that actually
+    complains is still heard.
+
+    It is pinned on ``settings`` and **not** by raising the ``alembic`` logger's level, which does
+    not work and is worth recording so nobody tries it again. ``migrations/env.py`` calls
+    ``configure_logging(stream=sys.stderr)`` at its own module scope - deliberately, so a migration
+    run has the same log shape as the service and writes to stderr while its stdout carries
+    generated DDL - and Alembic imports that module *inside* ``command.upgrade``. Any level set on
+    a logger beforehand is therefore reset by that call before the first revision runs. What the
+    call reads is ``settings.LOG_LEVEL``, so that is the lever that survives it.
+
+    :func:`~app.core.logging.configure_logging` is called again in the ``finally`` for the same
+    reason: env.py's call left the single root handler pointed at stderr and pinned to
+    ``WARNING``, and the session expects stdout at the configured level. Restoring it here means a
+    failing revision cannot leave logging reconfigured for every test that follows.
+
+    Raises:
+        RuntimeError: If the resolved target is not an authorised test database.
     """
+    _authorise_test_target(settings.DATABASE_URL, action="migrate")
+
     config = Config(str(_ALEMBIC_INI))
     config.set_main_option("script_location", str(_MIGRATIONS_DIR))
-    command.upgrade(config, "head")
+
+    previous_level = settings.LOG_LEVEL
+    settings.LOG_LEVEL = _MIGRATION_LOG_LEVEL
+    try:
+        command.upgrade(config, "head")
+    finally:
+        settings.LOG_LEVEL = previous_level
+        configure_logging()
 
 
 def _drop_test_database() -> None:
-    """Drop the test database, refusing outright unless its name is marked as a test database.
+    """Drop the test database, refusing outright unless its name is an authorised test target.
 
     Guarded twice. The caller only reaches this when ``TEST_DATABASE_DROP`` is truthy, and this
-    function additionally refuses any database whose name does not contain ``test``, so a
-    working database named ``blog`` can never be destroyed by a misconfigured override.
+    function passes the target through the same :func:`_authorise_test_target` gate the create
+    and migrate paths use, so a working database named ``blog`` can never be destroyed by a
+    misconfigured override - and neither can ``contest`` or ``latest``, which the substring
+    check this replaced would have accepted as disposable, nor one on a host this run was not
+    authorised to reach.
 
     ``WITH (FORCE)`` terminates any other session still attached, which is what makes the drop
     reliable rather than intermittently blocked - PostgreSQL 13 introduced it and this project
-    targets 18. The statement runs on an autocommit connection to the maintenance database for
-    the same reason ``CREATE DATABASE`` does.
+    targets 18. It is also why the drop is serialised by the same lock the create-and-migrate
+    step takes: forcing another clone's live session off a database it is mid-run against is
+    precisely the collision the lock and the per-clone name exist to prevent. The statement runs
+    on an autocommit connection to the maintenance database for the same reason
+    ``CREATE DATABASE`` does, and the identifier is rendered by the dialect's preparer rather
+    than wrapped in quote characters.
 
     Raises:
-        RuntimeError: If the resolved database name is not marked as a test database. Raised
-            rather than silently skipped, because a run that asked to drop and did not needs to
-            say why.
+        RuntimeError: If the resolved target is not an authorised test database. Raised rather
+            than silently skipped, because a run that asked to drop and did not needs to say
+            why.
     """
-    database = make_url(settings.DATABASE_URL).database or ""
-    if _DROP_GUARD_MARKER not in database.casefold():
-        message = (
-            f"Refusing to drop {database!r}: {TEST_DATABASE_DROP_ENV_VAR} only ever applies to "
-            f"a database whose name contains {_DROP_GUARD_MARKER!r}. Point "
-            f"{TEST_DATABASE_URL_ENV_VAR} at a dedicated database instead."
-        )
-        raise RuntimeError(message)
+    database = _authorise_test_target(settings.DATABASE_URL, action="drop").database or ""
 
-    engine = create_engine(_maintenance_url(), isolation_level="AUTOCOMMIT", future=True)
+    engine = _maintenance_engine()
     try:
         with engine.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'))
+            connection.execute(
+                text(f"DROP DATABASE IF EXISTS {_quote_identifier(database)} WITH (FORCE)")
+            )
     finally:
         engine.dispose()
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def database_schema() -> Iterator[str]:
     """Create the test database if absent and migrate it to head, once per session.
 
-    A plain synchronous fixture because everything it calls is blocking, and ``autouse`` so a
-    unit test that never asks for a session still runs in a session where the schema exists -
-    which matters because a module-level import in a unit test can reach the application and,
-    through it, the configured database.
+    A plain synchronous fixture because everything it calls is blocking, and **deliberately not
+    autouse**. Autouse would make every test in the tree - including the unit modules that
+    advertise themselves as touching neither the database nor the network - create a database
+    and run the whole revision chain before their first assertion, so ``pytest -m unit`` would
+    fail on a machine with no PostgreSQL and the marker would be describing something untrue.
+    Nothing in a unit module needs it: they import ``app.core.*`` and ``app.db.session``, and
+    ``create_async_engine`` resolves configuration without opening a connection.
 
-    Autouse settles *whether* it runs, not *when* relative to other fixtures, so
-    :func:`engine` declares this fixture as an argument rather than relying on ordering. That
-    explicit edge is what guarantees no connection is opened before the migrations have been
-    applied.
+    Every path that does reach the database therefore declares this fixture explicitly, and
+    :func:`engine` is the single such edge - ``db_session`` takes ``engine``, ``client`` takes
+    ``db_session``, and the identity fixtures and authenticated clients take ``db_session`` in
+    turn - so no connection can be opened before the migrations have been applied.
 
     ``alembic upgrade head`` rather than ``Base.metadata.create_all()``, and the difference is
     capability rather than preference - the AAP's reversible-schema-evolution standard
@@ -699,23 +1538,37 @@ def database_schema() -> Iterator[str]:
     rollback does not remove them. Assertions must be phrased as "contains" or "at least" -
     never "the database is empty", and never "there is exactly one category".
 
+    Creation and migration are one unit of work with one owner, so both run inside
+    :func:`_database_lifecycle_lock` - an advisory lock named for the resolved database. That
+    matters because this platform runs clones in parallel against one PostgreSQL server: two
+    processes reaching this fixture at the same instant would otherwise race ``CREATE DATABASE``
+    and interleave two ``alembic upgrade head`` runs on one ``alembic_version`` row. Under the
+    lock the second process finds the schema already at head and applies nothing, and processes
+    pointed at different databases - which per-clone naming makes the normal case - never
+    contend at all.
+
     Teardown leaves the database in place so a re-run skips creation and applies no revision.
-    Set ``TEST_DATABASE_DROP=1`` to drop it instead; that path refuses any database whose name
-    does not contain ``test``.
+    Set ``TEST_DATABASE_DROP=1`` to drop it instead; that path takes the same lock, for the same
+    reason in reverse - ``WITH (FORCE)`` would otherwise be able to terminate another process's
+    live session - and refuses any target :func:`_authorise_test_target` does not authorise.
 
     Yields:
         The resolved database name, so a test or another fixture can report which database it
         ran against without re-parsing the URL.
     """
-    _ensure_test_database_exists()
-    _upgrade_to_head()
+    authorised = _authorise_test_target(settings.DATABASE_URL, action="build the schema in")
+    database = authorised.database or ""
 
-    database = make_url(settings.DATABASE_URL).database or ""
+    with _database_lifecycle_lock(database):
+        _ensure_test_database_exists()
+        _upgrade_to_head()
+
     try:
         yield database
     finally:
-        if os.environ.get(TEST_DATABASE_DROP_ENV_VAR, "").strip().casefold() in _TRUTHY:
-            _drop_test_database()
+        if _is_truthy(TEST_DATABASE_DROP_ENV_VAR):
+            with _database_lifecycle_lock(database):
+                _drop_test_database()
 
 
 # ---------------------------------------------------------------------------------------
@@ -743,17 +1596,61 @@ async def engine(database_schema: str) -> AsyncIterator[AsyncEngine]:
     checks a connection out of it. Reusing it would mean two owners for one pool and a disposal
     this suite does not control.
 
+    What *is* borrowed from that module is the pair of values it declares for every connection
+    this project opens - ``safe_connect_args()`` and ``HIDE_PARAMETERS`` - and nothing else. Both
+    are pure and pool-free, so taking them costs no coupling; restating them here instead would
+    mean the suite ran under a different connection contract from the service it is testing, and
+    would let the two drift silently. Every pool setting stays behind, because ``NullPool``
+    retains no connection for one to describe.
+
+    ``hide_parameters=True`` mirrors ``app.db.session``'s engine, and it matters more here than
+    there rather than less. This is the engine every test writes through, so its statements bind
+    email addresses, argon2id hashes, refresh-token digests and post bodies - and SQLAlchemy
+    renders bound values into the message of a failed statement unless told otherwise, which
+    puts them in the pytest transcript, the CI log and the failure a developer pastes into an
+    issue. The statement is still reported in full; only the values become a marker.
+
     Args:
-        database_schema: The migrated-schema fixture, requested to order this one after it. The
-            value is not used; the dependency is the point, because relying on ``autouse``
-            ordering would let a connection open before the revisions had run.
+        database_schema: The migrated-schema fixture, requested so that it runs at all and runs
+            first. The value is not used; the dependency edge is the point. It is the *only*
+            edge to that fixture in this file - ``db_session`` takes this engine, ``client``
+            takes ``db_session``, and the identity fixtures take ``db_session`` in turn - so
+            declaring it here is what keeps a connection from being opened before the revisions
+            have run, and what keeps a test that asks for none of these from needing a database.
 
     Yields:
         The engine, bound to the resolved test database.
+
+    Raises:
+        ValueError: If the configured target is no longer a validated test database. Checked
+            here as well as at creation and migration time, because this is the engine the
+            tests write through.
     """
     del database_schema  # Requested for ordering; the name of the database is not needed here.
 
-    async_engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
+    # Re-authorised rather than taken on trust from the import-time bootstrap: `settings` is not
+    # frozen, so the value in force when the engine opens need not be the value that was in force
+    # when this module finished importing.
+    target = _authorise_test_target(
+        settings.DATABASE_URL, action="open the test engine"
+    ).render_as_string(hide_password=False)
+    async_engine = create_async_engine(
+        target,
+        poolclass=NullPool,
+        # The two invariants `app.db.session` declares for every connection this project
+        # opens, taken from there rather than restated - see "Three processes open connections
+        # to this database" in that module. Both matter to a test run specifically.
+        # `connect_timeout` bounds collection: without it, a database that accepts a socket and
+        # then goes silent holds the whole session on libpq's 130-second default before the
+        # first test reports anything. The UTC session option means the suite exercises the
+        # production wire contract rather than whatever zone the server happens to default to,
+        # so a timestamp assertion here is an assertion about what a response really carries.
+        connect_args=safe_connect_args(),
+        # And the suite is exactly where output is redirected to a file: without this, a failed
+        # statement in a fixture renders the bound values - a password hash, an email, a draft
+        # body - into the traceback pytest prints and CI keeps.
+        hide_parameters=HIDE_PARAMETERS,
+    )
     try:
         yield async_engine
     finally:
@@ -792,6 +1689,21 @@ async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     ``MissingGreenlet`` instead of returning a value. Leaving instances unexpired is what lets
     a test read a field off a row a service just persisted.
 
+    Every acquisition is inside something that releases it
+        The connection is taken with ``async with``, so it is returned however this fixture
+        exits - including a failure in ``connection.begin()`` or in the ``AsyncSession``
+        constructor, which happen *after* the connection exists and before any hand-written
+        ``finally`` used to be entered. A leaked connection is not a visible failure either: it
+        is a socket PostgreSQL holds until it times out, and one per affected test.
+
+        The teardown steps are then protected **independently** rather than sharing one
+        ``finally``. Closing a session, rolling a transaction back and releasing a connection
+        are three separate operations that can each fail, and a single sequential block means
+        the first failure skips the rest - so a session that raises on close would leave the
+        outer transaction open and its rows visible to whatever ran next. Nesting them means
+        every step is attempted, the outer rollback still happens, and the first exception is
+        the one that propagates.
+
     Args:
         engine: The session-scoped engine.
 
@@ -799,24 +1711,26 @@ async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
         A session whose every write is provisional. Hand this to ``tests.factories`` helpers,
         and note that they flush rather than commit for the same reason.
     """
-    connection = await engine.connect()
-    transaction = await connection.begin()
-    session = AsyncSession(
-        bind=connection,
-        expire_on_commit=False,
-        join_transaction_mode="create_savepoint",
-    )
-    try:
-        yield session
-    finally:
-        # Order matters. Close the session first so it releases its savepoint and stops using
-        # the connection; then roll the outer transaction back - `is_active` is false if a test
-        # rolled it back itself, and rolling back twice raises; then return the connection,
-        # which NullPool closes outright rather than pooling.
-        await session.close()
-        if transaction.is_active:
-            await transaction.rollback()
-        await connection.close()
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        try:
+            session = AsyncSession(
+                bind=connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            try:
+                yield session
+            finally:
+                # Closing the session first releases its savepoint and stops it using the
+                # connection. Wrapped so that a failure here cannot skip the rollback below:
+                # rows that are still visible are far worse than a close that complained.
+                await session.close()
+        finally:
+            # `is_active` is false when a test rolled the outer transaction back itself, and
+            # rolling back twice raises. The connection is released by the `async with`.
+            if transaction.is_active:
+                await transaction.rollback()
 
 
 # ---------------------------------------------------------------------------------------
@@ -826,6 +1740,87 @@ async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 #: Host the ASGI transport answers on. No name is resolved and no socket is opened - httpx
 #: needs an absolute base URL to build request targets from, and this is that placeholder.
 _BASE_URL: Final[str] = "http://testserver"
+
+
+def _request_scoped_get_db(session: AsyncSession) -> Callable[[], AsyncIterator[AsyncSession]]:
+    """Build the ``get_db`` replacement every client in this file installs.
+
+    One function rather than two identical closures, because the property it implements is the
+    one both clients have to get right and neither should be able to get right differently.
+
+    What it does, and why each half is load-bearing
+    -----------------------------------------------
+    It yields **the same session object** the test holds - the identity the whole suite rests
+    on: a row a factory created is visible to the request, a row the request created is visible
+    to the test afterwards, and one rollback at teardown undoes both. A fresh session per
+    request would break every assertion written against an instance the test already loaded, so
+    the identity is preserved deliberately rather than by omission.
+
+    Around that, it gives each request its own ``SAVEPOINT`` and mirrors what production's
+    ``app.core.dependencies.get_db`` does with it. Production opens a session per request and
+    closes it at the end, rolling back on the way out if the request raised; the request that
+    follows therefore starts from committed state and nothing else. Yielding a long-lived shared
+    session with no boundary at all does not reproduce that, it removes it: a request that
+    autoflushed a row and then failed - a service that wrote and then raised ``Conflict``, a
+    route that hit an ownership check after a write - used to leave that flushed work, and any
+    lock it held, sitting in the session for the *next* request in the same test. The next
+    request could then commit work it never performed, or fail on an aborted transaction for a
+    reason belonging to its predecessor. Either way the suite certifies behaviour a clean
+    request transaction would not exhibit, and it does so in an order-dependent way.
+
+    So: a savepoint per request, rolled back if the request raises, and discarded if the request
+    left it open. What survives a request is exactly what production would have kept - the work
+    a service explicitly committed.
+
+    Three mechanics worth stating, all measured on this stack
+    --------------------------------------------------------
+    * A service's ``session.commit()`` **succeeds** while this savepoint is open and releases
+      both it and the session's own root savepoint, promoting the work into the outer
+      transaction this file owns. So after a successful mutating request the handle is already
+      inactive, which is why every use of it below is guarded by ``is_active``: rolling back a
+      released handle raises ``ResourceClosedError``.
+    * Rolling this savepoint back discards only what happened inside it. Instances loaded
+      *before* the request stay loaded and readable - not expired - so a test can still read
+      attributes off a factory-created row after a request failed, with no ``MissingGreenlet``.
+    * The exception is re-raised untouched with a bare ``raise``, so ``app.core.exceptions``
+      still renders the domain error the service raised. Swallowing it here would turn a 404
+      into a 200 with an empty body, and preserving the traceback is why it is not ``raise
+      error``.
+
+    Nothing is committed here, exactly as production commits nothing in ``get_db``: transaction
+    boundaries belong to the service layer, which knows when a unit of work is complete.
+
+    Args:
+        session: The test's transaction-scoped session, which every request must share.
+
+    Returns:
+        An async-generator dependency suitable for
+        ``app.dependency_overrides[get_db]``. FastAPI resolves a dependency once per request, so
+        one call means one savepoint per request; requests are sequential, so the savepoints
+        never nest.
+    """
+
+    async def _override_get_db() -> AsyncIterator[AsyncSession]:
+        # The request's own unit of work, nested inside the test's outer transaction.
+        savepoint = await session.begin_nested()
+        try:
+            yield session
+        except Exception:
+            # Production rolls back before the connection returns to the pool; the equivalent
+            # here is discarding this request's savepoint, which leaves everything the test set
+            # up beforehand intact. Then `raise` with no argument, preserving the traceback.
+            if savepoint.is_active:
+                await savepoint.rollback()
+            raise
+        else:
+            # The request returned. Anything still inside this savepoint is work no service
+            # committed, and production would have discarded it when it closed the session - so
+            # it is discarded here too, before the next request begins. After a service commit
+            # the handle is already released and this is a no-op.
+            if savepoint.is_active:
+                await savepoint.rollback()
+
+    return _override_get_db
 
 
 @pytest.fixture(scope="session")
@@ -856,7 +1851,7 @@ def app() -> Any:
 async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
     """Yield an HTTP client that drives the application in process, on the test's session.
 
-    Two properties make this the centre of every integration test.
+    Three properties make this the centre of every integration test.
 
     **One session, shared.** The installed override yields the *same object* ``db_session``
     handed the test - not a new session on the same connection, and not a session from the
@@ -864,16 +1859,24 @@ async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
     the request, a row the request created visible to the test afterwards, and a single
     rollback sufficient to undo both.
 
+    **One transaction boundary per request.** The override comes from
+    :func:`_request_scoped_get_db`, so each request runs inside its own ``SAVEPOINT`` and that
+    savepoint is rolled back if the request raises - the same rollback-on-exception production's
+    ``get_db`` performs. Without it a request that autoflushed and then failed would leave its
+    work in the shared session for the next request to commit or trip over. See that function
+    for the whole contract.
+
     **No server.** ``AsyncClient(transport=ASGITransport(app=...))`` calls the ASGI
     application directly, so the suite needs nothing listening on any port - the in-process
     transport AAP §0.4.4.5 asks for. The transport is spelled out because httpx 0.28.1 removed
     the ``AsyncClient(app=...)`` shortcut; passing ``app=`` now raises :class:`TypeError`.
 
     ``ASGITransport`` runs no lifespan events, which is correct here rather than a shortfall.
-    ``app.main``'s lifespan configures logging - already done at import - and disposes
+    ``app.main``'s lifespan configures logging - already done at import - disposes
     ``app.db.session``'s engine, which this suite never draws a connection from because
-    ``get_db`` is overridden. Nothing below depends on a lifespan side effect, and nothing
-    should be made to.
+    ``get_db`` is overridden, and warms the argon2 stand-in hash, which changes how long the
+    first unknown-email login takes and nothing about what it answers. Nothing below depends on a
+    lifespan side effect, and nothing should be made to.
 
     The override is removed in a ``finally``, so a failing test cannot leave the application
     pointed at a session that has since been rolled back and closed.
@@ -888,10 +1891,7 @@ async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
         :func:`auth_headers_for` mints a header for a one-off call.
     """
 
-    async def _override_get_db() -> AsyncIterator[AsyncSession]:
-        yield db_session
-
-    fastapi_app.dependency_overrides[get_db] = _override_get_db
+    fastapi_app.dependency_overrides[get_db] = _request_scoped_get_db(db_session)
     try:
         async with AsyncClient(
             transport=ASGITransport(app=fastapi_app),
@@ -955,11 +1955,12 @@ class _UnavailableSession:
     That would work, but it would wait out a connect timeout on every call and make the failure
     mode depend on network behaviour; this fails instantly and identically on every machine.
 
-    The failure has to happen **inside** the route rather than while its dependencies are being
-    resolved. ``GET /readyz`` wraps ``await db.execute(select(1))`` in a ``try`` and converts
-    any :class:`Exception` into its 503 problem document, whereas an override that raised on
-    the way in would fail during dependency resolution and surface as a 500 through the handler
-    of last resort. So this object is yielded successfully and only :meth:`execute` raises.
+    The failure has to happen **after** the route's dependencies have been resolved rather than
+    while they are being resolved. :meth:`app.services.health_service.HealthService.check_readiness`
+    wraps the one repository call in a ``try`` and converts any :class:`Exception` into the 503
+    problem document, whereas an override that raised on the way in would fail during dependency
+    resolution and surface as a 500 through the handler of last resort. So this object is yielded
+    successfully and only :meth:`execute` raises.
 
     ``close`` and ``rollback`` are no-ops rather than absent, because a caller unwinding from
     the failure may reasonably invoke either.
@@ -1060,9 +2061,17 @@ async def reader_user(db_session: AsyncSession) -> User:
 async def author_user(db_session: AsyncSession) -> User:
     """Create an ``AUTHOR`` account: the owner in every ownership test.
 
-    Note that authoring is not gated on the role - ``POST /api/v1/posts`` requires only a
-    bearer token and ownership is decided by comparing ``posts.author_id`` - so this fixture
-    documents the typical case rather than a privilege boundary.
+    The role is a real privilege boundary, not a label. Authoring **is** gated on it: all five
+    post mutations declare ``AuthorUser``, so ``app.core.dependencies.require_author`` admits only
+    ``AUTHOR`` and ``ADMIN`` and refuses a ``READER`` with 403 before a handler body runs, and
+    ``app.services.post_service`` re-applies the same rule through ``ensure_can_author``. That is
+    what makes an administrator's demotion to ``READER`` mean something.
+
+    Authority on a mutation is then two rules rather than one - hold ``AUTHOR`` or ``ADMIN`` at
+    all, and, unless holding ``ADMIN``, be the post's own author, which ``ensure_can_modify``
+    decides by comparing ``posts.author_id``. So this fixture supplies the principal that
+    satisfies the first and, paired with :func:`other_author_user`, lets a test isolate the
+    second; a test that means to exercise the role boundary itself uses :func:`reader_user`.
 
     Args:
         db_session: The transaction-scoped session.
@@ -1225,12 +2234,17 @@ async def _authenticated_client(
     ``async for`` left the inner generator to the event loop's asynchronous-generator
     finalisation hooks and the override's removal to whenever those happened to fire.
 
-    The override is installed here as well as in :func:`client`, and installing it twice with
-    an equivalent generator is harmless: both yield the same session object, and each caller's
-    ``finally`` removes the entry. What would not be harmless is omitting it, because then a
-    request through an authenticated client would resolve the *real* ``get_db``, open a
-    connection from the application's own pool, and read a database in which none of the test's
-    provisional rows exists.
+    The override is installed here as well as in :func:`client`, and installing it twice is
+    harmless: both come from :func:`_request_scoped_get_db` over the same session object, and
+    each caller's ``finally`` removes the entry. What would not be harmless is omitting it,
+    because then a request through an authenticated client would resolve the *real* ``get_db``,
+    open a connection from the application's own pool, and read a database in which none of the
+    test's provisional rows exists.
+
+    Built from that shared factory rather than from a local closure for the same reason it is
+    shared at all: the per-request savepoint and its rollback-on-exception are the property both
+    clients must have, and a second hand-written override is a second chance to omit it. That is
+    precisely how the two overrides came to differ from production in the first place.
 
     Args:
         session: The session every request through the client must use.
@@ -1239,11 +2253,7 @@ async def _authenticated_client(
     Yields:
         The configured client.
     """
-
-    async def _override_get_db() -> AsyncIterator[AsyncSession]:
-        yield session
-
-    fastapi_app.dependency_overrides[get_db] = _override_get_db
+    fastapi_app.dependency_overrides[get_db] = _request_scoped_get_db(session)
     try:
         async with AsyncClient(
             transport=ASGITransport(app=fastapi_app),

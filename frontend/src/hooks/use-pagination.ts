@@ -4,25 +4,25 @@ import { useCallback, useMemo } from 'react';
 
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 
-import { derivePagination, FIRST_PAGE, toPageNumber } from '@/lib/pagination';
+import { derivePagination, FIRST_PAGE, toPageNumber } from '@/lib/utils';
 import type {
   PageWindowGapSlot,
   PageWindowPageSlot,
   PaginationDerivation,
   PaginationSource,
-} from '@/lib/pagination';
+} from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * The arithmetic contract, re-exported so a consumer has one import
  *
- * Every number below is derived by `@/lib/pagination`, which is deliberately hook-free: the same rules
- * have to serve `components/blog/post-list.tsx`, a Server Component that cannot call a hook at all.
- * These re-exports exist so `@/components/ui/pagination` and the administrative grid need not know
- * which of the two modules a given member comes from.
+ * Every number below is derived by the page-arithmetic section of `@/lib/utils`, which is deliberately
+ * hook-free and directive-free: the same rules have to serve `components/blog/post-list.tsx`, a Server
+ * Component that cannot call a hook at all. These re-exports exist so `@/components/ui/pagination` and
+ * the administrative grid need not know which of the two modules a given member comes from.
  * ---------------------------------------------------------------------------------------------- */
 
-export type { PaginationSource, PaginationDerivation } from '@/lib/pagination';
-export { formatResultRange, PAGE_WINDOW_SIBLING_COUNT } from '@/lib/pagination';
+export type { PaginationSource, PaginationDerivation } from '@/lib/utils';
+export { formatResultRange, PAGE_WINDOW_SIBLING_COUNT } from '@/lib/utils';
 
 /** A collapsed run of omitted pages. The pure module's sentinel, re-aliased for consumers. */
 export type PaginationGapSlot = PageWindowGapSlot;
@@ -51,13 +51,15 @@ export type PaginationSlot = PaginationPageSlot | PaginationGapSlot;
  * any of it is therefore a defect, not a convenience: two can disagree, and the symptom is a control
  * that offers a page the service will not serve.
  *
- * **The arithmetic itself lives in `@/lib/pagination`, not here.** This hook adds only what genuinely
+ * **The arithmetic itself lives in `@/lib/utils`, not here.** This hook adds only what genuinely
  * needs a client boundary: reading the current query string, building each page's href from it, and
  * imperative navigation. The split exists because one of the three surfaces —
  * `components/blog/post-list.tsx` — is a Server Component, deliberately, so the feed's rows reach the
  * initial HTML for the SEO requirement; it cannot call a hook, and while these rules lived here it
  * necessarily grew its own copy of the range calculation. Now it calls the same pure function this hook
- * calls.
+ * calls. That the arithmetic sits in `@/lib/utils` rather than in a module of its own is what AAP
+ * §0.4.5.3's four-module `src/lib/` inventory prescribes; the property that matters to this file is
+ * unchanged, because that module carries no `'use client'` directive either.
  *
  * ## What this hook is, and what it deliberately is not
  *
@@ -407,7 +409,7 @@ export function usePagination(source: PaginationSource): PaginationView {
   /*
    * The window is the pure module's; this only attaches an href to each page in it.
    *
-   * Which is the whole division of labour in this file: `@/lib/pagination` decides WHICH pages are
+   * Which is the whole division of labour in this file: `@/lib/utils` decides WHICH pages are
    * rendered, this decides WHERE each one points. A gap sentinel passes through untouched, because a gap
    * has no destination.
    */

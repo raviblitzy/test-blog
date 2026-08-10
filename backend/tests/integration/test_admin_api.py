@@ -40,15 +40,18 @@ guarantees **no individual route can omit the gate**, including one added months
 someone who never reads this file.
 
 A test that checked only ``GET /admin/stats`` would verify almost nothing about that design. So
-:data:`ADMIN_ROUTES` enumerates every one of the **fourteen** operations in the namespace, and
+:data:`ADMIN_ROUTES` enumerates every one of the **thirteen** operations in the namespace, and
 three parametrised tests drive the whole list: refused for a ``READER``, refused for an
-``AUTHOR``, refused unauthenticated. Adding a future administrative route is then a one-line
-change to that tuple, which is what makes the sweep an enforcement mechanism rather than a
-sample of one.
+``AUTHOR``, refused unauthenticated. That tuple is a **frozen** transcription of the AAP's REST
+surface (§0.6.2) rather than a summary of whatever happens to be mounted, and it is compared
+against the served document as an equality in both directions, so it reports an unswept route and
+an operation the plan does not declare with equal loudness.
 
-Note that the namespace carries fourteen operations, not thirteen: ``GET /admin/categories``
-returns a ``Page[CategoryPublic]`` alongside the three category mutations, so the
-administrative taxonomy screen can page and search where the public bare-array listing cannot.
+Thirteen, and the taxonomy is the one family with no administrative listing among them. That is
+the plan's surface rather than an omission: ``GET /api/v1/categories`` already returns the whole
+taxonomy, ascending by name, each term carrying the same ``post_count`` a reader sees, so the
+administrative categories screen renders that array and no privileged duplicate of it can
+disagree with the home page's filter control.
 
 Where the gate sits in the dependency order, and why it changes the negatives
 ----------------------------------------------------------------------------
@@ -130,6 +133,8 @@ from app.models import (
     User,
     UserRole,
 )
+from app.repositories import CategoryRepository
+from app.schemas.category import DESCRIPTION_MAX_LENGTH, NAME_MAX_LENGTH
 from tests import factories
 
 #: Every test here drives the API in-process against PostgreSQL, which is exactly what the
@@ -174,17 +179,37 @@ ADMIN_ROUTES: Final[tuple[tuple[str, str, dict[str, Any] | None], ...]] = (
         {"status": CommentStatus.APPROVED.value},
     ),
     ("DELETE", f"{ADMIN_PREFIX}/comments/{_SWEEP_ID}", None),
-    ("GET", f"{ADMIN_PREFIX}/categories", None),
     ("POST", f"{ADMIN_PREFIX}/categories", {"name": "Authorisation Sweep Category"}),
     ("PATCH", f"{ADMIN_PREFIX}/categories/{_SWEEP_ID}", {"name": "Authorisation Sweep Renamed"}),
     ("DELETE", f"{ADMIN_PREFIX}/categories/{_SWEEP_ID}", None),
 )
 """Every operation in the administrative namespace, as ``(method, path, body)``.
 
-All fourteen, spanning the four entity families the prompt names - users, posts, comments and
-categories - plus the overview, and covering reads and writes in every family. The gate is
-attached to the *include*, so a route missing from this tuple is a gate nobody tests; keeping
-the list exhaustive is the whole point, and adding to it is one line.
+**This tuple is the frozen contract, not a description of whatever is mounted.** It is
+transcribed from the AAP's REST surface (§0.6.2), which declares thirteen administrative
+operations: a listing for users, posts and comments, a state mutation and a deletion for each of
+the four families, the three category mutations, and the overview counts. The gate is attached to
+the *include*, so the sweep has to be exhaustive to mean anything - and it has to be frozen, or a
+route added tomorrow would be blessed by the very test that is supposed to notice it.
+
+Two properties follow, and both are asserted below rather than assumed.
+:data:`ADMIN_OPERATION_COUNT` pins the size, so an entry cannot be quietly added or dropped
+here; and :meth:`TestAdministratorGate.test_the_mounted_namespace_is_exactly_the_frozen_inventory`
+compares this literal against the served document as an **equality in both directions**, so an
+unswept route fails and so does a fourteenth operation the AAP does not declare.
+
+The taxonomy has no administrative listing on purpose, and its absence is part of the frozen
+contract: ``GET /api/v1/categories`` returns the whole taxonomy, ascending by name, with the same
+``post_count`` a reader sees, so the management screen reads that array rather than a privileged
+duplicate of it.
+"""
+
+ADMIN_OPERATION_COUNT: Final[int] = 13
+"""How many operations the administrative namespace has, frozen from AAP §0.6.2.
+
+Written as a literal rather than derived from :data:`ADMIN_ROUTES` - deriving it would make the
+count agree with the tuple by construction and assert nothing. Together they pin both halves: the
+number the plan specifies, and the identity of each operation that makes it up.
 """
 
 #: Human-readable parametrisation identifiers, so a failure names the operation that failed
@@ -218,6 +243,22 @@ PAGE_FIELDS: Final[frozenset[str]] = frozenset({"items", "total", "page", "page_
 #: Revision ``0003_seed_reference_categories`` commits this many rows as data. Used as a lower
 #: bound rather than an equality, because the fixture database may hold more.
 REFERENCE_CATEGORY_COUNT: Final[int] = 8
+
+#: The scalar types httpx accepts as a query-parameter value. Declared because the two
+#: disjoint-window tests below build a mapping that mixes a string identifier with an integer
+#: page size: left to inference that is a `dict[str, object]`, and `object` is not assignable to
+#: httpx's `params=` mapping, so the call type-checks only by accident of the value being
+#: unchecked. Naming the union keeps the mixed mapping honest rather than casting at the call
+#: site, which would suppress a real mistake in the same breath as this one.
+QueryValue = str | int
+
+#: One astral code point, U+1F600. It appears in the taxonomy boundaries below because the three
+#: units a length limit might be counted in disagree about it: one code point - which is what
+#: `pydantic.StringConstraints` counts, and therefore what `NAME_MAX_LENGTH` and
+#: `DESCRIPTION_MAX_LENGTH` mean - two UTF-16 code units, and four UTF-8 bytes. A field filled to
+#: its exact maximum with it is accepted by a correct implementation and refused by one counting
+#: either of the others, and no ASCII case can draw that distinction.
+ASTRAL: Final[str] = "\N{GRINNING FACE}"
 
 #: Matches any OpenAPI path parameter, so a served path template can be reduced to the same
 #: shape as a sweep entry. Used only by the completeness check at the end of the gate class.
@@ -690,34 +731,62 @@ class TestAdminAuthorisationGate:
         assert response.headers["www-authenticate"] == "Bearer"
         assert_problem_document(response.json(), HTTPStatus.UNAUTHORIZED)
 
-    async def test_the_sweep_covers_every_mounted_administrative_operation(
+    def test_the_frozen_inventory_has_the_size_the_plan_specifies(self) -> None:
+        """:data:`ADMIN_ROUTES` carries exactly :data:`ADMIN_OPERATION_COUNT` entries.
+
+        The two are independent statements of the same contract - a literal count from AAP §0.6.2
+        and a literal enumeration of the operations that make it up - so this catches an entry
+        added to the tuple without the plan changing, and an entry deleted from it. Deriving the
+        count from the tuple instead would assert nothing at all.
+        """
+        assert len(ADMIN_ROUTES) == ADMIN_OPERATION_COUNT, (
+            f"the frozen sweep lists {len(ADMIN_ROUTES)} operations, the plan specifies "
+            f"{ADMIN_OPERATION_COUNT}: {sorted(ADMIN_ROUTE_IDS)}"
+        )
+        # No duplicate entry can pad the count to the right number.
+        assert len({(method, path) for method, path, _ in ADMIN_ROUTES}) == ADMIN_OPERATION_COUNT
+
+    async def test_the_mounted_namespace_is_exactly_the_frozen_inventory(
         self, client: AsyncClient
     ) -> None:
-        """:data:`ADMIN_ROUTES` is exhaustive - no mounted admin operation escapes the sweep.
+        """The served ``/api/v1/admin`` operations equal :data:`ADMIN_ROUTES`, in both directions.
 
-        The sweep's value depends entirely on its completeness, and a hand-maintained list is
-        exactly the kind of thing that falls behind the code it describes. So the list is checked
-        against the served OpenAPI document: a route added under ``/api/v1/admin`` without a
-        matching entry here fails *this* test, which is a clear instruction to extend the tuple,
-        rather than silently going untested.
+        This is the assertion that makes the sweep a contract rather than a description. It used
+        to derive the expected set from the served document, which meant the document could never
+        disagree with it: an operation added under ``/api/v1/admin`` was normalised into the
+        expectation and then swept, so the test passed by construction and an addition the plan
+        does not declare - the fourteenth operation this namespace briefly carried - was blessed
+        rather than reported.
+
+        Now the expectation is the frozen literal and the comparison runs both ways. A mounted
+        operation missing from the tuple is an untested gate; a tuple entry that is not mounted is
+        a stale expectation; and an operation the AAP does not declare fails here even though the
+        gate would have refused it correctly, because "correctly gated" is not the same claim as
+        "part of the agreed surface".
         """
         document = (await client.get("/openapi.json")).json()
         # Both sides are reduced to the same shape before comparison: the document spells its
         # path parameters `{user_id}`, `{post_id}`, `{comment_id}` and `{category_id}`, while the
         # sweep carries a concrete identifier. Collapsing every parameter - and the sweep's
-        # placeholder - to one token compares route *structure*, which is what completeness means
-        # here, without this test having to know each family's parameter name.
+        # placeholder - to one token compares route *structure* without this test having to know
+        # each family's parameter name.
         mounted = {
             (method.upper(), _PATH_PARAMETER.sub(_PATH_TOKEN, path))
             for path, operations in document["paths"].items()
             if path.startswith(ADMIN_PREFIX)
             for method in operations
         }
-        swept = {(method, path.replace(_SWEEP_ID, _PATH_TOKEN)) for method, path, _ in ADMIN_ROUTES}
+        frozen = {
+            (method, path.replace(_SWEEP_ID, _PATH_TOKEN)) for method, path, _ in ADMIN_ROUTES
+        }
 
-        assert mounted == swept, (
-            f"unswept operations: {sorted(mounted - swept)}; "
-            f"stale sweep entries: {sorted(swept - mounted)}"
+        assert mounted == frozen, (
+            f"operations mounted but not in the frozen inventory: {sorted(mounted - frozen)}; "
+            f"operations the inventory requires but are not mounted: {sorted(frozen - mounted)}"
+        )
+        assert len(mounted) == ADMIN_OPERATION_COUNT, (
+            f"the namespace mounts {len(mounted)} operations, the plan specifies "
+            f"{ADMIN_OPERATION_COUNT}"
         )
 
 
@@ -1660,7 +1729,7 @@ class TestAdminPosts:
             post = await factories.create_published_post(db_session, author=author_user)
             created.add(str(post.id))
 
-        window = {"author_id": str(author_user.id), "page_size": 2}
+        window: dict[str, QueryValue] = {"author_id": str(author_user.id), "page_size": 2}
         first = assert_page_envelope(
             (await admin_client.get(f"{ADMIN_PREFIX}/posts", params={**window, "page": 1})).json()
         )
@@ -2137,7 +2206,7 @@ class TestAdminComments:
             comment = await factories.create_comment(db_session, post=post, author=reader_user)
             created.add(str(comment.id))
 
-        window = {"post_id": str(post.id), "page_size": 2}
+        window: dict[str, QueryValue] = {"post_id": str(post.id), "page_size": 2}
         first = assert_page_envelope(
             (
                 await admin_client.get(f"{ADMIN_PREFIX}/comments", params={**window, "page": 1})
@@ -2419,7 +2488,7 @@ class TestAdminComments:
 
 
 class TestAdminCategories:
-    """The taxonomy lifecycle: create, list, rename, and the two refusals that protect it.
+    """The taxonomy lifecycle: create, rename, delete, and the two refusals that protect it.
 
     ``AdminService`` **delegates** the whole of this family to ``CategoryService.create`` /
     ``update`` / ``delete``, so slug derivation and in-use protection are each declared exactly
@@ -2439,6 +2508,13 @@ class TestAdminCategories:
 
     The routes take ``{category_id}`` throughout - never a slug - even though the public read
     routes are addressed by slug. This surface addresses rows by key.
+
+    **There are three routes here and no listing**, which is the AAP's surface (§0.6.2) rather than
+    an omission, and two tests below hold that line from both directions:
+    :meth:`test_the_namespace_publishes_no_category_listing` asserts the operation does not exist,
+    and :meth:`test_the_public_taxonomy_is_what_the_management_screen_reads` asserts the screen is
+    not left without one - it reads the bare array the home page's filter control reads, which
+    carries every term with no window for a row to fall outside of.
     """
 
     async def test_creating_a_category_derives_its_slug_on_the_server(
@@ -2550,6 +2626,139 @@ class TestAdminCategories:
         assert body["slug"].startswith("edge-cases")
         assert body["id"] != first.json()["id"]
 
+    async def test_a_lost_slug_race_is_retried_rather_than_reported(
+        self,
+        admin_client: AsyncClient,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A concurrent create deriving the same slug stem receives the next suffix, not a 409.
+
+        The route publishes collision suffixing as a **promise** - ``python``, ``python-2``,
+        ``python-3`` - so a creation whose name is free and whose slug merely collides must
+        succeed. Losing the narrow window between reading the taken slug family and inserting
+        does not change that: the request was valid, and the remedy is to take the next free
+        suffix rather than to tell an administrator that a name nobody holds is unavailable.
+
+        The race is reproduced deterministically rather than by issuing two requests at once, and
+        the substitution is the minimum that causes it: ``slugs_starting_with`` answers *once* as
+        though the family were empty, which is precisely what a reader sees when the competing row
+        commits after its snapshot. The real unique ``citext`` index then refuses the insert, and
+        the retry - calling the unpatched method - sees the row that won. The genuine constraint
+        and the genuine retry are both exercised; only the visibility of one read is altered.
+        """
+        first = await admin_client.post(
+            f"{ADMIN_PREFIX}/categories", json={"name": "Category Slug Race"}
+        )
+        assert first.status_code == HTTPStatus.CREATED
+        assert first.json()["slug"] == "category-slug-race"
+
+        original = CategoryRepository.slugs_starting_with
+        calls = {"count": 0}
+
+        async def stale_family(self: CategoryRepository, prefix: str) -> set[str]:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                # The snapshot a losing writer held: nothing in the family yet.
+                return set()
+            return await original(self, prefix)
+
+        monkeypatch.setattr(CategoryRepository, "slugs_starting_with", stale_family)
+
+        # A DIFFERENT name - the name constraint is case-sensitive, so this one is free - that
+        # normalises to the same slug stem. That is the whole point: the name is available and only
+        # the address collides, so a conflict here would refuse a legitimate label.
+        response = await admin_client.post(
+            f"{ADMIN_PREFIX}/categories", json={"name": "category slug race"}
+        )
+
+        assert response.status_code == HTTPStatus.CREATED
+        body = response.json()
+        assert calls["count"] >= 2, (
+            "the first attempt did not lose the race, so nothing was retried"
+        )
+        assert_category_public_shape(body)
+        assert body["slug"] == "category-slug-race-2"
+        assert body["id"] != first.json()["id"]
+        # Both addresses resolve, which is the outcome the suffixing promise exists to produce.
+        assert (
+            await count_rows(db_session, Category.slug.startswith("category-slug-race"), Category)
+            == 2
+        )
+
+    async def test_sustained_slug_contention_is_reported_as_a_conflict(
+        self, admin_client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When every bounded attempt loses, the answer is a 409 that asks for a retry.
+
+        The other half of the bound. Retrying is what keeps the suffixing promise; a bound is what
+        keeps the method total, because a request losing on every attempt is contending with a
+        volume of identical stems that is no longer an allocation race. Two things are asserted
+        beyond the status: nothing was written, and the detail does **not** claim the name is
+        taken - the name is free, and telling an administrator to rename would send them to fix
+        the one thing that was never wrong.
+        """
+        seeded = await admin_client.post(
+            f"{ADMIN_PREFIX}/categories", json={"name": "Permanently Contended Category"}
+        )
+        assert seeded.status_code == HTTPStatus.CREATED
+
+        async def always_stale(self: CategoryRepository, prefix: str) -> set[str]:
+            return set()
+
+        monkeypatch.setattr(CategoryRepository, "slugs_starting_with", always_stale)
+
+        response = await admin_client.post(
+            f"{ADMIN_PREFIX}/categories", json={"name": "permanently contended category"}
+        )
+
+        assert response.status_code == HTTPStatus.CONFLICT
+        payload = response.json()
+        assert_problem_document(payload, HTTPStatus.CONFLICT)
+        assert "already exists" not in payload["detail"], (
+            "an exhausted slug race must not be reported as a name collision"
+        )
+        assert (
+            await count_rows(
+                db_session, Category.name == "permanently contended category", Category
+            )
+            == 0
+        )
+
+    async def test_an_unrecognised_integrity_failure_is_a_server_error_not_a_conflict(
+        self, admin_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An integrity failure naming neither category constraint answers 500, not a 409.
+
+        ``CategoryService.create`` recognises exactly two: the unique constraint on the name,
+        which is a genuine conflict an administrator can fix by choosing another label, and the
+        unique index on the slug, which is a race it retries. Anything else is a defect in the
+        service, and reporting a defect as a conflict is the one answer that guarantees nobody
+        finds it - the operator is told the name is taken, tries another, and the failure repeats
+        with no 500 raised and no frames kept.
+
+        The injected failure exposes no driver diagnostics, so no constraint can be named. This is
+        the fail-closed path: ``integrity_constraint_name`` returns ``None`` and the service
+        re-raises rather than guessing which of its two stories to tell.
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        async def raise_unknown_integrity_error(self: CategoryRepository, category: Any) -> Any:
+            raise IntegrityError("INSERT INTO categories", {}, Exception("some other invariant"))
+
+        monkeypatch.setattr(CategoryRepository, "add", raise_unknown_integrity_error)
+
+        response = await admin_client.post(
+            f"{ADMIN_PREFIX}/categories", json={"name": "Unrecognised Integrity Failure"}
+        )
+
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR, response.text
+        payload = response.json()
+        assert payload["status"] == int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        assert "already exists" not in payload["detail"], (
+            "a defect must not be reported as a name collision"
+        )
+
     async def test_a_created_category_appears_in_the_public_taxonomy(
         self, admin_client: AsyncClient, client: AsyncClient
     ) -> None:
@@ -2574,57 +2783,58 @@ class TestAdminCategories:
         assert len(found) == 1
         assert_category_public_shape(found[0])
 
-    async def test_the_administrative_listing_pages_and_searches_the_taxonomy(
+    async def test_the_namespace_publishes_no_category_listing(
         self, admin_client: AsyncClient
     ) -> None:
-        """``GET /admin/categories`` is the paged, searchable counterpart to the public array.
+        """``GET /admin/categories`` is not an operation, and an administrator gets 405 for it.
 
-        The fourteenth operation in the namespace, and the reason it exists: an administrative
-        screen managing a growing taxonomy needs a window and a search term, which the bare public
-        array deliberately does not offer.
+        The frozen surface has thirteen administrative operations and the taxonomy is the one family
+        with no privileged listing among them (AAP §0.6.2). Asserted from the outside, with an
+        administrator's credential, so this is a statement about the *surface* rather than about the
+        gate: the path exists for ``POST``, so the method is what is refused, and the ``Allow``
+        header names exactly the method that is mounted.
+
+        The complement of this assertion is
+        :meth:`test_the_public_taxonomy_is_what_the_management_screen_reads` below - the screen is
+        not left without a listing, it reads the public one.
+        """
+        response = await admin_client.get(f"{ADMIN_PREFIX}/categories")
+
+        assert response.status_code == HTTPStatus.METHOD_NOT_ALLOWED, response.text
+        assert response.headers["allow"] == "POST"
+        assert response.headers["content-type"].startswith(PROBLEM_MEDIA_TYPE)
+        assert_problem_document(response.json(), HTTPStatus.METHOD_NOT_ALLOWED)
+
+    async def test_the_public_taxonomy_is_what_the_management_screen_reads(
+        self, admin_client: AsyncClient, client: AsyncClient
+    ) -> None:
+        """The whole taxonomy, including the seeded reference set, is readable without a listing.
+
+        The AAP gives this relation one read, so the management screen consumes the same bare array
+        the home page's filter control does. This asserts that array is sufficient for the screen:
+        it carries every term - the eight revision ``0003`` commits as data, plus one written here
+        through the administrative surface - each with the ``post_count`` and description a
+        management table renders, and it is not windowed, so nothing can fall outside a page.
+
+        The reference count is a lower bound, never an equality: those eight rows are committed by
+        the migration rather than by a test, so no rollback removes them and a fresh environment can
+        exercise the category filter immediately.
         """
         created = await admin_client.post(
-            f"{ADMIN_PREFIX}/categories", json={"name": "Searchable Taxonomy Entry"}
+            f"{ADMIN_PREFIX}/categories", json={"name": "Management Screen Reads This"}
         )
+        assert created.status_code == HTTPStatus.CREATED, created.text
         category_id = created.json()["id"]
 
-        response = await admin_client.get(
-            f"{ADMIN_PREFIX}/categories", params={"q": "Searchable Taxonomy"}
-        )
+        response = await client.get("/api/v1/categories")
 
         assert response.status_code == HTTPStatus.OK
-        items = assert_page_envelope(response.json())
-        assert [item["id"] for item in items] == [category_id]
-        assert_category_public_shape(items[0])
-
-    async def test_the_administrative_listing_search_matches_the_slug(
-        self, admin_client: AsyncClient
-    ) -> None:
-        """``?q=`` matches the slug case-insensitively as well as the name."""
-        created = await admin_client.post(
-            f"{ADMIN_PREFIX}/categories", json={"name": "Slug Matched Taxonomy"}
-        )
-        slug = created.json()["slug"]
-
-        response = await admin_client.get(f"{ADMIN_PREFIX}/categories", params={"q": slug.upper()})
-
-        items = assert_page_envelope(response.json())
-        assert [item["slug"] for item in items] == [slug]
-
-    async def test_the_administrative_listing_includes_the_seeded_reference_set(
-        self, admin_client: AsyncClient
-    ) -> None:
-        """The reference categories revision ``0003`` commits are present before any test runs.
-
-        A lower bound, never an equality: those eight rows are committed by the migration rather
-        than by a test, so no rollback removes them and a fresh environment can exercise the
-        category filter immediately.
-        """
-        response = await admin_client.get(f"{ADMIN_PREFIX}/categories", params={"page_size": 100})
-
         payload = response.json()
-        assert_page_envelope(payload)
-        assert payload["total"] >= REFERENCE_CATEGORY_COUNT
+        assert isinstance(payload, list), "the taxonomy's only read is a bare array"
+        assert len(payload) >= REFERENCE_CATEGORY_COUNT + 1
+        for item in payload:
+            assert_category_public_shape(item)
+        assert category_id in {item["id"] for item in payload}
 
     async def test_renaming_a_category_keeps_its_slug(self, admin_client: AsyncClient) -> None:
         """A rename changes ``name`` and leaves ``slug`` exactly as it was.
@@ -2696,7 +2906,7 @@ class TestAdminCategories:
         assert response.json()["description"] is None
 
     async def test_renaming_onto_an_existing_name_is_a_conflict(
-        self, admin_client: AsyncClient
+        self, admin_client: AsyncClient, client: AsyncClient
     ) -> None:
         """A rename that collides with another category's name answers 409 and changes nothing."""
         first = await admin_client.post(
@@ -2713,8 +2923,12 @@ class TestAdminCategories:
 
         assert response.status_code == HTTPStatus.CONFLICT
         assert_problem_document(response.json(), HTTPStatus.CONFLICT)
-        readback = await admin_client.get(f"{ADMIN_PREFIX}/categories", params={"q": second_name})
-        assert [item["id"] for item in readback.json()["items"]] == [second_id]
+        # Read back through the taxonomy's only listing - the public bare array - and find the
+        # row by the name the refused rename left in place.
+        readback = await client.get("/api/v1/categories")
+        assert [item["id"] for item in readback.json() if item["name"] == second_name] == [
+            second_id
+        ]
 
     async def test_renaming_a_category_to_its_own_name_is_accepted(
         self, admin_client: AsyncClient
@@ -2853,3 +3067,179 @@ class TestAdminCategories:
 
         assert response.status_code == HTTPStatus.UNPROCESSABLE_CONTENT
         assert_validation_problem(response.json(), field="name")
+
+    @pytest.mark.parametrize(
+        ("member", "value"),
+        [
+            pytest.param("name", "n" * NAME_MAX_LENGTH, id="name-at-the-ceiling"),
+            pytest.param(
+                "name",
+                ASTRAL * NAME_MAX_LENGTH,
+                id="name-at-the-ceiling-in-astral-code-points",
+            ),
+            pytest.param(
+                "description",
+                "d" * DESCRIPTION_MAX_LENGTH,
+                id="description-at-the-ceiling",
+            ),
+            pytest.param(
+                "description",
+                ASTRAL * DESCRIPTION_MAX_LENGTH,
+                id="description-at-the-ceiling-in-astral-code-points",
+            ),
+        ],
+    )
+    async def test_a_taxonomy_member_exactly_at_its_ceiling_is_stored_verbatim(
+        self,
+        admin_client: AsyncClient,
+        client: AsyncClient,
+        member: str,
+        value: str,
+    ) -> None:
+        """The largest ``name`` and ``description`` each accepts is accepted, and comes back whole.
+
+        ``categories.name`` and ``categories.description`` are unbounded ``TEXT``, so the two
+        schema constants are the *only* limits that exist anywhere - nothing in the database would
+        refuse an over-long term. That makes the pair of cases here and below the whole of the
+        enforcement, and it makes the accepted maximum the number the category form's own
+        ``maxlength`` has to carry.
+
+        Read back **anonymously** through the public taxonomy as well, because that array is what
+        the home page's filter control renders: a term stored truncated would be truncated in every
+        reader's filter, and the response model alone would not show it. An astral ``name`` also
+        exercises slug derivation, which must still produce a usable canonical URL from a term with
+        no ASCII in it at all.
+        """
+        response = await admin_client.post(
+            f"{ADMIN_PREFIX}/categories", json={"name": "Bounded Term", member: value}
+        )
+
+        assert response.status_code == HTTPStatus.CREATED, response.text[:400]
+        body = response.json()
+        assert_category_public_shape(body)
+        assert body[member] == value, f"{member} was altered on the way in"
+        assert len(body[member]) == len(value), (member, len(body[member]), len(value))
+        # A slug is derived for every term, including one carrying no ASCII - the canonical URL
+        # cannot be empty, because it addresses the row.
+        assert body["slug"], body
+
+        published = await client.get("/api/v1/categories")
+        assert published.status_code == HTTPStatus.OK
+        stored = [term for term in published.json() if term["id"] == body["id"]]
+        assert stored, f"the created term is absent from the public taxonomy: {body['id']}"
+        assert stored[0][member] == value, f"{member} did not reach the column"
+
+    @pytest.mark.parametrize(
+        ("member", "value"),
+        [
+            pytest.param("name", "n" * (NAME_MAX_LENGTH + 1), id="name-one-over-the-ceiling"),
+            pytest.param(
+                "name",
+                ASTRAL * (NAME_MAX_LENGTH + 1),
+                id="name-one-over-the-ceiling-in-astral-code-points",
+            ),
+            pytest.param("name", "   ", id="name-whitespace-only"),
+            pytest.param("name", "", id="name-empty"),
+            pytest.param(
+                "description",
+                "d" * (DESCRIPTION_MAX_LENGTH + 1),
+                id="description-one-over-the-ceiling",
+            ),
+            pytest.param(
+                "description",
+                ASTRAL * (DESCRIPTION_MAX_LENGTH + 1),
+                id="description-one-over-the-ceiling-in-astral-code-points",
+            ),
+            pytest.param(
+                "name",
+                # `StorableText` refuses U+0000: the column is `text`, PostgreSQL cannot hold a NUL
+                # in one, and letting it through would surface as a 500 from the driver.
+                f"Nul{chr(0)}term",
+                id="name-carrying-a-null-code-point",
+            ),
+            pytest.param(
+                "description", f"Nul{chr(0)}note", id="description-with-a-null-code-point"
+            ),
+        ],
+    )
+    async def test_a_taxonomy_member_past_its_bound_is_refused_and_writes_nothing(
+        self,
+        admin_client: AsyncClient,
+        db_session: AsyncSession,
+        member: str,
+        value: str,
+    ) -> None:
+        """One code point past a bound is a 422 naming the member, and creates no row.
+
+        The row count is the second assertion and the load-bearing one. A refusal that had already
+        inserted would leave a term in every reader's filter control that the operator never
+        successfully created - and, because the slug is derived at creation and constrained unique,
+        it would also consume the slug their corrected second attempt wants.
+        """
+        before = await count_rows(db_session, Category.id.is_not(None), Category)
+
+        response = await admin_client.post(
+            f"{ADMIN_PREFIX}/categories", json={"name": "Bounded Term", member: value}
+        )
+
+        assert response.status_code == HTTPStatus.UNPROCESSABLE_CONTENT, response.text[:400]
+        assert_validation_problem(response.json(), field=member)
+        after = await count_rows(db_session, Category.id.is_not(None), Category)
+        assert after == before, "a refused creation wrote a row"
+
+    @pytest.mark.parametrize(
+        ("member", "value", "accepted"),
+        [
+            pytest.param("name", "n" * NAME_MAX_LENGTH, True, id="rename-to-the-ceiling"),
+            pytest.param(
+                "name", "n" * (NAME_MAX_LENGTH + 1), False, id="rename-one-over-the-ceiling"
+            ),
+            pytest.param(
+                "description",
+                "d" * DESCRIPTION_MAX_LENGTH,
+                True,
+                id="renote-to-the-ceiling",
+            ),
+            pytest.param(
+                "description",
+                "d" * (DESCRIPTION_MAX_LENGTH + 1),
+                False,
+                id="renote-one-over-the-ceiling",
+            ),
+        ],
+    )
+    async def test_the_same_bounds_apply_to_a_rename(
+        self,
+        admin_client: AsyncClient,
+        member: str,
+        value: str,
+        accepted: bool,
+    ) -> None:
+        """``CategoryUpdate`` bounds each member exactly as ``CategoryCreate`` does.
+
+        Asserted separately because they are separate declarations: the update model makes every
+        member optional so an operator may send one field, and an optional member is exactly where a
+        restated bound goes missing. A ceiling present on creation and absent on rename would let a
+        term become something it could not have been created as - and the rename deliberately does
+        **not** re-derive the slug, so the over-long name would keep a canonical URL that no longer
+        describes it.
+        """
+        created = await admin_client.post(
+            f"{ADMIN_PREFIX}/categories", json={"name": "Rebounded Term"}
+        )
+        assert created.status_code == HTTPStatus.CREATED
+        category_id = created.json()["id"]
+        original_slug = created.json()["slug"]
+
+        response = await admin_client.patch(
+            f"{ADMIN_PREFIX}/categories/{category_id}", json={member: value}
+        )
+
+        if accepted:
+            assert response.status_code == HTTPStatus.OK, response.text[:400]
+            assert response.json()[member] == value
+            # The canonical URL is written once, at creation, and a rename never moves it.
+            assert response.json()["slug"] == original_slug
+        else:
+            assert response.status_code == HTTPStatus.UNPROCESSABLE_CONTENT, response.text[:400]
+            assert_validation_problem(response.json(), field=member)

@@ -130,9 +130,16 @@ from typing import Annotated, Final
 
 from fastapi import APIRouter, Path, status
 
-from app.api.v1.responses import ProblemResponses, problem_response
 from app.core.dependencies import CurrentUser, DbSession, PageParamsDep
-from app.schemas import Page, PostSummary, UserMe, UserPublic, UserUpdate
+from app.schemas import (
+    Page,
+    PostSummary,
+    ProblemResponses,
+    UserMe,
+    UserPublic,
+    UserUpdate,
+    problem_response,
+)
 from app.schemas.common import StorableText
 from app.services import ProfileService
 
@@ -191,7 +198,7 @@ _UsernamePath = Annotated[
 # Documented failure modes
 #
 # Module constants rather than dict literals inside the decorators, and every one of them
-# built by `app.api.v1.responses.problem_response`: that helper names the model - which is
+# built by `app.schemas.common.problem_response`: that helper names the model - which is
 # what puts each failure body into the generated document, so a client generator emits a type
 # for it instead of leaving the error path untyped - and it is the single place the published
 # error media type is decided.

@@ -52,12 +52,12 @@ The three properties worth reading the file for
    viewer nor a status argument. So a draft is invisible on a profile to *everyone* - to an
    anonymous crawler, to an administrator, and to the author themselves. That last case looks
    like a bug and is not one, so
-   :func:`test_author_sees_own_draft_in_the_feed_but_never_on_their_profile` asserts the
-   contrast directly: the same author, the same draft, visible through
-   ``GET /api/v1/posts?author=<handle>`` and absent from
-   ``GET /api/v1/users/<handle>/posts``. That test is the negative control for every other
-   draft assertion in the module - if the filter were ever "fixed" into a viewer-aware
-   predicate, it is the one that would fail loudest.
+   :func:`test_author_sees_own_draft_only_through_the_workspace_never_on_their_profile` asserts
+   the contrast directly: the same author, the same draft, absent from both public surfaces -
+   ``GET /api/v1/posts?author=<handle>`` and ``GET /api/v1/users/<handle>/posts`` - and present
+   only in the private workspace mode ``GET /api/v1/posts?mine=true``. That test is the negative
+   control for every other draft assertion in the module: if either public filter were ever
+   "fixed" into a viewer-aware predicate, it is the one that would fail loudest.
 2. **The self-update cannot reach identity, authority or activation.** ``UserUpdate`` declares
    exactly ``display_name``, ``bio`` and ``avatar_url`` and sets ``extra="forbid"``, so a body
    proposing ``email``, ``username``, ``role``, ``is_active`` or ``id`` is a 422 rather than a
@@ -93,12 +93,13 @@ from typing import Any, Final
 
 import pytest
 from httpx import AsyncClient, Response
+from pydantic import HttpUrl, TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE, MIN_PAGE_SIZE
 from app.core.exceptions import PROBLEM_JSON_MEDIA_TYPE, WWW_AUTHENTICATE_HEADER
 from app.models import Post, PostStatus, User, UserRole
-from app.schemas.user import BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH
+from app.schemas.user import BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH, DISPLAY_NAME_MIN_LENGTH
 from tests import factories
 
 # `integration` is one of the two markers `backend/pyproject.toml` registers, and `addopts`
@@ -574,8 +575,8 @@ async def test_profile_post_listing_resolves_by_any_casing_of_the_handle(
 # The tests below assert that for all three callers the AAP names - anonymous, the author
 # themselves, and an administrator - and against every query-parameter shape a caller might try.
 # The author case is the surprising one and it is intentional: see
-# `test_author_sees_own_draft_in_the_feed_but_never_on_their_profile`, which asserts the contrast
-# with the feed's viewer-aware scoping and is the negative control for this whole block.
+# `test_author_sees_own_draft_only_through_the_workspace_never_on_their_profile`, which asserts the
+# contrast with the private workspace mode and is the negative control for this whole block.
 # =======================================================================================
 
 #: Query parameters a caller might reach for to widen a profile listing. None of them is
@@ -865,20 +866,20 @@ async def test_profile_posts_are_ordered_newest_first(
     assert _item_ids(response.json()) == [str(newest.id), str(middle.id), str(oldest.id)]
 
 
-async def test_author_sees_own_draft_in_the_feed_but_never_on_their_profile(
+async def test_author_sees_own_draft_only_through_the_workspace_never_on_their_profile(
     author_client: AsyncClient,
     author_user: User,
     db_session: AsyncSession,
 ) -> None:
-    """The negative control for every draft assertion above: the profile filter is stricter.
+    """The negative control for every draft assertion above: both public surfaces are strict.
 
-    One author, one draft, two surfaces, one credential. ``GET /api/v1/posts?author=<handle>``
-    is viewer-aware - ``post_service.visible_statuses_for`` widens to every state when the
-    viewer is the author being listed, which is how an author's workspace lists its own drafts -
-    while ``GET /api/v1/users/<handle>/posts`` is not, because it passes a constant. If the
-    profile filter were ever "corrected" into a viewer-aware predicate, this is the test that
-    fails, and the two halves side by side are what make the asymmetry legible as a design
-    decision rather than an oversight.
+    One author, one draft, three surfaces, one credential. Neither public surface is
+    viewer-aware: the profile listing passes the constant ``PUBLIC_PROFILE_STATUSES``, and the
+    public feed passes ``PUBLIC_POST_STATUSES`` for every caller including the author. The draft
+    is reachable only where the author asks for it, in the private ``?mine=true`` workspace mode.
+    If either public filter were ever "corrected" into a viewer-aware predicate, this is the test
+    that fails, and the three surfaces side by side are what make the design legible rather than
+    looking like an oversight.
     """
     draft = await factories.create_post(
         db_session,
@@ -894,14 +895,18 @@ async def test_author_sees_own_draft_in_the_feed_but_never_on_their_profile(
 
     feed = await author_client.get(_FEED_URL, params={"author": author_user.username})
     profile = await author_client.get(_profile_posts_url(author_user.username))
+    workspace = await author_client.get(_FEED_URL, params={"mine": "true"})
 
     assert feed.status_code == 200
     assert profile.status_code == 200
-    # The draft is reachable to its author through the feed...
-    assert str(draft.id) in set(_item_ids(feed.json()))
-    # ...and unreachable to that same author, with that same credential, on the profile.
+    assert workspace.status_code == 200
+    # Unreachable on the public feed, even to its own author with a credential presented...
+    assert str(draft.id) not in set(_item_ids(feed.json()))
+    # ...unreachable on the profile with that same credential...
     assert str(draft.id) not in set(_item_ids(profile.json()))
     assert _item_ids(profile.json()) == [str(published.id)]
+    # ...and reachable only where the author asked for it.
+    assert str(draft.id) in set(_item_ids(workspace.json()))
 
 
 # =======================================================================================
@@ -1163,6 +1168,60 @@ _FULL_SELF_UPDATE: Final[dict[str, str]] = {
 }
 
 
+# ---------------------------------------------------------------------------------------
+# Boundary vocabulary
+#
+# `users.display_name`, `users.bio` and `users.avatar_url` are unbounded `TEXT`, so the schema
+# constants below are the ONLY limits that exist anywhere - nothing in the database would refuse an
+# over-long value. That makes the pair of cases per bound the whole of the enforcement, and it makes
+# deriving each value from its constant rather than transcribing it the difference between a test
+# that guards the bound and one that merely used to.
+# ---------------------------------------------------------------------------------------
+
+_ASTRAL: Final[str] = "\N{GRINNING FACE}"
+"""One astral code point, U+1F600, used to fill a field to its exact ceiling.
+
+The three units a length limit might be counted in disagree about this character: it is one code
+point - which is what ``pydantic.StringConstraints`` counts and therefore what these limits mean -
+two UTF-16 code units, and four UTF-8 bytes. A field filled to its exact maximum with it is
+accepted by a correct implementation and refused by one counting either of the other two, which is
+a distinction no ASCII case can draw."""
+
+_AVATAR_URL_MAX_LENGTH: Final[int] = int(TypeAdapter(HttpUrl).json_schema()["maxLength"])
+"""The ceiling on ``avatar_url``, read from the type that enforces it.
+
+``app.schemas.user.OptionalAvatarUrl`` declares no explicit bound because
+:class:`~pydantic.HttpUrl` carries one and publishes it as ``maxLength`` in the generated schema.
+Read from the same place a generated client reads it, rather than transcribed out of a
+dependency."""
+
+#: Avatar destinations that must never be stored, with the validator that must refuse each. The
+#: stored value is rendered into an `<img src>` on every byline and profile heading, so the scheme
+#: allow-list is the control standing between a profile field and a script vector. The
+#: scheme-relative case is here because `//host/path` names no scheme and a browser supplies the
+#: page's own, so it loads - it is not a harmless relative path.
+_HOSTILE_AVATAR_URLS: Final[tuple[tuple[str, str, str], ...]] = (
+    ("javascript:alert(1)", "url_scheme", "javascript-scheme"),
+    ("JavaScript:alert(1)", "url_scheme", "javascript-scheme-mixed-case"),
+    ("data:text/html;base64,PHNjcmlwdD4=", "url_scheme", "data-scheme-carrying-a-document"),
+    ("vbscript:msgbox(1)", "url_scheme", "vbscript-scheme"),
+    ("file:///etc/passwd", "url_scheme", "file-scheme"),
+    ("ftp://example.com/a.png", "url_scheme", "ftp-scheme"),
+    ("//example.com/a.png", "url_parsing", "scheme-relative-reference"),
+    ("/avatars/local.png", "url_parsing", "site-relative-path"),
+    ("not a url", "url_parsing", "prose"),
+)
+
+
+def _avatar_url_of_length(length: int) -> str:
+    """Return an absolute ``https`` avatar URL of exactly *length* characters."""
+    prefix = "https://example.com/avatars/"
+    if length < len(prefix) + 1:
+        message = f"length must be at least {len(prefix) + 1}, got {length}"
+        raise ValueError(message)
+    return prefix + "a" * (length - len(prefix))
+
+
 async def test_self_update_applies_every_editable_member(
     author_client: AsyncClient,
 ) -> None:
@@ -1315,9 +1374,18 @@ async def test_self_update_without_a_credential_answers_401_with_a_bearer_challe
         ("display_name", None),
         ("display_name", "   "),
         ("display_name", "n" * (DISPLAY_NAME_MAX_LENGTH + 1)),
+        # The same ceiling in astral code points: one code point over, two UTF-16 units and four
+        # UTF-8 bytes per character. See `_ASTRAL`.
+        ("display_name", _ASTRAL * (DISPLAY_NAME_MAX_LENGTH + 1)),
+        # `StorableText` refuses U+0000 outright: the column is `text`, PostgreSQL cannot hold a
+        # NUL in one, and letting it through would surface as a 500 from the driver.
+        ("display_name", f"Nul{chr(0)}byte"),
         ("bio", "b" * (BIO_MAX_LENGTH + 1)),
+        ("bio", _ASTRAL * (BIO_MAX_LENGTH + 1)),
+        ("bio", f"Nul{chr(0)}byte"),
         ("avatar_url", "not a url"),
         ("avatar_url", "javascript:alert(1)"),
+        ("avatar_url", _avatar_url_of_length(_AVATAR_URL_MAX_LENGTH + 1)),
     ],
 )
 async def test_self_update_refuses_a_value_outside_its_declared_bounds(
@@ -1338,6 +1406,128 @@ async def test_self_update_refuses_a_value_outside_its_declared_bounds(
     response = await author_client.patch(_SELF_UPDATE_URL, json={member: value})
 
     assert member in _rejected_fields(response)
+
+
+@pytest.mark.parametrize(
+    ("member", "value"),
+    [
+        pytest.param(
+            "display_name",
+            "n" * DISPLAY_NAME_MIN_LENGTH,
+            id="display-name-at-the-floor",
+        ),
+        pytest.param(
+            "display_name",
+            "n" * DISPLAY_NAME_MAX_LENGTH,
+            id="display-name-at-the-ceiling",
+        ),
+        pytest.param(
+            "display_name",
+            _ASTRAL * DISPLAY_NAME_MAX_LENGTH,
+            id="display-name-at-the-ceiling-in-astral-code-points",
+        ),
+        pytest.param("bio", "b" * BIO_MAX_LENGTH, id="bio-at-the-ceiling"),
+        pytest.param(
+            "bio",
+            _ASTRAL * BIO_MAX_LENGTH,
+            id="bio-at-the-ceiling-in-astral-code-points",
+        ),
+        pytest.param(
+            "avatar_url",
+            _avatar_url_of_length(_AVATAR_URL_MAX_LENGTH),
+            id="avatar-url-at-the-ceiling",
+        ),
+    ],
+)
+async def test_self_update_accepts_a_value_exactly_at_its_bound_and_stores_it_verbatim(
+    author_client: AsyncClient,
+    client: AsyncClient,
+    author_user: User,
+    member: str,
+    value: str,
+) -> None:
+    """The largest value each member accepts is accepted, and comes back unaltered.
+
+    The half of a bound that is usually left untested, and the half a client needs: the accepted
+    maximum is what goes in a form's ``maxlength`` and its character counter, so a client built
+    against a guess either refuses text this API would take or submits text it will not.
+
+    Three assertions rather than one, because a status code proves the least of it. The response
+    echoes the value, so a ceiling enforced by silent truncation - which would also answer 200 -
+    fails here; the length is compared separately so such a failure reports the length it produced
+    rather than dumping five hundred code points into the message; and the value is then re-read
+    **anonymously** through the public profile, which is what proves it reached the column rather
+    than only the response model. All three of these members are rendered on that public page.
+    """
+    response = await author_client.patch(_SELF_UPDATE_URL, json={member: value})
+
+    assert response.status_code == 200, response.text[:400]
+    body = response.json()
+    _assert_self_projection(body)
+    assert body[member] == value, f"{member} was altered on the way in"
+    assert len(body[member]) == len(value), (member, len(body[member]), len(value))
+
+    public = await client.get(_profile_url(author_user.username))
+    assert public.status_code == 200
+    assert public.json()[member] == value, f"{member} did not reach the column"
+
+
+@pytest.mark.parametrize(
+    ("url", "error_type"),
+    [pytest.param(url, kind, id=name) for url, kind, name in _HOSTILE_AVATAR_URLS],
+)
+async def test_self_update_refuses_an_avatar_url_outside_the_scheme_allow_list(
+    author_client: AsyncClient,
+    url: str,
+    error_type: str,
+) -> None:
+    """Only an absolute ``http`` or ``https`` URL may become an avatar.
+
+    Not input hygiene. ``avatar_url`` is rendered into an ``<img src>`` on every byline this
+    account appears on and on its profile heading, so a stored ``javascript:`` or ``data:``
+    destination executes in the browser of every reader who loads any of those pages - and the
+    account can set it on itself, so no privilege is needed to plant it.
+
+    The machine-readable ``type`` is asserted alongside the status, because a client has to be able
+    to tell a refused *scheme* from an unparseable value in order to say which to the person typing.
+    """
+    response = await author_client.patch(_SELF_UPDATE_URL, json={"avatar_url": url})
+
+    assert "avatar_url" in _rejected_fields(response)
+    reported = {
+        entry["type"] for entry in response.json()["errors"] if entry["field"] == "avatar_url"
+    }
+    assert error_type in reported, reported
+
+
+async def test_self_update_leaves_the_record_untouched_when_a_bound_is_exceeded(
+    author_client: AsyncClient,
+) -> None:
+    """A refused edit writes nothing, including the members that were within their bounds.
+
+    The property that makes a settings form safe to submit. ``PATCH /me`` carries three members, so
+    a body can be simultaneously valid in one and invalid in another - and a service that assigned
+    as it validated would leave the account half-edited, with no status code saying so. Validation
+    happens before the service is reached at all, so the whole body is refused together.
+    """
+    seeded = await author_client.patch(_SELF_UPDATE_URL, json=_FULL_SELF_UPDATE)
+    assert seeded.status_code == 200
+    before = await author_client.get(_AUTH_ME_URL)
+    assert before.status_code == 200
+
+    response = await author_client.patch(
+        _SELF_UPDATE_URL,
+        json={
+            "display_name": "A Perfectly Good Name",
+            "bio": "b" * (BIO_MAX_LENGTH + 1),
+        },
+    )
+
+    assert "bio" in _rejected_fields(response)
+    after = await author_client.get(_AUTH_ME_URL)
+    assert after.status_code == 200
+    # Whole-body equality: the valid `display_name` in the refused request must not have landed.
+    assert after.json() == before.json()
 
 
 # =======================================================================================

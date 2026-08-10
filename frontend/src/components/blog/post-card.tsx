@@ -105,8 +105,7 @@ import Link from 'next/link';
 import type { ComponentProps, JSX } from 'react';
 
 import { AuthorByline } from '@/components/blog/author-byline';
-import { Badge, POST_STATUS_BADGE_VARIANTS } from '@/components/ui/badge';
-import { BadgeLink } from '@/components/ui/badge-link';
+import { Badge, BadgeLink, POST_STATUS_BADGE_VARIANTS } from '@/components/ui/badge';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { categoryFeedPath, postPath } from '@/lib/seo';
@@ -552,7 +551,7 @@ export function PostCard({
  *   excerpt      three `h-4` bars with `gap-1.5` = 3.75rem, against three `text-sm` lines at
  *                3 x 1.25rem = 3.75rem exactly, which is the height `line-clamp-3` caps the real
  *                excerpt at
- *   footer       two `h-6` chips, against the 1.5rem interactive minimum `ui/badge-link.tsx`
+ *   footer       two `h-6` chips, against the 1.5rem interactive minimum `ui/badge.tsx`
  *                sets for a category chip (`min-h-6`), which is what makes the real footer row 24px
  *                tall whether or not the lifecycle badge is rendered beside it - that badge is
  *                1.375rem and shorter, so the chips govern the height - and nothing else, because
@@ -584,8 +583,9 @@ const SKELETON_EXCERPT_LAST_LINE_CLASSES = 'h-4 w-4/5';
 /**
  * Two category chips, mirroring the footer's wrapping row.
  *
- * `h-6` is the real chip's own `min-h-6` from `ui/badge-link.tsx`, so the placeholder row and the
- * loaded row are the same height to the pixel and nothing below the card moves when the posts arrive.
+ * `h-6` is the real chip's own `min-h-6`, which `BadgeLink` in `ui/badge.tsx` sets, so the
+ * placeholder row and the loaded row are the same height to the pixel and nothing below the card
+ * moves when the posts arrive.
  */
 const SKELETON_CHIP_CLASSES = 'h-6 w-20 rounded-full';
 const SKELETON_CHIP_NARROW_CLASSES = 'h-6 w-16 rounded-full';

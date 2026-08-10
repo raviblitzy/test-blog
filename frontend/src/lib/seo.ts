@@ -93,8 +93,6 @@
 
 import type { Metadata } from 'next';
 
-import { encodePathSegment } from '@/lib/paths';
-import { codePointLength, sliceByCodePoints } from '@/lib/text';
 import type {
   CategoryPublic,
   CategorySummary,
@@ -103,6 +101,7 @@ import type {
   PostSummary,
   UserPublic,
 } from '@/lib/types';
+import { codePointLength, encodePathSegment, sliceByCodePoints } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Site configuration
@@ -347,7 +346,7 @@ function toRootRelative(path: string): string {
  * segment containing a slash or a question mark would silently restructure the canonical URL into a
  * different route, and a canonical link is precisely the wrong place to discover that.
  *
- * Three refusals, applied by `@/lib/paths` so this module and the seven request-path composers under
+ * Three refusals, applied by `@/lib/utils` so this module and the seven request-path composers under
  * `@/lib/api` share one rule rather than seven approximations of it:
  *
  * - An empty segment is a caller defect rather than a value to encode - `/blog/` is a different route

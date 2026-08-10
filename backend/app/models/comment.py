@@ -202,7 +202,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import ForeignKey, Index, Text, text
 from sqlalchemy.dialects import postgresql
@@ -220,7 +220,23 @@ if TYPE_CHECKING:
     from app.models.post import Post
     from app.models.user import User
 
-__all__ = ["Comment", "CommentStatus"]
+__all__ = ["VISIBLE_REPLY_COUNT_KEY", "Comment", "CommentStatus"]
+
+
+VISIBLE_REPLY_COUNT_KEY: Final[str] = "_visible_reply_count"
+"""The ``__dict__`` key :attr:`Comment.reply_count` reads and the repository writes.
+
+Not a mapped column, and not a relationship - an *annotation* the repository attaches to an
+instance it has just assembled, carrying a number that exists only in the context of one read: how
+many direct replies were visible **to that caller**, which depends on the moderation states their
+role admits. A stored column could not answer it, because there is no single true answer to store.
+
+A plain ``__dict__`` entry rather than an attribute, because SQLAlchemy's instrumentation owns the
+mapped names in that dictionary and ignores every other key: the mapper iterates its own attributes,
+so this one is invisible to flushing, to dirty-tracking and to ``populate_existing``. Exported so
+that ``app.repositories.comment_repository`` writes the same key this module reads - two spellings
+of one string is how a count silently becomes zero everywhere.
+"""
 
 
 class CommentStatus(enum.StrEnum):
@@ -552,7 +568,8 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             # `text()` is the string-safe spelling for a directional expression inside
             # __table_args__, exactly as ix_posts_status_published_at uses it: `created_at.desc()`
             # is unavailable here because the mixin's column object is not in scope at class-body
-            # evaluation time. Built by revision 0004.
+            # evaluation time. Built by revision 0001, where every B-tree index in this
+            # schema lives.
             "ix_comments_created_at_id",
             text("created_at DESC"),
             text("id DESC"),
@@ -699,3 +716,51 @@ class Comment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     properties of that query rather than of this declaration. ``app.schemas.comment`` projects this
     attribute as the recursive reply list on the public representation.
     """
+
+    @property
+    def reply_count(self) -> int:
+        """How many direct replies were visible to the caller who read this comment.
+
+        **Not ``len(replies)``, and the difference is the point.** A thread response is bounded -
+        ``app.repositories.comment_repository`` allots each root on a page a share of a fixed row
+        budget - so :attr:`replies` may carry fewer replies than exist. Without this number that
+        truncation is indistinguishable from a comment nobody answered, which is the defect this
+        member closes: a reader was shown a thread that looked complete and was not, with nothing in
+        the response saying so.
+
+        "Visible to the caller" is why this cannot be a stored column. The count is taken under the
+        same moderation filter as the rows, so an anonymous reader is told how many *approved*
+        replies a comment has while an administrator is told how many exist in every state. One
+        column could not hold both answers.
+
+        Returns:
+            The counted total when the repository annotated this instance, and otherwise the number
+            of replies actually loaded - which is exact for every path that does not truncate, and
+            is why a comment projected outside a thread read still reports something true.
+
+        Note:
+            Both reads go through ``__dict__`` rather than through the attributes. ``self.replies``
+            would trigger a lazy load on an instance whose collection was never populated, and under
+            an ``AsyncSession`` that raises ``MissingGreenlet`` - so a projection of a comment
+            carrying no thread would fail on a member whose honest answer is zero.
+        """
+        counted = self.__dict__.get(VISIBLE_REPLY_COUNT_KEY)
+        if isinstance(counted, int):
+            return counted
+        return len(self.__dict__.get("replies") or ())
+
+    @property
+    def has_more_replies(self) -> bool:
+        """Whether :attr:`replies` is incomplete, so a client knows to offer a continuation.
+
+        Derived rather than stored, so it cannot disagree with the two values it compares. ``True``
+        means the bounded read did not carry every visible reply to this comment, and the rest are
+        reachable through ``GET /api/v1/posts/{post_id}/comments?parent=<this id>`` - which pages
+        this comment's replies as its own collection, with its own ``total``. That is what keeps
+        every accepted reply addressable however wide a discussion becomes.
+
+        Returns:
+            ``True`` when more visible replies exist than were loaded; ``False`` when the loaded
+            collection is the whole of it, including the ordinary case of no replies at all.
+        """
+        return self.reply_count > len(self.__dict__.get("replies") or ())

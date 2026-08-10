@@ -78,8 +78,8 @@ Configuration
 -------------
 ``Strict-Transport-Security`` is the one conditional header, and it is gated *without*
 introducing an environment variable. ``app.core.config`` is the only module permitted to
-read the environment and its eleven fields mirror the repository-root ``.env.example``
-field for field; a twelfth key invented here would put this module in contradiction with
+read the environment and its twelve fields mirror the repository-root ``.env.example``
+field for field; a thirteenth key invented here would put this module in contradiction with
 both of them and would break the environment-only configuration contract in the name of
 honouring it. The gate is instead the ``settings.is_production`` predicate that already
 exists, with an ``enable_hsts`` constructor argument for a caller - ``app.main``, or a
@@ -99,6 +99,10 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final
 
+# ASGI-protocol surface, reached through the Starlette that FastAPI pins and installs. FastAPI
+# re-exports neither `MutableHeaders` nor the four protocol aliases, so there is no
+# FastAPI-surface spelling to prefer; see `app.middleware.request_context` for the same note and
+# `backend/pyproject.toml` for why starlette is not a direct dependency.
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 

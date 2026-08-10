@@ -70,18 +70,44 @@
 // inconsistent: a text field has an uncommitted draft that legitimately leads the URL by a
 // debounce window. A picker commits on the same tick it is changed, so it has no draft to hold.
 //
-// STALE SLUGS ARE HANDLED, not assumed away, and handling them properly takes TWO decisions rather
-// than one. A category deleted from the admin dashboard leaves live links pointing at its slug.
+// STALE SLUGS ARE HANDLED, not assumed away, and handling them properly takes THREE decisions
+// rather than one. A category deleted from the admin dashboard leaves live links pointing at its
+// slug.
 //
 //   * The trigger must not go blank. `?category=was-deleted` selects an option that no longer
 //     exists, so Radix has no item to take a label from. The label is therefore resolved in this
-//     file and passed to `SelectValue` as children, and it falls back to "All categories" - the
-//     truth about the feed beneath it.
+//     file and passed to `SelectValue` as children.
+//   * That label must not claim the feed is UNFILTERED. It used to fall back to "All categories",
+//     and that is false: the parameter is still in the URL, `listPosts` still forwards it, and the
+//     service still filters on it - `?category=was-deleted` matches no category and so answers an
+//     EMPTY page, which the backend documents as its behaviour rather than an error. So the control
+//     said "All categories" above a feed showing none, and the one fact the reader needed - that a
+//     filter they cannot see is excluding everything - was the fact the control hid. The
+//     unresolvable case therefore names itself; see UNRESOLVED_CATEGORY_LABEL_PREFIX.
 //   * The junk parameter must remain CLEARABLE. This is the half that is easy to miss and was found
 //     by driving the control in a real browser: mapping the unresolvable case onto the same sentinel
 //     the clean URL uses makes "All categories" a no-change, Radix then never fires
 //     `onValueChange`, and the parameter sticks forever behind an affordance that looks live. The
 //     unresolvable case therefore takes a value of its own - see UNRESOLVED_CATEGORY_VALUE.
+//
+// The label and the value are consequently derived from DIFFERENT questions, which is why they are
+// two expressions rather than one. The value answers "is the URL canonical?", so any `category` that
+// is present but unresolved - a deleted slug, or the blank `?category=` - keeps the reset affordance
+// live. The label answers "what is the feed beneath me actually filtered by?", and the blank case
+// parts company with the deleted one there: `backend/app/services/post_service.py` folds a
+// whitespace-only filter to `None` before it reaches the query, so `?category=` really is the
+// unfiltered feed and really is "All categories", while `?category=was-deleted` is not.
+//
+// ---------------------------------------------------------------------------
+// SLUG MATCHING IS CASE-INSENSITIVE, BECAUSE THE SERVICE'S IS
+//
+// `categories.slug` is a `citext` column and the feed's filter is documented as "Matched
+// case-insensitively", so `?category=Engineering` and `?category=engineering` are ONE URL to the
+// API: both return the Engineering posts. A control that compared with `===` therefore resolved only
+// one of them, and on the other it displayed "All categories" over a page of Engineering articles -
+// the picker contradicting the results underneath it. Comparison here is folded to lower case for
+// exactly that reason, and only for comparison: the slug that goes back INTO the URL is always the
+// canonical one the API reported, so re-choosing the current category also tidies a mixed-case link.
 //
 // ---------------------------------------------------------------------------
 // 4. THE ARRAY IS A PROP, NOT A FETCH, AND THAT IS AN SEO DECISION
@@ -284,8 +310,62 @@ const UNRESOLVED_CATEGORY_VALUE = '__unresolved__';
  *
  * Used in both places deliberately, so the field reads identically whether the sentinel is
  * selected or - in the moment before Radix resolves its value - nothing is.
+ *
+ * It is the label for exactly two URLs, and both of them really are the unfiltered feed: one with no
+ * `category` parameter, and one whose `category` is blank, which
+ * `backend/app/services/post_service.py` folds to `None` before the query is built. It is
+ * deliberately NOT the label for a `category` that names something unknown - see
+ * {@link UNRESOLVED_CATEGORY_LABEL_PREFIX}.
  */
 const ALL_CATEGORIES_LABEL = 'All categories';
+
+/**
+ * Opening of the label shown when the URL names a category this taxonomy does not contain.
+ *
+ * The slug is appended, because the reader is looking at an empty or unexpected feed and the value
+ * doing that to them is invisible otherwise - it is in the address bar, which is exactly where
+ * somebody following a shared link does not look. Naming it is what turns "there are no posts" into
+ * "there are no posts *under this filter*", and it is the difference between the reader clearing the
+ * filter and the reader concluding the site is empty.
+ *
+ * This label is a truth about the REQUEST, not a guess about the category: a slug can be unresolvable
+ * because the category was deleted, because it was renamed and re-slugged, or because the link was
+ * mistyped, and this control cannot tell those apart. "Unknown" covers all three without claiming
+ * which.
+ *
+ * Rendered as a text node by React, so a hostile `?category=` value is escaped rather than
+ * interpreted - there is no markup path here, and none is to be added.
+ */
+const UNRESOLVED_CATEGORY_LABEL_PREFIX = 'Unknown category: ';
+
+/**
+ * How much of an unresolvable slug is shown before it is elided.
+ *
+ * A real slug is short - `backend/app/core/slug.py` derives it from a category name - but this value
+ * comes from a URL, so its length is chosen by whoever wrote the link. Without a bound, one shared
+ * link could put a kilobyte of text into the trigger's accessible name, which a screen reader would
+ * then read out in full. Forty characters comfortably fits every seeded slug and every plausible one.
+ */
+const MAX_UNRESOLVED_SLUG_LENGTH = 40;
+
+/** Appended in place of the elided remainder of an over-long slug. */
+const ELLIPSIS = '…';
+
+/**
+ * The trigger's text when the URL names a category that is not in the supplied taxonomy.
+ *
+ * @param slug - The requested slug, already trimmed. Never blank: a blank filter is the unfiltered
+ * feed and takes {@link ALL_CATEGORIES_LABEL} instead.
+ * @returns A label naming the still-active filter, with an over-long value elided.
+ */
+function unresolvedCategoryLabel(slug: string): string {
+  const shown =
+    slug.length > MAX_UNRESOLVED_SLUG_LENGTH
+      ? `${slug.slice(0, MAX_UNRESOLVED_SLUG_LENGTH)}${ELLIPSIS}`
+      : slug;
+
+  return `${UNRESOLVED_CATEGORY_LABEL_PREFIX}${shown}`;
+}
 
 /**
  * The control's accessible name when the caller supplies none.
@@ -393,33 +473,59 @@ export function CategoryFilter({
   const fieldId = useId();
 
   /*
+   * The raw parameter, and the filter the SERVICE will actually apply.
+   *
+   * Two values rather than one, because they answer different questions and the derivations below
+   * need both. `urlCategory` says whether the parameter is PRESENT, which is what decides whether
+   * the URL is canonical. `requestedSlug` says what it asks for once trimmed, which is what decides
+   * whether anything is being filtered at all: `backend/app/services/post_service.py` folds a
+   * whitespace-only filter to `None`, so `?category=%20` narrows nothing there and must not be
+   * presented as narrowing something here.
+   *
+   * The empty string stands for "no filter requested" and covers the absent parameter too, so every
+   * expression below reads a `string` rather than re-testing for `null`.
+   */
+  const urlCategory = searchParams.get(CATEGORY_PARAM);
+  const requestedSlug = (urlCategory ?? '').trim();
+
+  /*
    * The category the URL names, resolved against what the caller actually supplied.
+   *
+   * CASE-INSENSITIVELY, because `categories.slug` is a `citext` column and the feed's `category`
+   * filter is documented as matched case-insensitively - so `?category=Engineering` returns the
+   * Engineering posts whether or not this control recognises the spelling. Comparing with `===`
+   * meant it did not, and the picker then read "All categories" over a page that was plainly
+   * filtered. Only the COMPARISON is folded: `selectedCategory.slug` - the canonical spelling the
+   * API reported - is what goes back into the URL.
    *
    * `find` rather than `some` because the ROW is wanted, not merely the fact of a match: it
    * answers the stale-slug question and yields the trigger's display text in one pass. A linear
    * scan is deliberate rather than a lookup table - the taxonomy is small and curated, and a `Map`
    * rebuilt on every render to answer one question would cost more than it saves.
    *
-   * `undefined` here means "no filter, as far as this control is concerned", and it covers three
-   * distinct URLs on purpose: no `category` parameter at all, a `category` naming a slug that no
-   * longer exists, and a `category` carrying the sentinel itself. Every one of them describes the
-   * unfiltered feed, so every one of them must present as "All categories" rather than as an empty
-   * field - the stale-slug case being the one a deleted category leaves behind in live links.
+   * `undefined` means "this control cannot name the filter", which is NOT the same as "there is no
+   * filter" - see `selectedLabel` for the two cases it covers and why they read differently.
    */
-  const urlCategory = searchParams.get(CATEGORY_PARAM);
+  const requestedSlugFolded = requestedSlug.toLowerCase();
   const selectedCategory =
-    urlCategory === null ? undefined : categories.find((category) => category.slug === urlCategory);
+    requestedSlug === ''
+      ? undefined
+      : categories.find((category) => category.slug.toLowerCase() === requestedSlugFolded);
 
   /*
    * The picker's controlled value, over three cases rather than two.
    *
    * A resolved category is its own slug. A URL with NO `category` at all is the sentinel, and
    * choosing "All categories" there is correctly a no-op because the URL is already canonical.
-   * A URL carrying a `category` that does not resolve is neither: it takes
+   * Anything else - a slug that does not resolve, a blank `?category=`, a hand-typed sentinel - takes
    * {@link UNRESOLVED_CATEGORY_VALUE}, which no option carries, so that choosing "All categories"
    * registers as a real change and the junk parameter actually gets deleted. Collapsing that third
    * case into the sentinel is what made the reset affordance inert - see that constant for the
    * browser evidence.
+   *
+   * Keyed on `urlCategory` rather than on `requestedSlug`, deliberately: a blank `?category=` filters
+   * nothing, but it is still a second URL for the unfiltered feed, so the reset must stay live for it
+   * even though the label below correctly calls it unfiltered.
    */
   const selectedValue =
     selectedCategory?.slug ??
@@ -440,8 +546,18 @@ export function CategoryFilter({
    * `valueNodeHasChildren` and then leaves the value node alone instead of portalling into it. So
    * the selected label is in the server-rendered HTML, correct before hydration, correct with
    * client scripting disabled, and there is no blank-to-populated flash on first paint.
+   *
+   * THREE CASES, AND THE THIRD IS THE ONE THAT USED TO LIE. A resolved category is its own name. A
+   * URL that requests no filter - no parameter, or a blank one the service folds away - is "All
+   * categories", which is true of the feed beneath it. A URL requesting a slug this taxonomy does not
+   * contain is NEITHER: the parameter is still sent, the service still filters on it, and it matches
+   * nothing, so the feed beneath is an empty page. Labelling that "All categories" told the reader
+   * the one thing that was not so, and hid the only thing that would have explained what they were
+   * looking at. It names the filter instead.
    */
-  const selectedLabel = selectedCategory?.name ?? ALL_CATEGORIES_LABEL;
+  const selectedLabel =
+    selectedCategory?.name ??
+    (requestedSlug === '' ? ALL_CATEGORIES_LABEL : unresolvedCategoryLabel(requestedSlug));
 
   /**
    * Write the chosen category into the URL, or return without navigating if it is already there.

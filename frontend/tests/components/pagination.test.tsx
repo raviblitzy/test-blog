@@ -309,8 +309,29 @@ function enclosingListItem(element: Element): Element {
 /** The marker the control renders for a collapsed run of omitted pages. */
 const OMITTED_RUN_MARKER = '\u2026';
 
-/** Window size of the feed envelope below, matching the service's default. */
-const FEED_PAGE_SIZE = 10;
+/**
+ * Window size of the feed envelope below: the service's own default.
+ *
+ * `DEFAULT_PAGE_SIZE` in `backend/app/core/pagination.py` is 20, and the feed endpoint declares it as
+ * the default of its `page_size` parameter - so a caller that omits the parameter receives twenty rows
+ * and this control is asked to describe a twenty-row window. Ten was the number here previously, and
+ * the description "matching the service's default" was the part that was wrong rather than the number
+ * being harmful: every arithmetic assertion below derives its expected range from this constant, so a
+ * wrong value produced consistent-but-fictional expectations.
+ *
+ * The service's bounds are 1 and 100 with 20 in the middle; nothing in this control cares which of
+ * those it is handed, and the cases below that need a different window pass their own literal.
+ *
+ * Restated as a literal rather than imported: the number lives in the service, and the only frontend
+ * module that names any part of the range is `@/lib/api/users`, which declares the two BOUNDS and
+ * deliberately declares no default so an omitted parameter reaches the API unset. A test that imported
+ * a constant to check it against would agree with whatever that constant said.
+ */
+const FEED_PAGE_SIZE = 20;
+
+/** The service's inclusive window bounds, restated for the same reason. */
+const MIN_PAGE_SIZE = 1;
+const MAX_PAGE_SIZE = 100;
 
 /**
  * One row of the feed envelope.
@@ -740,6 +761,32 @@ describe('Pagination', () => {
 
       expect(container).toBeEmptyDOMElement();
       expect(screen.queryByRole('link')).toBeNull();
+    });
+
+    it('renders identically at either bound of the service window, deriving nothing from it', () => {
+      // The envelope fixture carries the service's DEFAULT window, and this case is what keeps that a
+      // documented fact rather than a decorative one: the control accepts `page_size` because a whole
+      // `Page<T>` spreads into it, and then uses it for nothing rendered - `pagination.tsx` says so of
+      // both `total` and `page_size`. So the same page position must produce the same markup at 1 row
+      // per page and at 100.
+      expect(feedPage.page_size).toBe(FEED_PAGE_SIZE);
+      expect(FEED_PAGE_SIZE).toBeGreaterThanOrEqual(MIN_PAGE_SIZE);
+      expect(FEED_PAGE_SIZE).toBeLessThanOrEqual(MAX_PAGE_SIZE);
+
+      const { container: narrow, unmount } = render(
+        <Pagination page={2} pages={5} page_size={MIN_PAGE_SIZE} total={feedPage.total} />,
+      );
+      const narrowMarkup = narrow.innerHTML;
+      unmount();
+
+      const { container: wide } = render(
+        <Pagination page={2} pages={5} page_size={MAX_PAGE_SIZE} total={feedPage.total} />,
+      );
+
+      // Markup equality is the assertion here rather than an assertion about WHAT the markup is: the
+      // claim is indifference, and the day this control starts rendering a "showing 21-40 of 97" range
+      // it will need cases of its own instead of inheriting a fixture value nobody checked.
+      expect(wide.innerHTML).toBe(narrowMarkup);
     });
   });
 

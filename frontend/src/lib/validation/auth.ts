@@ -34,10 +34,10 @@
  * | `USERNAME_MIN_LENGTH` (3)        | `app.schemas.auth.USERNAME_MIN_LENGTH`                 |
  * | `USERNAME_MAX_LENGTH` (30)       | `app.schemas.auth.USERNAME_MAX_LENGTH`                 |
  * | `USERNAME_PATTERN`               | `app.schemas.auth.USERNAME_PATTERN`                    |
- * | `PASSWORD_MIN_LENGTH` (12)       | `app.core.password_policy.PASSWORD_MIN_LENGTH`         |
- * | `PASSWORD_MAX_LENGTH` (128)      | `app.core.password_policy.PASSWORD_MAX_LENGTH`         |
- * | `PASSWORD_MIN_CHARACTER_GROUPS`  | `app.core.password_policy.PASSWORD_MIN_CHARACTER_CLASSES` |
- * | `PASSWORD_CHARACTER_GROUPS`      | `app.core.password_policy.PASSWORD_CHARACTER_GROUPS`   |
+ * | `PASSWORD_MIN_LENGTH` (12)       | `app.schemas.auth.PASSWORD_MIN_LENGTH`         |
+ * | `PASSWORD_MAX_LENGTH` (128)      | `app.schemas.auth.PASSWORD_MAX_LENGTH`         |
+ * | `PASSWORD_MIN_CHARACTER_GROUPS`  | `app.schemas.auth.PASSWORD_MIN_CHARACTER_CLASSES` |
+ * | `PASSWORD_CHARACTER_GROUPS`      | `app.schemas.auth.PASSWORD_CHARACTER_GROUPS`   |
  * | `DISPLAY_NAME_MAX_LENGTH` (80)   | `app.schemas.auth.DISPLAY_NAME_MAX_LENGTH`             |
  *
  * When the service changes one of them, read it and change this file to match. Do not soften a rule
@@ -99,9 +99,8 @@
 
 import { z } from 'zod';
 
-import { codePointLength } from '@/lib/text';
-
 import type { LoginRequest, RegisterRequest } from '@/lib/types';
+import { codePointLength } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------------------------------
  * Username policy — mirrors `app.schemas.auth`
@@ -131,7 +130,7 @@ const USERNAME_MAX_LENGTH = 30;
 const USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/;
 
 /* -------------------------------------------------------------------------------------------------
- * Password policy — mirrors `app.core.password_policy`
+ * Password policy — mirrors `app.schemas.auth`
  *
  * Three independent rules, and it is worth being clear about which does what. The minimum length
  * and the character-group rule bound how weak a *new* password may be. The maximum length is a
@@ -140,24 +139,24 @@ const USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/;
  * primitive. That is why the maximum applies on log-in too while the other two do not.
  * ---------------------------------------------------------------------------------------------- */
 
-/** Shortest accepted new password. Mirrors `app.core.password_policy.PASSWORD_MIN_LENGTH`. */
+/** Shortest accepted new password. Mirrors `app.schemas.auth.PASSWORD_MIN_LENGTH`. */
 const PASSWORD_MIN_LENGTH = 12;
 
 /**
  * Longest accepted password, on sign-up and on log-in alike. Mirrors
- * `app.core.password_policy.PASSWORD_MAX_LENGTH`.
+ * `app.schemas.auth.PASSWORD_MAX_LENGTH`.
  */
 const PASSWORD_MAX_LENGTH = 128;
 
 /**
  * How many of {@link PASSWORD_CHARACTER_GROUPS} a new password must draw on. Mirrors
- * `app.core.password_policy.PASSWORD_MIN_CHARACTER_CLASSES`.
+ * `app.schemas.auth.PASSWORD_MIN_CHARACTER_CLASSES`.
  */
 const PASSWORD_MIN_CHARACTER_GROUPS = 3;
 
 /**
  * The five character groups {@link PASSWORD_MIN_CHARACTER_GROUPS} counts, in the service's order.
- * Mirrors `app.core.password_policy.PASSWORD_CHARACTER_GROUPS` phrase for phrase, because
+ * Mirrors `app.schemas.auth.PASSWORD_CHARACTER_GROUPS` phrase for phrase, because
  * {@link PASSWORD_VARIETY_MESSAGE} is built from this list exactly as the service builds its own —
  * so the sentence a user reads here and the sentence a `422` would carry are the same sentence
  * rather than two paraphrases of it.
@@ -180,7 +179,7 @@ const PASSWORD_CHARACTER_GROUPS = [
  *
  * Assembled from {@link PASSWORD_CHARACTER_GROUPS} rather than written out, using the same
  * separator the service uses, so this string is byte-identical to the one
- * `app.core.password_policy.PASSWORD_VARIETY_MESSAGE` produces. It names the rule and never quotes
+ * `app.schemas.auth.PASSWORD_VARIETY_MESSAGE` produces. It names the rule and never quotes
  * what was typed — a rejected password must not reach a message, a log line or a stack trace.
  */
 const PASSWORD_VARIETY_MESSAGE =
@@ -308,7 +307,7 @@ function hasSufficientCharacterVariety(password: string): boolean {
  * - **Neither password field is trimmed.** Whitespace is significant in a credential, and the
  *   service says so explicitly: trimming would silently change the password a user typed, and they
  *   would then be unable to log in with what they thought they had chosen.
- * - **Every length bound is measured in code points** through `codePointLength` from `@/lib/text`,
+ * - **Every length bound is measured in code points** through `codePointLength` from `@/lib/utils`,
  *   not in UTF-16 code units. That function is the tier's single measurement and its documentation
  *   carries the two observed failures this prevents; `validation/category.ts`, `validation/post.ts`
  *   and `validation/comment.ts` measure through the same one. It is why the bounds below are

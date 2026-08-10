@@ -87,6 +87,7 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { isApiError } from '@/lib/api/client';
 import { createPost, deletePost, publishPost, unpublishPost, updatePost } from '@/lib/api/posts';
+import { DASHBOARD_ROUTE, postEditRoute } from '@/lib/routes';
 import type {
   CategoryPublic,
   CategorySummary,
@@ -97,28 +98,6 @@ import type {
 import { IMAGE_HOST_ALLOWLIST, cn } from '@/lib/utils';
 import { postCreateSchema, postUpdateSchema } from '@/lib/validation/post';
 import type { PostUpdateFormValues } from '@/lib/validation/post';
-
-/* -------------------------------------------------------------------------------------------------
- * Routes
- *
- * No path helper is in this component's dependency set, so the two destinations it navigates to are
- * declared here rather than reached for through an import that does not exist. Both live in the
- * `(dashboard)` route group, which is why neither is public and neither appears in the sitemap.
- * ---------------------------------------------------------------------------------------------- */
-
-/** The author workspace - where Cancel returns to and where a deleted post's author lands. */
-const DASHBOARD_PATH = '/dashboard';
-
-/**
- * The canonical edit route for one post, keyed on its **server-generated identifier**.
- *
- * `encodeURIComponent` is applied even though the API only ever emits UUIDs. The cost is nothing and
- * the alternative is trusting a remote value to be URL-safe, which is the same class of assumption
- * that made the legacy `/items/{item_id}` route accept anything an integer parse would swallow.
- */
-function postEditPath(id: string): string {
-  return `${DASHBOARD_PATH}/posts/${encodeURIComponent(id)}/edit`;
-}
 
 /* -------------------------------------------------------------------------------------------------
  * Form values and validation
@@ -167,16 +146,43 @@ type FormFieldName = (typeof FORM_FIELD_NAMES)[number];
 /**
  * Resolve a server-reported field name onto one of this form's controls, or `null`.
  *
- * The API reports `field` as the path the failure occurred at, which may be qualified (`body.title`)
- * or bare (`title`) depending on where in the request the value sat. Taking the last segment
- * normalises both without guessing at a prefix. `Array.prototype.find` over the literal tuple
- * returns the narrowed member, so no assertion is needed to get from `string` to
- * {@link FormFieldName}.
+ * The API reports `field` as the path the failure occurred at, and the path has a variable prefix and
+ * a variable suffix. It may be qualified (`body.title`) or bare (`title`) depending on where in the
+ * request the value sat, and it may descend INTO a value: a rejected member of the category list
+ * arrives as `category_ids.0`, and through a body prefix as `body.category_ids.2`.
+ *
+ * So the match is on the FIRST segment that names a control, scanning left to right. Every one of
+ * those four shapes then lands on the right control:
+ *
+ * | Reported path          | Resolves to     |
+ * | ---------------------- | --------------- |
+ * | `title`                | `title`         |
+ * | `body.title`           | `title`         |
+ * | `category_ids.0`       | `category_ids`  |
+ * | `body.category_ids.2`  | `category_ids`  |
+ *
+ * Matching the LAST segment instead - which reads as the obvious normalisation, because it handles
+ * the prefix without knowing what the prefix is - silently drops exactly the indexed cases: the leaf
+ * of `category_ids.0` is `0`, which names no control, so the message went to the summary banner while
+ * the category group it was about showed nothing. The author was told a category was wrong and given
+ * no indication which control to look at.
+ *
+ * An index is deliberately NOT carried through to the control. The group renders one error region for
+ * the whole selection rather than one per option, because a category is chosen by toggling a badge
+ * and there is no per-option control for a message to sit beside; the service's prose already names
+ * the offending identifier when it matters.
+ *
+ * `Array.prototype.find` over the literal tuple returns the narrowed member, so no assertion is
+ * needed to get from `string` to {@link FormFieldName}.
  */
 function toFormFieldName(field: string): FormFieldName | null {
-  const segments = field.split('.');
-  const leaf = segments[segments.length - 1] ?? field;
-  return FORM_FIELD_NAMES.find((name) => name === leaf) ?? null;
+  for (const segment of field.split('.')) {
+    const match = FORM_FIELD_NAMES.find((name) => name === segment);
+    if (match !== undefined) {
+      return match;
+    }
+  }
+  return null;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -525,6 +531,15 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
    */
   const deleteTriggerRef = useRef<HTMLButtonElement>(null);
   const cancelTriggerRef = useRef<HTMLButtonElement>(null);
+  /**
+   * The first field a server refusal named, held until the form is interactive enough to focus it.
+   *
+   * State rather than a ref, and deliberately: it is written from `persist`, which the two submit
+   * handlers close over, and those handlers are built during render. A ref written along that path
+   * trips `react-hooks/refs` - "passing a ref to a function may read its value during render" - which
+   * is a blocking lint error under `--max-warnings=0`. A setter carries no such hazard.
+   */
+  const [pinnedField, setPinnedField] = useState<FormFieldName | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   /** Set when a draft saved but its publish transition did not. Drives the retry affordance. */
   const [publishFailed, setPublishFailed] = useState(false);
@@ -558,6 +573,7 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
     register,
     reset,
     setError,
+    setFocus,
   } = useForm<PostEditorFormValues>({
     defaultValues,
     mode: 'onBlur',
@@ -668,6 +684,11 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
    * `aria-describedby` and the primitive marks the control `aria-invalid`. Anything naming a field
    * this form does not render stays in the banner, because pinning a message to a control that is not
    * on screen hides it completely.
+   *
+   * The first field pinned is also recorded, so focus can be taken to it once the form is
+   * interactive again - see the effect below. `setError`'s own `shouldFocus` cannot do that job here:
+   * it focuses synchronously, and at the moment this runs every control is still `disabled` by the
+   * operation that just failed, so the focus call would land on a disabled element and be discarded.
    */
   const applyFailure = useCallback(
     (error: unknown, fallback: string): string => {
@@ -677,6 +698,9 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
           const name = toFormFieldName(item.field);
           if (name !== null) {
             setError(name, { message: item.message, type: 'server' });
+            if (pinned === 0) {
+              setPinnedField(name);
+            }
             pinned += 1;
           }
         }
@@ -686,6 +710,37 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
     },
     [setError],
   );
+
+  /**
+   * Take focus to the first field a server refusal named, once the operation has settled.
+   *
+   * Submitting disables every control, and a disabled element cannot hold focus - so pressing Save
+   * drops focus onto `<body>`, and a `422` that pins a message beside the excerpt or the category
+   * group would otherwise leave the author reading it with the keyboard parked at the top of the
+   * document. This puts them on the control they have to change.
+   *
+   * It matters most for `category_ids`, which is the one field here with no `Input` or `Textarea` of
+   * its own: `setFocus` reaches it through the `Controller` ref attached to the group's first toggle,
+   * which is why that ref exists.
+   *
+   * Three guards, each removing a way this could misbehave: it acts only once, because focusing the
+   * target means `activeElement` is no longer `<body>` on any re-run; only when a server failure
+   * actually named a field, and every operation clears that record before it starts, so a successful
+   * save cannot inherit the previous refusal's target; and only while focus is still on `<body>`, so
+   * it never steals focus from an author who moved on, nor from the field the resolver's own
+   * `shouldFocusError` has just focused after a client-side validation failure. It waits for the
+   * operation to finish for the reason given above - the target is disabled until then.
+   *
+   * The record is cleared at each operation's start rather than here on purpose: clearing it in this
+   * effect would be a `setState` inside an effect, which the React Compiler's lint rules reject.
+   */
+  useEffect(() => {
+    if (isBusy || pinnedField === null || document.activeElement !== document.body) {
+      return;
+    }
+
+    setFocus(pinnedField);
+  }, [isBusy, pinnedField, setFocus]);
 
   /**
    * Save, and - when that is what the author asked for - publish.
@@ -705,6 +760,12 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
    * same handler with an empty patch and goes straight to the publish call, so only the part that
    * failed is repeated.
    *
+   * Rebinding is TWO things, and only the second of them survives the document: this component's
+   * `persisted` state, and the browser's address. Both are set as soon as the create resolves, before
+   * the publish is attempted - see the `router.replace` below. State alone left `/posts/new` in the
+   * address bar over a draft that really existed, so a reload re-entered create mode and the next save
+   * wrote a SECOND draft; a guard held in memory cannot see across documents.
+   *
    * Publishing always saves first, and that asymmetry with unpublish is deliberate: publishing makes
    * content public, so publishing a stale body would expose the wrong text, whereas unpublishing only
    * withdraws content and cannot be stale.
@@ -715,6 +776,9 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
   ): Promise<void> => {
     setSummaryError(null);
     setPublishFailed(false);
+    // Any field a previous refusal named stops being the focus effect's target here: this attempt
+    // gets its own answer, and inheriting the last one would move focus after a save that succeeded.
+    setPinnedField(null);
     setOperation(intent === 'publish' ? 'publish' : 'save');
 
     const target = persisted;
@@ -752,11 +816,32 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
       // body - never after a status transition, which would silently discard edits still on screen.
       reset(toFormValues(saved));
 
+      if (wasCreate) {
+        // THE URL IS REBOUND HERE - immediately after the create resolved, and BEFORE the publish
+        // attempt below - and the position of this call is the whole point rather than a detail.
+        //
+        // `setPersisted` above rebinds the COMPONENT to the new post, and that is enough for as long
+        // as this JavaScript context survives. It does not survive a reload, a Back-then-Forward, or
+        // the author opening the same tab again later; the URL does. Leaving the address at
+        // `/posts/new` while a real, persisted draft existed meant a reload re-entered CREATE mode
+        // holding the same text, and the next save wrote a SECOND draft - the in-memory guard cannot
+        // see across documents, and the author had just been told their draft was safe.
+        //
+        // The publish path is where that mattered most: it is the one path that can fail AFTER the
+        // create succeeded, and it deliberately keeps the author on this screen to retry. So the
+        // address has to be correct before the failure can happen, not after the success.
+        //
+        // `replace` rather than `push`, so Back does not return to an empty editor that would create
+        // yet another draft. It changes only the address - the component is already bound, and no
+        // remount or refetch follows.
+        router.replace(postEditRoute(saved.id));
+      }
+
       if (intent === 'save') {
         toast.success(wasCreate ? 'Draft saved.' : 'Changes saved.');
-        if (wasCreate) {
-          router.replace(postEditPath(saved.id));
-        } else {
+        if (!wasCreate) {
+          // An existing post's Server Components hold the old body; a created one has no rendered
+          // route to refresh, and the `replace` above is what puts it on the right address.
           router.refresh();
         }
         return;
@@ -766,13 +851,14 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
         const published = await publishMutation.mutateAsync(saved.id);
         setPersisted(published);
         toast.success('Post published.');
-        if (wasCreate) {
-          router.replace(postEditPath(published.id));
-        } else {
+        if (!wasCreate) {
           router.refresh();
         }
       } catch (error) {
-        // The body is saved. Say precisely that, keep the author here, and leave the retry to them.
+        // The body is saved AND the address now names it, so "the draft is safe" is true of the
+        // browser and not merely of this component's state: a reload lands in the editor for the
+        // created post rather than in an empty one. Say precisely that, keep the author here, and
+        // leave the retry to them.
         setPublishFailed(true);
         setSummaryError(applyFailure(error, 'Could not publish this post.'));
         toast.error(
@@ -819,6 +905,7 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
     }
     setSummaryError(null);
     setPublishFailed(false);
+    setPinnedField(null);
     setOperation('unpublish');
     try {
       const updated = await unpublishMutation.mutateAsync(persisted.id);
@@ -845,12 +932,13 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
       return;
     }
     setSummaryError(null);
+    setPinnedField(null);
     setOperation('delete');
     try {
       await deleteMutation.mutateAsync(persisted.id);
       setActiveDialog('none');
       toast.success('Post deleted, along with its comments and likes.');
-      router.replace(DASHBOARD_PATH);
+      router.replace(DASHBOARD_ROUTE);
       router.refresh();
     } catch (error) {
       // Closed so the summary banner behind it is readable; the failure is not the dialog's to show.
@@ -885,13 +973,13 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
       setActiveDialog('discard');
       return;
     }
-    router.push(DASHBOARD_PATH);
+    router.push(DASHBOARD_ROUTE);
   }, [isDirty, router]);
 
   const discardAndLeave = useCallback((): void => {
     setActiveDialog('none');
     reset(defaultValues);
-    router.push(DASHBOARD_PATH);
+    router.push(DASHBOARD_ROUTE);
   }, [defaultValues, reset, router]);
 
   const saveLabel = persisted === null ? 'Save draft' : 'Save';
@@ -1027,8 +1115,14 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
                and object storage, so a cover image is a reference to an image somebody else already
                hosts. The allow-list is read from `IMAGE_HOST_ALLOWLIST`, which is the same constant
                `next.config.ts` builds `images.remotePatterns` from - naming the hosts twice is how the
-               two lists drift and a valid URL starts rendering as a broken image. */
-            helper={`A link to an image that is already online — there is no upload. Must be an https URL on one of: ${IMAGE_HOST_ALLOWLIST.join(', ')}, because the image is served through Next.js and only these hosts are allow-listed.`}
+               two lists drift and a valid URL starts rendering as a broken image.
+
+               The sentence is now a promise the form keeps rather than advice it hoped for:
+               `postCreateSchema` calls `isAllowedImageUrl` on this field, so an address on another
+               host - or over plain http, or carrying credentials - is refused here with a message
+               beside the control. Before that check existed, such an address saved successfully and
+               then rendered nowhere, while the OpenGraph and JSON-LD metadata still advertised it. */
+            helper={`A link to an image that is already online — there is no upload. It must be an https URL on one of: ${IMAGE_HOST_ALLOWLIST.join(', ')}, because the image is served through Next.js and only these hosts are allow-listed. Another host is refused here rather than saved and then not shown.`}
             helperId={`${coverImageId}-${helperSuffix}`}
             label="Cover image URL"
             optional
@@ -1061,7 +1155,24 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
               const selected = field.value ?? [];
               const errorMessage = errors.category_ids?.message;
               return (
-                <fieldset className="flex min-w-0 flex-col gap-2" disabled={isBusy}>
+                /* The help and error references and the invalid state belong on the FIELDSET, not on
+                   the flex wrapper inside it. The fieldset is the element with the accessible name
+                   and the `group` role - it is the control, as far as assistive technology is
+                   concerned - so a description hung on an anonymous inner `div` was announced for
+                   nothing: entering the group read out its legend and neither the help text nor the
+                   failure. `aria-invalid` is authored here for the same reason and is the one place
+                   in this form where it is: `Input` and `Textarea` derive their own from their
+                   `invalid` prop, but a fieldset is not a primitive and has nothing to derive it
+                   from. Both attributes are supported on `group`. */
+                <fieldset
+                  aria-describedby={describedBy(
+                    `${categoriesId}-${helperSuffix}`,
+                    errorMessage !== undefined && `${categoriesId}-${errorSuffix}`,
+                  )}
+                  aria-invalid={errorMessage !== undefined || undefined}
+                  className="flex min-w-0 flex-col gap-2"
+                  disabled={isBusy}
+                >
                   <legend className="text-foreground text-sm leading-none font-medium">
                     Categories
                   </legend>
@@ -1073,14 +1184,8 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
                       </AlertDescription>
                     </Alert>
                   ) : (
-                    <div
-                      aria-describedby={describedBy(
-                        `${categoriesId}-${helperSuffix}`,
-                        errorMessage !== undefined && `${categoriesId}-${errorSuffix}`,
-                      )}
-                      className="flex flex-wrap gap-2"
-                    >
-                      {categories.map((category) => {
+                    <div className="flex flex-wrap gap-2">
+                      {categories.map((category, index) => {
                         const isSelected = selected.includes(category.id);
                         return (
                           <Button
@@ -1094,6 +1199,19 @@ export function PostEditor({ mode, post, categories, className }: PostEditorProp
                                   : [...selected, category.id],
                               );
                             }}
+                            /* The controller's ref, on the FIRST toggle only. A `Controller` hands
+                               out one ref for a whole group, and react-hook-form uses it for exactly
+                               one thing: moving focus to the field that failed, both through
+                               `shouldFocusError` on submit and through
+                               `setError(..., { shouldFocus: true })`. Left unattached - as it was -
+                               the group had no focus target at all, so a root `category_ids` failure
+                               was visible and unreachable: the author read "choose at most N
+                               categories" with the keyboard still parked wherever it happened to be.
+                               The first toggle is the stable choice because it is the group's entry
+                               point and it exists whenever any toggle does; it is still the project
+                               `Button` primitive, which forwards `ref` to its own element, so nothing
+                               is bypassed to get it. */
+                            ref={index === 0 ? field.ref : undefined}
                             size="sm"
                             variant={isSelected ? 'primary' : 'secondary'}
                           >

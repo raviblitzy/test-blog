@@ -102,8 +102,8 @@
 //   2. It renders `@/components/ui/pagination`, which reads the URL and is therefore a client
 //      component itself. All four administrative screens are client screens in the plan's own screen
 //      inventory, so nothing is lost. Note that this file no longer calls `usePagination` directly:
-//      its page arithmetic comes from `@/lib/pagination`, which is a pure function, so the grid holds
-//      no URL subscription of its own.
+//      its page arithmetic comes from `@/lib/utils`, which is a pure, directive-free module, so the
+//      grid holds no URL subscription of its own.
 //
 // The island still stays narrow: nothing entity-specific is pushed in here. There is not one
 // reference below to a user, a post, a comment or a category - no `role`, no `status`, no
@@ -170,9 +170,8 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { isApiError } from '@/lib/api/client';
-import { derivePagination, formatResultRange } from '@/lib/pagination';
 import type { Page } from '@/lib/types';
-import { cn } from '@/lib/utils';
+import { cn, derivePagination, formatResultRange } from '@/lib/utils';
 
 /* -------------------------------------------------------------------------- */
 /* Token-derived class constants                                              */

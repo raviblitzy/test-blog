@@ -89,8 +89,8 @@ Layering
 This file sits at the very top of the one-way chain - routes delegate to services, services to
 repositories, repositories own the queries, models own the schema - and it imports downwards no
 further than it must. It reaches ``app.core.dependencies`` for the gate and
-``app.api.v1.responses`` for the error contract - a sibling in this same tier, which is why the
-error model itself is not imported here - and it touches ``app.services``, ``app.repositories``,
+``app.schemas`` for the error contract, whose helper names the error model so this file does
+not have to - and it touches ``app.services``, ``app.repositories``,
 ``app.models`` and ``app.db`` not at all. There is no ``HTTPException`` here either: services
 raise the typed ``AppError`` family and the handlers registered by ``app.main`` render every
 failure as one :class:`~app.schemas.common.ProblemDetail`, so the three duplicated ad-hoc 404
@@ -101,9 +101,9 @@ from typing import Final
 
 from fastapi import APIRouter, Depends, status
 
-from app.api.v1.responses import ProblemResponses, problem_response
 from app.api.v1.routers import admin, auth, categories, comments, likes, posts, users
 from app.core.dependencies import require_admin
+from app.schemas import ProblemResponses, problem_response
 
 __all__ = ["API_V1_PREFIX", "api_router", "router"]
 
@@ -131,7 +131,7 @@ silently re-route every route in the service.
 #
 # The gate is attached on the `admin` include below, so the two statuses it introduces are
 # documented on the same call rather than left as undeclared bodies a client generator has
-# to guess at. Both entries come from `app.api.v1.responses.problem_response`, because this
+# to guess at. Both entries come from `app.schemas.common.problem_response`, because this
 # API has exactly one error shape for every failure at every status code and exactly one
 # media type for it - and that helper is the single place either is decided.
 #

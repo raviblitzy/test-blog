@@ -129,7 +129,6 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.concurrency import run_cpu_bound
 from app.core.dependencies import PageParams, ensure_can_modify, is_admin
 from app.core.exceptions import (
     AppValidationError,
@@ -137,9 +136,11 @@ from app.core.exceptions import (
     FieldError,
     ForbiddenError,
     NotFoundError,
+    integrity_constraint_name,
 )
 from app.core.logging import get_logger
 from app.core.pagination import Page, build_page
+from app.core.security import run_cpu_bound
 from app.models import Comment, CommentStatus, Post, User
 from app.repositories import CommentRepository, PostRepository
 from app.schemas.comment import CommentCreate, CommentPublic, CommentUpdate
@@ -302,6 +303,26 @@ _THREAD_CHANGED: Final[str] = (
     "The post or the comment being replied to was removed while this comment was being written. "
     "Retry the request."
 )
+_THREAD_FOREIGN_KEYS: Final[frozenset[str]] = frozenset(
+    {"fk_comments_post_id_posts", "fk_comments_parent_id_comments"}
+)
+"""The only two constraints a concurrent comment insert can legitimately violate.
+
+Both are foreign keys created under these names by revision ``0001``, and both mean exactly what
+:data:`_THREAD_CHANGED` says: the post being commented on, or the comment being replied to, was
+deleted between this request's visibility check and its insert. Nothing else on ``comments`` is a
+race. ``pk_comments`` is a server-generated UUID, so a collision there is not something a client
+can cause, and a ``NOT NULL`` or check violation means the row assembled above was wrong - each is
+a defect in this service and is re-raised untouched so it surfaces as a ``500`` with frames.
+"""
+
+_THREAD_SQLSTATES: Final[frozenset[str]] = frozenset({"23503"})
+"""``foreign_key_violation`` - the only class a concurrent comment insert can produce.
+
+``23505`` is absent deliberately: nothing about a comment is unique except its generated key, so a
+unique violation here would be a defect rather than contention.
+"""
+
 _FIELD_PARENT_ID: Final[str] = "parent_id"
 _FIELD_BODY: Final[str] = "body"
 _FIELD_ERROR_TYPE: Final[str] = "value_error"
@@ -871,6 +892,7 @@ class CommentService:
         post_id: uuid.UUID,
         *,
         viewer: User | None,
+        parent_id: uuid.UUID | None = None,
         page: int,
         page_size: int,
     ) -> Page[CommentPublic]:
@@ -888,6 +910,16 @@ class CommentService:
             viewer: The resolved principal, or ``None`` for an anonymous caller. It decides two
                 things and nothing else: whether the post is visible at all, and which moderation
                 states are in scope.
+            parent_id: When given, page that comment's direct **replies** instead of the post's
+                top-level comments. This is the continuation window, and it is what keeps every
+                accepted reply addressable: a thread response allots each root a share of a bounded
+                row budget, so a comment with more replies than its share carries only a prefix of
+                them and reports :attr:`~app.models.comment.Comment.has_more_replies`. Re-entering
+                here with that comment's identifier makes its replies the page members, with their
+                own ``total`` and their own pages, so breadth is paged rather than truncated. A
+                parent that does not exist, or that belongs to another post, yields an empty page
+                rather than an error - it is indistinguishable from a comment nobody answered, and
+                distinguishing them would report whether a given identifier exists.
             page: The 1-based page requested. A page beyond the last is not an error - it returns
                 an empty ``items`` list beside the real ``total`` and ``pages``, which is how a
                 client detects it has run off the end.
@@ -940,6 +972,10 @@ class CommentService:
         rows, total = await self._comments.list_for_post(
             post.id,
             statuses=_visible_comment_statuses(post, viewer),
+            # Passed straight through. The repository turns it into one predicate on the same
+            # statement rather than a second query, so the continuation window inherits the
+            # ordering, the counting and - critically - the moderation filter of the default one.
+            parent_id=parent_id,
             limit=window.limit,
             offset=window.offset,
         )
@@ -1064,6 +1100,17 @@ class CommentService:
             # Rolled back first: the transaction is aborted, so anything else issued on this
             # session would fail too and `get_db` would have nothing left to close cleanly.
             await self._session.rollback()
+
+            # Only the two thread foreign keys are contention; everything else is a defect here.
+            # This used to report every integrity failure as "the thread changed", which told a
+            # reader to retry a request that could never succeed and hid the real fault - a column
+            # this method failed to populate, a check it violated - behind a plausible 409 with no
+            # traceback and no 500 to alert on.
+            if (
+                integrity_constraint_name(error, sqlstates=_THREAD_SQLSTATES)
+                not in _THREAD_FOREIGN_KEYS
+            ):
+                raise
             raise ConflictError(_THREAD_CHANGED) from error
 
         get_logger(__name__).info(

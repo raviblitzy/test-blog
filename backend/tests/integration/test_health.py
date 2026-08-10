@@ -39,20 +39,60 @@ caused it; it would silently redirect a later one. Nothing here calls
 :func:`client` installs and break isolation for the remainder of the run.
 
 The substituted session fails at ``execute``, never on the way in, and that detail is
-load-bearing. ``readiness`` wraps only ``await db.execute(select(1))`` in its ``try``, so a
-provider that raised during dependency resolution would surface as a 500 through the handler
-of last resort instead of the deliberate 503 this suite is here to assert. The one place a
+load-bearing. :meth:`~app.services.health_service.HealthService.check_readiness` wraps only
+the repository's one statement in its ``try``, so a provider that raised during dependency
+resolution would surface as a 500 through the handler of last resort instead of the deliberate
+503 this suite is here to assert. The one place a
 raise-on-resolution provider *is* used is the liveness isolation test above, where reaching it
 at all is the failure being detected.
 
+``GET /readyz`` answers *inside a bounded window* when a statement does not return
+    A database that refuses a connection fails in milliseconds. A database that accepts one and
+    then takes far too long over a statement raises nothing until something bounds it, and a probe
+    with no deadline of its own answers long after the orchestrator that asked has given up - and
+    long after the classified failure record would still have been worth writing. The route's own
+    deadline is therefore asserted as the promise it is, against a substituted session whose
+    statement never completes. ``app.api.v1.routers.health.READINESS_TIMEOUT_SECONDS`` documents
+    the one transport failure no client-side deadline can shorten; that case is a property of the
+    driver's cancellation path rather than of this route, so it is documented there and not
+    simulated here.
+
+``GET /readyz`` answers 503 for a **database** failure and 500 for a defect in *this service*
+    The two are not the same event and must not produce the same answer. A 503 tells an
+    orchestrator to withhold traffic from a healthy process; a 500 with frames tells an engineer
+    a line of code is wrong. A handler that caught both alike reported its own bugs as
+    infrastructure outages, logged no traceback for them, and kept them out of 5xx alerting -
+    so both directions are asserted here.
+
 What is asserted, and what deliberately is not
 ----------------------------------------------
-Only status codes, response headers and response bodies - the wire. Nothing here inspects a
-handler, a service, a repository, a private attribute or a log record: every request goes
-through the in-process client, which is what makes these integration tests rather than unit
-tests of :mod:`app.api.v1.routers.health`. The one apparent exception is not one: the failure
-document is checked for the absence of a driver's topology and credential text, and that is an
-assertion about the response body, not about logging.
+Status codes, response headers and response bodies - the wire - for every claim the wire can
+carry. Nothing here inspects a handler, a service or a repository: every request goes through
+the in-process client, which is what makes these integration tests rather than unit tests of
+:mod:`app.api.v1.routers.health`.
+
+Two claims cannot be read off the wire, and both are read off the log instead, through the
+service's own configured handler pointed at a buffer:
+
+* **the classification** a readiness failure is filed under. The document is deliberately
+  identical for every cause, so the classification is the only place the reason survives - and
+  two of its members arrive as the *same* exception class, separated by nothing but a condition
+  code, which is precisely the kind of wiring that breaks silently.
+* **the traceback** a defect escaping to the handler of last resort carries. Answering 500 is
+  half of treating a bug as a bug; the frames are the half that makes it findable.
+
+One module constant is substituted, in the timeout cases only:
+``READINESS_TIMEOUT_SECONDS`` is patched down from five seconds to fifty milliseconds so a
+blocking gate does not pay five seconds per case to prove a deadline binds. The production value
+is asserted directly, and against the lower-layer bounds it has to sit beneath, by a test that
+patches nothing.
+
+:class:`TestApiTierLayering` is a deliberate departure from that rule, and it exists because the
+wire cannot express the property it asserts. Readiness answered 200 and 503 identically before and
+after the statement was moved out of the route and behind
+:class:`~app.services.health_service.HealthService`, so every behavioural test in this file passed
+against the layering violation a review found here. A behavioural suite cannot tell a delegating
+handler from a querying one; only the source can, so that class reads it.
 
 Two further contracts are asserted here because nothing else enforces them:
 
@@ -81,8 +121,14 @@ dependent on anything outside the fixtures it declares.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+import ast
+import asyncio
+import io
+import json
+from collections.abc import AsyncIterator, Callable, Iterator
 from http import HTTPStatus
+from pathlib import Path
+from time import perf_counter
 from typing import Any, Final, NoReturn
 
 import pytest
@@ -95,7 +141,12 @@ from sqlalchemy.exc import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.api
 from app.api.v1.router import API_V1_PREFIX
+from app.api.v1.routers import health
+from app.core.logging import configure_logging
+from app.db.session import STATEMENT_TIMEOUT_SECONDS, TCP_KEEPALIVE_ARGS
+from app.services import health_service
 
 # ---------------------------------------------------------------------------------------
 # The two paths under test
@@ -183,6 +234,18 @@ SERVICE_UNAVAILABLE_TITLE: Final[str] = "Service Unavailable"
 """``title`` of the readiness failure document."""
 
 SERVICE_UNAVAILABLE_DETAIL: Final[str] = "The service is not ready to accept traffic."
+
+INTERNAL_TYPE: Final[str] = "/errors/internal-server-error"
+"""``type`` of the 500 document, which a defect inside the readiness handler must produce instead of
+the 503 - the whole distinction :class:`TestReadinessDefects` exists to hold. Restated rather than
+imported for the same reason as the two above: ``app.core.exceptions`` holds these privately, and a
+published contract asserted against its own source proves nothing about what a client sees."""
+
+INTERNAL_TITLE: Final[str] = "Internal Server Error"
+"""``title`` of the 500 document."""
+
+INTERNAL_DETAIL: Final[str] = "An unexpected error occurred."
+"""``detail`` of the 500 document. Fixed, like every other detail this API publishes."""
 """``detail`` of the readiness failure document: a fixed sentence stating the verdict, never
 the caught exception's message. Asserted as an equality rather than a pattern, because the
 whole point is that two readiness failures with two different causes read identically."""
@@ -192,7 +255,7 @@ whole point is that two readiness failures with two different causes read identi
 # Disclosure markers
 #
 # A real driver's connection failure names the host, the port, the database and the user it
-# tried - `psycopg` renders exactly that - and `app.api.v1.routers.health` and
+# tried - `psycopg` renders exactly that - and `app.services.health_service` and
 # `app.core.exceptions` both call out passing it through as a topology and credential
 # disclosure on an UNAUTHENTICATED endpoint. That guarantee is asserted here by planting
 # distinctive markers in the substituted failure's message and then searching the whole
@@ -246,29 +309,102 @@ _FAILURE_MESSAGE: Final[str] = (
 
 
 READINESS_STATEMENT: Final[str] = "SELECT 1"
-"""The statement ``readiness`` issues, restated so the substituted failures name it too.
+"""The statement readiness issues, restated so the substituted failures name it too.
 
-Not imported from anywhere: the route builds it as ``select(1)``, which has no textual form to
-share. It appears here only inside a fabricated exception, so the two never need to agree - what
-matters is that a failure carries a statement at all, because a real one does and it is one more
+Not imported from anywhere: :meth:`~app.repositories.health_repository.HealthRepository.ping`
+builds it as ``select(1)``, which has no textual form to share. It appears here only inside a
+fabricated exception, so the two never need to agree - what matters is that a failure carries a
+statement at all, because a real one does and it is one more
 thing that must not reach the response.
 """
 
 SQLSTATE_INVALID_PASSWORD: Final[str] = "28P01"
 """A SQLSTATE a rejected credential produces. Carried on a substituted driver exception so the
-route's SQLSTATE extraction is exercised. A condition code names a *condition*, never a host, a
-credential or a row, which is why ``app.api.v1.routers.health`` treats it as safe to log while
-treating the message it arrived with as unsafe to publish."""
+service's SQLSTATE extraction is exercised. A condition code names a *condition*, never a host, a
+credential or a row, which is why ``app.services.health_service`` treats it as safe to log
+while treating the message it arrived with as unsafe to publish."""
 
 SQLSTATE_TOO_MANY_CONNECTIONS: Final[str] = "53300"
 """A SQLSTATE an exhausted server produces. Present for the same reason as the one above."""
+
+SQLSTATE_QUERY_CANCELED: Final[str] = "57014"
+"""PostgreSQL's ``query_canceled``, which is how a server-side ``statement_timeout`` reports itself.
+
+Restated rather than imported: ``app.api.v1.routers.health`` holds it as a private constant, and
+sharing one with the code under test would make the assertion circular. This is the code the
+*server* publishes, so a test that spells it out is testing that the route recognises the database's
+vocabulary rather than its own.
+
+It arrives wrapped in an :class:`~sqlalchemy.exc.OperationalError`, which is the class the route
+otherwise files as ``connection_failure`` - so this code is the only thing separating "the
+connection failed" from "the connection was fine and the statement was killed", and those have
+different remedies.
+"""
+
+_SILENCE_SECONDS: Final[float] = 30.0
+"""How long :class:`SilentDatabaseSession` sleeps for: long enough that only a deadline can end it.
+
+Three orders of magnitude above the deadline these tests install, so the pass is unambiguous - a
+test that finishes quickly finished because the timeout fired, not because the sleep elapsed. It is
+never actually waited out: ``asyncio.timeout`` cancels the sleep, so no test in this module costs
+anything near this.
+"""
+
+_TEST_DEADLINE_SECONDS: Final[float] = 0.05
+"""The deadline the timeout tests substitute for the route's real five seconds.
+
+Fifty milliseconds because these tests must prove *that* the deadline binds, not *what* it is set
+to - and a suite that waited the production value on every timeout case would add five seconds per
+test to a blocking gate. The production value is asserted directly, and against the lower-layer
+bounds it has to sit under, by
+:meth:`TestReadinessDeadline.test_the_deadline_sits_below_every_lower_layer_bound`; nothing else in
+this module reads or depends on it.
+"""
+
+_ELAPSED_CEILING_SECONDS: Final[float] = 2.0
+"""The wall-clock ceiling a timed readiness request must come in under.
+
+Forty times the substituted deadline and far below :data:`_SILENCE_SECONDS`, so it separates the
+two outcomes without being sensitive to scheduling on a loaded machine. Strictly below the
+*production* deadline as well - not equal to it - so this assertion fails rather than passing by a
+scheduling margin if a future edit ever drops the substitution and lets the real value apply.
+"""
+
+_DEFECT_MESSAGE: Final[str] = "MARKER-READINESS-DEFECT: attribute does not exist"
+"""Message of the fabricated programming defect, distinctive so the logged frames can be searched.
+
+Not a disclosure marker: it is planted precisely so a test can prove it *did* reach the log, which
+is the opposite of every other marker in this module.
+"""
+
+READINESS_FAILURE_EVENT: Final[str] = "readiness_probe_failed"
+"""Event name ``app.api.v1.routers.health`` writes its classified failure record under.
+
+Restated rather than imported, for the same reason as the SQLSTATE above: the route holds it
+privately, and it is documented as stable so that alerts can be built on it - which makes it fair
+game for one test to assert on, and worth asserting precisely because an alert would break silently
+if it changed.
+"""
+
+UNHANDLED_EVENT: Final[str] = "unhandled_exception_response"
+"""Event name ``app.core.exceptions`` writes when it renders a 500.
+
+Asserted here because the readiness route deliberately routes a defect *to* that handler rather than
+absorbing it, so the event is the evidence that the escape happened."""
+
+LOG_FIELD_FAILURE_CLASS: Final[str] = "failure_class"
+"""Field carrying the classification on the readiness failure record."""
+
+LOG_FIELD_SQLSTATE: Final[str] = "sqlstate"
+"""Field carrying the driver's condition code on the readiness failure record."""
 
 
 class DriverFailureError(Exception):
     """Stand-in for the driver exception SQLAlchemy exposes as ``DBAPIError.orig``.
 
     Real drivers wrap a lower-level failure and publish a SQLSTATE alongside it - psycopg 3
-    exposes the code as ``sqlstate`` - and ``app.api.v1.routers.health`` reads both the wrapped
+    exposes the code as ``sqlstate`` - and
+    :func:`~app.services.health_service.readiness_failure_fields` reads both the wrapped
     exception's class name and that attribute when it classifies a readiness failure. A purpose
     built double is used rather than a bare :class:`Exception` so those two reads are exercised
     rather than skipped, and so the attribute can be omitted on the shapes where a real driver
@@ -301,6 +437,27 @@ def build_pool_timeout() -> PoolTimeoutError:
         The exception, carrying every disclosure marker in its message.
     """
     return PoolTimeoutError(_FAILURE_MESSAGE)
+
+
+def build_query_timeout() -> TimeoutError:
+    """Build the failure this route's own deadline produces.
+
+    Classified ``query_timeout``, and the shape a database that accepted the connection and then
+    answered nothing arrives as: ``asyncio.timeout`` raises the builtin :class:`TimeoutError` at
+    :data:`~app.api.v1.routers.health.READINESS_TIMEOUT_SECONDS`, cancelling the statement in
+    flight.
+
+    A builtin rather than a SQLAlchemy exception on purpose - that is genuinely what the deadline
+    raises - and it matters twice over. It is an :class:`OSError` subclass, so the route's narrowed
+    ``except`` catches it without ``Exception`` being caught; and it is the one shape that makes the
+    route invalidate the connection instead of returning it to the pool, which
+    :class:`TestReadinessDeadline` asserts separately.
+
+    Returns:
+        The exception, carrying every disclosure marker in its message so the parametrised
+        document test holds for this branch too.
+    """
+    return TimeoutError(_FAILURE_MESSAGE)
 
 
 def build_connection_failure() -> OperationalError:
@@ -375,24 +532,33 @@ def build_unexpected_failure() -> OSError:
 
 FAILURE_BUILDERS: Final[tuple[Callable[[], Exception], ...]] = (
     build_pool_timeout,
+    build_query_timeout,
     build_connection_failure,
     build_driver_interface_failure,
     build_database_error,
     build_unexpected_failure,
 )
-"""One builder per classification ``app.api.v1.routers.health`` publishes, in the order it tests
-them.
+"""One builder per classification ``app.services.health_service`` publishes, in the order it
+tests them.
 
-Five, and the set is exhaustive rather than illustrative: it is exactly the
+Six, and the set is exhaustive rather than illustrative: it is exactly the
 ``ReadinessFailureClass`` vocabulary the route declares, so a classification added there without a
 case added here leaves a branch of the failure path unexercised. Every builder plants the *same*
 message, so the only thing varying between parametrised cases is the exception class - which is
-the variable under test. Parametrising over all five is what turns "the document is fixed" from a
+the variable under test. Parametrising over all six is what turns "the document is fixed" from a
 claim about one code path into a claim about the contract.
+
+One classification is reachable two ways and appears once here: ``query_timeout`` is produced by
+this route's own deadline *and* by the server cancelling under ``app.db.session``'s
+``statement_timeout``. The builder covers the first;
+:meth:`TestReadinessFailureClassification.test_a_server_side_cancellation_is_a_query_timeout`
+covers the second, because the two arrive as different exception classes and only one of them is
+a deadline.
 """
 
 FAILURE_BUILDER_IDS: Final[tuple[str, ...]] = (
     "pool_timeout",
+    "query_timeout",
     "connection_failure",
     "driver_interface_failure",
     "database_error",
@@ -430,11 +596,15 @@ class UnreachableDatabaseSession:
     instantly and identically everywhere.
 
     The failure happens at :meth:`execute` and nowhere earlier, which is what makes the 503
-    reachable: ``readiness`` wraps only its ``execute`` call in a ``try``, so an object that
-    failed while being yielded would fail during dependency resolution and be reported as a 500.
+    reachable: the readiness service wraps only the one repository call in a ``try``, so an
+    object that failed while being yielded would fail during dependency resolution and be
+    reported as a 500 instead.
 
     ``close`` and ``rollback`` are present and inert because a caller unwinding from the failure
-    may reasonably invoke either.
+    may reasonably invoke either. ``invalidate`` is present for a sharper reason: the route
+    invalidates the connection on its deadline path, so a double without the method would turn that
+    503 into a 500 through an ``AttributeError`` - and it records the call, which is how
+    :class:`TestReadinessDeadline` asserts the discard happened at all.
     """
 
     def __init__(self, failure: Exception) -> None:
@@ -445,6 +615,7 @@ class UnreachableDatabaseSession:
                 :data:`FAILURE_BUILDERS`, so no exception instance is ever raised twice.
         """
         self._failure = failure
+        self.invalidated = False
 
     async def execute(self, *args: Any, **kwargs: Any) -> NoReturn:
         """Raise instead of executing, whatever statement was passed.
@@ -458,6 +629,124 @@ class UnreachableDatabaseSession:
         """
         del args, kwargs
         raise self._failure
+
+    async def close(self) -> None:
+        """Accept a close, having nothing to close."""
+
+    async def rollback(self) -> None:
+        """Accept a rollback, having nothing to roll back."""
+
+    async def invalidate(self) -> None:
+        """Record that the connection was discarded rather than returned to the pool."""
+        self.invalidated = True
+
+
+class SilentDatabaseSession:
+    """Session-shaped double whose statement never completes, standing in for a silent peer.
+
+    The failure mode ``READINESS_TIMEOUT_SECONDS`` exists for, and the one no exception can
+    simulate: the database accepted the connection and then stopped answering, so nothing is raised
+    and nothing returns. Before the deadline, a request to ``/readyz`` waited on this for as long as
+    the kernel's keepalive budget allowed - roughly twenty-five seconds under
+    ``app.db.session``'s settings - which is long past the point an orchestrator has given up and
+    long past the point the classified failure record would still have been useful.
+
+    The sleep is deliberately far longer than any deadline a test sets, so a test that passes can
+    only have passed because the deadline fired. Cancellation is what ends it: ``asyncio.timeout``
+    cancels the awaited operation, and :meth:`execute` therefore never runs to completion in any
+    test in this module.
+    """
+
+    def __init__(self, seconds: float = _SILENCE_SECONDS) -> None:
+        """Store how long a statement will appear to hang for.
+
+        Args:
+            seconds: Duration of the sleep. Defaults to :data:`_SILENCE_SECONDS`, which is orders
+                of magnitude above the deadlines these tests set.
+        """
+        self._seconds = seconds
+        self.invalidated = False
+
+    async def execute(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Sleep past any deadline instead of executing.
+
+        Args:
+            *args: Ignored - the statement never runs.
+            **kwargs: Ignored, for the same reason.
+
+        Raises:
+            AssertionError: If the sleep ever completes, which means no deadline cancelled it.
+        """
+        del args, kwargs
+        await asyncio.sleep(self._seconds)
+        raise AssertionError(
+            f"the substituted statement slept {self._seconds}s to completion, so no deadline "
+            f"cancelled it"
+        )
+
+    async def close(self) -> None:
+        """Accept a close, having nothing to close."""
+
+    async def rollback(self) -> None:
+        """Accept a rollback, having nothing to roll back."""
+
+    async def invalidate(self) -> None:
+        """Record that the connection was discarded rather than returned to the pool."""
+        self.invalidated = True
+
+
+class UninvalidatableDatabaseSession(SilentDatabaseSession):
+    """A silent session whose connection cannot even be discarded.
+
+    The pathological corner of the deadline path: the statement is cancelled, the route tries to
+    invalidate the connection so a broken one is not pooled, and *that* fails too - which is
+    entirely possible, because a connection whose socket has already gone will refuse to close
+    cleanly. The route guards the invalidation for exactly this reason, and this double is how the
+    guard is exercised: without it, a failure to discard would turn a correct 503 into a 500 and an
+    orchestrator would restart a process whose only problem was an unreachable database.
+    """
+
+    async def invalidate(self) -> NoReturn:
+        """Fail the discard the way a connection with a dead socket does.
+
+        Raises:
+            OperationalError: Always. A SQLAlchemy error rather than an arbitrary one, because that
+                is what the route's ``suppress`` names and what a real failed discard raises.
+        """
+        raise OperationalError(READINESS_STATEMENT, {}, DriverFailureError(_FAILURE_MESSAGE))
+
+
+class DefectiveDatabaseSession:
+    """Session-shaped double that raises a programming defect rather than a database failure.
+
+    The subject of the narrowed ``except``. An :class:`AttributeError` is what a refactor produces -
+    a renamed method, a mistyped attribute - and it is emphatically not a database outage. Answering
+    503 for it reported a defect in this service as an infrastructure problem, wrote no traceback,
+    kept it out of 5xx alerting and had an orchestrator withdraw traffic from an instance that was
+    working. It must reach the handler of last resort instead.
+    """
+
+    def __init__(self, message: str = _DEFECT_MESSAGE) -> None:
+        """Store the defect's message.
+
+        Args:
+            message: Text of the raised :class:`AttributeError`. Distinctive by default, so the
+                logged frames can be searched for it.
+        """
+        self._message = message
+
+    async def execute(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Raise a defect instead of executing.
+
+        Args:
+            *args: Ignored - the statement never runs.
+            **kwargs: Ignored, for the same reason.
+
+        Raises:
+            AttributeError: Always.
+        """
+        del args, kwargs
+        raise AttributeError(self._message)
 
     async def close(self) -> None:
         """Accept a close, having nothing to close."""
@@ -494,6 +783,56 @@ async def refuse_to_provide_a_session() -> NoReturn:
 
 
 # ---------------------------------------------------------------------------------------
+# The log sink
+#
+# Two of this module's claims are invisible on the wire, so they are read off the one place they
+# exist: the classification a readiness failure is filed under, and the traceback a defect escaping
+# to the handler of last resort carries. Both are asserted through the service's own configured
+# handler rather than by patching a logger, so what a test reads is exactly the bytes a collector
+# would have received.
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def captured_log_stream() -> Iterator[io.StringIO]:
+    """Point the service's single log handler at a buffer, and put it back afterwards.
+
+    ``configure_logging`` replaces the root handler rather than adding one, so this leaves exactly
+    one handler writing to the buffer and exactly one line per record - and calling it again with no
+    argument in the teardown restores the process configuration whether the test passed, failed or
+    was interrupted.
+
+    Nothing about the settings object is touched. The suite runs as ``ENVIRONMENT=test``, which
+    selects the JSON chain, so the buffer receives one parsable object per line; and at
+    ``LOG_LEVEL=WARNING``, which is below the ``error`` both records under test are written at.
+
+    Yields:
+        The buffer, holding exactly the bytes a log collector would have received.
+    """
+    buffer = io.StringIO()
+    configure_logging(stream=buffer)
+    try:
+        yield buffer
+    finally:
+        configure_logging()
+
+
+def records_named(stream: io.StringIO, event: str) -> list[dict[str, Any]]:
+    """Return every captured record whose ``event`` is *event*, in the order written.
+
+    Args:
+        stream: The buffer :func:`captured_log_stream` filled.
+        event: Event name to select on.
+
+    Returns:
+        The matching records, parsed. Empty when none was written, which every caller asserts
+        against rather than indexing blindly.
+    """
+    parsed = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+    return [record for record in parsed if record.get("event") == event]
+
+
+# ---------------------------------------------------------------------------------------
 # Assertion helpers
 #
 # They exist so that every response in this module is held to the SAME checks. A test that
@@ -519,7 +858,10 @@ def media_type_of(response: Response) -> str:
     Returns:
         The media type, lower-cased by the server and stripped of surrounding whitespace.
     """
-    return response.headers.get("content-type", "").split(";")[0].strip()
+    # `str(...)` because httpx annotates `Headers.get` as returning `Any`, so without it the
+    # declared `str` here would be a claim nothing checks - and this helper's whole job is to hand
+    # every caller a value they can compare as a string.
+    return str(response.headers.get("content-type", "")).split(";")[0].strip()
 
 
 def assert_success_document(response: Response, expected_body: dict[str, object]) -> None:
@@ -792,3 +1134,442 @@ class TestHealthSeparation:
 
         # And liveness, which was never affected in either direction, still answers.
         assert_success_document(await client.get(LIVENESS_PATH), LIVENESS_BODY)
+
+
+class TestReadinessDeadline:
+    """``/readyz`` answers inside a bounded window even when the database answers not at all.
+
+    The failure mode no exception simulates. A refused connection fails in milliseconds and was
+    always reported correctly; a statement that does not come back raises nothing and returns
+    nothing, and before this deadline existed the request had no bound of its own at all - the
+    server-side ceiling ends the statement at ten seconds and the keepalive budget ends an
+    unreachable host at about twenty-five, both of them well past the point an orchestrator times a
+    readiness probe out in single digits. Every one of those requests was abandoned by its caller
+    before it answered, and the classified failure record the route writes beside the 503 was never
+    written at all: the reason for the outage was lost precisely when it was needed.
+
+    The deadline these tests exercise is the route's own promise about its worst case, so it is
+    asserted as one: the answer arrives, it is the ordinary 503 document, and the connection the
+    cancelled statement left in an indeterminate state is discarded rather than pooled.
+    """
+
+    def _silence(
+        self,
+        override_get_db: SessionProviderInstaller,
+        monkeypatch: pytest.MonkeyPatch,
+        session: SilentDatabaseSession,
+    ) -> None:
+        """Install *session* under ``get_db`` and shorten the route's deadline for one test.
+
+        The deadline is substituted rather than waited out. ``READINESS_TIMEOUT_SECONDS`` is a
+        public module constant read at call time by
+        :meth:`~app.services.health_service.HealthService.readiness`, so patching it *there*
+        changes the bound this request is held to and nothing else, and ``monkeypatch`` restores it
+        however the test ends. It is patched on the service rather than on
+        ``app.api.v1.routers.health``, which only re-exports the name for callers that read it:
+        the router owns the response, the service owns the deadline, and a patch has to reach the
+        module that applies the value. Waiting the real five seconds would prove the same thing
+        five seconds more slowly, per case, in a gate that has to stay fast enough to block a
+        merge.
+
+        Args:
+            override_get_db: The installer from ``backend/tests/conftest.py``, which restores the
+                previous provider in its own teardown.
+            monkeypatch: pytest's patcher, so the constant is put back automatically.
+            session: The silent double to serve this request with.
+        """
+
+        async def silent_database() -> AsyncIterator[SilentDatabaseSession]:
+            yield session
+
+        monkeypatch.setattr(health_service, "READINESS_TIMEOUT_SECONDS", _TEST_DEADLINE_SECONDS)
+        override_get_db(silent_database)
+
+    async def test_readyz_answers_503_when_the_database_never_answers(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AAP §0.9.4.4: a silent database is an unready instance, and it is one *promptly*."""
+        session = SilentDatabaseSession()
+        self._silence(override_get_db, monkeypatch, session)
+
+        started = perf_counter()
+        response = await client.get(READINESS_PATH)
+        elapsed = perf_counter() - started
+
+        # The document first: a deadline must produce the SAME 503 as every other cause, or the
+        # wire would start distinguishing failures the contract says are indistinguishable.
+        assert_readiness_failure(response)
+
+        # Then the bound, which is the whole point of the finding this closes. The substituted
+        # statement sleeps for `_SILENCE_SECONDS`, so an answer inside this ceiling can only mean
+        # the deadline cancelled it - and the ceiling is below the production deadline too, so this
+        # assertion also fails if the substitution above ever stops taking effect.
+        assert elapsed < _ELAPSED_CEILING_SECONDS, (
+            f"{READINESS_PATH} took {elapsed:.3f}s against a database that never answers; the "
+            f"deadline did not bind"
+        )
+
+    async def test_readyz_discards_the_connection_its_deadline_cancelled(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cancelled statement leaves a connection nobody else may be given."""
+        session = SilentDatabaseSession()
+        self._silence(override_get_db, monkeypatch, session)
+
+        assert_readiness_failure(await client.get(READINESS_PATH))
+
+        # Cancelling mid-statement leaves the connection's protocol state indeterminate: the
+        # server may still be writing a result nobody will read. Returning it to the pool would
+        # hand the next caller a connection that fails on a statement of its own, turning one
+        # readiness timeout into a cascade of unrelated 500s. Invalidation discards it instead and
+        # the pool opens a fresh one on the next checkout.
+        assert session.invalidated, "the cancelled connection was returned to the pool"
+
+    async def test_readyz_still_answers_503_when_the_discard_itself_fails(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The clean-up may not change the verdict it is cleaning up after."""
+        # A connection whose socket has already gone can refuse to close, so the invalidation is
+        # guarded. Unguarded, this exact sequence - deadline, failed discard - would have answered
+        # 500 and had an orchestrator restart a healthy process because a *database* was silent.
+        self._silence(override_get_db, monkeypatch, UninvalidatableDatabaseSession())
+
+        assert_readiness_failure(await client.get(READINESS_PATH))
+
+    def test_the_deadline_sits_below_every_lower_layer_bound(self) -> None:
+        """The route's promise is only a promise if it is the first bound to fire."""
+        deadline = health.READINESS_TIMEOUT_SECONDS
+        assert deadline > 0
+
+        # Below the server-side ceiling, or PostgreSQL would cancel the statement first and this
+        # route's own bound would be decoration.
+        assert deadline <= STATEMENT_TIMEOUT_SECONDS
+
+        # And below the kernel's worst case for a connection whose peer went silent, which is the
+        # bound that used to govern this route: idle time plus every probe interval. A deadline at
+        # or above that number would answer no sooner than doing nothing did.
+        keepalive_worst_case = int(TCP_KEEPALIVE_ARGS["keepalives_idle"]) + int(
+            TCP_KEEPALIVE_ARGS["keepalives_interval"]
+        ) * int(TCP_KEEPALIVE_ARGS["keepalives_count"])
+        assert deadline < keepalive_worst_case
+
+
+class TestReadinessFailureClassification:
+    """The one field that says *why*, read off the record the route writes beside its 503.
+
+    The wire is deliberately uniform - every cause produces the same document, and every other
+    test here asserts that - so the classification is the only place a readiness failure's reason
+    survives at all. Two members of the vocabulary are worth asserting directly because they are
+    reachable through the same exception class and are told apart by nothing but a condition code:
+    a connection that failed and a statement the server killed have different remedies, and filing
+    one as the other sends an operator to the wrong system.
+    """
+
+    def _classification_of(self, stream: io.StringIO) -> dict[str, Any]:
+        """Return the single classified failure record the last request wrote.
+
+        Args:
+            stream: The buffer :func:`captured_log_stream` filled.
+
+        Returns:
+            The record. Asserted to exist, and asserted to be the only one, because "exactly one
+            line is logged here" is itself part of this route's documented behaviour - a second
+            record would mean a caught failure was logged twice.
+        """
+        records = records_named(stream, READINESS_FAILURE_EVENT)
+        assert len(records) == 1, (
+            f"expected exactly one {READINESS_FAILURE_EVENT!r} record, got "
+            f"{len(records)}:\n{stream.getvalue()}"
+        )
+        return records[0]
+
+    async def test_a_deadline_is_a_query_timeout(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+        monkeypatch: pytest.MonkeyPatch,
+        captured_log_stream: io.StringIO,
+    ) -> None:
+        """The route's own deadline is reported as a deadline, not as an unknown failure."""
+
+        async def silent_database() -> AsyncIterator[SilentDatabaseSession]:
+            yield SilentDatabaseSession()
+
+        monkeypatch.setattr(health_service, "READINESS_TIMEOUT_SECONDS", _TEST_DEADLINE_SECONDS)
+        override_get_db(silent_database)
+
+        assert_readiness_failure(await client.get(READINESS_PATH))
+
+        record = self._classification_of(captured_log_stream)
+        assert record[LOG_FIELD_FAILURE_CLASS] == "query_timeout"
+        # The builtin, which `asyncio.timeout` raises and which is an `OSError` subclass - the
+        # reason the route's narrowed `except` catches it without catching `Exception`.
+        assert record["exception_type"] == "TimeoutError"
+
+    async def test_a_server_side_cancellation_is_a_query_timeout(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+        captured_log_stream: io.StringIO,
+    ) -> None:
+        """``57014`` is a killed statement, and must not be filed as a failed connection."""
+        # The second route to `query_timeout`, and the one a real deployment hits: the statement
+        # exceeded `app.db.session`'s server-side `statement_timeout`, so PostgreSQL cancelled it
+        # and psycopg reported `query_canceled`. SQLAlchemy wraps that in an `OperationalError` -
+        # the same class a refused connection arrives as - so without the condition code the two
+        # are indistinguishable, and an operator would go looking at a connection that was fine.
+        failure = OperationalError(
+            READINESS_STATEMENT,
+            {},
+            DriverFailureError(_FAILURE_MESSAGE, SQLSTATE_QUERY_CANCELED),
+        )
+
+        async def cancelled_database() -> AsyncIterator[UnreachableDatabaseSession]:
+            yield UnreachableDatabaseSession(failure)
+
+        override_get_db(cancelled_database)
+
+        assert_readiness_failure(await client.get(READINESS_PATH))
+
+        record = self._classification_of(captured_log_stream)
+        assert record[LOG_FIELD_FAILURE_CLASS] == "query_timeout"
+        assert record[LOG_FIELD_SQLSTATE] == SQLSTATE_QUERY_CANCELED
+
+    async def test_a_refused_connection_is_still_a_connection_failure(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+        captured_log_stream: io.StringIO,
+    ) -> None:
+        """The guard on the branch above: an ``OperationalError`` is not timed out by default."""
+        # Same exception class as the previous test, different condition code, and the
+        # classification must differ accordingly. Written as its own case because the two branches
+        # are ordered - the code is checked before the class - and an ordering mistake would make
+        # every operational failure look like a timeout, which is exactly as unhelpful as the
+        # reverse.
+
+        async def refused_database() -> AsyncIterator[UnreachableDatabaseSession]:
+            yield UnreachableDatabaseSession(build_connection_failure())
+
+        override_get_db(refused_database)
+
+        assert_readiness_failure(await client.get(READINESS_PATH))
+
+        record = self._classification_of(captured_log_stream)
+        assert record[LOG_FIELD_FAILURE_CLASS] == "connection_failure"
+        assert record[LOG_FIELD_SQLSTATE] == SQLSTATE_INVALID_PASSWORD
+
+    async def test_the_failure_record_carries_no_driver_text(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+        captured_log_stream: io.StringIO,
+    ) -> None:
+        """Not on the wire and not in the log either: this record is built from types alone."""
+        # The response is proven clean for every failure shape elsewhere in this module. The log is
+        # the other sink, and it is where a driver's message would most plausibly be tolerated -
+        # an operator reading it is authorised. It is still withheld here, because the record is
+        # assembled from the exception's class, the wrapped driver's class and the condition code,
+        # and never from a message: a fixed field set cannot leak a credential the way a formatted
+        # string can. Where the cause legitimately does survive, redacted, is the 500 path, which
+        # `TestReadinessDefects` asserts.
+        failure = build_connection_failure()
+
+        async def refused_database() -> AsyncIterator[UnreachableDatabaseSession]:
+            yield UnreachableDatabaseSession(failure)
+
+        override_get_db(refused_database)
+        assert_readiness_failure(await client.get(READINESS_PATH))
+
+        record = self._classification_of(captured_log_stream)
+        rendered = json.dumps(record)
+        failure_text = str(failure)
+        for marker in DISCLOSURE_MARKERS:
+            assert marker in failure_text, (
+                f"{marker!r} is no longer planted in the substituted failure, so its absence "
+                f"from the record proves nothing:\n{failure_text}"
+            )
+            assert marker not in rendered, f"{marker!r} reached the failure record:\n{rendered}"
+
+        # No frames either: the route logs with `error` rather than `exception` precisely so a
+        # traceback - which would carry the driver's text in a frame - is not attached.
+        assert "exception" not in record
+
+
+class TestReadinessDefects:
+    """A defect in this service is a 500 with frames, not a 503 with a classification.
+
+    The distinction the narrowed ``except`` exists to make. ``SQLAlchemyError`` and ``OSError``
+    describe the database and the transport to it; an :class:`AttributeError` from a refactor
+    describes this file. Catching both alike answered 503 for a working instance, wrote a bounded
+    record with no traceback, kept the failure out of 5xx alerting and had an orchestrator withdraw
+    traffic it should have kept sending - four consequences of one over-broad clause.
+    """
+
+    async def test_a_defect_in_the_route_is_a_500_not_a_503(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+    ) -> None:
+        """AAP §0.10.1 #4: the status names the provenance, and this one is the server's."""
+
+        async def defective_database() -> AsyncIterator[DefectiveDatabaseSession]:
+            yield DefectiveDatabaseSession()
+
+        override_get_db(defective_database)
+        response = await client.get(READINESS_PATH)
+
+        # The uniform problem document, at 500 rather than 503: same shape, same media type, same
+        # correlation, different status and different published type. A caller branching on `type`
+        # can therefore tell "this instance cannot reach its database" from "this instance is
+        # broken", which is the difference between waiting and paging somebody.
+        assert_problem_document(
+            response,
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            error_type=INTERNAL_TYPE,
+            title=INTERNAL_TITLE,
+            instance=READINESS_PATH,
+            detail=INTERNAL_DETAIL,
+        )
+
+    async def test_a_defect_is_logged_with_frames_and_not_as_a_readiness_failure(
+        self,
+        client: AsyncClient,
+        override_get_db: SessionProviderInstaller,
+        captured_log_stream: io.StringIO,
+    ) -> None:
+        """Answering 500 is half of it; the traceback is what makes the defect findable."""
+
+        async def defective_database() -> AsyncIterator[DefectiveDatabaseSession]:
+            yield DefectiveDatabaseSession()
+
+        override_get_db(defective_database)
+        response = await client.get(READINESS_PATH)
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+
+        rendered = captured_log_stream.getvalue()
+
+        # Not classified as a readiness failure at all. A record here would mean the route had
+        # caught the defect, and everything above about the status would be accidental.
+        assert not records_named(captured_log_stream, READINESS_FAILURE_EVENT), (
+            f"a defect was filed as a readiness failure:\n{rendered}"
+        )
+
+        unhandled = records_named(captured_log_stream, UNHANDLED_EVENT)
+        assert unhandled, f"no {UNHANDLED_EVENT!r} record was written:\n{rendered}"
+
+        record = unhandled[-1]
+        assert record["exception_type"] == "AttributeError"
+        assert record["status_code"] == int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        assert record["path"] == READINESS_PATH
+        assert record["request_id"] == response.headers.get(REQUEST_ID_HEADER)
+
+        # The frames themselves, and the defect's own text inside them. `exception` is the key
+        # structlog's frame transformer writes, and it holds a list of structured frames rather
+        # than a formatted string - so it is searched as rendered JSON, which is what a collector
+        # receives. Its absence is precisely what made the old 503 unactionable.
+        frames = record.get("exception")
+        assert frames, f"the 500 was logged without frames:\n{rendered}"
+
+        rendered_frames = json.dumps(frames)
+        # The message points at what went wrong.
+        assert _DEFECT_MESSAGE in rendered_frames, (
+            f"the defect's message is not in the frames:\n{rendered_frames}"
+        )
+        # And the frames reach this route, which is what points at where. A traceback that stopped
+        # at the framework would say a request failed and not which handler.
+        assert "routers/health.py" in rendered_frames, (
+            f"the frames do not reach the readiness handler:\n{rendered_frames}"
+        )
+
+
+class TestApiTierLayering:
+    """The API tier composes no SQL, asserted from the source rather than from the wire.
+
+    AAP §0.2.3 is unconditional: "Layered separation is mandatory. Route handlers contain no
+    data-access logic. Handlers delegate to services, services delegate to repositories,
+    repositories own queries." Readiness is where that rule was broken - the route issued
+    ``SELECT 1`` itself and classified the driver's failure itself - and it is where the rule is
+    least self-enforcing, because a probe's whole job is to touch the database and one statement
+    always looks too small to be worth a layer.
+
+    Nothing about the response can detect the difference, which is exactly why this class reads the
+    modules instead. Two properties, checked over the whole package rather than only the file the
+    finding named, because the argument for an exemption is not specific to readiness and neither
+    is the guard against it.
+    """
+
+    @staticmethod
+    def _api_tier_sources() -> dict[str, str]:
+        """Read every module of the API tier.
+
+        Returns:
+            A mapping of dotted-ish module path to source text, covering the routers package, the
+            versioned aggregate and the shared response declarations - which together are every
+            file in the service that is allowed to speak HTTP.
+        """
+        api_root = Path(app.api.__file__).parent
+        return {
+            str(path.relative_to(api_root.parent)): path.read_text(encoding="utf-8")
+            for path in sorted(api_root.rglob("*.py"))
+        }
+
+    def test_no_api_tier_module_imports_the_sql_toolkit(self) -> None:
+        """A router cannot compose a statement if it cannot name one.
+
+        The strongest available form of the layering rule, and the cheapest to keep true: an
+        ``import`` is a structural fact rather than a style preference, so this fails the moment
+        anybody reaches for ``select``, ``text`` or a session type in the API tier - before the
+        statement it would have been used to build is ever written.
+
+        ``sqlalchemy.ext.asyncio`` is caught by the same check, which is deliberate. A handler that
+        annotated a parameter as an ``AsyncSession`` would be reaching past
+        ``app.core.dependencies.DbSession``, the one alias the tier is meant to know the session
+        by, and that alias is precisely what keeps the session opaque here.
+        """
+        offenders = {
+            module: [
+                line.strip()
+                for line in source.splitlines()
+                if line.startswith(("import sqlalchemy", "from sqlalchemy"))
+            ]
+            for module, source in self._api_tier_sources().items()
+        }
+        assert {module: lines for module, lines in offenders.items() if lines} == {}
+
+    def test_no_api_tier_module_executes_a_statement(self) -> None:
+        """No handler calls ``execute`` on anything, on any session, by any name.
+
+        The complement of the import check, and it catches what an import check cannot: a module
+        that reached ``session.execute(text("select 1"))`` through the injected session alone,
+        naming ``sqlalchemy`` never. Parsed rather than grepped, so a mention inside a docstring or
+        a comment - and this package's prose mentions ``execute`` in several places, describing
+        what the layer below it does - is not mistaken for a call.
+
+        ``scalar``, ``scalars`` and ``stream`` are checked beside it because each is another way to
+        run a statement on a session, and an exemption argued for one would be argued for all four.
+        """
+        forbidden = {"execute", "scalar", "scalars", "stream"}
+        offenders: dict[str, list[str]] = {}
+        for module, source in self._api_tier_sources().items():
+            called = sorted(
+                {
+                    node.func.attr
+                    for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in forbidden
+                }
+            )
+            if called:
+                offenders[module] = called
+        assert offenders == {}

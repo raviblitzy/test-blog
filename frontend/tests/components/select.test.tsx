@@ -117,6 +117,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+// The wire contract, imported for ONE thing: the `PostStatus` union that types the status fixtures
+// below. Nothing else is taken from it - this is a design-system primitive's spec, and every other
+// value it asserts on is a fixture declared in this file.
+import type { PostStatus } from '@/lib/types';
 
 /* -------------------------------------------------------------------------------------------------
  * Fixtures
@@ -143,7 +147,13 @@ interface CategoryOption {
  * provably different strings.
  */
 interface StatusOption {
-  readonly literal: string;
+  /**
+   * The value the API stores and accepts, in the wire's own case.
+   *
+   * Typed as the real `PostStatus` union rather than as `string`, so a lowercase or invented spelling
+   * is a compile error in this file rather than a fixture that quietly disagrees with the service.
+   */
+  readonly literal: PostStatus;
   readonly name: string;
   readonly postCount: number;
 }
@@ -168,9 +178,22 @@ const CATEGORY_OPTIONS: readonly CategoryOption[] = [
   LAST_CATEGORY,
 ];
 
-const DRAFT_STATUS: StatusOption = { literal: 'draft', name: 'Draft', postCount: 4 };
-const PUBLISHED_STATUS: StatusOption = { literal: 'published', name: 'Published', postCount: 11 };
-const ARCHIVED_STATUS: StatusOption = { literal: 'archived', name: 'Archived', postCount: 2 };
+/*
+ * THE LITERALS ARE THE WIRE'S, IN THE WIRE'S CASE.
+ *
+ * `PostStatus` is `'DRAFT' | 'PUBLISHED' | 'ARCHIVED'`, mirroring the `post_status` enum PostgreSQL
+ * stores and the value every API surface sends and accepts - the feed's `status`, the admin listing's
+ * filter, and the body of `PATCH /api/v1/admin/posts/{id}/status`. Lowercase spellings were here
+ * before, and the difference is not cosmetic: this primitive hands `onValueChange` the option's value
+ * verbatim, so a picker built on `'draft'` produces a request the service refuses with a validation
+ * problem for an enum it does not recognise, and every case here would still pass.
+ *
+ * The `postCount` beside each label is this file's own decoration, not a wire field, and it exists so
+ * that an option's visible text and its accessible name are provably different strings.
+ */
+const DRAFT_STATUS: StatusOption = { literal: 'DRAFT', name: 'Draft', postCount: 4 };
+const PUBLISHED_STATUS: StatusOption = { literal: 'PUBLISHED', name: 'Published', postCount: 11 };
+const ARCHIVED_STATUS: StatusOption = { literal: 'ARCHIVED', name: 'Archived', postCount: 2 };
 
 /** The three lifecycle states a post moves through, in the order the workspace lists them. */
 const STATUS_OPTIONS: readonly StatusOption[] = [DRAFT_STATUS, PUBLISHED_STATUS, ARCHIVED_STATUS];
@@ -201,6 +224,17 @@ interface CategoryPickerProps {
 
   /** Forwarded to the root, which is the documented way to disable the whole control. */
   readonly disabled?: boolean;
+
+  /** Forwarded to the trigger. Mirrors itself into `aria-invalid` unless one is supplied. */
+  readonly invalid?: boolean;
+
+  /**
+   * Forwarded to the trigger verbatim, including a deliberate `false`.
+   *
+   * Typed as the three-state union the DOM attribute really is rather than as `boolean`, so a case can
+   * express "supplied as false" and "not supplied at all" as different inputs.
+   */
+  readonly ariaInvalid?: boolean;
 }
 
 /**
@@ -208,12 +242,18 @@ interface CategoryPickerProps {
  * bound by `htmlFor` to the trigger's `id`, a `SelectValue` carrying a placeholder, and one
  * `SelectItem` per category with plain text children so the wrapper supplies the `SelectItemText`.
  */
-function CategoryPicker({ value, onValueChange, disabled }: CategoryPickerProps): JSX.Element {
+function CategoryPicker({
+  value,
+  onValueChange,
+  disabled,
+  invalid,
+  ariaInvalid,
+}: CategoryPickerProps): JSX.Element {
   return (
     <>
       <Label htmlFor={CATEGORY_FIELD_ID}>{CATEGORY_FIELD_LABEL}</Label>
       <Select value={value} onValueChange={onValueChange} disabled={disabled}>
-        <SelectTrigger id={CATEGORY_FIELD_ID}>
+        <SelectTrigger aria-invalid={ariaInvalid} id={CATEGORY_FIELD_ID} invalid={invalid}>
           <SelectValue placeholder={CATEGORY_PLACEHOLDER} />
         </SelectTrigger>
         <SelectContent>
@@ -390,6 +430,41 @@ describe('Select', () => {
       // ...and the chevron itself is hidden from assistive technology, which is why. Exactly one
       // glyph: the field renders the chevron and nothing else.
       expectGlyphsHiddenFromAssistiveTech(trigger, 1);
+    });
+
+    it('carries no aria-invalid until the owning form says the field is wrong', () => {
+      render(<CategoryPicker />);
+
+      // ABSENT rather than `"false"`. Every picker in the product would otherwise announce a validity
+      // state it has not been given, which is noise in the accessibility tree that says nothing.
+      expect(screen.getByRole('combobox', { name: CATEGORY_FIELD_LABEL })).not.toHaveAttribute(
+        'aria-invalid',
+      );
+    });
+
+    it('mirrors `invalid` into aria-invalid so the state is programmatic, not only visual', () => {
+      render(<CategoryPicker invalid />);
+
+      // Colour is never the only signal: the prop supplies the border and halo AND this attribute, so
+      // a visitor who cannot distinguish the tone still learns the field is wrong. The owning form
+      // supplies the message; this primitive supplies the machine-readable half.
+      expect(screen.getByRole('combobox', { name: CATEGORY_FIELD_LABEL })).toHaveAttribute(
+        'aria-invalid',
+        'true',
+      );
+    });
+
+    it('lets an explicitly supplied aria-invalid win over `invalid`', () => {
+      render(<CategoryPicker ariaInvalid={false} invalid />);
+
+      // Resolved with `??` rather than `||`, so a form that computes the attribute itself keeps
+      // control - including the deliberate `false` that a truthy `invalid` would otherwise override.
+      // Byte-identical to `input.tsx`'s handling, which is what lets a form treat the two
+      // interchangeably.
+      expect(screen.getByRole('combobox', { name: CATEGORY_FIELD_LABEL })).toHaveAttribute(
+        'aria-invalid',
+        'false',
+      );
     });
 
     it('cannot be opened while the picker is disabled', () => {
