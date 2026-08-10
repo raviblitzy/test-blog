@@ -153,8 +153,8 @@ export function cn(...inputs: ClassValue[]): string {
  *
  * SOURCE CODE, NOT CONFIGURATION - and deliberately so.
  *
- * `.env.example` is this repository's enforced configuration contract and it declares fourteen
- * variables: eleven backend fields and three public `NEXT_PUBLIC_` values. Admitting a remote
+ * `.env.example` is this repository's enforced configuration contract and it declares fifteen
+ * variables: twelve backend fields and three public `NEXT_PUBLIC_` values. Admitting a remote
  * image host is not one of them, and making it one would be worse than verbose. `next.config.ts`
  * is evaluated once, when the application is built, so a host list supplied through the
  * environment could not be changed by the deployment that runs the image optimiser anyway - it

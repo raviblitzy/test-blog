@@ -260,19 +260,18 @@ class Category(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # uq_categories_name and the unique index ix_categories_slug - and those serve the lookups
     # that resolve a slug from a URL and detect a duplicate name on create.
     #
-    # The two declared here serve PATTERN matching over these columns, which an
-    # equality-oriented b-tree cannot answer:
+    # The one declared here serves the single PATTERN predicate in
+    # app.repositories.category_repository, which an equality-oriented b-tree cannot answer:
+    # slug de-duplication runs `slug LIKE 'base%'` before every category insert and rename.
+    # Anchoring the pattern means the query is not PREVENTED from using an index, but the default
+    # operator class over a citext column does not provide one, so it was a sequential scan
+    # regardless.
     #
-    #   slug family   slug de-duplication runs `slug LIKE 'base%'` before every category insert
-    #                 and rename - CategoryRepository.slugs_starting_with. Anchoring the pattern
-    #                 means the query is not PREVENTED from using an index, but the default
-    #                 operator class over a citext column does not provide one, so it was a
-    #                 sequential scan regardless.
-    #   containment   a `%term%` match against name or slug, which no b-tree can use at all. No
-    #                 route publishes one today - the AAP's surface gives this relation a single
-    #                 bare-array read and three mutations - and the index is declared here rather
-    #                 than deferred because it is the pair `gin_trgm_ops` needs on this table and
-    #                 the slug half of it is load-bearing for the family scan above.
+    # `name` deliberately carries NO trigram index. No query matches a pattern against it: the
+    # taxonomy has exactly one read, `GET /api/v1/categories`, which returns every term with its
+    # count and takes no search parameter, and equality lookups on `name` are already served by
+    # uq_categories_name. An unused GIN index is write amplification on every insert and rename
+    # for no read it can serve.
     #
     # `slug` is CITEXT, and gin_trgm_ops is defined over `text` while citext's own `~~`/`~~*`
     # operators are not in that operator family - so an index declared directly on it is accepted

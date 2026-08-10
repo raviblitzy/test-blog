@@ -115,6 +115,24 @@ operational consequence, and it is named separately because the remedy is differ
 connection that was refused needs the database brought back, a connection that answered
 nothing needs the network path or a saturated server looked at.
 
+That record is emitted for a **failure of the database**, and for nothing else. The handler
+catches ``SQLAlchemyError`` and ``OSError`` rather than ``Exception``, so an
+``AttributeError``, a ``TypeError`` or any other defect in this service's own code is never
+classified, never renamed as a dependency outage and never answered 503. It propagates instead,
+and ``app.core.exceptions`` answers it with the standard 500 problem document *and* logs it with
+``logger.exception``, so the frames that identify the defect survive - redacted, because
+``app.core.logging`` reduces addresses and strips credentials from the rendered traceback. The
+two outcomes are therefore distinguishable at a glance: a 503 on ``/readyz`` means the database
+could not serve a trivial statement, a 500 on ``/readyz`` means this file has a bug.
+
+One member of that classification vocabulary is not a fault at all. ``query_timeout`` is
+reported when the interaction outlived :data:`READINESS_TIMEOUT_SECONDS` - this route's own
+deadline, not a diagnosis - or when PostgreSQL cancelled the statement at the server-side
+ceiling ``app.db.session`` sets. It is logged like the others because it has the same
+operational consequence, and it is named separately because the remedy is different: a
+connection that was refused needs the database brought back, a connection that answered
+nothing needs the network path or a saturated server looked at.
+
 Governing standards
 -------------------
 ``review_rules`` reports that this project specifies no user rules, so none governs this

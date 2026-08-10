@@ -2771,6 +2771,17 @@ def register_exception_handlers(app: FastAPI) -> None:
     ``app.middleware.request_context`` would log the frames on its way out: one 500 and one
     traceback either way.
 
+    ``DataError``'s handler is the one that does not always answer. It renders a 400 only for a
+    failure it can prove the caller caused and **re-raises** everything else, which is what sends
+    a server-side data failure to the unhandled-500 owner with its traceback rather than filing it
+    as a client error. Starlette's exception middleware does not catch an exception raised by a
+    handler, so the re-raise leaves this dispatch site and is caught by the ``ExceptionMiddleware``
+    ``app.main`` registers as the innermost user middleware - the same site that renders every
+    other unanticipated failure, inside the CORS layer. Were that wrapper ever absent,
+    ``ServerErrorMiddleware`` and this module's outer registration would answer instead, and
+    ``app.middleware.request_context`` would log the frames on its way out: one 500 and one
+    traceback either way.
+
     Registration is by exception class throughout, never by status code. Starlette consults its
     integer status handlers *before* walking the MRO for an ``HTTPException``, so a status-keyed
     registration would quietly take precedence over a class-keyed one and split the contract.

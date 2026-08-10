@@ -87,6 +87,35 @@ through the template. Passing the finished ``ck_posts_published_at_required`` th
 what belong there - ``published_at_required`` and ``view_count_non_negative``, exactly as
 ``app/models/post.py`` declares them - and the convention supplies the ``ck_posts_`` prefix.
 
+Two spellings that are correctness requirements, not style
+----------------------------------------------------------
+Three of the B-tree indexes below - ``ix_users_created_at_id``, ``ix_posts_published_at_id`` and
+``ix_comments_created_at_id`` - exist so that the first page of each administrative management
+screen is an index scan that stops after twenty rows rather than a sort of the whole relation.
+Each is spelled with directions and null ordering written into the index, and both spellings are
+load-bearing.
+
+**``DESC`` belongs in the index.** A B-tree can be walked backwards, so an ascending index can
+satisfy a descending ``ORDER BY`` when it is the *only* ordering column. It stops working as soon
+as there are two columns and they are not both reversed - ``(created_at DESC, id DESC)`` is a
+backwards walk of ``(created_at ASC, id ASC)``, but ``(created_at DESC, id ASC)`` is neither, and
+would force a sort. Declaring both directions explicitly means the index order and the query order
+are the same order, and the planner needs no sort node.
+
+**``NULLS LAST`` belongs in the index on ``posts``.** A ``DESC`` index column places ``NULL``
+*first* by PostgreSQL's default, so an index declared plain ``published_at DESC`` cannot satisfy
+``ORDER BY published_at DESC NULLS LAST`` - the two orderings genuinely differ, and the planner
+resolves the mismatch with a full sort. A draft has no publication instant, so every surface that
+admits drafts must place ``NULL`` explicitly;
+``app.repositories.post_repository._recency_ordering`` emits ``NULLS LAST`` for exactly those
+surfaces and the plain form for the public feed, which is why ``posts`` needs both
+``ix_posts_published_at_id`` and ``ix_posts_status_published_at`` rather than one of them.
+
+No index here is built ``CONCURRENTLY``, and that is not an oversight: Alembic wraps a migration in
+a transaction and ``CREATE INDEX CONCURRENTLY`` cannot run inside one, so the flag would abort the
+upgrade rather than speed it up. Every build is ordinary and takes a brief ``ROW EXCLUSIVE`` lock
+on its table.
+
 Reversibility
 -------------
 ``downgrade()`` genuinely restores an empty database, in strict reverse dependency order:
@@ -243,6 +272,19 @@ def upgrade() -> None:
     )
     op.create_index("ix_users_email", "users", ["email"], unique=True)
     op.create_index("ix_users_username", "users", ["username"], unique=True)
+    # The administrative user table's default and only ordering. Both columns descending, so the
+    # index order IS the query order - see "Two spellings that are correctness requirements" in
+    # the module docstring for why a mixed-direction index would still force a sort. The two
+    # unique citext indexes above supply equality, and a unique index on an unrelated column
+    # supplies no ordering at all, so without this one every page of the user table sorted every
+    # account ever registered before applying LIMIT.
+    #
+    # `sa.text()` because a direction is part of an index definition rather than a column name.
+    op.create_index(
+        "ix_users_created_at_id",
+        "users",
+        [sa.text("created_at DESC"), sa.text("id DESC")],
+    )
 
     # --- refresh_tokens ------------------------------------------------------------------
     # Only a hash of each issued refresh token is stored, so a database disclosure yields no
@@ -385,6 +427,26 @@ def upgrade() -> None:
         ["status", sa.text("published_at DESC")],
     )
 
+    # The all-status recency ordering ix_posts_status_published_at cannot supply, because that
+    # index leads with the equality column `status`. The administrative post table is the one
+    # listing in the product with NO status predicate: it reads every lifecycle state in one
+    # window ordered `published_at DESC NULLS LAST, id DESC` globally, and a leading equality
+    # column cannot provide a global order. Enumerating all three enum values into an IN list
+    # cannot either - the plan would have to merge three ordered groups, so PostgreSQL sorts the
+    # relation instead, which is why `app.services.admin_service.list_posts` passes
+    # `statuses=None` and emits no status predicate at all.
+    #
+    # NULLS LAST is written INTO the index because a DESC index column orders NULL first by
+    # PostgreSQL's default, and a draft carries no publication instant - so the administrative
+    # table's `published_at DESC NULLS LAST` is a genuinely different ordering from the public
+    # feed's `published_at DESC` rather than a spelling of it, and `posts` needs both indexes
+    # rather than one of them.
+    op.create_index(
+        "ix_posts_published_at_id",
+        "posts",
+        [sa.text("published_at DESC NULLS LAST"), sa.text("id DESC")],
+    )
+
     # --- post_categories -----------------------------------------------------------------
     # The many-to-many association between posts and categories, owned by
     # app.models.category. The composite primary key covers (post_id, category_id) and so
@@ -487,6 +549,17 @@ def upgrade() -> None:
     op.create_index("ix_comments_status", "comments", ["status"])
     op.create_index("ix_comments_parent_id_status", "comments", ["parent_id", "status"])
     op.create_index("ix_comments_author_id", "comments", ["author_id"])
+    # The moderation queue's default view: every post, every state, newest first.
+    # ix_comments_status serves the FILTERED queue - "show me PENDING" - and
+    # ix_comments_post_id_created_at serves one post's thread ascending; neither orders the whole
+    # relation descending, which is what the first screen an administrator opens actually asks
+    # for. `comments` is the largest relation in this schema by row count, so this is the sort
+    # worth removing most.
+    op.create_index(
+        "ix_comments_created_at_id",
+        "comments",
+        [sa.text("created_at DESC"), sa.text("id DESC")],
+    )
 
     # --- post_likes ----------------------------------------------------------------------
     # No surrogate key: (post_id, user_id) is the primary key, and that is the whole
@@ -537,6 +610,7 @@ def downgrade() -> None:
     op.drop_table("post_likes")
 
     # --- comments ------------------------------------------------------------------------
+    op.drop_index("ix_comments_created_at_id", table_name="comments")
     op.drop_index("ix_comments_author_id", table_name="comments")
     op.drop_index("ix_comments_parent_id_status", table_name="comments")
     op.drop_index("ix_comments_status", table_name="comments")
@@ -548,6 +622,7 @@ def downgrade() -> None:
     op.drop_table("post_categories")
 
     # --- posts ---------------------------------------------------------------------------
+    op.drop_index("ix_posts_published_at_id", table_name="posts")
     op.drop_index("ix_posts_status_published_at", table_name="posts")
     op.drop_index("ix_posts_slug", table_name="posts")
     op.drop_index("ix_posts_author_id", table_name="posts")
@@ -563,6 +638,7 @@ def downgrade() -> None:
     op.drop_table("refresh_tokens")
 
     # --- users ---------------------------------------------------------------------------
+    op.drop_index("ix_users_created_at_id", table_name="users")
     op.drop_index("ix_users_username", table_name="users")
     op.drop_index("ix_users_email", table_name="users")
     op.drop_table("users")
