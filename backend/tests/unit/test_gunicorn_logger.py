@@ -58,6 +58,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, Final
@@ -185,6 +186,28 @@ class TestArbiterRecordsAreStructured:
         # The timestamp is what makes an arbiter line correlatable with the worker lines around it,
         # and gunicorn's own format does not carry one in a machine-readable form at all.
         assert record["timestamp"]
+
+    def test_an_arbiter_line_names_the_process_that_wrote_it(
+        self, structured_stream: io.StringIO
+    ) -> None:
+        """The worker identifier reaches a FOREIGN record, which is where it is hardest to get.
+
+        ``pid`` is added by a processor in ``configure_logging``'s shared list, and that list is
+        used twice - as *structlog*'s own chain and as ``ProcessorFormatter``'s
+        ``foreign_pre_chain``. A field added to only the first would be present on every service
+        record and absent from exactly the lines this class exists for: the arbiter's, which are
+        the ones an operator reads when a worker is killed and replaced. Asserting it on a
+        ``gunicorn.error`` record is what proves it is on both paths.
+
+        The value is compared to this process's own identifier rather than merely checked for
+        presence, because the failure worth catching is not absence but staleness: a
+        module-level constant captured at import would be the ARBITER's identifier in every
+        forked worker, and a plausible-looking number is harder to notice than a missing key.
+        """
+        logging.getLogger(GUNICORN_ERROR_LOGGER).error(ARBITER_MESSAGE)
+
+        record = json.loads(structured_stream.getvalue().strip().splitlines()[-1])
+        assert record["pid"] == os.getpid()
 
     def test_the_line_is_recorded_exactly_once(self, structured_stream: io.StringIO) -> None:
         """One handler, so one line - not the two a leftover handler would produce."""

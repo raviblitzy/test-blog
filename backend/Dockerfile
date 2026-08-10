@@ -267,6 +267,27 @@ USER blog
 # nothing; an operator who wants it passes `--control-socket <writable path>` through
 # GUNICORN_CMD_ARGS.
 #
+# --worker-tmp-dir /dev/shm is the OTHER half of accommodating a read-only root filesystem, and
+# it was missing: gunicorn's arbiter gives each worker a heartbeat file, created with
+# `tempfile.mkstemp` in this directory, and the arbiter touches it to decide whether that worker
+# is alive. With the default of `/tmp` and `--read-only`, the container did not degrade - it
+# never started: `FileNotFoundError: No usable temporary directory found in ['/tmp', '/var/tmp',
+# '/usr/tmp', '/srv/backend']` from `gunicorn/workers/workertmp.py`, exit 255, HEALTHCHECK
+# unhealthy, every endpoint unreachable. So the flag above declined a channel nothing needs while
+# the container still could not boot the way its own comment said it accommodated.
+#
+# /dev/shm rather than documenting `--tmpfs /tmp` for the operator, and the difference is who has
+# to know: Docker mounts /dev/shm as a read-write tmpfs even under --read-only, so this flag makes
+# the image boot hardened with no extra run argument at all, whereas the documented-flag route
+# fails closed the first time somebody adds `read_only: true` without reading the note. It is also
+# the placement gunicorn's own documentation recommends for containers, because a heartbeat file
+# on a disk-backed /tmp is a write per worker per second against the container filesystem.
+#
+# One caveat, recorded rather than defended: `docker run --ipc=none` removes /dev/shm entirely, and
+# under that flag this path does not exist. Nothing in this project's documented deployment uses
+# it, and an operator who does needs `--worker-tmp-dir` pointed somewhere writable through
+# GUNICORN_CMD_ARGS - the same override that tunes every other setting on this command line.
+#
 # Both logs go to `-`, which gunicorn maps to stdout for access lines and stderr for error
 # lines, so the container log stream is the only place logs live - no files, no rotation, no
 # writable volume required.
@@ -308,5 +329,6 @@ CMD ["gunicorn", "app.main:app", \
   "--workers", "2", \
   "--bind", "0.0.0.0:8000", \
   "--no-control-socket", \
+  "--worker-tmp-dir", "/dev/shm", \
   "--access-logfile", "-", \
   "--error-logfile", "-"]

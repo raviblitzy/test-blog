@@ -164,7 +164,6 @@ from typing import Any, Final
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse
 
 # The class FastAPI itself installs as the innermost exception boundary, imported here so the
 # inner handler table can be attached to that same class. FastAPI re-exports it nowhere, so it is
@@ -174,7 +173,7 @@ from starlette.middleware.exceptions import ExceptionMiddleware
 
 from app.api.v1.router import API_V1_PREFIX, api_router
 from app.api.v1.routers.health import router as health_router
-from app.core.config import settings
+from app.core.config import settings, suspicious_environment_keys
 from app.core.dependencies import OPTIONAL_AUTHENTICATION_EXTENSION
 from app.core.exceptions import (
     CORS_EXPOSE_HEADERS,
@@ -185,6 +184,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import configure_logging, get_logger
 from app.core.rate_limit import limiter
+from app.core.responses import ORJSONResponse
 from app.core.security import warm_password_hashing
 from app.db.session import engine
 from app.middleware.body_limit import BodyLimitMiddleware
@@ -890,15 +890,44 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     logger = get_logger(__name__)
 
     # One line, and every field on it is a question an operator asks of a running deployment:
-    # which build is this, which stage is it configured as, where does the versioned surface
-    # begin, and is the interactive documentation exposed here.
+    # which build is this, where does the versioned surface begin, is the interactive
+    # documentation exposed here - and, from `effective_configuration`, what configuration is
+    # ACTUALLY in force.
+    #
+    # That last part is the substance rather than a flourish. Every invalid value already stops
+    # the process with a message naming the field, and every misspelt key in an env FILE is
+    # refused outright - but a misspelt key supplied as a real environment variable, which is the
+    # only channel a container has, is neither: pydantic reads only declared names out of the
+    # environment, so `AUTH_RATE_LIMITT` is not an extra input to reject, it is a name nothing
+    # reads. The field keeps its default and the service starts healthy. Reporting the effective
+    # values means the difference between a default nobody chose and a value somebody set is one
+    # line away instead of unknowable from outside the process.
+    #
+    # `environment` arrives THROUGH that mapping rather than being passed separately - it is a
+    # declared setting like any other - which is why it is no longer named here.
     logger.info(
         "application startup",
         version=application.version,
-        environment=settings.ENVIRONMENT,
         api_prefix=API_V1_PREFIX,
         docs_enabled=application.docs_url is not None,
+        **settings.effective_configuration(),
     )
+
+    # And the other half of the same signal: a key in the environment that looks like a failed
+    # attempt at one of ours. Reported at `warning` because it is a similarity heuristic and must
+    # never stop a healthy deployment - `app.core.config` explains why the exact rule can fail
+    # closed and this one may not - and as ONE bounded record rather than one per key, so an
+    # environment full of near-misses cannot flood the stream. Emitted only when there is
+    # something to say, so a clean deployment's WARNING level stays empty on the happy path.
+    suspicious = suspicious_environment_keys()
+    if suspicious:
+        logger.warning(
+            "unrecognised environment variables",
+            count=len(suspicious),
+            # Rendered as `KEY~SETTING` pairs joined into one scalar, for the same reason the
+            # origins list is joined: a flat field is greppable and a nested one is not.
+            unrecognised=",".join(f"{key}~{resembles}" for key, resembles in suspicious.items()),
+        )
 
     # Before the first request, never in response to one. `app.services.auth_service` verifies an
     # unknown email against a stand-in argon2id hash so that a login for an unregistered address
@@ -1008,17 +1037,26 @@ def create_app() -> FastAPI:
         docs_url=None if settings.is_production else DOCS_URL,
         redoc_url=None if settings.is_production else REDOC_URL,
         # `orjson` is pinned for exactly this: it serialises the datetimes and UUIDs this
-        # domain is full of natively, in C, so every route gains it without opting in.
+        # domain is full of natively, in C, so every route gains it without opting in. Declaring
+        # it here is also what puts the success path and the error path on ONE serialiser rather
+        # than two, because every handler in `app.core.exceptions` returns this same class for
+        # the problem document.
         #
-        # FastAPI 0.141.1 emits a deprecation notice for this class, on the grounds that it
-        # now serialises directly to JSON bytes through Pydantic when a response model is
-        # declared. Naming it is nonetheless the right choice here and is kept deliberately:
-        # every handler in `app.core.exceptions` already returns an `ORJSONResponse` for the
-        # problem document, so declaring it here is what puts the success path and the error
-        # path on ONE serialiser rather than two. Deprecated is not removed, and the notice
-        # is reported rather than fatal - `[tool.pytest.ini_options] filterwarnings` is
-        # `default`. Dropping it would be a change to make when that class is withdrawn and
-        # the error contract moves with it, in one edit, not two.
+        # The class is `app.core.responses.ORJSONResponse` - this project's own, not the
+        # framework's deprecated one, which the pinned FastAPI 0.141.1 withdraws on the
+        # grounds that it now serialises through Pydantic when a response model is declared.
+        # That deprecation was not merely advisory: the warning is installed on construction
+        # and derives from `UserWarning` rather than `DeprecationWarning`, so it escaped
+        # Python's default filters and was reported at WARNING level in the shipped image's log
+        # on a clean boot. Naming a project-owned class is what lets BOTH things hold at once:
+        # `orjson` stays the default response class as AAP §0.5.2 requires, and every handler in
+        # `app.core.exceptions` still returns the same class for the problem document - so the
+        # success path and the error path remain on ONE serialiser, which Pydantic
+        # serialisation could not give the error path because a problem document has no
+        # response model to be serialised through. See that module for the full reasoning,
+        # including why neither dropping the response class nor filtering the warning was the
+        # right remedy. Nothing about the wire changed with the swap: same bytes, same media
+        # type.
         default_response_class=ORJSONResponse,
         lifespan=lifespan,
     )

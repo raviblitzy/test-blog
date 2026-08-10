@@ -8,12 +8,25 @@ configured value::
 
 ``app.main``, ``app.db.session``, ``app.db.seed``, ``app.core.security``,
 ``app.core.logging``, ``app.core.rate_limit`` and ``migrations/env.py`` all import that
-one name. No module under ``backend/app/`` reaches for the environment itself - there is
-no ``os`` environment lookup and no dotenv loader anywhere in the package, including this
-file, which delegates the reading to ``pydantic-settings``. Keeping every read in one
+one name. No module under ``backend/app/`` reaches for the environment itself, and no
+dotenv loader exists anywhere in the package: reading a *value* is delegated entirely to
+``pydantic-settings``, and the only direct environment access in this repository is the
+single ``os.environ`` default in :func:`suspicious_environment_keys` below, which reads
+KEYS rather than values and does so to report a misspelt one. Keeping every read in one
 place is what makes the answer to "where does this value come from?" a single lookup, and
 what makes ``.env.example`` an enforced contract rather than documentation that drifts
 away from the code.
+
+What a running deployment can be asked about itself
+---------------------------------------------------
+Two surfaces exist for the operator rather than for the application, and both are consumed
+by ``app.main``'s ``application startup`` record:
+:meth:`Settings.effective_configuration` reports every non-secret value actually in force,
+and :func:`suspicious_environment_keys` names environment keys that look like a failed
+attempt at one of ours. Together they close the one gap validation cannot: a *misspelt*
+optional variable supplied as a real environment variable is not an invalid value and not
+an extra input - it is a name nothing reads, leaving a default in place with no signal at
+all. See each of the two for why one warns and the other cannot fail closed.
 
 Twelve variables, and exactly three tolerated strangers
 ------------------------------------------------------
@@ -148,8 +161,10 @@ module in the repository that reads the environment. The sibling it imports is n
 to that rule; it reads nothing at all.
 """
 
+import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Set as AbstractSet
+from difflib import SequenceMatcher
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, Self
@@ -184,6 +199,7 @@ __all__ = [
     "JwtAlgorithm",
     "Settings",
     "settings",
+    "suspicious_environment_keys",
 ]
 
 
@@ -1299,6 +1315,208 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         """Whether this process is running the production configuration."""
         return self.ENVIRONMENT == "production"
+
+    # -- Operator-facing reporting ------------------------------------------------------
+
+    def effective_configuration(self) -> dict[str, object]:
+        """The non-secret configuration actually in force, as log fields.
+
+        ``app.main`` puts this on the ``application startup`` record, and it exists because of a
+        gap that has nothing to do with validation. Every *invalid* value already stops the
+        process with a message naming the field, and every *misspelt key in an env file* is
+        already refused by ``extra="forbid"``. What neither covers is a misspelt key supplied as a
+        real environment variable - the only configuration channel a container has. Pydantic reads
+        only DECLARED names out of the environment, so ``AUTH_RATE_LIMITT=1/minute`` is not an
+        extra input to reject; it is simply never read, the field keeps its default, and the
+        service starts perfectly. Before this record existed nothing in the log said which values
+        were in force, so a silent default was indistinguishable from a deliberate one.
+
+        One line answers that for every optional variable at once, which is why this is derived
+        from :attr:`~pydantic.BaseModel.model_fields` rather than hand-listed: a field added later
+        appears here automatically, and one that must not appear has to be named in
+        :data:`_WITHHELD_FROM_STARTUP_RECORD` deliberately. ``backend/tests`` asserts that the two
+        sets partition the model exactly, so "we forgot to decide" is a test failure rather than
+        either a leak or a blind spot.
+
+        Keys are lower-cased field names - ``log_level``, ``auth_rate_limit`` - because that is the
+        convention every other structured field in this service follows, and the uppercase
+        environment spelling is recoverable by eye.
+
+        One consequence worth knowing before reading a record: these values are subject to the
+        same treatment as every other log field, and ``app.core.logging`` anonymises IP addresses
+        wherever they appear - so a loopback origin in ``CORS_ALLOW_ORIGINS`` is rendered as
+        ``http://127.0.0.0/24:3000``. That is the project's address policy applying uniformly
+        rather than a defect in this report, and the exact configured list remains readable from
+        ``.env``; nothing here suppresses or works around it, because a field that opted out of
+        the redaction chain would be the one place an address could reach a log intact.
+
+        Returns:
+            A mapping of log fields covering every declared setting except those
+            :data:`_WITHHELD_FROM_STARTUP_RECORD` names. ``CORS_ALLOW_ORIGINS`` is rendered as a
+            comma-joined string rather than a list so the record stays flat and greppable.
+        """
+        reported: dict[str, object] = {}
+        for name in type(self).model_fields:
+            if name in _WITHHELD_FROM_STARTUP_RECORD:
+                continue
+            value = getattr(self, name)
+            # The one field whose type is not a scalar. Joined rather than nested so every value
+            # on this record is a scalar: a JSON collector that flattens nested arrays renders
+            # `cors_allow_origins.0`, and an operator grepping for an origin finds nothing.
+            reported[name.lower()] = ",".join(value) if isinstance(value, list) else value
+        return reported
+
+
+# ---------------------------------------------------------------------------------------
+# What the startup record withholds
+#
+# Declared after `Settings` because it names its fields, and named rather than inferred
+# because "is this value safe to log?" is a judgement, not a property of a type. All four
+# are withheld for a stated reason:
+#
+#   DATABASE_URL         embeds the password in its userinfo. `app.db.session` and
+#                        migrations/env.py already redact it wherever they mention it, and a
+#                        startup record is the last place it should reappear.
+#   JWT_SECRET_KEY       the signing key. Logging it forges every token in the deployment.
+#   SEED_ADMIN_PASSWORD  a credential, and `repr=False` on the field says so already.
+#   SEED_ADMIN_EMAIL     not a secret, but an email address is an identity: `app.core.logging`
+#                        anonymises client addresses for the same reason, and a log audit that
+#                        can assert "no email address appears in any record" is worth more than
+#                        one field an operator can read out of `.env` anyway.
+#
+# Every other field is a threshold, an interval, a stage name, an algorithm name or a list of
+# public origins, and each is a value an operator actively needs to see confirmed.
+# ---------------------------------------------------------------------------------------
+_WITHHELD_FROM_STARTUP_RECORD: Final[frozenset[str]] = frozenset(
+    {
+        "DATABASE_URL",
+        "JWT_SECRET_KEY",
+        "SEED_ADMIN_PASSWORD",
+        "SEED_ADMIN_EMAIL",
+    }
+)
+
+
+# ---------------------------------------------------------------------------------------
+# Catching a misspelt environment variable
+#
+# `extra="forbid"` makes a typo in an env FILE a hard startup failure, and that guard is
+# unreachable for the channel a container actually uses: `docker run --env-file` sets real
+# environment variables, and pydantic-settings reads only the names this model declares out
+# of the environment, so an undeclared `LOG_LEVLE` is not an extra input - it is nothing at
+# all. The field keeps its default, the service starts healthy, and nothing says a word.
+#
+# There is no deterministic fix available. The process environment legitimately contains
+# dozens of variables that are none of this service's business, so "unrecognised" cannot mean
+# "wrong" here the way it does in a file this repository owns. What CAN be recognised is a
+# name that looks like a failed attempt at one of ours, and that is what the function below
+# reports.
+#
+# It WARNS rather than refusing to start, and the asymmetry with the file channel is
+# deliberate: the file rule is exact, so failing closed on it costs a deployment nothing,
+# while this rule is a similarity heuristic and a false positive that refused to boot a
+# healthy deployment would be a worse defect than the one being fixed. A named warning
+# restores the property the module docstring claims - "a typo is loud" - without giving a
+# heuristic the power to stop a process.
+# ---------------------------------------------------------------------------------------
+
+_ENV_NAME_SIMILARITY_THRESHOLD: Final[float] = 0.85
+"""How similar an undeclared key must be to a declared one before it is reported.
+
+`difflib.SequenceMatcher`'s ratio, and the number is calibrated against real names rather than
+picked. It reports every misspelling this module's own docstring cites and every one observed in
+testing - ``LOG_LEVLE`` 0.89, ``ENVIRONMNET`` 0.91, ``SEED_ADMIN_PASSWD`` 0.94, ``DATABSE_URL``
+0.96, ``AUTH_RATE_LIMITT`` 0.97, ``MAX_REQUEST_BODY_BYTE`` 0.98, ``ACCESS_TOKEN_EXPIRE_MINUTS``
+0.98 - while leaving the deployment names that legitimately sit near ours alone:
+``TEST_DATABASE_URL`` 0.83, ``SEED_ADMIN_NAME`` 0.77, ``DATABASE_URL_REPLICA`` 0.75,
+``NEXT_PUBLIC_SITE_DESCRIPTION`` 0.75. Lowering it to 0.80 would start reporting the first of
+those, which is a name a CI matrix really does set.
+"""
+
+_SUSPICIOUS_ENV_KEY_LIMIT: Final[int] = 10
+"""Most keys one report names.
+
+A bound rather than a completeness compromise: an environment that produced more than ten
+near-misses is not a deployment with a typo, and an unbounded field built from environment keys is
+an unbounded log line built from something a caller may influence. The count is reported alongside,
+so a truncated report still says how many there were.
+"""
+
+
+def suspicious_environment_keys(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Report environment variables that look like a misspelling of a setting this service reads.
+
+    Two rules, and each catches a shape the other misses:
+
+    * **Similarity.** An undeclared key whose upper-cased form is at least
+      :data:`_ENV_NAME_SIMILARITY_THRESHOLD` similar to a declared name. This is the
+      transposition-and-dropped-letter family - ``LOG_LEVLE``, ``ACCESS_TOKEN_EXPIRE_MINUTS`` - and
+      it also catches a correctly spelled name in the wrong case, which
+      ``case_sensitive=True`` would otherwise ignore in silence.
+    * **A missing trailing segment.** An undeclared key that a declared name extends by one whole
+      ``_``-delimited segment: ``JWT_SECRET`` for ``JWT_SECRET_KEY``, the exact example this
+      module's docstring cites as "a hopeful ``JWT_SECRET``". Similarity alone scores that pair at
+      0.83 and would miss it. The rule is one-directional on purpose - a key that EXTENDS a
+      declared name, such as ``DATABASE_URL_REPLICA``, is a normal deployment convention rather
+      than a failed attempt at ours.
+
+    The three ``NEXT_PUBLIC_`` keys count as declared: they are the presentation tier's, they
+    legitimately appear in a shared environment, and ``_drop_frontend_keys`` already tolerates them
+    by exact name.
+
+    Args:
+        environ: The environment to inspect. Defaults to the process environment. Injectable so
+            the rules can be exercised against a fixed table rather than against whatever the
+            machine running the suite happens to export - and this parameter is the only reason
+            this module reads ``os.environ`` at all, which it does here and nowhere else.
+
+    Returns:
+        A mapping of suspicious key to the declared name it resembles, ordered by key and bounded
+        to :data:`_SUSPICIOUS_ENV_KEY_LIMIT` entries. Empty - the overwhelmingly common case - when
+        nothing in the environment looks like a failed attempt at a setting name.
+    """
+    declared = set(Settings.model_fields) | _FRONTEND_ENV_KEYS
+    source = os.environ if environ is None else environ
+
+    reported: dict[str, str] = {}
+    for key in sorted(source):
+        if key in declared:
+            continue
+        candidate = key.upper()
+        resembles = _closest_declared_name(candidate, declared)
+        if resembles is not None:
+            reported[key] = resembles
+        if len(reported) == _SUSPICIOUS_ENV_KEY_LIMIT:
+            break
+    return reported
+
+
+def _closest_declared_name(candidate: str, declared: AbstractSet[str]) -> str | None:
+    """Return the declared name *candidate* looks like a failed attempt at, or ``None``.
+
+    Args:
+        candidate: The undeclared key, upper-cased so a case mismatch is caught rather than
+            treated as a different name.
+        declared: Every name this service reads, including the tolerated presentation-tier keys.
+
+    Returns:
+        The best-matching declared name, or ``None`` when nothing is close enough. The best match
+        is the highest-scoring one, so a report names the single most likely intended setting
+        rather than an arbitrary member of a tie.
+    """
+    best: tuple[float, str] | None = None
+    for name in declared:
+        # The segment rule first, and scored at 1.0 so it always wins a tie: `JWT_SECRET` really is
+        # `JWT_SECRET_KEY` with a segment left off, and no similarity score expresses that as
+        # confidently as the structure does.
+        if name.startswith(f"{candidate}_"):
+            return name
+        score = SequenceMatcher(None, candidate, name).ratio()
+        if score >= _ENV_NAME_SIMILARITY_THRESHOLD and (best is None or score > best[0]):
+            best = (score, name)
+    return best[1] if best is not None else None
 
 
 # The one instance every other module imports, built at import time on purpose. A missing

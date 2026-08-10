@@ -899,3 +899,233 @@ describe('the administrator fixture is what these assertions assume', () => {
     expect(fixtureAuthorAccount.role).not.toBe('ADMIN');
   });
 });
+
+/* =================================================================================================
+ * ROUTE-PATH ALIGNMENT
+ *
+ * Everything above pins BEHAVIOUR - what the double answers, and to whom. Nothing above pinned the
+ * ADDRESSES, and that is a distinct class of defect with the same consequence: a double that answers
+ * a URL the server 404s makes every spec written against it green over a broken integration, and a
+ * URL the server serves but the double omits is a request that fails as a harness fault the first
+ * time a component issues it.
+ *
+ * The health probes are the case that proved the gap is real. `app.main` mounts them UNPREFIXED,
+ * deliberately, so a probe address does not move when the API is versioned. `handlers.ts` once
+ * declared them as `'*​/healthz'`, and a leading `*` matches any number of segments - so
+ * `/api/v1/healthz` matched too and answered 200 in every spec while answering 404 in production.
+ * That was fixed by anchoring the two patterns on the origin and answering the two prefixed
+ * addresses with the 404 the service actually sends. Nothing in this file would have noticed either
+ * the original defect or a regression of it, because the whole subject was outside its assertions.
+ *
+ * So the inventory below is the checked-in copy of the served contract, and the tests compare it
+ * against what the handler array declares - in BOTH directions, since each direction fails
+ * differently. Drift then surfaces here as a named failure rather than as a silently divergent mock.
+ * ============================================================================================== */
+
+/**
+ * Every operation the service serves, as `METHOD path` with path parameters normalised to `{p}`.
+ *
+ * Transcribed from the live `GET /openapi.json` of the running API: 32 path keys carrying 39
+ * operations - 37 under `/api/v1` plus the two unversioned probes. Parameter NAMES are normalised
+ * away on both sides of the comparison on purpose: the server names them `{post_id}`, `{slug}`,
+ * `{username}`, `{comment_id}`, `{category_id}` and `{user_id}`, while `msw` addresses them as
+ * `:postId`, `:slug` and so on, and a parameter's name is a local binding rather than part of the
+ * contract. What must match is the METHOD and the SHAPE.
+ */
+const SERVED_OPERATIONS: readonly string[] = [
+  'POST /api/v1/auth/register',
+  'POST /api/v1/auth/login',
+  'POST /api/v1/auth/refresh',
+  'POST /api/v1/auth/logout',
+  'GET /api/v1/auth/me',
+  'PATCH /api/v1/users/me',
+  'GET /api/v1/users/{p}',
+  'GET /api/v1/users/{p}/posts',
+  'GET /api/v1/posts',
+  'POST /api/v1/posts',
+  'GET /api/v1/posts/{p}',
+  'PATCH /api/v1/posts/{p}',
+  'DELETE /api/v1/posts/{p}',
+  'POST /api/v1/posts/{p}/publish',
+  'POST /api/v1/posts/{p}/unpublish',
+  'PUT /api/v1/posts/{p}/like',
+  'DELETE /api/v1/posts/{p}/like',
+  'GET /api/v1/posts/{p}/likes',
+  'GET /api/v1/posts/{p}/comments',
+  'POST /api/v1/posts/{p}/comments',
+  'PATCH /api/v1/comments/{p}',
+  'DELETE /api/v1/comments/{p}',
+  'GET /api/v1/categories',
+  'GET /api/v1/categories/{p}',
+  'GET /api/v1/admin/stats',
+  'GET /api/v1/admin/users',
+  'PATCH /api/v1/admin/users/{p}',
+  'DELETE /api/v1/admin/users/{p}',
+  'GET /api/v1/admin/posts',
+  'PATCH /api/v1/admin/posts/{p}/status',
+  'DELETE /api/v1/admin/posts/{p}',
+  'GET /api/v1/admin/comments',
+  'PATCH /api/v1/admin/comments/{p}/status',
+  'DELETE /api/v1/admin/comments/{p}',
+  'POST /api/v1/admin/categories',
+  'PATCH /api/v1/admin/categories/{p}',
+  'DELETE /api/v1/admin/categories/{p}',
+  'GET /healthz',
+  'GET /readyz',
+];
+
+/**
+ * Addresses the double declares in order to REFUSE them, mirroring the service's own 404.
+ *
+ * These are not gaps. `/api/v1/healthz` and `/api/v1/readyz` genuinely do not exist - the running
+ * service answers both with the uniform problem document - and a handler that returns that 404 is
+ * more faithful than no handler at all: under `onUnhandledRequest: 'error'` an undeclared address
+ * fails as a harness fault, which reads as a broken test rather than as the missing route it is.
+ * The list is short and closed on purpose; a route that merely has no handler yet does not belong
+ * here.
+ */
+const DELIBERATELY_REFUSED: readonly string[] = ['GET /api/v1/healthz', 'GET /api/v1/readyz'];
+
+/** The two probe addresses the service really serves, and the versioned addresses it does not. */
+const PROBE_ADDRESSES: readonly { readonly served: string; readonly prefixed: string }[] = [
+  { served: '/healthz', prefixed: '/api/v1/healthz' },
+  { served: '/readyz', prefixed: '/api/v1/readyz' },
+];
+
+/** One handler's declared address, reduced to the comparable `METHOD shape` form. */
+interface DeclaredRoute {
+  readonly method: string;
+  /** `null` for a handler declared with a regular expression, which has no comparable literal. */
+  readonly shape: string | null;
+  /** The raw declaration, carried so a failure message can name what it actually saw. */
+  readonly raw: string;
+}
+
+/**
+ * Reduce a declared path literal to the shape form `SERVED_OPERATIONS` is written in.
+ *
+ * Two transformations, matching the two ways `msw` and OpenAPI differ:
+ * strip the single leading `*` origin wildcard, and collapse every `:param` segment to `{p}`.
+ */
+function toShape(path: string): string {
+  return path.replace(/^\*/, '').replace(/:[A-Za-z0-9_]+/g, '{p}');
+}
+
+/** Read what the default handler array declares, without issuing a single request. */
+function declaredRoutes(): readonly DeclaredRoute[] {
+  return handlers.map((handler) => {
+    const { method, path } = handler.info;
+    const rawMethod = typeof method === 'string' ? method : String(method);
+
+    return typeof path === 'string'
+      ? { method: rawMethod, shape: toShape(path), raw: path }
+      : { method: rawMethod, shape: null, raw: String(path) };
+  });
+}
+
+describe('route-path alignment with the served contract', () => {
+  it('declares no address the service does not serve', () => {
+    // The direction that produces a FALSE PASS: the double answers, the server 404s, and the spec
+    // that relied on it passes anyway. Regex-declared handlers are excluded here and covered by
+    // behaviour below, because a pattern has no literal to compare.
+    const permitted = new Set([...SERVED_OPERATIONS, ...DELIBERATELY_REFUSED]);
+    const unserved = declaredRoutes()
+      .filter((route) => route.shape !== null)
+      .map((route) => `${route.method} ${route.shape}`)
+      .filter((operation) => !permitted.has(operation));
+
+    expect(unserved).toEqual([]);
+  });
+
+  it('declares every operation the service serves under the version prefix', () => {
+    // The other direction, which produces a harness fault rather than a false pass: a served route
+    // with no handler fails the first spec that touches it, naming a URL rather than a defect.
+    // The probes are excluded from this comparison and asserted by behaviour, since they are the
+    // two declared as patterns.
+    const declared = new Set(
+      declaredRoutes()
+        .filter((route) => route.shape !== null)
+        .map((route) => `${route.method} ${route.shape}`),
+    );
+    const missing = SERVED_OPERATIONS.filter(
+      (operation) => operation.startsWith('GET /api/v1') || !operation.startsWith('GET /health'),
+    )
+      .filter((operation) => !operation.startsWith('GET /readyz'))
+      .filter((operation) => !declared.has(operation));
+
+    expect(missing).toEqual([]);
+  });
+
+  it('covers the whole served contract once every declaration is accounted for', () => {
+    // Belt and braces over the two set comparisons: the counts must reconcile exactly, so a
+    // handler added without a served counterpart - or removed while its route still exists -
+    // cannot be absorbed by an off-by-one somewhere else.
+    const routes = declaredRoutes();
+    const literals = routes.filter((route) => route.shape !== null);
+    const patterns = routes.filter((route) => route.shape === null);
+
+    expect(routes).toHaveLength(SERVED_OPERATIONS.length + DELIBERATELY_REFUSED.length);
+    // One pattern per unversioned probe: anchored on the origin so nothing nested beneath a
+    // prefix can match them.
+    expect(patterns).toHaveLength(PROBE_ADDRESSES.length);
+    expect(literals).toHaveLength(
+      SERVED_OPERATIONS.length - PROBE_ADDRESSES.length + DELIBERATELY_REFUSED.length,
+    );
+    // No duplicate declaration: two handlers on one address means the second is unreachable, and
+    // `resetHandlers` would not surface it.
+    const shapes = literals.map((route) => `${route.method} ${route.shape}`);
+    expect(new Set(shapes).size).toBe(shapes.length);
+  });
+
+  it('answers each probe at its unversioned address, exactly as the service mounts it', async () => {
+    for (const { served } of PROBE_ADDRESSES) {
+      const response = await fetch(`${ORIGIN}${served}`);
+
+      expect([served, response.status]).toEqual([served, 200]);
+      expect(await response.json()).toMatchObject({ status: expect.any(String) as unknown });
+    }
+  });
+
+  it('refuses each probe under the version prefix, exactly as the service refuses it', async () => {
+    // The regression guard for the wildcard defect. A leading `*` would make these 200, which is
+    // precisely the divergence that was invisible before this block existed.
+    for (const { prefixed } of PROBE_ADDRESSES) {
+      const response = await fetch(`${ORIGIN}${prefixed}`);
+
+      expect([prefixed, response.status]).toEqual([prefixed, 404]);
+      const problem = (await response.json()) as ProblemDetail;
+      expect(problem.type).toBe('/errors/not-found');
+      expect(problem.instance).toBe(prefixed);
+      expect(problem.request_id).toBeTruthy();
+    }
+  });
+
+  it('anchors the probe patterns on the origin rather than on a trailing segment', () => {
+    // The property the two patterns exist for, asserted against the predicates themselves rather
+    // than against one sampled address: the probe name must be the FIRST path segment, so nothing
+    // nested beneath any prefix can be answered as a probe. The addresses that matter most -
+    // `/api/v1/healthz` and `/api/v1/readyz` - are covered by behaviour in the test above; this
+    // generalises the same rule to any nesting, including a future `/api/v2`.
+    //
+    // Driven through `RegExp.test` rather than through `fetch`, because an unmatched request under
+    // `onUnhandledRequest: 'error'` is reported on the console before it rejects, and a suite whose
+    // passing output contains handler-fault messages is a suite nobody reads the output of.
+    const patterns = handlers
+      .map((handler) => handler.info.path)
+      .filter((path): path is RegExp => path instanceof RegExp);
+
+    expect(patterns).toHaveLength(PROBE_ADDRESSES.length);
+    for (const { served, prefixed } of PROBE_ADDRESSES) {
+      const matching = patterns.filter((pattern) => pattern.test(`${ORIGIN}${served}`));
+      expect([served, matching]).toHaveLength(2);
+      expect([served, matching.length]).toEqual([served, 1]);
+
+      for (const nested of [prefixed, `/api/v2${served}`, `/nested/deeply${served}`]) {
+        expect([nested, patterns.some((pattern) => pattern.test(`${ORIGIN}${nested}`))]).toEqual([
+          nested,
+          false,
+        ]);
+      }
+    }
+  });
+});

@@ -344,6 +344,27 @@ class TestProductionEntryPointUsesTheConfig:
             f"gunicorn.conf.py publishes; the selection must be made in one place only: {command}"
         )
 
+    def test_the_dockerfile_command_places_worker_heartbeats_on_a_tmpfs(self) -> None:
+        """The image must boot under ``--read-only``, and this flag is what makes it able to.
+
+        Gunicorn's arbiter gives each worker a heartbeat file created with ``tempfile.mkstemp`` and
+        touches it to decide whether that worker is alive. Under the default ``/tmp`` and a
+        read-only root filesystem there is nowhere to create it, and the failure is not a
+        degradation: the container exited 255 with ``No usable temporary directory found``, Docker
+        reported it unhealthy and every endpoint was unreachable. ``/dev/shm`` is a tmpfs Docker
+        mounts read-write even under ``--read-only``, so naming it here means the image boots
+        hardened with no additional run argument.
+
+        Asserted against the parsed ``CMD`` rather than the file text for the reason the parser
+        exists: the comment block beside this flag explains the failure it prevents at length, and a
+        whole-file search would be satisfied by that prose after the flag itself was dropped.
+        """
+        command = _dockerfile_command()
+        assert '"--worker-tmp-dir", "/dev/shm"' in command, (
+            "backend/Dockerfile's CMD does not place gunicorn's worker heartbeat files on a tmpfs, "
+            f"so the image cannot start with a read-only root filesystem: {command}"
+        )
+
 
 class TestConfigureLoggingRemainsIdempotent:
     """The hook relies on ``configure_logging`` being safe to call again, so that is asserted."""

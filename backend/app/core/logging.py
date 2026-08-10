@@ -221,6 +221,7 @@ remain: ``show_locals=False`` keeps a frame's variables out of a rendered traceb
 
 import ipaddress
 import logging
+import os
 import re
 import sys
 import unicodedata
@@ -240,6 +241,7 @@ __all__ = [
     "HTTP_LOG_FIELD_PATH",
     "HTTP_LOG_FIELD_STATUS",
     "LOG_EXCEPTION_VALUE_MAX_LENGTH",
+    "LOG_FIELD_PROCESS_ID",
     "LOG_REDACTION_PLACEHOLDER",
     "LOG_TEXT_MAX_LENGTH",
     "StructlogGunicornLogger",
@@ -274,6 +276,21 @@ HTTP_LOG_FIELD_STATUS: Final[str] = "status_code"
 
 HTTP_LOG_FIELD_CLIENT_NETWORK: Final[str] = "client_network"
 """Anonymised peer network - see :func:`anonymised_client_network`. Never a full address."""
+
+LOG_FIELD_PROCESS_ID: Final[str] = "pid"
+"""Which process in this container wrote the record. On **every** record, not just the HTTP ones.
+
+The shipped image runs a Gunicorn arbiter with two Uvicorn workers, and until this field existed
+nothing in the log said which of the three a line came from. Per-request correlation was never
+affected - ``request_id`` covers that - but a question one process below that is unanswerable
+without it: whether a worker is taking its share of traffic, whether an error is confined to one
+worker or spread across both, and which worker the arbiter's ``WORKER TIMEOUT`` line is about. It
+also disambiguates the per-worker multiplication ``app.core.rate_limit`` documents, where two
+workers each hold their own limiter bucket.
+
+It is a process identifier and nothing more: no host, no user, no path, and it is meaningless
+outside the container that emitted it, so it discloses nothing.
+"""
 
 
 # ---------------------------------------------------------------------------------------
@@ -920,6 +937,35 @@ def redact_log_event(
     return event_dict
 
 
+def _add_process_id(
+    _logger: object, _name: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Stamp the emitting process's identifier onto the record.
+
+    Read at emit time, and that is the whole subtlety of this three-line function. A module-level
+    constant would be captured at IMPORT time - and this module is imported in the Gunicorn
+    **arbiter**, by ``gunicorn.conf.py``, before any worker exists. Every forked worker would
+    inherit the arbiter's value and the field would confidently name the wrong process on every
+    request record in the image. ``os.getpid()`` per record costs a syscall in the noise of writing
+    a line and cannot be wrong across a fork.
+
+    ``setdefault`` rather than assignment, so a caller that has a more specific answer - a record
+    describing a *different* process, such as a supervisor reporting on a child - keeps it. Nothing
+    in this service does that today; the alternative is a processor that silently overwrites a
+    field somebody deliberately set.
+
+    Args:
+        _logger: The wrapped logger. Unused, part of the *structlog* processor signature.
+        _name: The method name. Unused, part of the same signature.
+        event_dict: The event being built.
+
+    Returns:
+        The same event dictionary, mutated in place and returned as the chain requires.
+    """
+    event_dict.setdefault(LOG_FIELD_PROCESS_ID, os.getpid())
+    return event_dict
+
+
 def _shared_processors() -> list[Processor]:
     """Build the processors every record passes through, whatever emitted it.
 
@@ -938,9 +984,12 @@ def _shared_processors() -> list[Processor]:
        record that key is the only place the originating logger's name survives.
     3. ``add_log_level`` next, so ``level`` is a field rather than something a reader has to
        infer from a stream.
-    4. ``TimeStamper`` in ISO-8601 UTC. UTC because comparing two containers' logs must not
+    4. :func:`_add_process_id`, which is in this list rather than in *structlog*'s chain alone
+       for the reason the list exists: a Gunicorn arbiter line and a Uvicorn line are foreign
+       records, and "which process wrote this?" is a question worth asking of exactly those.
+    5. ``TimeStamper`` in ISO-8601 UTC. UTC because comparing two containers' logs must not
        depend on where they were scheduled, and ISO-8601 because it sorts lexicographically.
-    5. ``StackInfoRenderer``, which renders ``stack_info=True`` into a ``stack`` field for a
+    6. ``StackInfoRenderer``, which renders ``stack_info=True`` into a ``stack`` field for a
        caller that wants a stack without an exception.
 
     Exception rendering and the terminal renderer are intentionally *not* here: they belong
@@ -950,6 +999,7 @@ def _shared_processors() -> list[Processor]:
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
+        _add_process_id,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
     ]

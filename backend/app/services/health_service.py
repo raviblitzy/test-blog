@@ -30,20 +30,29 @@ The repository is one statement because readiness *is* one statement. This servi
 classification and a disclosure rule, which is three decisions that were previously being made
 inside a route handler.
 
-Why the 503 lives here and not in ``app.core.exceptions``
----------------------------------------------------------
+Why the readiness 503 is *raised* here and not in ``app.core.exceptions``
+------------------------------------------------------------------------
 That module declares the error contract and five domain members of it - 404, 409, 403, 422, 401 -
-and deliberately no 503, because service unavailability is not a rule any *domain* service
-enforces: no ownership check produces it, no lifecycle transition produces it, and nothing but this
-one probe can detect the condition. :class:`DatabaseUnavailableError` therefore lives beside the
-only thing that raises it, and the domain hierarchy stays exactly the five failures the domain
-reports.
+and no 503 among them, because service unavailability is not a rule any *domain* service enforces:
+no ownership check produces it and no lifecycle transition produces it.
+:class:`DatabaseUnavailableError` therefore lives beside the only thing that raises it, and the
+domain hierarchy stays exactly the five failures the domain reports.
 
-It is nevertheless a full member of the error contract on the wire. Starlette dispatches a handler
-by walking ``type(exc).__mro__``, so subclassing ``AppError`` is what routes this failure to the
-one registered ``AppError`` handler: the document, its ``instance`` path, its ``request_id``, its
-``X-Request-ID`` header and its ``application/problem+json`` media type all come from there. A
-readiness 503 is byte-for-byte the same kind of object as a 404 from a post lookup.
+That is a statement about which *exception* is declared where, and not a claim that this file owns
+the status. ``app.core.exceptions`` also answers 503 - for a data route whose statement could not
+reach the database, through ``_database_unavailable_handler`` - and it must, because that failure
+arrives as a raw SQLAlchemy exception at a route this service knows nothing about. The two are one
+contract seen from two surfaces: identical ``type``, ``title`` and status, identical classified log
+fields from :func:`~app.core.exceptions.database_failure_fields`, and a ``detail`` that differs
+only in the sentence a person reads - "not ready to accept traffic" for an orchestrator deciding
+whether to route here at all, "could not reach its data store" for a caller whose request failed.
+
+The readiness failure is nevertheless a full member of the error contract on the wire. Starlette
+dispatches a handler by walking ``type(exc).__mro__``, so subclassing ``AppError`` is what routes
+this failure to the one registered ``AppError`` handler: the document, its ``instance`` path, its
+``request_id``, its ``X-Request-ID`` header and its ``application/problem+json`` media type all
+come from there. A readiness 503 is byte-for-byte the same kind of object as a 404 from a post
+lookup.
 
 Exactly one record is logged, and only on failure
 -------------------------------------------------
@@ -78,21 +87,14 @@ can be read together.
 from __future__ import annotations
 
 import asyncio
-import re
 from contextlib import suppress
-from typing import Final, Literal
+from typing import Final
 
 from fastapi import status
-from sqlalchemy.exc import (
-    DBAPIError,
-    InterfaceError,
-    OperationalError,
-    SQLAlchemyError,
-    TimeoutError as PoolTimeoutError,
-)
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, DatabaseFailureClass, database_failure_fields
 from app.core.logging import get_logger
 from app.repositories import HealthRepository
 
@@ -144,40 +146,40 @@ failure record :meth:`HealthService.check_readiness` emits beside it."""
 # ---------------------------------------------------------------------------------------
 # The readiness failure record
 #
-# A closed vocabulary and three type-derived fields. Nothing here is composed from an
-# exception's message, because a driver's message names the host, the port, the database and
-# the user it tried - see `_DETAIL_NOT_READY` above and `app.core.exceptions`.
+# A closed vocabulary and three type-derived fields, and NOT declared here: the classification
+# lives in `app.core.exceptions` as `database_failure_fields`, and this module re-exports it
+# under the readiness-facing name its callers already use.
 #
-# The classifications are the operational distinctions an operator acts on differently, and
-# no finer: a pool that ran out needs a capacity or leak investigation, a connection that
-# could not be made needs the database or the network looked at, a driver-level fault needs
-# the client library or the socket state looked at, and anything else needs a person. Adding
-# a member here is adding a distinction somebody would act on; anything else belongs in the
-# SQLSTATE, which is already carried.
+# It moved there because a second surface needed the identical reduction. A data route that
+# cannot reach the database answers 503 through
+# `app.core.exceptions._database_unavailable_handler`, which writes the same fields from the same
+# function - so an operator watching one outage can group the readiness record and every data
+# record it produced on `failure_class` and `sqlstate` rather than on two vocabularies that agree
+# only by coincidence. Two classifications of one condition is one too many whichever is read.
+#
+# The direction is forced as well as correct: this module imports `AppError` from
+# `app.core.exceptions`, so a classifier owned here and imported back would close a cycle. The
+# classification is also part of the error contract, which is what that module is.
 # ---------------------------------------------------------------------------------------
 
-ReadinessFailureClass = Literal[
-    "pool_timeout",
-    "query_timeout",
-    "connection_failure",
-    "driver_interface_failure",
-    "database_error",
-    "unexpected_failure",
-]
+ReadinessFailureClass = DatabaseFailureClass
 """The fixed vocabulary of readiness failure classifications.
 
-A named alias rather than an inline annotation so that the values a dashboard or an alert rule
-groups by are declared in one place, and so mypy rejects a classification this module never
-published.
+An alias of :data:`~app.core.exceptions.DatabaseFailureClass` rather than a second Literal with
+the same members: two copies of a closed vocabulary drift, and the drift is invisible until an
+alert rule stops matching one of the two surfaces that publish it. Kept under this name because
+``app.api.v1.routers.health`` and the readiness suite refer to it, and because "readiness failure
+class" is what it means at this boundary.
 """
 
 _READINESS_FAILURE_EVENT: Final[str] = "readiness_probe_failed"
-"""Event name of the failure record. Stable, so it is safe to alert on."""
+"""Event name of the failure record. Stable, so it is safe to alert on.
 
-_LOG_FIELD_FAILURE_CLASS: Final[str] = "failure_class"
-_LOG_FIELD_EXCEPTION_TYPE: Final[str] = "exception_type"
-_LOG_FIELD_DRIVER_EXCEPTION_TYPE: Final[str] = "driver_exception_type"
-_LOG_FIELD_SQLSTATE: Final[str] = "sqlstate"
+Distinct from the ``database_unavailable_response`` event a data route writes, deliberately: the
+two describe the same condition seen from different surfaces - "do not route to this instance" and
+"this request could not be served" - and an operator needs to be able to ask for either alone. The
+FIELDS are identical, which is what makes asking for both together equally easy.
+"""
 
 READINESS_TIMEOUT_SECONDS: Final[float] = 5.0
 """How long :meth:`HealthService.check_readiness` may spend on the database before it gives up.
@@ -215,99 +217,33 @@ The one failure this deadline cannot shorten, stated plainly
     the classified record, not the decision.
 """
 
-_SQLSTATE_QUERY_CANCELED: Final[str] = "57014"
-"""PostgreSQL's ``query_canceled``, which is how ``app.db.session``'s server-side
-``statement_timeout`` reports itself.
-
-SQLAlchemy wraps it as an ``OperationalError``, which would otherwise be filed as
-``connection_failure``. Checked before the class-based branches for that reason.
-"""
-
-_SQLSTATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9]{5}\Z")
-"""A SQLSTATE is exactly five alphanumeric characters - ``28P01``, ``08006``, ``53300``.
-
-Validated rather than trusted even though it arrives from the driver, because it is read off an
-arbitrary exception object through ``getattr`` and is about to become a log field. Anything that
-is not the documented shape is dropped rather than rendered: a five-character code is worth a
-field, and something else in its place is worth nothing at all.
-"""
-
 
 def readiness_failure_fields(exc: BaseException) -> dict[str, str]:
     """Reduce a caught database failure to the safe fields the failure record carries.
 
-    Built entirely from types and from one validated driver attribute. No message, no argument, no
-    statement, no parameters, no connection URL: the four things an operator needs to distinguish
-    one readiness failure from another are *which class of failure it was*, *which exception
-    SQLAlchemy raised*, *which driver exception it wrapped* and *what the database server called
-    it*.
+    One line, and the line is the point: this is
+    :func:`~app.core.exceptions.database_failure_fields` under the name the readiness surface
+    calls it by. That function derives every field from types and one validated driver attribute
+    - no message, no argument, no statement, no parameters, no connection URL - and it is what a
+    data route's 503 record is built from too, so the two records describing one outage carry
+    identical ``failure_class``, ``exception_type``, ``driver_exception_type`` and ``sqlstate``
+    values and can be grouped on any of them.
 
-    ``sqlstate`` is where the real precision lives, and it costs nothing to carry: ``28P01`` is an
-    invalid password, ``08006`` a failed connection, ``3D000`` a missing database, ``53300`` too
-    many clients. Those are exactly the cases that would otherwise be indistinguishable, and the
-    code itself discloses nothing - it names a condition, not a host, a credential or a row.
-
-    Public rather than private, unlike every other helper in this module, because the failure
-    vocabulary is what an alert rule and a dashboard group by: it is part of this service's
-    observability contract rather than an implementation detail of one raise site.
+    Kept as a named function here rather than deleted in favour of the import, for two reasons
+    that are both about the boundary rather than about the code. It is the name
+    ``app.api.v1.routers.health`` and the readiness suite already refer to, and this docstring is
+    where a reader of *this* module learns what the probe's record contains without having to
+    follow an alias into another package.
 
     Args:
         exc: The exception :meth:`HealthService.check_readiness` caught. Any type, including one
-            this module has never heard of, which is what ``unexpected_failure`` exists for.
+            neither module has heard of, which is what ``unexpected_failure`` exists for.
 
     Returns:
         A mapping of log fields. ``failure_class`` and ``exception_type`` are always present;
         ``driver_exception_type`` and ``sqlstate`` appear only when the driver supplied them.
     """
-    failure_class: ReadinessFailureClass
-    if isinstance(exc, PoolTimeoutError):
-        # Checked FIRST, and it must stay first: this is a pool-level failure raised without any
-        # connection attempt being made, so it carries no driver exception and no SQLSTATE, and
-        # it is the one classification whose remedy (capacity, or a session that is not being
-        # released) has nothing to do with the database being reachable.
-        failure_class = "pool_timeout"
-    elif isinstance(exc, TimeoutError):
-        # This service's own deadline. `TimeoutError` is the builtin, which `asyncio.timeout`
-        # raises on expiry - not SQLAlchemy's pool timeout, which is aliased above as
-        # `PoolTimeoutError` and checked first. Reported as a deadline rather than a fault,
-        # because the database may be perfectly healthy and merely slower than
-        # `READINESS_TIMEOUT_SECONDS`.
-        failure_class = "query_timeout"
-    elif getattr(getattr(exc, "orig", None), "sqlstate", None) == _SQLSTATE_QUERY_CANCELED:
-        # The server cancelled the statement under `app.db.session`'s `statement_timeout`.
-        # Checked BEFORE the `OperationalError` branch below, because SQLAlchemy wraps it as one
-        # and it would otherwise be filed as a connection failure - the wrong story entirely,
-        # since the connection was fine and the statement was not, and it would send an operator
-        # to the wrong system.
-        failure_class = "query_timeout"
-    elif isinstance(exc, OperationalError):
-        failure_class = "connection_failure"
-    elif isinstance(exc, InterfaceError):
-        failure_class = "driver_interface_failure"
-    elif isinstance(exc, DBAPIError):
-        failure_class = "database_error"
-    else:
-        failure_class = "unexpected_failure"
-
-    fields = {
-        _LOG_FIELD_FAILURE_CLASS: failure_class,
-        _LOG_FIELD_EXCEPTION_TYPE: type(exc).__name__,
-    }
-
-    # `DBAPIError.orig` is the driver's own exception, and its class name is the more specific
-    # of the two - SQLAlchemy's `OperationalError` wraps psycopg's `OperationalError`,
-    # `ConnectionTimeout` or `InvalidPassword` alike, and only the inner name says which.
-    driver_error = getattr(exc, "orig", None)
-    if driver_error is not None:
-        fields[_LOG_FIELD_DRIVER_EXCEPTION_TYPE] = type(driver_error).__name__
-        # psycopg 3 exposes `sqlstate`; the attribute is read defensively because `orig` is
-        # whatever the configured driver raised, and a driver that does not publish one simply
-        # contributes no field.
-        sqlstate = getattr(driver_error, "sqlstate", None)
-        if isinstance(sqlstate, str) and _SQLSTATE_PATTERN.match(sqlstate):
-            fields[_LOG_FIELD_SQLSTATE] = sqlstate
-
-    return fields
+    return database_failure_fields(exc)
 
 
 class DatabaseUnavailableError(AppError):

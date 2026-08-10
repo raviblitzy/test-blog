@@ -102,8 +102,8 @@ escape with a different shape: Starlette raises ``HTTPException`` for an unmatch
 for a method mismatch, FastAPI raises ``RequestValidationError`` when a payload fails its
 model, and slowapi raises ``RateLimitExceeded`` when a login is throttled.
 
-The six handlers
-----------------
+The handlers
+------------
 :func:`register_exception_handlers` installs all of them, and ``app.main`` calls it exactly
 once. Dispatch is not registration-ordered: Starlette walks ``type(exc).__mro__`` and takes
 the first registered class it finds, so the most-derived registration always wins. The order
@@ -125,8 +125,30 @@ Exception                   Status   Notes
                                      recomputed across every route matching the
                                      path, because the framework's own value names
                                      only the one route that raised.
+``DataError``               400/500  A value the caller sent, classified by
+                                     SQLSTATE; anything whose provenance is not
+                                     the caller's is re-raised to the 500 owner.
+``OperationalError``        503      A database that could not be reached or could
+``InterfaceError``                   not carry a statement, and pool exhaustion.
+``TimeoutError``                     One classified record, ``Retry-After``, and no
+(SQLAlchemy's pool timeout)          traceback: an outage is not a defect.
 ``Exception``               500      Generic detail, nothing internal, logged in full.
 =========================== ======== =================================================
+
+Why a database outage has its own status
+----------------------------------------
+The three connection-level registrations above exist so that "the database is unreachable" and
+"this code has a bug" are different answers rather than the same 500. That distinction was
+already made for ``GET /readyz`` - ``app.services.health_service`` classifies the failure and
+answers 503 - and every other route contradicted it: a stopped database answered 500 with a full
+exception chain per request, which is the highest-volume log path in the system firing exactly
+when the system is least able to absorb it, while monitoring could not tell an infrastructure
+outage from a code defect by status code alone and standard 503-based retry and backoff never
+engaged.
+
+:func:`database_failure_fields` is the one classifier both surfaces use, so the vocabulary an
+alert rule groups by is identical whichever route reported the condition. What is deliberately
+NOT registered is as much of the policy as what is: see :func:`_database_unavailable_handler`.
 
 Registering the ``HTTPException`` handler is what retires the legacy surface at the error
 contract: after this change ``/items`` matches no route, so Starlette raises a 404 that would
@@ -149,9 +171,10 @@ Import purity
 ``app.core`` is the root of the backend import graph, and this module keeps it that way. It
 imports the standard library, FastAPI, Starlette, slowapi, ``sqlalchemy.exc`` and
 ``app.core.logging`` - nothing else, and in particular **not** ``app.schemas``. The SQLAlchemy
-import is one exception class, ``IntegrityError``, for :func:`integrity_constraint_name`, and it
-adds no edge to the graph that ``app.core.dependencies`` does not already have: no model, no
-session and no query is imported, and nothing here touches the database. That asymmetry is
+imports are exception classes only - ``IntegrityError`` for :func:`integrity_constraint_name`,
+``DataError`` for the classification by provenance, and the connection-level family for the 503 -
+and they add no edge to the graph that ``app.core.dependencies`` does not already have: no model,
+no session and no query is imported, and nothing here touches the database. That asymmetry is
 deliberate rather than tidy: ``app.schemas.common`` declares the Pydantic model of this document
 for the OpenAPI surface and therefore may import from ``app.core``, so an import back the other
 way would close a cycle. The handlers here build the body as a plain dict instead, which is also why
@@ -162,22 +185,27 @@ import re
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from http import HTTPStatus
 from types import MappingProxyType
-from typing import ClassVar, Final, TypedDict, cast
+from typing import ClassVar, Final, Literal, TypedDict, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-
-# `ORJSONResponse` carries a FastAPIDeprecationWarning as of FastAPI 0.141.1, because the
-# framework now serialises through Pydantic when a route declares a response model. It is
-# nonetheless the correct class here: `app.main` installs it as the application's
-# `default_response_class`, so every successful body is already rendered by it, and rendering
-# failures through anything else would reintroduce - between success and failure this time -
-# precisely the serialisation inconsistency this module exists to eliminate. The warning is a
-# property of the pinned release and of that application-wide choice, so it is recorded here
-# rather than silenced: mutating the global warning filters from a library module would hide
-# unrelated deprecations for the whole process.
-from fastapi.responses import ORJSONResponse
 from slowapi.errors import RateLimitExceeded
+
+# Exception classes only, and every one of them is either handled or classified here.
+# `IntegrityError` backs `integrity_constraint_name`; `DataError` is classified by provenance;
+# and the last four are the database-availability family, which is why each is named rather than
+# the `SQLAlchemyError` root: a *statement* failure and a *connection* failure are the two
+# outcomes this module has to keep apart, and catching the root would collapse them. `TimeoutError`
+# is SQLAlchemy's POOL timeout, aliased because the builtin of that name is a different condition
+# and both appear in `database_failure_fields`.
+from sqlalchemy.exc import (
+    DataError,
+    DBAPIError,
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+    TimeoutError as PoolTimeoutError,
+)
 
 # Reached through the Starlette that FastAPI pins and installs, and each of the three has no
 # FastAPI-surface equivalent to prefer. `StarletteHTTPException` is the BASE class - FastAPI's own
@@ -185,7 +213,6 @@ from slowapi.errors import RateLimitExceeded
 # path or method, so a handler registered on the subclass would not see a 404 or a 405 at all.
 # `Match` and `ExceptionHandler` are re-exported nowhere under `fastapi`. None of the three is a
 # reason to declare starlette directly in `backend/pyproject.toml`: see that file for why.
-from sqlalchemy.exc import DataError, IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 from starlette.types import ExceptionHandler
@@ -200,6 +227,19 @@ from app.core.logging import (
     redact_sensitive_text,
 )
 
+# The project's own orjson response class, and NOT `fastapi.responses.ORJSONResponse`, which the
+# pinned FastAPI 0.141.1 deprecates. The deprecation was not merely advisory in its effects: the
+# warning is installed on construction and derives from `UserWarning` rather than
+# `DeprecationWarning`, so it escaped Python's default filters and - because `configure_logging`
+# calls `logging.captureWarnings(True)` - put a WARNING record in the shipped image's log for each
+# handler below, once per site per worker. `app.core.responses` documents the whole decision,
+# including why neither dropping the response class nor filtering the warning was the right
+# remedy. The property that matters here is unchanged, and is why every handler returns this
+# class: `app.main` installs the same class as the application's `default_response_class`, so
+# rendering failures through it keeps success and failure on ONE serialiser instead of two, and no
+# problem document is ever built by a class a dependency bump could withdraw.
+from app.core.responses import ORJSONResponse
+
 __all__ = [
     "CORS_EXPOSE_HEADERS",
     "PROBLEM_JSON_MEDIA_TYPE",
@@ -211,6 +251,7 @@ __all__ = [
     "AppError",
     "AppValidationError",
     "ConflictError",
+    "DatabaseFailureClass",
     "FieldError",
     "ForbiddenError",
     "InvalidTokenError",
@@ -218,6 +259,7 @@ __all__ = [
     "RequestBodyTooLargeError",
     "TokenExpiredError",
     "UnauthorizedError",
+    "database_failure_fields",
     "inner_exception_handlers",
     "integrity_constraint_name",
     "is_usable_request_id",
@@ -435,6 +477,22 @@ _DETAIL_INVALID_FIELD: Final[str] = "This value is invalid."
 # case that is expected to occur and this is the residue.
 _DETAIL_DATA_ERROR: Final[str] = "The request contained a value that could not be processed."
 
+# The 503 body for a data route that could not reach the database - see
+# `_database_unavailable_handler`. It names no host, no port, no database and no user, because the
+# driver's own message names all four and that is precisely the disclosure this document exists to
+# withhold; and it names no configured interval, because the number a client can act on travels in
+# `Retry-After` instead.
+#
+# Deliberately DIFFERENT from `app.services.health_service`'s readiness detail, which states that
+# this instance is not ready to accept traffic. That one answers an orchestrator asking whether to
+# route to this process at all; this one answers a caller whose request could not be served right
+# now. The `type`, `title` and status are identical for both - one machine branch per status, as
+# the contract requires - and only the prose a person reads differs.
+_DETAIL_SERVICE_UNAVAILABLE: Final[str] = (
+    "The service is temporarily unable to reach its data store. Retry after the interval given "
+    "in the Retry-After header."
+)
+
 # ---------------------------------------------------------------------------------------
 # Which data exceptions are the caller's fault
 #
@@ -587,6 +645,18 @@ _CORS_EXPOSE_HEADERS_VALUE: Final[str] = ", ".join(CORS_EXPOSE_HEADERS)
 # attached - `RateLimitExceeded.limit` defaults to None at class level, so the attribute is
 # genuinely optional. One minute matches the granularity AUTH_RATE_LIMIT is expressed in.
 _DEFAULT_RETRY_AFTER_SECONDS: Final[int] = 60
+
+# `Retry-After` for a database that could not be reached. Five seconds, and derived rather than
+# picked: `app.db.session.CONNECT_TIMEOUT_SECONDS` is 5, so a client that waits this long has
+# waited out one whole connection attempt rather than racing the one that just failed. It is also
+# the observed order of magnitude for the condition it describes - a restarted database was
+# serving again 1.1s after it came back - so a caller that honours the header recovers on its
+# first retry instead of hammering an instance that is still reconnecting.
+#
+# Not read from settings, deliberately: it is a property of this service's own connection
+# behaviour, not a deployment choice, and a header value nobody can misconfigure is one fewer
+# thing to get wrong. It is a hint in any case - RFC 9110 defines `Retry-After` as advisory.
+_SERVICE_UNAVAILABLE_RETRY_AFTER_SECONDS: Final[int] = 5
 
 # The first element of a Pydantic `loc` tuple names the part of the request the value came
 # from. It is dropped from the reported field path so that `("body", "email")` becomes
@@ -864,6 +934,158 @@ def integrity_constraint_name(
         return None
     constraint = getattr(diagnostic, "constraint_name", None)
     return constraint if isinstance(constraint, str) else None
+
+
+# ---------------------------------------------------------------------------------------
+# Classifying a database failure
+#
+# One vocabulary, two surfaces. `app.services.health_service` reduces the failure behind a
+# readiness probe to these fields; `_database_unavailable_handler` below reduces the failure
+# behind a data route to the same ones. They were written once here rather than twice, because
+# the alternative is two classifications of one condition that drift apart and an operator who
+# cannot group an outage across the two records it produces.
+#
+# It lives in `app.core` and not in the service for a reason that is not preference: the service
+# imports `AppError` from this module, so a classifier owned there and imported back would close
+# a cycle. This direction is the only one available, and it is also the correct one - the
+# classification is part of the error contract, which is what this module is.
+#
+# Every field is a type name, a closed vocabulary member or a five-character condition code.
+# Nothing is ever built from an exception's MESSAGE, and that is the whole discipline: a driver's
+# connection-failure message names the host, the port, the database and the user it tried, and a
+# log field is indexed, retained and searched.
+# ---------------------------------------------------------------------------------------
+
+DatabaseFailureClass = Literal[
+    "pool_timeout",
+    "query_timeout",
+    "connection_failure",
+    "driver_interface_failure",
+    "database_error",
+    "unexpected_failure",
+]
+"""The fixed vocabulary of database failure classifications.
+
+A named alias rather than an inline annotation so that the values a dashboard or an alert rule
+groups by are declared in one place, and so mypy rejects a classification this module never
+published. ``app.services.health_service`` re-exports it under its own readiness-facing name.
+
+The members are the operational distinctions an operator acts on differently, and no finer: a pool
+that ran out needs a capacity or leak investigation, a statement that was cancelled needs the query
+or the timeout looked at, a connection that could not be made needs the database or the network
+looked at, a driver-level fault needs the client library or the socket state looked at, and
+anything else needs a person. Adding a member is adding a distinction somebody would act on;
+anything else belongs in the SQLSTATE, which is already carried.
+"""
+
+DATABASE_FAILURE_LOG_FIELD_CLASS: Final[str] = "failure_class"
+"""Field naming the :data:`DatabaseFailureClass` member. Stable, so it is safe to alert on."""
+
+DATABASE_FAILURE_LOG_FIELD_EXCEPTION_TYPE: Final[str] = "exception_type"
+"""Field naming the exception class SQLAlchemy raised. Shared with the 500 record's own field of
+the same name on purpose: one query filters both."""
+
+DATABASE_FAILURE_LOG_FIELD_DRIVER_EXCEPTION_TYPE: Final[str] = "driver_exception_type"
+"""Field naming the driver's own exception class, which is the more specific of the two."""
+
+DATABASE_FAILURE_LOG_FIELD_SQLSTATE: Final[str] = "sqlstate"
+"""Field carrying the server's condition code, when the driver published one."""
+
+_SQLSTATE_QUERY_CANCELED: Final[str] = "57014"
+"""PostgreSQL's ``query_canceled``, which is how ``app.db.session``'s server-side
+``statement_timeout`` reports itself.
+
+SQLAlchemy wraps it as an ``OperationalError``, which would otherwise be filed as
+``connection_failure`` - the wrong story entirely, since the connection was fine and the statement
+was not, and it would send an operator to the wrong system. Checked before the class-based
+branches for that reason.
+"""
+
+_SQLSTATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9]{5}\Z")
+"""A SQLSTATE is exactly five alphanumeric characters - ``28P01``, ``08006``, ``53300``.
+
+Validated rather than trusted even though it arrives from the driver, because it is read off an
+arbitrary exception object through ``getattr`` and is about to become a log field. Anything that is
+not the documented shape is dropped rather than rendered: a five-character code is worth a field,
+and something else in its place is worth nothing at all.
+"""
+
+
+def database_failure_fields(exc: BaseException) -> dict[str, str]:
+    """Reduce a caught database failure to the safe fields a log record may carry.
+
+    Built entirely from types and from one validated driver attribute. No message, no argument, no
+    statement, no parameters, no connection URL: the four things an operator needs to distinguish
+    one database failure from another are *which class of failure it was*, *which exception
+    SQLAlchemy raised*, *which driver exception it wrapped* and *what the database server called
+    it*.
+
+    ``sqlstate`` is where the real precision lives, and it costs nothing to carry: ``28P01`` is an
+    invalid password, ``08006`` a failed connection, ``3D000`` a missing database, ``53300`` too
+    many clients. Those are exactly the cases that would otherwise be indistinguishable, and the
+    code itself discloses nothing - it names a condition, not a host, a credential or a row.
+
+    Public rather than private, because the failure vocabulary is what an alert rule and a
+    dashboard group by: it is part of this service's observability contract rather than an
+    implementation detail of one raise site. It is also what makes the readiness probe's record and
+    a data route's record comparable, since both are built by this function.
+
+    Args:
+        exc: The exception that was caught. Any type, including one this module has never heard
+            of, which is what ``unexpected_failure`` exists for - so a caller may pass whatever it
+            caught without pre-filtering.
+
+    Returns:
+        A mapping of log fields. :data:`DATABASE_FAILURE_LOG_FIELD_CLASS` and
+        :data:`DATABASE_FAILURE_LOG_FIELD_EXCEPTION_TYPE` are always present;
+        :data:`DATABASE_FAILURE_LOG_FIELD_DRIVER_EXCEPTION_TYPE` and
+        :data:`DATABASE_FAILURE_LOG_FIELD_SQLSTATE` appear only when the driver supplied them.
+    """
+    failure_class: DatabaseFailureClass
+    if isinstance(exc, PoolTimeoutError):
+        # Checked FIRST, and it must stay first: this is a pool-level failure raised without any
+        # connection attempt being made, so it carries no driver exception and no SQLSTATE, and it
+        # is the one classification whose remedy (capacity, or a session that is not being
+        # released) has nothing to do with the database being reachable.
+        failure_class = "pool_timeout"
+    elif isinstance(exc, TimeoutError):
+        # A deadline imposed by the caller. `TimeoutError` is the builtin, which `asyncio.timeout`
+        # raises on expiry - not SQLAlchemy's pool timeout, which is aliased above as
+        # `PoolTimeoutError` and checked first. Reported as a deadline rather than a fault, because
+        # the database may be perfectly healthy and merely slower than the deadline allowed.
+        failure_class = "query_timeout"
+    elif getattr(getattr(exc, "orig", None), "sqlstate", None) == _SQLSTATE_QUERY_CANCELED:
+        # The server cancelled the statement under `app.db.session`'s `statement_timeout`. Checked
+        # BEFORE the `OperationalError` branch below - see `_SQLSTATE_QUERY_CANCELED`.
+        failure_class = "query_timeout"
+    elif isinstance(exc, OperationalError):
+        failure_class = "connection_failure"
+    elif isinstance(exc, InterfaceError):
+        failure_class = "driver_interface_failure"
+    elif isinstance(exc, DBAPIError):
+        failure_class = "database_error"
+    else:
+        failure_class = "unexpected_failure"
+
+    fields = {
+        DATABASE_FAILURE_LOG_FIELD_CLASS: failure_class,
+        DATABASE_FAILURE_LOG_FIELD_EXCEPTION_TYPE: type(exc).__name__,
+    }
+
+    # `DBAPIError.orig` is the driver's own exception, and its class name is the more specific of
+    # the two - SQLAlchemy's `OperationalError` wraps psycopg's `OperationalError`,
+    # `ConnectionTimeout` or `InvalidPassword` alike, and only the inner name says which.
+    driver_error = getattr(exc, "orig", None)
+    if driver_error is not None:
+        fields[DATABASE_FAILURE_LOG_FIELD_DRIVER_EXCEPTION_TYPE] = type(driver_error).__name__
+        # psycopg 3 exposes `sqlstate`; the attribute is read defensively because `orig` is
+        # whatever the configured driver raised, and a driver that does not publish one simply
+        # contributes no field.
+        sqlstate = getattr(driver_error, "sqlstate", None)
+        if isinstance(sqlstate, str) and _SQLSTATE_PATTERN.match(sqlstate):
+            fields[DATABASE_FAILURE_LOG_FIELD_SQLSTATE] = sqlstate
+
+    return fields
 
 
 class AppError(Exception):
@@ -1921,6 +2143,88 @@ async def _data_error_handler(request: Request, exc: Exception) -> ORJSONRespons
     )
 
 
+async def _database_unavailable_handler(request: Request, exc: Exception) -> ORJSONResponse:
+    """Render a database that could not serve the request as a 503, with no traceback.
+
+    **The status is the point.** A stopped, unreachable or saturated database is an
+    infrastructure condition, and answering it with a 500 tells every consumer the wrong thing:
+    monitoring cannot separate an outage from a defect by status code, a client's standard
+    503-based retry and backoff never engages, and the 5xx budget that is supposed to mean "this
+    service has a bug" is spent by something outside the service entirely. ``GET /readyz`` has
+    always made this distinction - ``app.services.health_service`` classifies the failure and
+    answers 503 - and until this handler existed every other route contradicted it.
+
+    **The absent traceback is equally the point.** The 500 owner serialises frames, correctly: an
+    unanticipated failure is undiagnosable without them. A refused connection is not
+    unanticipated, its frames are the same three lines on every request, and a real outage means
+    *every* request takes this path - so the highest-volume log path in the system would fire
+    exactly when the system is least able to absorb it. One classified record is written instead,
+    at ``error`` because an outage is an incident, carrying
+    :func:`database_failure_fields`' closed vocabulary and nothing composed from the exception's
+    message. That is the same reduction the readiness probe writes, from the same function, so one
+    query finds both records for one outage.
+
+    Registered for three SQLAlchemy classes, and what is NOT registered is as deliberate:
+
+    * ``OperationalError`` - a connection that could not be made or was lost, an authentication
+      rejection, a database that does not exist, too many clients, a cancelled statement. The
+      overwhelming majority of real occurrences.
+    * ``InterfaceError`` - the driver connection is unusable rather than unreachable.
+    * SQLAlchemy's ``TimeoutError`` (aliased ``PoolTimeoutError``) - no pool slot became
+      available. Transient by definition and retryable, which is exactly what a 503 with
+      ``Retry-After`` says.
+    * **Not** ``OSError``, though a socket failure is what several of the above wrap. At an
+      application-wide handler that class is far too broad: a failed file read or a broken pipe
+      while writing a response would be filed as a database outage, which loses the 500 that
+      alerting keys on and the traceback that says whose bug it is.
+      ``HealthService.check_readiness`` does catch it, and consistently so - inside that ``try``
+      the entire operation is one database statement, so there is no other thing an ``OSError``
+      could be.
+    * **Not** ``ProgrammingError`` and not the ``DBAPIError`` root. A missing table or a bad
+      column is a deployment or a code defect - an unmigrated database, most often - and it must
+      keep answering 500 with frames rather than being dressed up as a transient outage a client
+      should retry.
+
+    Registered only through :func:`register_exception_handlers`, and not in
+    :func:`inner_exception_handlers`. No middleware in this application issues a statement, so a
+    database failure can only be raised at or below the router - which the framework's own
+    exception middleware dispatches from *inside* ``CORSMiddleware``. This response therefore
+    travels back out through the CORS layer, the security headers and the request context like
+    any other answer, and needs none of them written by hand.
+
+    Args:
+        request: The request being answered. Read for the method and path the record carries and
+            for the correlation identifier the document and the header share.
+        exc: The raised exception. One of the three registered classes, by MRO dispatch, and
+            passed to :func:`database_failure_fields` rather than inspected here.
+
+    Returns:
+        The 503 problem document, carrying ``Retry-After`` and - through
+        :func:`_problem_response` - the same six members every other error in this API has.
+    """
+    # `logger.error`, never `logger.exception`, and no `exc_info`: see the docstring above for why
+    # frames are withheld here and serialised on the 500 path. The HTTP fields are neutralised
+    # exactly as every other record in this module neutralises them, because a path can carry
+    # whatever a caller put in it.
+    get_logger(__name__).error(
+        "database_unavailable_response",
+        **{
+            HTTP_LOG_FIELD_METHOD: log_safe_text(request.method),
+            HTTP_LOG_FIELD_PATH: log_safe_text(request.url.path),
+            HTTP_LOG_FIELD_STATUS: int(HTTPStatus.SERVICE_UNAVAILABLE),
+        },
+        **database_failure_fields(exc),
+    )
+    return _problem_response(
+        request=request,
+        status=HTTPStatus.SERVICE_UNAVAILABLE,
+        error_type=_ERROR_TYPE_SERVICE_UNAVAILABLE,
+        title=_TITLE_SERVICE_UNAVAILABLE,
+        detail=_DETAIL_SERVICE_UNAVAILABLE,
+        headers={RETRY_AFTER_HEADER: str(_SERVICE_UNAVAILABLE_RETRY_AFTER_SECONDS)},
+    )
+
+
 def _headers_for_http_exception(
     request: Request, error: StarletteHTTPException
 ) -> Mapping[str, str] | None:
@@ -2443,7 +2747,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     """Install every error handler on the application. Called exactly once, by ``app.main``.
 
     After this call there is no route in the service that can answer with a body of any other
-    shape: the four framework and domain exception families are handled explicitly and bare
+    shape: the framework, domain and database exception families are handled explicitly and bare
     ``Exception`` catches the rest, so the uniform problem document is a property of the
     application rather than a convention each route has to remember.
 
@@ -2489,4 +2793,11 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(DataError, _data_error_handler)
+    # The database-availability family. Three sibling registrations rather than one on a shared
+    # base, because their nearest common ancestor is `DBAPIError` - which also covers
+    # `ProgrammingError` and `DataError`, both of which must keep answering as they do now. See
+    # `_database_unavailable_handler` for what each class means and why `OSError` is absent.
+    app.add_exception_handler(OperationalError, _database_unavailable_handler)
+    app.add_exception_handler(InterfaceError, _database_unavailable_handler)
+    app.add_exception_handler(PoolTimeoutError, _database_unavailable_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)

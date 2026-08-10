@@ -1,9 +1,21 @@
-"""Integration suite for the one error the contract classifies by *provenance* rather than class.
+"""Integration suite for the errors the contract classifies by *provenance* rather than class.
 
 Every other failure in this service maps to a status by its type: a ``NotFoundError`` is a 404, a
 ``RequestValidationError`` is a 422, an unanticipated exception is a 500.
 ``sqlalchemy.exc.DataError`` is the exception to that rule, and this module is here because the
 exception is subtle enough to regress silently.
+
+The database-availability family is the second half of the same question
+-----------------------------------------------------------------------
+A ``DataError`` asks "whose value failed?". A connection-level SQLAlchemy failure asks "whose fault
+is it that this request could not be served at all?" - and the answer is the same shape of
+judgement: a database that is stopped, unreachable, saturated or cancelling statements is an
+infrastructure condition, so it answers **503** with ``Retry-After`` and one classified record,
+while a missing table or a bad column is a deployment or a code defect and keeps answering **500**
+with frames. Both halves are asserted here, and the negative cases matter as much as the positive
+ones: a 500 for an outage spends the 5xx budget that is supposed to mean "this service has a bug"
+and floods the log with a traceback per request exactly when the system is least able to absorb it,
+while a 503 for a real defect hides the incident behind a status a client is told to retry.
 
 Why provenance and not class
 ----------------------------
@@ -59,6 +71,7 @@ from __future__ import annotations
 
 import io
 import json
+import warnings
 from collections.abc import AsyncIterator, Callable, Iterator
 from http import HTTPStatus
 from typing import Any, Final, NoReturn
@@ -66,10 +79,18 @@ from typing import Any, Final, NoReturn
 import pytest
 from fastapi import HTTPException
 from httpx import AsyncClient, Response
-from sqlalchemy.exc import DataError
+from sqlalchemy.exc import (
+    DataError,
+    InterfaceError,
+    OperationalError,
+    ProgrammingError,
+    TimeoutError as PoolTimeoutError,
+)
 
 from app.api.v1.router import API_V1_PREFIX
 from app.core.logging import configure_logging
+from app.core.responses import ORJSONResponse
+from app.main import create_app
 
 # ---------------------------------------------------------------------------------------
 # The route under test
@@ -102,6 +123,31 @@ BAD_REQUEST_DETAIL: Final[str] = "The request contained a value that could not b
 INTERNAL_TYPE: Final[str] = "/errors/internal-server-error"
 INTERNAL_TITLE: Final[str] = "Internal Server Error"
 INTERNAL_DETAIL: Final[str] = "An unexpected error occurred."
+
+SERVICE_UNAVAILABLE_TYPE: Final[str] = "/errors/service-unavailable"
+SERVICE_UNAVAILABLE_TITLE: Final[str] = "Service Unavailable"
+SERVICE_UNAVAILABLE_DETAIL: Final[str] = (
+    "The service is temporarily unable to reach its data store. Retry after the interval given "
+    "in the Retry-After header."
+)
+"""The published 503 triple, restated rather than imported.
+
+Every constant in this module is restated for the same reason: these three strings are the contract
+a client branches on, and a test that imported them from the code under test would assert only that
+the code equals itself. The ``detail`` is deliberately NOT the readiness probe's sentence - that one
+tells an orchestrator this instance is not ready, this one tells a caller their request could not be
+served - and asserting the two apart is what keeps the distinction from being lost in a refactor.
+"""
+
+RETRY_AFTER_HEADER: Final[str] = "Retry-After"
+EXPECTED_RETRY_AFTER: Final[str] = "5"
+"""The window a database-unavailable 503 advertises, in seconds, as it appears on the wire.
+
+Asserted as an exact string because the value is a hint a client acts on: a 503 with no
+``Retry-After`` leaves a caller to invent a backoff, and one that changed silently would change
+every caller's retry behaviour. Five seconds is one whole connection attempt at
+``app.db.session.CONNECT_TIMEOUT_SECONDS``.
+"""
 
 # ---------------------------------------------------------------------------------------
 # Markers
@@ -145,6 +191,36 @@ UNHANDLED_EVENT: Final[str] = "unhandled_exception_response"
 """Event name ``app.core.exceptions`` writes when it renders a 500. Stable, so it is safe to alert
 on - and therefore safe for one test to assert on."""
 
+DATABASE_UNAVAILABLE_EVENT: Final[str] = "database_unavailable_response"
+"""Event name ``app.core.exceptions`` writes when it renders a database-unavailable 503.
+
+Distinct from the readiness probe's ``readiness_probe_failed`` because the two surfaces must stay
+separately queryable, and distinct from :data:`UNHANDLED_EVENT` because the whole point of the
+classification is that an outage is not an unhandled failure. Restated here, since it is the name an
+alert rule is written against.
+"""
+
+SQLSTATE_INVALID_PASSWORD: Final[str] = "28P01"
+"""``invalid_password``. A rejected credential arrives as an ``OperationalError``, so it is one of
+the conditions the availability family covers - and the one that proves the code itself discloses
+nothing: it names a condition, not a host, a user or a secret."""
+
+SQLSTATE_TOO_MANY_CONNECTIONS: Final[str] = "53300"
+"""``too_many_connections``. Saturation rather than absence, and transient, which is exactly what a
+503 with ``Retry-After`` says and a 500 does not."""
+
+SQLSTATE_QUERY_CANCELED: Final[str] = "57014"
+"""``query_canceled`` - how ``app.db.session``'s server-side ``statement_timeout`` reports itself.
+
+SQLAlchemy wraps it as an ``OperationalError``, so the status is the same 503; the *classification*
+must not be, because the connection was fine and the statement was not, and an operator sent after a
+healthy connection is an operator sent to the wrong system.
+"""
+
+SQLSTATE_UNDEFINED_TABLE: Final[str] = "42P01"
+"""``undefined_table``. The negative case: an unmigrated database or a model that has drifted is a
+deployment or a code defect, not an outage, so it must keep answering 500 with frames."""
+
 SERVER_ERROR_DETAIL: Final[str] = "The server could not complete the request."
 """``detail`` published when a 5xx ``HTTPException`` arrived carrying one of its own.
 
@@ -179,12 +255,13 @@ sharing a constant with the code under test would assert nothing.
 
 
 class DriverDataError(Exception):
-    """Stand-in for the driver exception SQLAlchemy exposes as ``DataError.orig``.
+    """Stand-in for the driver exception SQLAlchemy exposes as ``DBAPIError.orig``.
 
     psycopg publishes the five-character condition code on its exceptions as ``sqlstate``, and
-    ``app.core.exceptions`` reads exactly that attribute to decide provenance. A purpose-built
-    double is used so the attribute can also be *absent* in effect - ``None`` - which is the shape
-    a client-side refusal really has.
+    ``app.core.exceptions`` reads exactly that attribute both to decide a ``DataError``'s
+    provenance and to classify a connection failure. A purpose-built double is used so the
+    attribute can also be *absent* in effect - ``None`` - which is the shape a client-side refusal
+    and most driver-interface failures really have.
     """
 
     def __init__(self, message: str, sqlstate: str | None = None) -> None:
@@ -217,8 +294,71 @@ def build_data_error(sqlstate: str | None, message: str = _FAILURE_MESSAGE) -> D
     return DataError(MARKER_STATEMENT, {}, DriverDataError(message, sqlstate))
 
 
-class DataFailingSession:
-    """Session-shaped double whose every statement raises the data failure it was built with.
+def build_connection_failure(sqlstate: str | None = SQLSTATE_INVALID_PASSWORD) -> OperationalError:
+    """Build the failure SQLAlchemy raises when the database could not carry the statement.
+
+    A refused connection, an unresolvable host, a rejected password, a database that does not exist
+    and a server with no connection slots left all arrive as this class in production, which makes
+    it the single most likely real cause of a data-plane 503.
+
+    Args:
+        sqlstate: The condition code the server published, or ``None`` for a failure raised before
+            the server was reached - a refused TCP connection has no code to report.
+
+    Returns:
+        The exception, wrapping a driver double whose message carries every disclosure marker, so
+        the assertions that the driver's text reaches neither the response nor the log are real.
+    """
+    return OperationalError(MARKER_STATEMENT, {}, DriverDataError(_FAILURE_MESSAGE, sqlstate))
+
+
+def build_driver_interface_failure() -> InterfaceError:
+    """Build the failure raised when the driver connection is unusable rather than unreachable.
+
+    A socket closed underneath a live connection, or a client library in a state it cannot recover
+    from, produces this rather than an operational error - a distinction an operator acts on
+    differently, and one that must not change the status a caller sees.
+
+    Returns:
+        The exception, wrapping a driver double with no SQLSTATE, as this class of failure usually
+        arrives without one.
+    """
+    return InterfaceError(MARKER_STATEMENT, {}, DriverDataError(_FAILURE_MESSAGE, None))
+
+
+def build_pool_timeout() -> PoolTimeoutError:
+    """Build SQLAlchemy's pool timeout: no connection slot became available in time.
+
+    Not a ``DBAPIError`` at all - it is raised before any connection attempt is made, so it carries
+    no driver exception and no condition code. Included because it is the availability failure whose
+    remedy has nothing to do with the database being reachable, and because a class outside the
+    ``DBAPIError`` hierarchy is exactly the kind of registration a refactor drops silently.
+
+    Returns:
+        The exception, carrying the marker-bearing message so the disclosure assertions hold here
+        too.
+    """
+    return PoolTimeoutError(_FAILURE_MESSAGE)
+
+
+def build_undefined_table_failure() -> ProgrammingError:
+    """Build the failure an unmigrated database or a drifted model produces.
+
+    The negative case for the availability family, and the reason the registrations name
+    ``OperationalError`` and ``InterfaceError`` rather than their shared ``DBAPIError`` base: this
+    is a sibling of both, it is a defect rather than an outage, and filing it as a transient 503
+    would tell a client to retry a request that cannot succeed until somebody deploys a migration.
+
+    Returns:
+        The exception, wrapping a driver double carrying ``42P01``.
+    """
+    return ProgrammingError(
+        MARKER_STATEMENT, {}, DriverDataError(_FAILURE_MESSAGE, SQLSTATE_UNDEFINED_TABLE)
+    )
+
+
+class FailingSession:
+    """Session-shaped double whose every statement raises the failure it was built with.
 
     The failure happens at :meth:`execute` and nowhere earlier, which is what makes the handler
     reachable: an object that failed while being yielded would fail during dependency resolution,
@@ -229,11 +369,14 @@ class DataFailingSession:
     the way out of a failed request.
     """
 
-    def __init__(self, failure: DataError) -> None:
+    def __init__(self, failure: Exception) -> None:
         """Store the exception every statement will raise.
 
         Args:
-            failure: Built fresh per test, so no exception instance is ever raised twice.
+            failure: Built fresh per test, so no exception instance is ever raised twice. Any
+                exception class: this module drives a data failure, four availability failures and
+                one defect through the same double, and the double is deliberately indifferent to
+                which - the classification under test belongs to ``app.core.exceptions``, not here.
         """
         self._failure = failure
 
@@ -245,7 +388,7 @@ class DataFailingSession:
             **kwargs: Ignored, for the same reason.
 
         Raises:
-            DataError: Always, and always the instance this double was built with.
+            Exception: Always, and always the instance this double was built with.
         """
         del args, kwargs
         raise self._failure
@@ -261,8 +404,8 @@ class DataFailingSession:
 def failing_client(
     client: AsyncClient,
     override_get_db: Callable[[Callable[..., Any]], None],
-) -> Callable[[DataError], AsyncClient]:
-    """Return an installer that points the client's session at a data failure.
+) -> Callable[[Exception], AsyncClient]:
+    """Return an installer that points the client's session at a failure of the caller's choosing.
 
     :func:`~tests.conftest.client` is requested rather than left to the test's signature, and that
     is not cosmetic: it installs its own ``get_db`` override while it is being set up, so a test
@@ -277,12 +420,15 @@ def failing_client(
         override_get_db: The restoring installer.
 
     Returns:
-        A callable taking the failure to raise and returning the client to drive.
+        A callable taking the failure to raise and returning the client to drive. Typed to
+        ``Exception`` rather than to one class because the two halves of this module's subject -
+        classification by provenance and classification by availability - are exercised through the
+        same seam, and one installer keeps them driving the same route through the same override.
     """
 
-    def install(failure: DataError) -> AsyncClient:
-        async def _failing_db() -> AsyncIterator[DataFailingSession]:
-            yield DataFailingSession(failure)
+    def install(failure: Exception) -> AsyncClient:
+        async def _failing_db() -> AsyncIterator[FailingSession]:
+            yield FailingSession(failure)
 
         override_get_db(_failing_db)
         return client
@@ -313,6 +459,24 @@ def captured_log_stream() -> Iterator[io.StringIO]:
         yield buffer
     finally:
         configure_logging()
+
+
+def _is_fastapi_deprecation(entry: warnings.WarningMessage) -> bool:
+    """Report whether *entry* is the framework's own deprecation notice.
+
+    Matched by class NAME rather than by importing ``fastapi.exceptions.FastAPIDeprecationWarning``,
+    and that is deliberate: importing the class to assert about it would tie this test to a symbol
+    the framework is free to move, and the assertion is about the *category a caller would see* in
+    a captured warning. The name is checked across the whole class hierarchy so a future subclass
+    is caught too.
+
+    Args:
+        entry: One captured warning, as ``warnings.catch_warnings(record=True)`` yields them.
+
+    Returns:
+        Whether any class in the warning category's MRO is FastAPI's deprecation warning.
+    """
+    return any(base.__name__ == "FastAPIDeprecationWarning" for base in entry.category.__mro__)
 
 
 def assert_problem_document(
@@ -469,6 +633,274 @@ class TestServerCausedDataFailure:
             title=INTERNAL_TITLE,
             detail=INTERNAL_DETAIL,
         )
+
+
+class TestNothingOnEitherPathIsDeprecated:
+    """A boot and a served request must not emit a ``FastAPIDeprecationWarning``. Ever.
+
+    Not a style rule, and not really about warnings. ``app.core.logging.configure_logging`` calls
+    ``logging.captureWarnings(True)``, so a warning in this process is a **log record**, and
+    ``FastAPIDeprecationWarning`` derives from ``UserWarning`` rather than ``DeprecationWarning``,
+    so Python's default filters do not hide it. Constructing a deprecated framework class therefore
+    put WARNING-level records into the shipped image's log on a clean boot serving nothing but a
+    health probe - in a service whose logging design deliberately downgrades healthy probe traffic
+    to ``debug`` so that WARNING remains worth reading. It also meant the artefact depended on an
+    API the pinned framework has announced it is removing.
+
+    Both halves are asserted, because the two construction sites are independent: the application
+    factory names a ``default_response_class`` for every route, and every handler in this module's
+    subject constructs a response directly.
+    """
+
+    def test_assembling_the_application_emits_no_deprecation(self) -> None:
+        """The factory builds a full application - metadata, middleware, routers, handlers - clean.
+
+        ``create_app`` is called rather than the module-level application being inspected, because
+        the warning under test fires at construction: an object already built during collection
+        would have emitted it before the recorder was installed, and the test would pass
+        vacuously.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            # `always`, not the pinned `default`: `default` reports a given warning once per
+            # location per process, so a suite that had already built an application would leave
+            # this assertion satisfied by the filter rather than by the code.
+            warnings.simplefilter("always")
+            create_app()
+
+        offenders = [str(entry.message) for entry in caught if _is_fastapi_deprecation(entry)]
+        assert offenders == [], f"assembling the application emitted deprecations: {offenders}"
+
+    async def test_rendering_a_problem_document_emits_no_deprecation(
+        self, failing_client: Callable[[Exception], AsyncClient]
+    ) -> None:
+        """The error path builds its response by hand, so it is the other half of the same claim.
+
+        Driven through a real request rather than by calling a handler, so the response class the
+        application actually uses is the one exercised - and a 503 is chosen because it is rendered
+        by the newest of the handlers, which is the one a reader would most expect to have reached
+        for the framework's class by habit.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            response = await failing_client(build_connection_failure()).get(CATEGORIES_PATH)
+
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        offenders = [str(entry.message) for entry in caught if _is_fastapi_deprecation(entry)]
+        assert offenders == [], f"rendering an error emitted deprecations: {offenders}"
+
+    def test_the_application_serialises_through_this_project_s_response_class(self) -> None:
+        """The default response class is the project's, and it renders bytes through ``orjson``.
+
+        Asserted on the built application rather than on the import, because the property that
+        matters is which class every route inherits - and asserted by identity rather than by name,
+        since the framework's deprecated class carries the same name and a re-added import of it
+        would satisfy any check written against the string.
+        """
+        application = create_app()
+
+        assert application.router.default_response_class is ORJSONResponse
+        assert ORJSONResponse.__module__ == "app.core.responses"
+        # The rendering contract itself, in one line: `orjson` returns bytes and serialises the two
+        # types this domain is full of and the standard library's encoder refuses.
+        rendered = ORJSONResponse(content=None).render({"n": 1})
+        assert rendered == b'{"n":1}'
+
+
+class TestTheDatabaseIsUnavailable:
+    """A database that could not carry the statement: 503, ``Retry-After``, and no traceback.
+
+    Every case here answers the same status through a different class, and that is the assertion:
+    an operator, a monitor and a client all need "the database is down" to be one answer regardless
+    of whether the driver reported a refused connection, a rejected credential, an exhausted pool,
+    a dead socket or a cancelled statement.
+    """
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            build_connection_failure,
+            lambda: build_connection_failure(None),
+            lambda: build_connection_failure(SQLSTATE_TOO_MANY_CONNECTIONS),
+            lambda: build_connection_failure(SQLSTATE_QUERY_CANCELED),
+            build_driver_interface_failure,
+            build_pool_timeout,
+        ],
+        ids=[
+            "rejected_credential",
+            "connection_refused_no_sqlstate",
+            "too_many_connections",
+            "statement_cancelled",
+            "driver_interface_failure",
+            "pool_timeout",
+        ],
+    )
+    async def test_an_unreachable_database_is_a_503(
+        self, failing_client: Callable[[Exception], AsyncClient], build: Callable[[], Exception]
+    ) -> None:
+        """The status, the document and the retry hint, for all five classes at once.
+
+        ``assert_problem_document`` additionally proves the driver's markers are absent, which is
+        what makes this the *same* contract as the 400 and the 500 rather than a new document that
+        happens to share a shape: a connection-failure message names the host, the port, the
+        database and the user it tried, and none of it may reach an unauthenticated caller.
+        """
+        response = await failing_client(build()).get(CATEGORIES_PATH)
+
+        assert_problem_document(
+            response,
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            error_type=SERVICE_UNAVAILABLE_TYPE,
+            title=SERVICE_UNAVAILABLE_TITLE,
+            detail=SERVICE_UNAVAILABLE_DETAIL,
+        )
+        assert response.headers.get(RETRY_AFTER_HEADER) == EXPECTED_RETRY_AFTER
+
+    @pytest.mark.parametrize(
+        ("build", "failure_class", "exception_type", "sqlstate"),
+        [
+            (build_connection_failure, "connection_failure", "OperationalError", "28P01"),
+            (
+                lambda: build_connection_failure(SQLSTATE_QUERY_CANCELED),
+                "query_timeout",
+                "OperationalError",
+                "57014",
+            ),
+            (build_driver_interface_failure, "driver_interface_failure", "InterfaceError", None),
+            (build_pool_timeout, "pool_timeout", "TimeoutError", None),
+        ],
+        ids=["connection_failure", "statement_cancelled", "interface_failure", "pool_timeout"],
+    )
+    async def test_the_503_is_logged_once_with_the_classification_and_no_frames(
+        self,
+        failing_client: Callable[[Exception], AsyncClient],
+        captured_log_stream: io.StringIO,
+        build: Callable[[], Exception],
+        failure_class: str,
+        exception_type: str,
+        sqlstate: str | None,
+    ) -> None:
+        """One classified record per failed request, and deliberately no stack.
+
+        The classification is the whole diagnostic here, which is why it is asserted value by value:
+        a rejected credential (``28P01``) and a cancelled statement (``57014``) both arrive as an
+        ``OperationalError``, and they are filed differently because their remedies are - one is a
+        credential that was rotated without telling this deployment, the other a query or a timeout
+        to look at. A record that collapsed the two would send an operator to the wrong system.
+
+        The **absence** of frames is asserted just as hard. An outage means every request takes this
+        path, so a traceback here is a traceback per request at exactly the moment the system is
+        least able to absorb it; and there is nothing in those frames to learn, because the failure
+        is not in this code. The 500 path keeps its frames, and
+        :class:`TestTheServerErrorIsDiagnosable` asserts that it does.
+        """
+        response = await failing_client(build()).get(CATEGORIES_PATH)
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+
+        rendered = captured_log_stream.getvalue()
+        records = [json.loads(line) for line in rendered.splitlines() if line.strip()]
+        classified = [r for r in records if r.get("event") == DATABASE_UNAVAILABLE_EVENT]
+        assert len(classified) == 1, (
+            f"expected exactly one {DATABASE_UNAVAILABLE_EVENT!r} record, "
+            f"got {len(classified)}:\n{rendered}"
+        )
+
+        record = classified[0]
+        assert record["failure_class"] == failure_class
+        assert record["exception_type"] == exception_type
+        assert record["level"] == "error"
+        assert record["status_code"] == int(HTTPStatus.SERVICE_UNAVAILABLE)
+        assert record["http_method"] == "GET"
+        assert record["path"] == CATEGORIES_PATH
+        assert record["request_id"] == response.headers.get(REQUEST_ID_HEADER)
+
+        if sqlstate is None:
+            assert "sqlstate" not in record
+        else:
+            assert record["sqlstate"] == sqlstate
+
+        assert "exception" not in record, f"the 503 was logged with frames:\n{rendered}"
+        assert "Traceback" not in rendered, f"a traceback was written for an outage:\n{rendered}"
+        assert not [r for r in records if r.get("event") == UNHANDLED_EVENT], (
+            f"an outage was also filed as an unhandled failure:\n{rendered}"
+        )
+
+    async def test_the_drivers_text_reaches_neither_the_response_nor_the_log(
+        self,
+        failing_client: Callable[[Exception], AsyncClient],
+        captured_log_stream: io.StringIO,
+    ) -> None:
+        """The one record about an outage is built from types, not from a message.
+
+        This is where the availability path is *stricter* than the 500 path, and the difference is
+        intentional. A 500 keeps the driver's message in the log because the cause is a defect
+        somebody has to read; an outage's cause is already fully described by ``failure_class`` and
+        ``sqlstate``, so the message adds nothing and the message is what names the host, the port,
+        the database and the user. Nothing is redacted here because nothing is written.
+        """
+        response = await failing_client(build_connection_failure()).get(CATEGORIES_PATH)
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+
+        rendered = captured_log_stream.getvalue()
+        for marker in (MARKER_HOST, MARKER_USER, MARKER_VALUE, MARKER_STATEMENT):
+            assert marker not in rendered, f"{marker!r} was written to the log:\n{rendered}"
+
+    async def test_two_consecutive_outages_answer_identically(
+        self, failing_client: Callable[[Exception], AsyncClient]
+    ) -> None:
+        """An outage lasts longer than one request, so the second one must look like the first.
+
+        The condition this handler answers is, by nature, the one that repeats: a stopped database
+        fails every request until it comes back. Two identical documents with two distinct
+        correlation identifiers is what proves the path leaves nothing behind between them - no
+        half-sent response, no consumed handler, no session that failed to close.
+        """
+        client = failing_client(build_connection_failure())
+
+        first = await client.get(CATEGORIES_PATH)
+        second = await client.get(CATEGORIES_PATH)
+
+        for response in (first, second):
+            assert_problem_document(
+                response,
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                error_type=SERVICE_UNAVAILABLE_TYPE,
+                title=SERVICE_UNAVAILABLE_TITLE,
+                detail=SERVICE_UNAVAILABLE_DETAIL,
+            )
+        assert first.json()["request_id"] != second.json()["request_id"]
+
+    async def test_a_missing_relation_is_still_a_500_with_frames(
+        self,
+        failing_client: Callable[[Exception], AsyncClient],
+        captured_log_stream: io.StringIO,
+    ) -> None:
+        """The negative case, and why the registrations are per class rather than on the base.
+
+        ``ProgrammingError`` is a sibling of ``OperationalError`` and ``InterfaceError`` under
+        ``DBAPIError``, and an unmigrated database is the way it actually occurs. It must not be a
+        503: that would tell a client to retry a request which cannot succeed until somebody deploys
+        a migration, and it would hide a deployment defect behind a status that reads as
+        infrastructure weather. So it keeps the generic 500 body, the frames, and the
+        unhandled-response record - and produces no availability record at all.
+        """
+        response = await failing_client(build_undefined_table_failure()).get(CATEGORIES_PATH)
+
+        assert_problem_document(
+            response,
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            error_type=INTERNAL_TYPE,
+            title=INTERNAL_TITLE,
+            detail=INTERNAL_DETAIL,
+        )
+
+        rendered = captured_log_stream.getvalue()
+        records = [json.loads(line) for line in rendered.splitlines() if line.strip()]
+        assert not [r for r in records if r.get("event") == DATABASE_UNAVAILABLE_EVENT], (
+            f"a defect was filed as an outage:\n{rendered}"
+        )
+        unhandled = [r for r in records if r.get("event") == UNHANDLED_EVENT]
+        assert unhandled, f"no {UNHANDLED_EVENT!r} record was written:\n{rendered}"
+        assert unhandled[-1].get("exception"), f"the 500 was logged without frames:\n{rendered}"
 
 
 class TestTheServerErrorIsDiagnosable:
