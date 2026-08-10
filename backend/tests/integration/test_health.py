@@ -129,7 +129,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from http import HTTPStatus
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Final, NoReturn
+from typing import Any, Final, NoReturn, get_args
 
 import pytest
 from httpx import AsyncClient, Response
@@ -1074,10 +1074,13 @@ class TestHealthSeparation:
         override_get_db(unreachable_database)
         response = await client.get(READINESS_PATH)
 
-        # Asserted per parametrised case, so passing for all five shapes is the proof that the
-        # document is a property of the contract rather than of one code path: the route files
-        # these failures under five different classifications in its log record and must not
-        # distinguish them at all on the wire.
+        # Asserted per parametrised case, so passing for every shape in `FAILURE_BUILDERS` is the
+        # proof that the document is a property of the contract rather than of one code path: the
+        # route files these failures under distinct `ReadinessFailureClass` classifications in its
+        # log record and must not distinguish them at all on the wire. The builders are asserted to
+        # cover that vocabulary exhaustively by
+        # `TestFailureVocabularyIsCoveredExhaustively`, so "every shape" means every shape the
+        # service can publish rather than every shape somebody remembered to list.
         assert_readiness_failure(response)
 
         # The security half. The substituted failure's message names a host, a port, a database
@@ -1261,6 +1264,42 @@ class TestReadinessDeadline:
             TCP_KEEPALIVE_ARGS["keepalives_interval"]
         ) * int(TCP_KEEPALIVE_ARGS["keepalives_count"])
         assert deadline < keepalive_worst_case
+
+
+class TestFailureVocabularyIsCoveredExhaustively:
+    """The parametrised failure set is the route's whole vocabulary, asserted rather than counted.
+
+    :data:`FAILURE_BUILDERS` claims to be "exactly the ``ReadinessFailureClass`` vocabulary the
+    route declares", and every uniformity assertion in this module rests on that claim: a
+    classification the service can publish but this file does not build is a branch of the failure
+    path that no test reaches, and nothing else here would notice.
+
+    The claim used to be defended by prose and by a number written into a comment - which is how
+    the comment came to say *five* while the service published *six*. A stated count is a second
+    declaration of a set that already exists in code, so it is replaced by the relationship: one
+    assertion, over the two things that must agree.
+    """
+
+    def test_every_published_classification_has_a_builder(self) -> None:
+        """A classification with no builder is an unexercised failure branch."""
+        published = set(get_args(health_service.ReadinessFailureClass))
+        covered = set(FAILURE_BUILDER_IDS)
+
+        assert published == covered, (
+            "FAILURE_BUILDERS and ReadinessFailureClass disagree; missing builders for "
+            f"{sorted(published - covered)}, builders for classifications the service does not "
+            f"publish: {sorted(covered - published)}"
+        )
+
+    def test_each_builder_is_paired_with_the_identifier_it_is_filed_under(self) -> None:
+        """The two tuples are read positionally by ``parametrize``, so their lengths must match.
+
+        ``ids=`` is applied by position, so a builder added without its identifier - or the reverse
+        - would silently mislabel every case after it, and a failing test would then name the wrong
+        branch. That is worse than an unlabelled failure: it sends a reader to the wrong code.
+        """
+        assert len(FAILURE_BUILDERS) == len(FAILURE_BUILDER_IDS)
+        assert len(set(FAILURE_BUILDER_IDS)) == len(FAILURE_BUILDER_IDS)
 
 
 class TestReadinessFailureClassification:

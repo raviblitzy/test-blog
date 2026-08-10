@@ -154,40 +154,42 @@ type CategoryFieldName = (typeof CATEGORY_FIELD_NAMES)[number];
 type CategoryFieldErrorSetter = (field: CategoryFieldName, message: string) => void;
 
 /**
- * `ProblemDetail.type` for every conflict the service raises.
+ * Why a `409` is never attached to a field from its `type` alone.
  *
- * The service uses one URI for all of them, so `type` alone cannot say *which* conflict occurred -
- * but the operation can, and does. Reading `CategoryService`'s raise sites:
+ * The service raises every conflict under one URI, `/errors/conflict`, so `type` cannot say *which*
+ * conflict occurred - and on this form the candidates have **opposite remedies**. Reading
+ * `CategoryService`'s raise sites:
  *
- *   * **On submit, the conflict is a taken NAME.** `categories.name` is uniquely constrained, and
- *     both `create` and `update` pre-check it and raise "A category with that name already exists."
- *     The remedy is to change the name, so the message belongs on the name field.
- *   * **A slug collision is NOT a submit conflict**, and this is the correction worth stating,
- *     because the opposite reads plausibly. The slug is not submitted at all: the service derives it
- *     from the name and then hands it to `unique_slug`, which appends a deterministic suffix until it
- *     does not collide. So filing a second "Machine Learning" after a `machine-learning` already
- *     exists SUCCEEDS, with a suffixed slug, and the resolved value comes back in the response - it
- *     is not something the operator is asked to resolve. `update` does not re-derive the slug at all:
- *     a rename retains the address the taxonomy is linked and crawled under.
+ *   * **A taken NAME.** `categories.name` is uniquely constrained, and both `create` and `update`
+ *     pre-check it and raise "A category with that name already exists." The remedy is to change the
+ *     name, so this one does belong beside the name control.
+ *   * **A slug-allocation RACE, where the name is perfectly valid.** The slug is not submitted at
+ *     all: the service derives it from the name and hands it to `unique_slug`, which appends a
+ *     deterministic suffix until it does not collide - so filing a second "Machine Learning" after a
+ *     `machine-learning` already exists SUCCEEDS, with a suffixed slug, and the resolved value comes
+ *     back in the response. Only *sustained* contention on one slug family exhausts the retry bound,
+ *     and that raises a distinct 409 saying the address "is being claimed concurrently. Try again."
+ *     The remedy there is to **re-submit the same name**, so marking the name control invalid would
+ *     tell the operator to change the one thing that was not wrong. `update` never re-derives a
+ *     slug, so a rename retains the address the taxonomy is linked and crawled under.
+ *   * **On delete, the in-use guard**: "Posts are still filed under this category. Re-file them
+ *     before deleting it." Not a field error at all - no control on this form caused it and none can
+ *     fix it.
  *
- *     One residual case does name both columns - `_DETAIL_NAME_OR_SLUG_TAKEN` - and it is a RACE
- *     rather than a rule: two concurrent writers that both passed the pre-check, reported by the
- *     database instead of by the service. The remedy is identical (choose another name), which is why
- *     it lands on the same field and needs no branch of its own here.
- *   * **On delete, the only conflict is the in-use guard**: "Posts are still filed under this
- *     category. Re-file them before deleting it." That is not a field error at all - no control on
- *     this form caused it and none can fix it.
+ * A `ProblemDetail` carries `errors` **only for a validation failure** (`app.core.exceptions`
+ * omits the key entirely for every other status), so a conflict arrives with no field attribution
+ * and the client has no machine-readable way to tell those first two apart. Guessing is what this
+ * form used to do, and it guessed wrong for the retryable case. So the rule is: attach a message to
+ * a control **only when the document itself names the field**, and render every other refusal at
+ * form level, verbatim, through {@link resolveFailureCopy} - which shows the service's own `detail`,
+ * and whose prose already tells the operator which of the two remedies applies.
  *
  * Hence {@link applySubmitFailureToFields} is used on the submit path only, and the delete flow
  * renders its refusal in place instead.
  */
-const CONFLICT_PROBLEM_TYPE = '/errors/conflict';
 
 /** `type` recorded on errors this component attaches, distinguishing them from resolver errors. */
 const SERVER_ERROR_TYPE = 'server';
-
-/** Shown against the name when a conflict arrives carrying no prose of its own. */
-const CONFLICT_FALLBACK_MESSAGE = 'That category name is already taken. Choose another.';
 
 /** Headline for a failure that is not one of the service's problem documents. */
 const UNEXPECTED_FAILURE_HEADLINE = 'Something went wrong.';
@@ -215,19 +217,20 @@ function toCategoryFieldName(field: string): CategoryFieldName | null {
 }
 
 /**
- * Attach a submit failure to the fields that caused it, reporting whether anything was attached.
+ * Attach a submit failure to the fields the document itself blames, reporting whether it named any.
  *
- * Two failures are attributable, and both put the message beside the control the operator has to
- * change rather than in a banner away from it:
+ * **Exactly one class of failure is attributable: one that arrives carrying `errors`.** That is the
+ * request-validation document, which lists one entry per rejected field, and each entry's message
+ * goes beside the control the operator has to change rather than into a banner away from it.
  *
- *   - a request-validation failure, which carries one entry per rejected field; and
- *   - a conflict, which on this path always concerns the name or the slug derived from it, and whose
- *     remedy - choose another name - is the same either way.
- *
- * Everything else is not a field's fault. A `403` from an account that is not an administrator, a
- * `404` for a category deleted in another tab, a rate-limit refusal, a gateway that never answered:
- * each returns `false` so the caller renders it as a form-level alert instead. Nothing is ever
- * swallowed.
+ * Everything else returns `false` so the caller renders it as a form-level alert. That deliberately
+ * includes a **`409` conflict**: the service publishes one conflict `type` for a taken name and for
+ * a retryable slug-allocation race, their remedies are opposite, and the document names no field -
+ * so attributing it to `name` would be a guess, and the guess mis-advises the operator in the
+ * retryable case. See the note above {@link SERVER_ERROR_TYPE}. A `403` from an account that is not
+ * an administrator, a `404` for a category deleted in another tab, a rate-limit refusal and a
+ * gateway that never answered all take the same path. Nothing is ever swallowed: the form-level
+ * alert renders the service's own `title` and `detail`.
  *
  * @param failure - The rejection, still unnarrowed.
  * @param setFieldError - Attaches one message to one field.
@@ -257,12 +260,6 @@ function applySubmitFailureToFields(
     }
 
     return attached;
-  }
-
-  if (failure.problem.type === CONFLICT_PROBLEM_TYPE) {
-    const detail = failure.problem.detail.trim();
-    setFieldError('name', detail.length > 0 ? detail : CONFLICT_FALLBACK_MESSAGE);
-    return true;
   }
 
   return false;
@@ -388,7 +385,16 @@ const RENAME_SUBMIT_HINT = 'Only the fields you change are sent.';
 const SLUG_TERM = 'Address';
 const SLUG_NOTE =
   'Permanent. Renaming the category does not change it, so existing links keep working.';
-const POST_COUNT_TERM = 'Posts filed';
+/**
+ * Deliberately "Published posts" and not "Posts filed".
+ *
+ * `CategoryPublic.post_count` comes from `category_repository.list_with_post_counts`, whose join
+ * condition carries `status = PUBLISHED` - so it is the tally a *reader* sees beside a filter chip,
+ * and it counts neither drafts nor archived posts. Calling it "Posts filed" invited exactly the
+ * inference `describeDeletion` used to make: that `0` means nothing is filed and the category can be
+ * removed. It does not, and the API publishes no all-status association count to say otherwise.
+ */
+const POST_COUNT_TERM = 'Published posts';
 
 const DELETE_TRIGGER_LABEL = 'Delete category';
 const DELETE_CONFIRM_LABEL = 'Delete';
@@ -574,8 +580,14 @@ function CategoryFields({
  *
  * Both values are here for a reason beyond completeness. The address is shown *with* its guarantee,
  * so an administrator renaming a category can see that the link they published still resolves. The
- * filed-post count is shown because it is exactly what decides whether a delete will be permitted,
- * and seeing it beforehand turns a refusal from a confusing failure into an expected one.
+ * published-post count is shown because it is the only measure of use the API discloses, and knowing
+ * a category is carrying live articles is worth knowing before renaming it.
+ *
+ * **It is not a deletability test, and nothing here presents it as one.** `post_count` counts
+ * PUBLISHED posts, while `category_service.delete` refuses on `is_in_use` - an `EXISTS` over
+ * `post_categories` that sees a draft and an archived post too. A category showing `0` here can
+ * still be refused, so the confirmation copy states the server's rule instead of predicting its
+ * answer.
  *
  * Neither is a control, so neither is labelled by a `Label` or associated with a field: a description
  * list is what a set of read-only term-and-value pairs actually is.
@@ -724,27 +736,34 @@ function ActionLabel({
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Describe what deleting this category would do, in terms of what is filed under it.
+ * Describe what deleting this category would do, and what the server will check before it does.
  *
- * The count is quoted because it is the condition the service actually checks: a category with posts
- * still filed under it is refused, and it is refused for a reason worth stating - the association
- * cascades, so an unguarded delete would succeed while quietly stripping the category from every post
- * that used it. Saying so before the operator confirms means the refusal, when it comes, is the
- * outcome they were told to expect.
+ * The rule is stated rather than predicted, and that distinction is the whole of this function.
+ * `category_service.delete` refuses whenever **any** post is filed under the category -
+ * `CategoryRepository.is_in_use` is an `EXISTS` over `post_categories` with no status predicate, so a
+ * draft and an archived post count exactly as a published one does. The only tally this client holds
+ * is `post_count`, which counts PUBLISHED posts alone, so it can never prove a delete will be
+ * permitted. This copy therefore never promises the outcome: it says what the server checks, so a
+ * refusal reads as the documented rule rather than as a contradiction of the screen.
+ *
+ * The published count is still quoted when there is one, because it is real information about a term
+ * carrying live articles - it is simply reported as what it is rather than as a verdict.
  *
  * @param category - The category the confirmation is about.
- * @returns One or two sentences naming the category and its filed-post count.
+ * @returns Two sentences: what deletion means, and the condition the server enforces.
  */
 function describeDeletion(category: CategoryPublic): string {
   const { name, post_count: postCount } = category;
+  const rule = `Deleting “${name}” cannot be undone, and the server refuses it while any post is still filed under the category. A draft or an archived post counts as much as a published one.`;
 
   if (postCount === 0) {
-    return `No posts are filed under “${name}”, so it can be removed. This cannot be undone.`;
+    return `${rule} No published post uses it, but re-file anything unpublished first.`;
   }
 
-  const posts = postCount === 1 ? '1 post is' : `${String(postCount)} posts are`;
+  const posts =
+    postCount === 1 ? '1 published post uses' : `${String(postCount)} published posts use`;
 
-  return `${posts} still filed under “${name}”. Deleting a category that is still in use is refused, so re-file or remove those posts first.`;
+  return `${rule} ${posts} it today, so re-file those first.`;
 }
 
 /**
@@ -1163,7 +1182,7 @@ export interface CategoryFormProps {
    * The category being edited, or absent to create a new one.
    *
    * This single member selects the mode. Passing it switches the form to a partial update against
-   * that category's identifier, shows its permanent address and filed-post count as read-only
+   * that category's identifier, shows its permanent address and published-post count as read-only
    * context, and reveals the delete affordance.
    */
   category?: CategoryPublic;

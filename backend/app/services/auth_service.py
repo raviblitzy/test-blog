@@ -113,6 +113,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import (
+    AppError,
     ConflictError,
     ForbiddenError,
     UnauthorizedError,
@@ -254,7 +255,9 @@ class AuthService:
     :meth:`authenticate`            Verify a credential. Returns the mapped user, **no
                                     tokens** - separated so the credential rule can be tested
                                     without minting anything.
-    :meth:`issue_token_pair`        Mint and record a pair for a user already established.
+    :meth:`issue_token_pair`        Mint and record a pair for a user already established,
+                                    re-confirming under the account lock that the account is
+                                    still active.
     :meth:`login`                   :meth:`authenticate` then :meth:`issue_token_pair`, which
                                     is what the login route calls.
     :meth:`rotate_refresh_token`    Spend a refresh token and mint its replacement.
@@ -573,10 +576,20 @@ class AuthService:
 
         Raises:
             UnauthorizedError: The email is unknown or the password is wrong.
-            ForbiddenError: The account is deactivated.
+            ForbiddenError: The account is deactivated - whether that was already true when
+                :meth:`authenticate` looked, or became true while it was verifying the password.
+                One answer for both, because a race a caller can distinguish from a steady state
+                is a race a caller can detect.
         """
         user = await self.authenticate(credentials)
-        return await self.issue_token_pair(user)
+        # The same refusal `authenticate` would have raised, handed to `issue_token_pair` so that
+        # it can be raised from UNDER the account lock. Verifying a password costs tens of
+        # milliseconds of argon2id, and an administrator's deactivation can commit inside that
+        # window; the re-check under the lock is what catches it, and passing the error here is
+        # what keeps the response indistinguishable from the ordinary suspended-account answer.
+        return await self.issue_token_pair(
+            user, inactive_error=ForbiddenError(_ACCOUNT_DEACTIVATED)
+        )
 
     # -----------------------------------------------------------------------------------
     # Token issuance
@@ -608,13 +621,16 @@ class AuthService:
         """
         return await self.users.get_by_id(user_id, for_update=True)
 
-    async def issue_token_pair(self, user: User) -> TokenPair:
+    async def issue_token_pair(
+        self, user: User, *, inactive_error: AppError | None = None
+    ) -> TokenPair:
         """Mint an access token and a refresh token for an account already established.
 
         Called once by :meth:`login` and once by :meth:`rotate_refresh_token`, so a session
-        begins the same way whether it was just signed into or just renewed. It performs no
-        authority check of its own and must not be reached without one: the caller has either
-        verified a password or spent a valid refresh token.
+        begins the same way whether it was just signed into or just renewed. The caller has
+        either verified a password or spent a valid refresh token; what this method adds is the
+        one check that cannot be delegated, because it has to happen **while the account row is
+        locked** - see "Every claim here is made against the locked row" below.
 
         The two halves are deliberately unalike
         ---------------------------------------
@@ -631,14 +647,57 @@ class AuthService:
         then unrecoverable - not from the database, not from a log - so a disclosure of the
         ``refresh_tokens`` relation yields no usable session.
 
+        Every claim here is made against the LOCKED row, not against the argument
+        ---------------------------------------------------------------------------
+        ``user`` names *which* account to issue for and nothing else. Its identifier is used to
+        take the lock, and after that every value this method reads - ``is_active``, ``id`` and
+        ``role`` - comes from the row :meth:`_lock_account` returned. That is not a stylistic
+        preference; it closes a race that this method used to lose.
+
+        The interleaving: :meth:`authenticate` verifies a password, which costs tens of
+        milliseconds of argon2id; while it does, an administrator commits
+        ``AdminService.update_user(is_active=False)``; this method then locks the row and
+        proceeds. Reading ``user.is_active`` cannot see the suspension - that attribute was
+        loaded before it happened - so a *session was issued for an account an administrator had
+        already deactivated*, and because the access token is not recorded anywhere it cannot be
+        withdrawn before it expires. The refresh row would have been committed too, so the
+        session could be renewed indefinitely from a suspended account.
+
+        Two things had to change, and the second is invisible in this file. The check has to be
+        re-made under the lock, which is the ``locked.is_active`` branch below. And the locked
+        read has to actually return committed state: ``SELECT ... FOR UPDATE`` blocks until the
+        administrator's transaction commits and then reads the new row, but SQLAlchemy discards
+        those values for an instance this unit of work already holds unless the read carries
+        ``populate_existing`` -
+        :meth:`~app.repositories.base.UUIDPrimaryKeyRepository.get_by_id` sets it whenever a lock
+        is asked for, and states the measurement. Without both halves the lock is real and the
+        decision behind it is stale.
+
         Args:
-            user: The account the pair is issued to. Persistent, so ``id`` and ``role`` are the
-                database's values rather than anything a caller supplied.
+            user: The account the pair is issued to, and the source of the identifier that is
+                locked. Only ``id`` is read from it - deliberately, because that is the one
+                attribute a concurrent administrative write cannot change.
+            inactive_error: What to raise if the locked row turns out to be deactivated. The
+                answer belongs to the caller because the two callers are answering different
+                questions: a sign-in must report ``403`` with
+                :data:`_ACCOUNT_DEACTIVATED`, exactly as :meth:`authenticate` does for the same
+                account a moment earlier, so a client is not told to refresh a credential that
+                was never the problem; a rotation must report the same undifferentiated ``401``
+                it reports for every other unusable token, because whether the account was
+                deleted or suspended is not the presenter's business. Defaults to a bare
+                :class:`~app.core.exceptions.UnauthorizedError` - the most conservative answer,
+                naming nothing - so a future caller that forgets to choose discloses nothing.
 
         Returns:
             The :class:`~app.schemas.auth.TokenPair`, with ``expires_in`` describing the access
             token's configured lifetime in seconds so a client can schedule its refresh without
             decoding anything.
+
+        Raises:
+            UnauthorizedError: The account was deleted and committed between the caller
+                establishing it and this lock; or it is deactivated and no *inactive_error* was
+                supplied.
+            AppError: Whatever *inactive_error* carries, when the locked row is deactivated.
         """
         # THE lock, taken before any token row is written - see the protocol on this class. Held
         # unconditionally rather than left to the caller: this is the only method that INSERTS a
@@ -655,7 +714,22 @@ class AuthService:
             # foreign key and answer 500 for an ordinary, if rare, sequence of events.
             raise UnauthorizedError
 
-        access_token = create_access_token(subject=user.id, role=user.role)
+        # THE re-check, and it must stay on this side of the lock. `locked.is_active` is the
+        # committed value: the FOR UPDATE above blocked until any concurrent administrative write
+        # committed, and it carries `populate_existing`, so this reads the row as it now IS rather
+        # than as the caller loaded it. Refusing here is what makes a suspension take effect
+        # against a sign-in already in flight instead of one request too late - and it happens
+        # BEFORE the token row is inserted, so nothing has to be undone.
+        if not locked.is_active:
+            raise inactive_error if inactive_error is not None else UnauthorizedError
+
+        # Minted from the LOCKED row. Passing `user.role` here would put a role the administrator
+        # has just changed into a signed token that nothing can withdraw for its whole lifetime;
+        # `locked.role` is the value the database holds now. `locked.id` equals `user.id` by
+        # construction - it is what was looked up - and is used for the same reason: one object is
+        # the authority for this whole method, so no future edit can read half its facts from the
+        # argument.
+        access_token = create_access_token(subject=locked.id, role=locked.role)
 
         # The plaintext exists in this frame and in the response, and nowhere else.
         refresh_token = generate_refresh_token()
@@ -664,7 +738,10 @@ class AuthService:
         # a value no later lookup could match, and every rotation would then fail to find a row
         # that exists - silently, and identically for every user.
         await self.refresh_tokens.create(
-            user_id=user.id,
+            # The locked row again, for the same reason the access token is minted from it: this
+            # row is the account this transaction proved usable, and it is the one the foreign key
+            # will resolve against.
+            user_id=locked.id,
             token_hash=hash_refresh_token(refresh_token),
             # Computed by `app.core.security` from REFRESH_TOKEN_EXPIRE_DAYS as an aware UTC
             # instant. Derived there rather than here so the lifetime has one definition site,
@@ -791,7 +868,14 @@ class AuthService:
         # Until this returns, the revocation and the new row are both pending in the same
         # transaction, so any failure between here and the commit leaves the presented token
         # exchangeable rather than destroying a live session.
-        return await self.issue_token_pair(user)
+        #
+        # The same undifferentiated 401 this method reports for every other unusable token is
+        # handed down for the deactivation case, so the re-check under the account lock cannot
+        # become the one branch that tells a presenter *why*: an account suspended while this
+        # rotation was in flight answers exactly like one suspended a minute earlier.
+        return await self.issue_token_pair(
+            user, inactive_error=UnauthorizedError(_INVALID_REFRESH_TOKEN)
+        )
 
     async def _reject_unclaimable_token(self, token_hash: str) -> NoReturn:
         """Explain a failed claim, act on it if it was reuse, and refuse the exchange.

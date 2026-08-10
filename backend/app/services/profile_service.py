@@ -107,6 +107,7 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dependencies import PageParams
 from app.core.exceptions import NotFoundError
 from app.core.pagination import Page, build_page
 from app.models import PostStatus, User
@@ -280,11 +281,17 @@ class ProfileService:
         # nothing" for a profile that does not exist.
         author = await self._require_visible_author(username)
 
+        # The window arithmetic has exactly one definition, in `PageParams` - the same object the
+        # route's own dependency resolves to - and every list surface in this tier goes through it
+        # rather than restating `(page - 1) * page_size`. Constructed here from plain integers
+        # because this service is also called from a unit test with no request to resolve a
+        # dependency against; the field bounds are FastAPI query metadata and are inert in plain
+        # Python, so an out-of-range page passes through to be answered with an empty page.
+        window = PageParams(page=page, page_size=page_size)
+
         # ONE call into the single composed statement that serves every listing surface in the
         # product. `statuses` is the module constant and nothing else; `q` and `category_slug`
-        # are None because a profile neither searches nor filters by taxonomy. Window
-        # arithmetic is `PageParams`' vocabulary translated into the statement's: `limit` is
-        # the page size, and `offset` is how many rows precede this page.
+        # are None because a profile neither searches nor filters by taxonomy.
         rows, total = await self._posts.list_posts(
             q=None,
             category_slug=None,
@@ -296,8 +303,8 @@ class ProfileService:
             # characters per article - and the author's private columns would be work the response
             # discards. A profile page renders cards, not documents.
             projection="summary",
-            limit=page_size,
-            offset=(page - 1) * page_size,
+            limit=window.limit,
+            offset=window.offset,
         )
 
         # `author` and `categories` were eagerly loaded by the statement above - narrowed to the
@@ -307,7 +314,7 @@ class ProfileService:
         # makes the narrowing safe rather than merely thrifty.
         items = [PostSummary.model_validate(row) for row in rows]
 
-        return build_page(items, total, page, page_size)
+        return build_page(items, total, window.page, window.page_size)
 
     async def update_self(self, user: User, payload: UserUpdate) -> User:
         """Apply a principal's own profile changes, and only the three that are theirs to make.

@@ -128,14 +128,24 @@ from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.base import metadata
 
-# Imported for two values and nothing else: the connect arguments and the parameter-hiding
-# invariant every engine in this project opens with. `app.db.session` builds the application's
-# pooled engine at import time, and that costs nothing here - construction is pure bookkeeping
-# and the first connection is only established when a session needs one, which is exactly why
-# that module documents itself as importable by `alembic check` with no database reachable. The
-# engine this file builds below is its own, separate, NullPool engine; nothing here draws a
-# connection from the application's pool.
-from app.db.session import HIDE_PARAMETERS, safe_connect_args
+# Imported for two values and nothing else: the MIGRATION connect arguments and the
+# parameter-hiding invariant every engine in this project opens with.
+#
+# `migration_connect_args` rather than `safe_connect_args`, and the difference is the point: the
+# request-path factory adds a ten-second server-side `statement_timeout`, which is right for a
+# route and wrong for a migration. `0002` builds seven GIN and trigram indexes and `0004` builds
+# three B-trees; over a populated relation an ordinary index build can exceed ten seconds, and
+# under that ceiling PostgreSQL would cancel it with `57014 query_canceled` and abort the whole
+# upgrade - on the container's start-up path, before the service answers anything. The migration
+# factory keeps every other invariant (UTC session time zone, the five-second connect bound, the
+# keepalive group) and declares no statement ceiling.
+#
+# `app.db.session` builds the application's pooled engine at import time, and that costs nothing
+# here - construction is pure bookkeeping and the first connection is only established when a
+# session needs one, which is exactly why that module documents itself as importable by
+# `alembic check` with no database reachable. The engine this file builds below is its own,
+# separate, NullPool engine; nothing here draws a connection from the application's pool.
+from app.db.session import HIDE_PARAMETERS, migration_connect_args
 
 if TYPE_CHECKING:
     # Imported for annotations only, and therefore never at run time. Both of these are
@@ -521,15 +531,22 @@ def run_migrations_online() -> None:
     a revision raises, which matters most in CI, where a lingering backend can hold a lock that
     the next step then waits on.
 
-    The engine is built with ``app.db.session.safe_connect_args()`` and that module's
-    ``HIDE_PARAMETERS``, so a migration reaches the database under the **same** connection
-    contract the service does: the session time zone is UTC before the first statement, one
-    connection attempt is bounded at five seconds instead of libpq's 130, and no bound value is
-    rendered into a logged statement or into the message on a wrapped ``DBAPIError``. Only the
-    *pool* settings are left behind, because ``NullPool`` retains nothing for them to describe.
-    Both properties are properties of a connection, and a migration is the connection most
-    likely to meet a cold or wedged database first: this run happens on the container's
-    start-up path, before the service answers anything.
+    The engine is built with ``app.db.session.migration_connect_args()`` and that module's
+    ``HIDE_PARAMETERS``, so a migration reaches the database under the same connection
+    invariants the service does: the session time zone is UTC before the first statement, one
+    connection attempt is bounded at five seconds instead of libpq's 130, the keepalive group is
+    in force, and no bound value is rendered into a logged statement or into the message on a
+    wrapped ``DBAPIError``. Both are properties of a connection, and a migration is the
+    connection most likely to meet a cold or wedged database first: this run happens on the
+    container's start-up path, before the service answers anything.
+
+    Two things are deliberately left behind. The *pool* settings, because ``NullPool`` retains
+    nothing for them to describe. And the request path's ``statement_timeout``, because a
+    ten-second ceiling that is generous for a route is a cancellation for an index build over a
+    populated relation - ``57014 query_canceled``, a failed revision, and a rolled-back upgrade
+    that takes the container start with it. ``migration_connect_args`` is where that exclusion is
+    declared, so it is a property of the factory a workload names rather than of a comment
+    somebody has to remember.
 
     Transaction handling is left at Alembic's default - one transaction spanning the whole run,
     so a failed revision rolls the entire attempt back rather than stranding the schema
@@ -566,14 +583,18 @@ def run_migrations_online() -> None:
         url,
         poolclass=pool.NullPool,
         future=True,
-        # The two invariants a *connection* carries, shared with the application and the test
-        # engine rather than restated - see "Three processes open connections to this database"
-        # in `app.db.session`. `connect_timeout` matters more here than anywhere: this run sits
-        # on the container's start-up path, so without it a hung server holds the whole start
-        # for libpq's 130-second default while the service beside it fails in five.
+        # The invariants a *connection* carries, shared with the application and the test engine
+        # rather than restated - see "Three processes open connections to this database" in
+        # `app.db.session`. `connect_timeout` matters more here than anywhere: this run sits on
+        # the container's start-up path, so without it a hung server holds the whole start for
+        # libpq's 130-second default while the service beside it fails in five.
         # `hide_parameters` matters because `--sql` output and CI logs are redirected to files,
         # and revision `0003` binds the reference category rows as parameters.
-        connect_args=safe_connect_args(),
+        #
+        # The MIGRATION factory, so no `statement_timeout` is declared on these connections: the
+        # request path's ten-second ceiling would cancel a legitimate index build over a populated
+        # relation and fail the upgrade. See `migration_connect_args`.
+        connect_args=migration_connect_args(),
         hide_parameters=HIDE_PARAMETERS,
     )
     try:

@@ -36,16 +36,40 @@ import {
   FIXTURE_ADMIN_ACCESS_TOKEN,
   FIXTURE_AUTHOR_ACCESS_TOKEN,
   FIXTURE_READER_ACCESS_TOKEN,
+  FIXTURE_SUSPENDED_ACCESS_TOKEN,
+  FIXTURE_SUSPENDED_REFRESH_TOKEN,
   errorHandlers,
   fixtureAdminAccount,
+  fixtureAdminRotatedTokenPair,
+  fixtureAdminTokenPair,
   fixtureAuthorAccount,
   fixtureCategories,
+  fixtureDraftPost,
   fixtureEngineeringCategory,
+  fixtureNoExcerptPost,
+  fixturePost,
   fixturePosts,
+  fixtureReaderAccount,
+  fixtureReaderRotatedTokenPair,
+  fixtureReaderTokenPair,
+  fixtureRootComment,
   fixtureUnusedCategory,
   handlers,
 } from './handlers';
-import type { CommentPublic, Page, PostSummary, ProblemDetail } from '@/lib/types';
+import type {
+  AdminComment,
+  AdminPost,
+  AdminStats,
+  AdminUser,
+  CategoryPublic,
+  CommentPublic,
+  Page,
+  PostDetail,
+  PostSummary,
+  ProblemDetail,
+  TokenPair,
+  UserMe,
+} from '@/lib/types';
 
 /** Any origin the wildcard predicates match; nothing here depends on which. */
 const ORIGIN = 'http://contract.test';
@@ -67,11 +91,20 @@ afterAll(() => {
 /** Issue a request against the mocked API and return the response. */
 async function call(
   path: string,
-  init?: { readonly method?: string; readonly token?: string; readonly body?: unknown },
+  init?: {
+    readonly method?: string;
+    readonly token?: string;
+    /** A verbatim `Authorization` value, for the cases where the *syntax* is the subject. */
+    readonly authorization?: string;
+    readonly body?: unknown;
+  },
 ): Promise<Response> {
   const headers: Record<string, string> = {};
   if (init?.token !== undefined) {
     headers['Authorization'] = `Bearer ${init.token}`;
+  }
+  if (init?.authorization !== undefined) {
+    headers['Authorization'] = init.authorization;
   }
   if (init?.body !== undefined) {
     headers['Content-Type'] = 'application/json';
@@ -82,6 +115,15 @@ async function call(
     headers,
     ...(init?.body === undefined ? {} : { body: JSON.stringify(init.body) }),
   });
+}
+
+/** The rows of an administrative listing, read as the administrator. */
+async function adminRows<T>(path: string, query: string): Promise<readonly T[]> {
+  const response = await call(`${path}${query}`, { token: FIXTURE_ADMIN_ACCESS_TOKEN });
+  expect([query, response.status]).toEqual([query, 200]);
+  const page = (await response.json()) as Page<T>;
+
+  return page.items;
 }
 
 /** The slugs of a feed page, in the order it reported them. */
@@ -364,6 +406,489 @@ describe('registration conflict (I-14)', () => {
     expect(problem.detail).toBe('That email address or username is already registered.');
     expect(problem.detail).not.toContain('email address.');
     expect(problem.detail).toContain('or username');
+  });
+});
+
+describe('typed query parameters are refused, not ignored (I-08)', () => {
+  it('answers 422 for a `mine` that is not a boolean, rather than serving the public feed', async () => {
+    // `mine: bool` is validated by the framework before the route body runs, so a value it cannot
+    // interpret never reaches the mode rules. Reading it as `=== 'true'` made `?mine=maybe` the public
+    // feed - the same substitution the route refuses outright for a missing credential.
+    const response = await call('/posts?mine=maybe', { token: FIXTURE_AUTHOR_ACCESS_TOKEN });
+    expect(response.status).toBe(422);
+    const problem = (await response.json()) as ProblemDetail;
+    expect(problem.errors?.[0]?.field).toBe('mine');
+    expect(problem.errors?.[0]?.type).toBe('bool_parsing');
+  });
+
+  it('accepts every boolean spelling Pydantic accepts', async () => {
+    for (const truthy of ['true', '1', 'yes', 'on', 'TRUE']) {
+      const response = await call(`/posts?mine=${truthy}`);
+      // No credential, so the workspace refusal proves the value was read as TRUE.
+      expect([truthy, response.status]).toEqual([truthy, 401]);
+    }
+    for (const falsy of ['false', '0', 'no', 'off']) {
+      const response = await call(`/posts?mine=${falsy}`);
+      expect([falsy, response.status]).toEqual([falsy, 200]);
+    }
+  });
+
+  it('answers 422 for a workspace `status` outside the lifecycle set, not an empty page', async () => {
+    // An empty page reads as "you have no drafts", which is a different answer and an untrue one.
+    const response = await call('/posts?mine=true&status=PUBLSIHED', {
+      token: FIXTURE_AUTHOR_ACCESS_TOKEN,
+    });
+    expect(response.status).toBe(422);
+    const problem = (await response.json()) as ProblemDetail;
+    expect(problem.errors?.[0]?.field).toBe('status');
+    expect(problem.errors?.[0]?.type).toBe('enum');
+  });
+
+  it('reports every rejected parameter from one request', async () => {
+    // FastAPI validates the whole request and answers with each field it rejected, so a caller that
+    // sent two bad values must not have to fix them one round trip at a time.
+    const response = await call('/posts?sort=newest&page=0', {
+      token: FIXTURE_AUTHOR_ACCESS_TOKEN,
+    });
+    expect(response.status).toBe(422);
+    const problem = (await response.json()) as ProblemDetail;
+    expect(problem.errors?.map((item) => item.field).sort()).toEqual(['page', 'sort']);
+  });
+});
+
+describe('feed ordering matches the repository clause lists (I-08)', () => {
+  it('never orders by engagement, and never breaks a recency tie on the title', async () => {
+    // `_build_ordering` has no `view_count` clause and no title clause; its last clause is always
+    // `posts.id DESC`. A most-viewed-first sequence is one the service cannot produce.
+    const published = [...fixturePosts]
+      .filter((post) => post.status === 'PUBLISHED')
+      .sort((left, right) => right.view_count - left.view_count)
+      .map((post) => post.slug);
+    const byEngagement = published.join('|');
+
+    expect((await feedSlugs('')).join('|')).not.toBe(byEngagement);
+    expect((await feedSlugs('?sort=relevance')).join('|')).not.toBe(byEngagement);
+  });
+
+  it('leads a searched relevance page with the best title match', async () => {
+    // rank first, then trigram similarity on the title - so the post whose TITLE carries the term
+    // leads a page it shares with posts that only mention it in the body.
+    const ranked = await feedSlugs('?q=search');
+    expect(ranked[0]).toBe(fixtureNoExcerptPost.slug);
+  });
+
+  it('is a total order: page two is disjoint from page one', async () => {
+    // What the `posts.id DESC` tail exists for. With a non-total order two rows sharing a key can be
+    // returned by both pages while a third is returned by neither.
+    const first = await feedSlugs('?page=1&page_size=2');
+    const second = await feedSlugs('?page=2&page_size=2');
+    expect(first).toHaveLength(2);
+    expect(second).toHaveLength(2);
+    expect(first.filter((slug) => second.includes(slug))).toEqual([]);
+  });
+});
+
+describe('request bodies are read against their own schema (I-10)', () => {
+  it('refuses a blank self-profile display_name rather than treating it as a no-op', async () => {
+    // `DisplayName` carries no blank-folding validator, because `users.display_name` is NOT NULL - so
+    // a cleared control is too short, not "leave it alone". Folding it answered 200 with the old name.
+    const response = await call('/users/me', {
+      method: 'PATCH',
+      token: FIXTURE_AUTHOR_ACCESS_TOKEN,
+      body: { display_name: '   ' },
+    });
+    expect(response.status).toBe(422);
+    const problem = (await response.json()) as ProblemDetail;
+    expect(problem.errors?.[0]).toEqual({
+      field: 'display_name',
+      message: 'String should have at least 1 characters',
+      type: 'string_too_short',
+    });
+  });
+
+  it('still clears a nullable profile member from a blank submission', async () => {
+    // The other half of the same rule: `OptionalBio` DOES declare `_blank_to_none`, because
+    // `users.bio` is nullable and a cleared textarea means "remove it".
+    const response = await call('/users/me', {
+      method: 'PATCH',
+      token: FIXTURE_AUTHOR_ACCESS_TOKEN,
+      body: { bio: '' },
+    });
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as UserMe).bio).toBeNull();
+  });
+
+  it('refuses a blank or malformed parent_id instead of posting a root comment', async () => {
+    // `CommentCreate.parent_id` is `uuid.UUID | None`. Read as a blank-folding string, a reply whose
+    // parent identifier the client failed to supply was accepted at the top of the thread, with a 201.
+    for (const parentId of ['', '   ', 'not-a-uuid']) {
+      const response = await call(`/posts/${fixturePost.id}/comments`, {
+        method: 'POST',
+        token: FIXTURE_READER_ACCESS_TOKEN,
+        body: { body: 'A reply that names no parent.', parent_id: parentId },
+      });
+      expect([parentId, response.status]).toEqual([parentId, 422]);
+      const problem = (await response.json()) as ProblemDetail;
+      expect(problem.errors?.[0]?.field).toBe('parent_id');
+    }
+  });
+
+  it('still accepts an explicit null parent_id as a root comment', async () => {
+    const response = await call(`/posts/${fixturePost.id}/comments`, {
+      method: 'POST',
+      token: FIXTURE_READER_ACCESS_TOKEN,
+      body: { body: 'A root comment.', parent_id: null },
+    });
+    expect(response.status).toBe(201);
+    expect(((await response.json()) as CommentPublic).parent_id).toBeNull();
+  });
+
+  it('treats an empty comment update as the valid no-op the schema declares', async () => {
+    // `CommentUpdate`'s single member is optional and the service dumps `exclude_unset=True`, so `{}`
+    // validates, changes nothing and must not be refused with "Field required".
+    const response = await call(`/comments/${fixtureRootComment.id}`, {
+      method: 'PATCH',
+      token: FIXTURE_READER_ACCESS_TOKEN,
+      body: {},
+    });
+    expect(response.status).toBe(200);
+    const unchanged = (await response.json()) as CommentPublic;
+    expect(unchanged.body).toBe(fixtureRootComment.body);
+    // A no-op writes nothing, so neither the moderation state nor the timestamp moves.
+    expect(unchanged.status).toBe(fixtureRootComment.status);
+    expect(unchanged.updated_at).toBe(fixtureRootComment.updated_at);
+  });
+
+  it('still validates a comment body that IS present', async () => {
+    const response = await call(`/comments/${fixtureRootComment.id}`, {
+      method: 'PATCH',
+      token: FIXTURE_READER_ACCESS_TOKEN,
+      body: { body: '   ' },
+    });
+    expect(response.status).toBe(422);
+  });
+});
+
+describe('credential syntax and optional authentication (I-11)', () => {
+  it('matches the Bearer scheme case-insensitively, as RFC 7235 requires', async () => {
+    // `app.core.dependencies` folds the parsed scheme with `.lower()`. Matching the literal
+    // `'Bearer '` by prefix made a client that spelled the scheme unconventionally look anonymous.
+    for (const scheme of ['bearer', 'BEARER', 'BeArEr']) {
+      const response = await call('/auth/me', {
+        authorization: `${scheme} ${FIXTURE_READER_ACCESS_TOKEN}`,
+      });
+      expect([scheme, response.status]).toEqual([scheme, 200]);
+    }
+  });
+
+  it('refuses a present-but-unusable credential with 401 on a PUBLIC read', async () => {
+    // The distinction `_bearer_token` exists to draw: an absent header is anonymous, a header this
+    // API cannot use is a 401 - on the four optional-authentication reads as much as on a protected
+    // route. Downgrading it to anonymous strands a client with a lapsed token on the public
+    // projection forever, because refresh-on-401 is keyed on precisely this status.
+    for (const authorization of [
+      `Basic ${FIXTURE_READER_ACCESS_TOKEN}`,
+      'Bearer',
+      'Bearer   ',
+      FIXTURE_READER_ACCESS_TOKEN,
+    ]) {
+      for (const path of [
+        '/posts',
+        `/posts/${fixturePost.slug}`,
+        `/posts/${fixturePost.id}/comments`,
+        `/posts/${fixturePost.id}/likes`,
+      ]) {
+        const response = await call(path, { authorization });
+        expect([authorization, path, response.status]).toEqual([authorization, path, 401]);
+        expect(response.headers.get('WWW-Authenticate')).toBe('Bearer');
+      }
+    }
+  });
+
+  it('refuses an unrecognised credential on a public read rather than serving it anonymously', async () => {
+    const response = await call('/posts', { token: 'not-a-token-this-module-issued' });
+    expect(response.status).toBe(401);
+  });
+
+  it('answers a deactivated account anonymously on a public read and 403 on a protected one', async () => {
+    // `get_current_user_optional` narrows an inactive principal to anonymous BEFORE it returns, so a
+    // suspended author reads what the public reads and no more; `get_current_active_user` refuses.
+    const feed = await call('/posts', { token: FIXTURE_SUSPENDED_ACCESS_TOKEN });
+    expect(feed.status).toBe(200);
+    const page = (await feed.json()) as Page<PostSummary>;
+    expect(page.items.every((item) => item.status === 'PUBLISHED')).toBe(true);
+    expect(page.items.some((item) => item.slug === fixtureDraftPost.slug)).toBe(false);
+
+    expect((await call('/auth/me', { token: FIXTURE_SUSPENDED_ACCESS_TOKEN })).status).toBe(403);
+  });
+
+  it('leaves an absent header anonymous', async () => {
+    expect((await call('/posts')).status).toBe(200);
+  });
+});
+
+describe('refresh rotation (I-11)', () => {
+  it('issues the PRESENTING principal a pair, so a rotation cannot switch identity', async () => {
+    // One shared rotated pair, mapped to the author, made a reader's or an administrator's rotation
+    // return as the author - and every assertion after that rotation was about the wrong person.
+    const cases = [
+      { presented: fixtureReaderTokenPair, expected: fixtureReaderRotatedTokenPair },
+      { presented: fixtureAdminTokenPair, expected: fixtureAdminRotatedTokenPair },
+    ];
+
+    for (const { presented, expected } of cases) {
+      const rotated = await call('/auth/refresh', {
+        method: 'POST',
+        body: { refresh_token: presented.refresh_token },
+      });
+      expect(rotated.status).toBe(200);
+      expect((await rotated.json()) as TokenPair).toEqual(expected);
+
+      const me = await call('/auth/me', { token: expected.access_token });
+      expect((await me.json()) as UserMe).toEqual(
+        presented === fixtureReaderTokenPair ? fixtureReaderAccount : fixtureAdminAccount,
+      );
+    }
+  });
+
+  it('keeps administrative authority across an administrator rotation', async () => {
+    const stats = await call('/admin/stats', {
+      token: fixtureAdminRotatedTokenPair.access_token,
+    });
+    expect(stats.status).toBe(200);
+    const asReader = await call('/admin/stats', {
+      token: fixtureReaderRotatedTokenPair.access_token,
+    });
+    expect(asReader.status).toBe(403);
+  });
+
+  it('refuses every unexchangeable token with the same 401, deactivated owners included', async () => {
+    // `rotate_refresh_token` raises one `UnauthorizedError` for never-issued, already-spent, expired
+    // and owner-unusable alike. It has no 403 branch, so the 403 this module used to answer for a
+    // suspended owner was a status no client could ever receive.
+    for (const refreshToken of ['never-issued-by-this-module', FIXTURE_SUSPENDED_REFRESH_TOKEN]) {
+      const response = await call('/auth/refresh', {
+        method: 'POST',
+        body: { refresh_token: refreshToken },
+      });
+      expect([refreshToken, response.status]).toEqual([refreshToken, 401]);
+      expect(response.headers.get('WWW-Authenticate')).toBe('Bearer');
+      const problem = (await response.json()) as ProblemDetail;
+      expect(problem.type).toBe('/errors/unauthorized');
+    }
+  });
+});
+
+describe('administrative listings query what the repositories query (I-12)', () => {
+  it('searches accounts by username and email, and not by display name', async () => {
+    // `UserRepository` builds `username ILIKE :p OR email ILIKE :p` over those two columns only.
+    const byEmail = await adminRows<AdminUser>('/admin/users', `?q=${fixtureReaderAccount.email}`);
+    expect(byEmail.map((row) => row.id)).toEqual([fixtureReaderAccount.id]);
+
+    const byHandle = await adminRows<AdminUser>(
+      '/admin/users',
+      `?q=${fixtureReaderAccount.username}`,
+    );
+    expect(byHandle.map((row) => row.id)).toContain(fixtureReaderAccount.id);
+
+    // The display name is deliberately NOT searched: a term that appears only there finds nothing.
+    const displayOnly = fixtureReaderAccount.display_name.split(' ')[1] ?? '';
+    expect(displayOnly.length).toBeGreaterThan(0);
+    expect(fixtureReaderAccount.username.toLowerCase()).not.toContain(displayOnly.toLowerCase());
+    const byDisplayName = await adminRows<AdminUser>('/admin/users', `?q=${displayOnly}`);
+    expect(byDisplayName).toEqual([]);
+  });
+
+  it('searches posts by title, excerpt and body, and not by slug', async () => {
+    // The listing is ranked with the same vector the feed uses, and that vector covers those three.
+    const contentTerm = 'Invalidation';
+    expect(fixtureDraftPost.content).toContain(contentTerm);
+    expect(fixtureDraftPost.title).not.toContain(contentTerm);
+    const byBody = await adminRows<AdminPost>('/admin/posts', `?q=${contentTerm}`);
+    expect(byBody.map((row) => row.id)).toContain(fixtureDraftPost.id);
+  });
+
+  it('searches comments by body alone', async () => {
+    const authored = await adminRows<AdminComment>(
+      '/admin/comments',
+      `?q=${fixtureRootComment.author.username}`,
+    );
+    expect(authored).toEqual([]);
+  });
+
+  it('answers 422 for a malformed enum, boolean or identifier filter rather than ignoring it', async () => {
+    const cases: ReadonlyArray<readonly [string, string, string]> = [
+      ['/admin/users', '?role=SUPERUSER', 'role'],
+      ['/admin/users', '?is_active=maybe', 'is_active'],
+      ['/admin/posts', '?status=PUBLSIHED', 'status'],
+      ['/admin/posts', '?author_id=not-a-uuid', 'author_id'],
+      ['/admin/comments', '?status=APROVED', 'status'],
+      ['/admin/comments', '?post_id=42', 'post_id'],
+    ];
+
+    for (const [path, query, field] of cases) {
+      const response = await call(`${path}${query}`, { token: FIXTURE_ADMIN_ACCESS_TOKEN });
+      expect([query, response.status]).toEqual([query, 422]);
+      const problem = (await response.json()) as ProblemDetail;
+      expect(problem.errors?.[0]?.field).toBe(field);
+    }
+  });
+});
+
+describe('the administrator lockout guard (I-12)', () => {
+  it('refuses self-demotion, self-deactivation and self-deletion with 409', async () => {
+    // `AdminService` refuses all three, and `UserRowActions` relies on that refusal rather than
+    // duplicating the rule - so a mock that permitted them left the guard untestable.
+    const demote = await call(`/admin/users/${fixtureAdminAccount.id}`, {
+      method: 'PATCH',
+      token: FIXTURE_ADMIN_ACCESS_TOKEN,
+      body: { role: 'AUTHOR' },
+    });
+    expect(demote.status).toBe(409);
+    expect(((await demote.json()) as ProblemDetail).detail).toContain('own administrator role');
+
+    const deactivate = await call(`/admin/users/${fixtureAdminAccount.id}`, {
+      method: 'PATCH',
+      token: FIXTURE_ADMIN_ACCESS_TOKEN,
+      body: { is_active: false },
+    });
+    expect(deactivate.status).toBe(409);
+    expect(((await deactivate.json()) as ProblemDetail).detail).toContain('deactivate their own');
+
+    const remove = await call(`/admin/users/${fixtureAdminAccount.id}`, {
+      method: 'DELETE',
+      token: FIXTURE_ADMIN_ACCESS_TOKEN,
+    });
+    expect(remove.status).toBe(409);
+    expect(((await remove.json()) as ProblemDetail).detail).toContain('delete their own');
+  });
+
+  it('permits the three self-targeted moves that are not lockouts', async () => {
+    // An empty patch is a legitimate no-op, re-sending ADMIN changes nothing, and `is_active: true`
+    // asks to stay active. Refusing any of them would be as wrong as omitting the guard.
+    for (const body of [{}, { role: 'ADMIN' }, { is_active: true }]) {
+      const response = await call(`/admin/users/${fixtureAdminAccount.id}`, {
+        method: 'PATCH',
+        token: FIXTURE_ADMIN_ACCESS_TOKEN,
+        body,
+      });
+      expect([JSON.stringify(body), response.status]).toEqual([JSON.stringify(body), 200]);
+      const updated = (await response.json()) as AdminUser;
+      expect(updated.role).toBe('ADMIN');
+      expect(updated.is_active).toBe(true);
+    }
+  });
+
+  it('still lets an administrator act on somebody else', async () => {
+    const response = await call(`/admin/users/${fixtureReaderAccount.id}`, {
+      method: 'PATCH',
+      token: FIXTURE_ADMIN_ACCESS_TOKEN,
+      body: { role: 'AUTHOR' },
+    });
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as AdminUser).role).toBe('AUTHOR');
+  });
+});
+
+describe('taxonomy and slug allocation (I-10)', () => {
+  it('reports counts that match the collections they count', async () => {
+    // Derived rather than written out: `category_count` said three while four categories were stored.
+    const response = await call('/admin/stats', { token: FIXTURE_ADMIN_ACCESS_TOKEN });
+    const stats = (await response.json()) as AdminStats;
+    expect(stats.category_count).toBe(fixtureCategories.length);
+    expect(stats.post_count).toBe(fixturePosts.length);
+  });
+
+  it('allocates a free slug rather than answering with one that is already held', async () => {
+    // `categories.slug` and `posts.slug` are uniquely constrained, so a create cannot answer with a
+    // slug something else holds. The service appends the first free suffix; so does the mock.
+    const category = await call('/admin/categories', {
+      method: 'POST',
+      token: FIXTURE_ADMIN_ACCESS_TOKEN,
+      body: { name: 'engineering!' },
+    });
+    expect(category.status).toBe(201);
+    const created = (await category.json()) as CategoryPublic;
+    expect(created.slug).not.toBe(fixtureEngineeringCategory.slug);
+    expect(created.slug).toBe(`${fixtureEngineeringCategory.slug}-2`);
+
+    const post = await call('/posts', {
+      method: 'POST',
+      token: FIXTURE_AUTHOR_ACCESS_TOKEN,
+      body: { title: fixturePost.title, content: 'A second article with the same title.' },
+    });
+    expect(post.status).toBe(201);
+    expect(((await post.json()) as PostDetail).slug).toBe(`${fixturePost.slug}-2`);
+  });
+
+  it('refuses a rename onto a name another category holds, and permits re-sending its own', async () => {
+    const collision = await call(`/admin/categories/${fixtureUnusedCategory.id}`, {
+      method: 'PATCH',
+      token: FIXTURE_ADMIN_ACCESS_TOKEN,
+      body: { name: fixtureEngineeringCategory.name },
+    });
+    expect(collision.status).toBe(409);
+    expect(((await collision.json()) as ProblemDetail).detail).toBe(
+      'A category with that name already exists.',
+    );
+
+    const noop = await call(`/admin/categories/${fixtureUnusedCategory.id}`, {
+      method: 'PATCH',
+      token: FIXTURE_ADMIN_ACCESS_TOKEN,
+      body: { name: fixtureUnusedCategory.name },
+    });
+    expect(noop.status).toBe(200);
+    expect(((await noop.json()) as CategoryPublic).slug).toBe(fixtureUnusedCategory.slug);
+  });
+
+  it('counts an unpublished association as an association', () => {
+    // The semantics the refusal is keyed on, asserted on the data rather than through a request.
+    // `post_count` counts PUBLISHED alone; `is_in_use` counts every lifecycle state. At least one
+    // fixture category must exhibit the gap or the mock's predicate is untested even in principle.
+    const divergent = fixtureCategories.filter((category) => {
+      const associations = fixturePosts.filter((post) =>
+        post.categories.some((entry) => entry.id === category.id),
+      );
+
+      return associations.length > category.post_count;
+    });
+
+    expect(divergent.length).toBeGreaterThan(0);
+    for (const category of divergent) {
+      const unpublished = fixturePosts.filter(
+        (post) =>
+          post.status !== 'PUBLISHED' && post.categories.some((entry) => entry.id === category.id),
+      );
+      expect(unpublished.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('keys the delete refusal on every association, not on the published count', async () => {
+    // `CategoryService.delete` refuses on `is_in_use`, an EXISTS over `post_categories` carrying no
+    // status predicate, while `post_count` counts PUBLISHED alone. The two diverge for a category
+    // whose only posts are unpublished: `post_count` reports it as empty, the server still refuses.
+    //
+    // The expectation is DERIVED from an all-status scan rather than written out, so it follows the
+    // rule rather than today's data. Stated plainly: no current fixture has zero published posts AND
+    // a non-zero association count, so reverting this one predicate to `post_count > 0` would not
+    // fail today - the derived form is what makes the assertion bite the moment a fixture does.
+    for (const category of fixtureCategories) {
+      const referenced = fixturePosts.some((post) =>
+        post.categories.some((entry) => entry.id === category.id),
+      );
+
+      const response = await call(`/admin/categories/${category.id}`, {
+        method: 'DELETE',
+        token: FIXTURE_ADMIN_ACCESS_TOKEN,
+      });
+
+      expect([category.name, response.status]).toEqual([category.name, referenced ? 409 : 204]);
+      if (referenced) {
+        expect(((await response.json()) as ProblemDetail).detail).toBe(
+          'Posts are still filed under this category. Re-file them before deleting it.',
+        );
+      }
+    }
   });
 });
 

@@ -127,14 +127,15 @@ gap.
 
 Gunicorn does offer one hook that runs inside the arbiter, and it is a class rather than a
 callback: ``Arbiter.setup`` constructs ``cfg.logger_class(cfg)`` **before** the arbiter logs its
-first line. :class:`StructlogGunicornLogger` is that class, and ``backend/Dockerfile`` passes it
-as ``--logger-class app.core.logging.StructlogGunicornLogger``. It lives here rather than in a
-``gunicorn.conf.py`` for two reasons: this module owns the processor chain and the logger bridge,
-so the remedy is one subclass whose whole body is ``super().setup(cfg)`` then
-:func:`configure_logging`; and a class named on the command line is loaded by ``gunicorn`` itself,
-with no second configuration file whose ``logconfig_dict`` would restate a chain that already
-exists. Measured after the change, same command and same stage: **0** plain-text lines, with the
-arbiter's boot and shutdown records rendered as JSON on the ``gunicorn.error`` logger.
+first line. :class:`StructlogGunicornLogger` is that class. It *lives* here because this module
+owns the processor chain and the logger bridge, so the remedy is one subclass whose whole body is
+``super().setup(cfg)`` then :func:`configure_logging`, and reversing those two lines is the one way
+to get it wrong. It is *selected* in ``backend/gunicorn.conf.py``, which imports it and assigns it
+to ``logger_class``, and ``backend/Dockerfile``'s ``CMD`` reaches it through
+``--config gunicorn.conf.py`` with no ``--logger-class`` flag of its own - one implementation, one
+selection point, because a flag and a config-file assignment are two selections of which only the
+flag can ever win. Measured after the change, same command and same stage: **0** plain-text lines,
+with the arbiter's boot and shutdown records rendered as JSON on the ``gunicorn.error`` logger.
 
 No further work is needed in this module for it: ``gunicorn`` and ``gunicorn.error`` are already
 in :data:`_DELEGATED_LOGGERS`, so :func:`configure_logging` detaches the arbiter's own plain-text
@@ -1321,7 +1322,8 @@ def get_logger(name: str | None = None) -> FilteringBoundLogger:
 # See "Under Gunicorn the arbiter is a second process" in the module docstring for the
 # measurement. In short: the arbiter binds the socket, forks and handles signals without ever
 # importing `app.main`, so its own boot and shutdown lines are the only ones that escape the
-# structured stream - and `--logger-class` is the only hook gunicorn offers inside it.
+# structured stream - and `logger_class` is the only hook gunicorn offers inside it. The class
+# below is the implementation; `backend/gunicorn.conf.py` is the one place it is selected.
 #
 # The base class has to be imported at module scope, because a base class cannot be resolved
 # lazily, and that is safe here on both counts this module cares about. `gunicorn==26.0.0` is a
@@ -1337,11 +1339,19 @@ def get_logger(name: str | None = None) -> FilteringBoundLogger:
 class StructlogGunicornLogger(_GunicornLogger):  # type: ignore[misc]
     """Gunicorn's logger, reconfigured so the arbiter's own records are structured too.
 
-    Passed on the command line by ``backend/Dockerfile`` as ``--logger-class
-    app.core.logging.StructlogGunicornLogger``. ``Arbiter.setup`` constructs
-    ``cfg.logger_class(cfg)`` before the arbiter logs anything, and ``Application.load_config``
-    has already put the working directory on ``sys.path``, so this dotted path resolves in the
-    arbiter process and this class is in place for its first line.
+    The **only** implementation of this hook, and it is selected in exactly one place:
+    ``backend/gunicorn.conf.py`` imports it and publishes it as ``logger_class``, and
+    ``backend/Dockerfile``'s ``CMD`` names that file with ``--config gunicorn.conf.py`` and passes
+    no ``--logger-class`` of its own. That arrangement is deliberate. A command-line setting
+    outranks a configuration file, so a flag on the ``CMD`` and an assignment in the config file
+    are two selections of which only one can win - and while both existed, the config file's copy
+    was unreachable in the shipped image while looking, in code review and in its own tests,
+    exactly like live code.
+
+    ``Arbiter.setup`` constructs ``cfg.logger_class(app.cfg)`` before the arbiter logs anything and
+    ``Arbiter.__init__`` calls ``setup`` immediately, so this class is in place for the arbiter's
+    first line - which is what no later hook can achieve. ``gunicorn.conf.py`` records why
+    ``on_starting``, ``post_fork`` and ``logconfig_dict`` cannot substitute for it.
 
     One method, and the order inside it is the whole design.
     """

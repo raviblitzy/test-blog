@@ -1162,7 +1162,10 @@ def create_app() -> FastAPI:
     # BARE. `api_router` was constructed with `prefix=API_V1_PREFIX` already applied, so passing
     # a prefix here as well would double the segment: every path would become
     # `/api/v1/api/v1/...` and the entire API would answer 404 while the process reported itself
-    # perfectly healthy. This one call carries all thirty-eight versioned operations.
+    # perfectly healthy. This one call carries every versioned operation in the service - the
+    # exact number is asserted once, against `app.openapi()`, in
+    # `backend/tests/integration/test_openapi_contract.py`, rather than restated here where it
+    # would drift the first time an operation was added or withdrawn.
     application.include_router(api_router)
 
     # UNPREFIXED, and the only unversioned paths in the service. `/healthz` and `/readyz` must

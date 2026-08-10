@@ -75,8 +75,8 @@ Quantity                                Value  Where it comes from
 :data:`POOL_SIZE`                       3      this module
 :data:`MAX_OVERFLOW`                    2      this module
 per-worker ceiling                      5      ``POOL_SIZE + MAX_OVERFLOW``
-:data:`MAX_WORKERS_PER_REPLICA`         4      the Gunicorn worker count
-                                               ``backend/Dockerfile`` is built around
+:data:`MAX_WORKERS_PER_REPLICA`         4      the supported MAXIMUM Gunicorn worker
+                                               count; ``backend/Dockerfile`` ships 2
 :data:`MAX_REPLICAS`                    2      the planned replica count this budget is
                                                sized for
 peak application connections            40     ``2 x 4 x 5``
@@ -258,9 +258,26 @@ hung server would have held a migration - and with it a container start - for li
 130 seconds while the application next door failed in five, and a statement logged by
 Alembic or by the suite would have carried its bound values in full while the same
 statement logged by a route carried a marker. That asymmetry is what
-:func:`safe_connect_args` and :data:`HIDE_PARAMETERS` exist to remove: they are pure,
+:func:`_connection_invariants` and :data:`HIDE_PARAMETERS` exist to remove: they are pure,
 environment-independent values, they name no pool, and each of the three owners applies
 them to whatever engine it builds.
+
+One of them travels with the *request path* only
+------------------------------------------------
+:data:`STATEMENT_TIMEOUT_SECONDS` is the exception, and it is why there are two factories
+rather than one. A request and a migration want opposite things from a statement ceiling: a
+route that has not answered in ten seconds has already failed its caller, while a
+``CREATE INDEX`` over a populated relation legitimately takes longer than any request may and
+is cancelled by the same ceiling with ``57014 query_canceled`` - aborting an upgrade that was
+doing exactly what it was asked to do, on the container's start-up path, where the abort also
+takes the service start with it.
+
+So the invariants that belong to every connection live in :func:`_connection_invariants`, and
+each workload adds what belongs to it: :func:`safe_connect_args` for the request path, which is
+the application engine and the suite's session engine, and :func:`migration_connect_args` for
+Alembic, which is identical except that it declares no statement ceiling. Splitting the
+factories rather than passing a flag is what makes the choice visible at the call site and
+impossible to inherit by accident.
 
 What deliberately does **not** travel with them is every pool setting -
 :data:`POOL_SIZE`, :data:`MAX_OVERFLOW`, :data:`POOL_RECYCLE_SECONDS`,
@@ -380,6 +397,7 @@ __all__ = [
     "WORKER_CONNECTION_CEILING",
     "AsyncSessionLocal",
     "engine",
+    "migration_connect_args",
     "safe_connect_args",
 ]
 
@@ -394,12 +412,19 @@ __all__ = [
 # ---------------------------------------------------------------------------------------
 
 MAX_WORKERS_PER_REPLICA: Final[int] = 4
-"""Gunicorn worker processes one container is permitted to run.
+"""The MAXIMUM Gunicorn worker processes one container may run, not the number it ships with.
 
 Each worker imports this module, so each builds its own engine and its own pool -
-:data:`engine` is per process, never per container. Four is the worker count
-``backend/Dockerfile`` is built around, and raising it without re-deriving the budget below
-is precisely the mistake the import-time assertion exists to catch.
+:data:`engine` is per process, never per container. This value is the *supported ceiling*: the
+budget asserted below is sized so that four workers per replica still fit, which is what makes
+scaling up to four a configuration change rather than a code change.
+
+``backend/Dockerfile``'s ``CMD`` ships **two**, deliberately, and an operator raises it through
+``GUNICORN_CMD_ARGS`` or by replacing the container's command. So the deployment as shipped runs
+comfortably inside this budget rather than at it, and that headroom is the point: an operator who
+doubles the workers to meet load must not also have to re-derive a connection budget. Raising the
+count *past* this ceiling without re-deriving the budget is precisely the mistake the import-time
+assertion exists to catch.
 """
 
 MAX_REPLICAS: Final[int] = 2
@@ -621,10 +646,15 @@ ordinary slow moment into a failed request; this one converts an *indefinite* wa
 bounded failure, which is the actual defect being closed. A caller that needs a promise
 tighter than this imposes its own deadline, as ``app.api.v1.routers.health.readiness`` does.
 
-It does **not** apply to migrations. ``backend/migrations/env.py`` builds its own synchronous
-engine and passes no connect arguments, so a long ``CREATE INDEX`` is unaffected by a value
-chosen for request-time statements - which is exactly why this belongs here and not in a
-server-wide setting.
+It does **not** apply to migrations, and that exclusion is enforced by which factory a
+migration uses rather than by a convention. ``backend/migrations/env.py`` builds its own
+synchronous engine from :func:`migration_connect_args`, which carries every other invariant
+below and deliberately omits this one, so a long ``CREATE INDEX`` on a populated table is
+unaffected by a value chosen for request-time statements. Handing a migration the request-path
+ceiling would cancel a legitimate index build with ``57014`` and abort the upgrade on the
+container's start-up path - see that function for the full account. This is also exactly why the
+ceiling belongs here, on a per-connection factory, rather than in a server-wide setting no
+workload could opt out of.
 """
 
 STATEMENT_TIMEOUT_MILLISECONDS: Final[int] = STATEMENT_TIMEOUT_SECONDS * 1000
@@ -689,21 +719,59 @@ session is exactly where a developer pipes output to a file and forgets it.
 """
 
 
-def safe_connect_args() -> dict[str, str]:
+def _connection_invariants() -> dict[str, str]:
     """Return the libpq connect arguments every engine in this project must open with.
+
+    The shared half of the connection contract, and the whole of what a *migration* needs:
+    the session time zone, the bound on one connection attempt, and the keepalive group. What
+    is deliberately absent is the request-path statement ceiling, which
+    :func:`safe_connect_args` adds on top and :func:`migration_connect_args` does not - see
+    "One of them travels with the request path only" in the module docstring.
+
+    Private because a caller should always be naming a workload rather than assembling one:
+    both public factories below are built from this, so there is one definition of the shared
+    invariants and two documented choices about the ceiling, rather than three engines each
+    deciding for themselves.
+
+    Returns:
+        A new mapping carrying ``options`` (the ``-c timezone`` setting alone),
+        ``connect_timeout`` and the four keepalive keywords.
+    """
+    return {
+        # A libpq options string, forwarded by psycopg at connection time, so the setting is
+        # established before the first statement and costs no extra round trip. `-c timezone=UTC`
+        # is `SET TIME ZONE 'UTC'` without needing a statement, an event listener or a checkout
+        # hook to issue it. Each public factory extends THIS string rather than replacing it -
+        # overwriting it is how the time zone would silently be lost while a timeout test still
+        # passed, which is the regression
+        # `tests/integration/test_db_session_config.py` pins.
+        "options": f"-c timezone={SESSION_TIME_ZONE}",
+        "connect_timeout": str(CONNECT_TIMEOUT_SECONDS),
+        **TCP_KEEPALIVE_ARGS,
+    }
+
+
+def safe_connect_args() -> dict[str, str]:
+    """Return the libpq connect arguments a REQUEST-PATH engine must open with.
+
+    The shared invariants plus :data:`STATEMENT_TIMEOUT_MILLISECONDS`. Used by the application
+    engine below and by ``backend/tests/conftest.py``'s session engine, because the suite drives
+    the same routes the request path does and must therefore be bounded the same way. Alembic
+    calls :func:`migration_connect_args` instead.
 
     A pure function of module constants: it reads no environment variable, opens nothing,
     and depends on no pool, which is what lets the two non-application engine owners -
-    ``backend/migrations/env.py`` and ``backend/tests/conftest.py`` - call it as freely as
-    the engine below does. A **fresh** dictionary is returned on every call rather than one
-    shared module-level mapping, so an engine that mutates what it is handed (or a caller
+    ``backend/migrations/env.py`` and ``backend/tests/conftest.py`` - call into this module as
+    freely as the engine below does. A **fresh** dictionary is returned on every call rather than
+    one shared module-level mapping, so an engine that mutates what it is handed (or a caller
     that adds a key of its own) cannot reach into another engine's configuration.
 
     Every entry is a requirement rather than tuning:
 
     ``options``
         A libpq options string, forwarded by psycopg at connection time, so both settings are
-        established before the first statement and cost no extra round trip.
+        established before the first statement and cost no extra round trip. It is composed by
+        extending the shared string :func:`_connection_invariants` returns, not by replacing it.
         ``-c timezone=UTC`` is ``SET TIME ZONE 'UTC'`` without needing a statement, an event
         listener or a checkout hook to issue it, and ``-c statement_timeout`` is
         ``SET statement_timeout`` on the same terms. See "Every connection speaks UTC" and
@@ -733,16 +801,61 @@ def safe_connect_args() -> dict[str, str]:
         :func:`~sqlalchemy.ext.asyncio.create_async_engine` or
         :func:`~sqlalchemy.create_engine`. Both reach the same psycopg 3 driver, because
         AAP §0.5.6 excludes ``asyncpg`` and this project has exactly one driver, so one
-        mapping serves the asynchronous application, the synchronous migration side and the
-        test harness alike.
+        mapping serves the asynchronous application and the asynchronous test session alike.
     """
-    return {
-        "options": (
-            f"-c timezone={SESSION_TIME_ZONE} -c statement_timeout={STATEMENT_TIMEOUT_MILLISECONDS}"
-        ),
-        "connect_timeout": str(CONNECT_TIMEOUT_SECONDS),
-        **TCP_KEEPALIVE_ARGS,
-    }
+    args = _connection_invariants()
+    # EXTENDED, never replaced. The two `-c` settings share one libpq option string, so assigning
+    # a new value here instead of appending to the existing one would drop the session time zone
+    # and leave every stored and returned instant interpreted in the server's local zone - a
+    # failure no assertion about the timeout would notice.
+    args["options"] = f"{args['options']} -c statement_timeout={STATEMENT_TIMEOUT_MILLISECONDS}"
+    return args
+
+
+def migration_connect_args() -> dict[str, str]:
+    """Return the libpq connect arguments the ALEMBIC engine must open with.
+
+    Exactly :func:`_connection_invariants` - the session time zone, the five-second bound on one
+    connection attempt, and the keepalive group - and deliberately **no**
+    ``statement_timeout``. It is the counterpart of :func:`safe_connect_args`, and the single
+    difference between them is the whole reason both exist.
+
+    Why the request ceiling must not reach a migration
+    -------------------------------------------------
+    :data:`STATEMENT_TIMEOUT_SECONDS` is ten seconds because no *request* in this service has any
+    business running longer. A migration is not a request. ``0002`` builds seven GIN and trigram
+    indexes and ``0004`` builds three B-trees, and an ordinary ``CREATE INDEX`` over a populated
+    relation can legitimately exceed ten seconds - at which point PostgreSQL cancels it with
+    ``57014 query_canceled``, Alembic sees the revision fail, the whole upgrade rolls back, and in
+    the container the failing step is the one that runs *before* the service starts. The ceiling
+    would therefore convert successful maintenance into a failed deployment, and it would do so
+    only on databases with data in them: an empty database builds every index in milliseconds, so
+    a fresh-database test cannot see it.
+
+    What the migration engine still keeps, and why each matters more here than anywhere
+    ----------------------------------------------------------------------------------
+    ``connect_timeout``
+        This run sits on the container's start-up path, so libpq's 130-second default is what
+        turns an unreachable database into a stalled deployment rather than a fast, legible
+        failure.
+    the session time zone
+        ``0003`` inserts rows, and every timestamp column in this schema is ``timestamptz``. A
+        migration writing under the server's local zone would store instants the application
+        then reads as UTC.
+        (:data:`HIDE_PARAMETERS`, passed separately by the engine owner, is what keeps those
+        bound row values out of ``--sql`` output and CI logs.)
+    the keepalive group
+        A long index build is exactly the window in which a peer can disappear without closing
+        the socket, and the server-side ceiling this factory omits is precisely the mechanism
+        that would otherwise have bounded it.
+
+    Returns:
+        A new mapping suitable for ``connect_args=`` on :func:`~sqlalchemy.create_engine`,
+        carrying no statement ceiling. ``backend/migrations/env.py`` is its only caller;
+        ``backend/tests/integration/test_db_session_config.py`` asserts the absence, because
+        "no ceiling" is a guarantee that leaves no trace in a passing migration.
+    """
+    return _connection_invariants()
 
 
 # ---------------------------------------------------------------------------------------

@@ -73,15 +73,25 @@
  *
  * A request carries a token from a small closed set, and which token it carries decides who the
  * caller is: `FIXTURE_AUTHOR_ACCESS_TOKEN`, `FIXTURE_READER_ACCESS_TOKEN`,
- * `FIXTURE_ADMIN_ACCESS_TOKEN`, `FIXTURE_ROTATED_ACCESS_TOKEN` and
- * `FIXTURE_SUSPENDED_ACCESS_TOKEN` are the whole vocabulary. Anything else - including
- * `FIXTURE_UNKNOWN_ACCESS_TOKEN`, which exists so a spec can attach a *wrong* credential
- * deliberately - is a 401 with `WWW-Authenticate: Bearer`, which is also what an absent header
- * earns and what the client's single-flight rotation keys on.
+ * `FIXTURE_ADMIN_ACCESS_TOKEN`, the three rotated tokens
+ * (`FIXTURE_ROTATED_ACCESS_TOKEN`, `FIXTURE_READER_ROTATED_ACCESS_TOKEN`,
+ * `FIXTURE_ADMIN_ROTATED_ACCESS_TOKEN` - one per principal, because a rotation replaces a credential
+ * and never moves an identity) and `FIXTURE_SUSPENDED_ACCESS_TOKEN` are the whole vocabulary.
+ * Anything else - including `FIXTURE_UNKNOWN_ACCESS_TOKEN`, which exists so a spec can attach a
+ * *wrong* credential deliberately - is a 401 with `WWW-Authenticate: Bearer`, which is also what an
+ * absent header earns and what the client's single-flight rotation keys on.
+ *
+ * The `Authorization` header is parsed the way `app.core.dependencies` parses it: the scheme is
+ * matched **case-insensitively** (RFC 7235 declares `auth-scheme` case-insensitive), the split is on
+ * the first space, and the parse distinguishes **no header** from **a header that cannot be used** -
+ * another scheme, an empty `Bearer`, a raw token with no scheme. Only the first of those is anonymous.
  *
  * From there the three gates are the service's own: `authenticate` for a route that needs a
  * principal, `authenticateAdmin` for the administrative namespace, and `optionalPrincipal` for a
- * public route whose answer is nonetheless viewer-scoped. Role and ownership refusals are therefore
+ * public route whose answer is nonetheless viewer-scoped. The last of those has **three** outcomes
+ * rather than two - a principal, anonymous, or a 401 - because the service does: an unusable or
+ * unrecognised credential on a public read is refused rather than downgraded, and only an absent
+ * header or a deactivated account is answered anonymously. Role and ownership refusals are therefore
  * reachable from the **default** array by presenting the credential of somebody who is not entitled
  * - which is how a spec should reach them, because that is how a browser will.
  *
@@ -177,7 +187,15 @@ const ERROR_TITLE_VALIDATION = 'Validation Error';
 const ERROR_TITLE_RATE_LIMITED = 'Too Many Requests';
 
 const AUTHORIZATION_HEADER = 'Authorization';
-const BEARER_PREFIX = 'Bearer ';
+/**
+ * The one scheme this API accepts, folded to lower case for comparison.
+ *
+ * Lower case because RFC 7235 declares `auth-scheme` case-insensitive and
+ * `app.core.dependencies` compares `scheme.lower()` against exactly this literal. The value is the
+ * comparison target, never something written into a header - see {@link WWW_AUTHENTICATE_BEARER} for
+ * the challenge's own canonical spelling.
+ */
+const BEARER_SCHEME = 'bearer';
 const WWW_AUTHENTICATE_HEADER = 'WWW-Authenticate';
 const WWW_AUTHENTICATE_BEARER = 'Bearer';
 const RETRY_AFTER_HEADER = 'Retry-After';
@@ -248,6 +266,15 @@ const COMMENT_STATUS_VALUES: readonly CommentStatus[] = ['PENDING', 'APPROVED', 
 const USER_ROLE_VALUES: readonly UserRole[] = ['READER', 'AUTHOR', 'ADMIN'];
 
 /** The moderation state at which a comment becomes visible to an anonymous reader. */
+/**
+ * The shape `uuid.UUID` accepts: 8-4-4-4-12 hexadecimal, case-insensitively.
+ *
+ * Restated here rather than validated by a library because the mock may import nothing but `msw`.
+ * Pydantic also accepts a `urn:uuid:` prefix and an unhyphenated form; neither is anything this
+ * client sends, and admitting them would widen the mock past the values the API is asked for.
+ */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const VISIBLE_COMMENT_STATUS: CommentStatus = 'APPROVED';
 
 /**
@@ -300,6 +327,22 @@ const IDENTIFIER_TAKEN_DETAIL = 'That email address or username is already regis
  * Phrased as an instruction because the conflict is entirely resolvable by the caller, and because the
  * alternative to refusing is data loss - `post_categories.category_id` cascades.
  */
+/**
+ * The three lockout refusals, quoted from `app.services.admin_service`.
+ *
+ * Each is rendered verbatim as a problem document's `detail`, and each names the remedy rather than
+ * only the refusal - "ask another administrator" is the whole of what the operator can do - so the
+ * wording is part of the contract a component renders and not decoration.
+ */
+const SELF_DEMOTION_DETAIL =
+  'An administrator cannot remove their own administrator role. Ask another administrator to make ' +
+  'this change.';
+const SELF_DEACTIVATION_DETAIL =
+  'An administrator cannot deactivate their own account. Ask another administrator to make this ' +
+  'change.';
+const SELF_DELETION_DETAIL =
+  'An administrator cannot delete their own account. Ask another administrator to make this change.';
+
 const CATEGORY_IN_USE_DETAIL =
   'Posts are still filed under this category. Re-file them before deleting it.';
 
@@ -428,18 +471,45 @@ const ACCESS_TOKEN_LIFETIME_SECONDS = 900;
 export const FIXTURE_AUTHOR_ACCESS_TOKEN = 'fixture-author-access-token';
 export const FIXTURE_READER_ACCESS_TOKEN = 'fixture-reader-access-token';
 export const FIXTURE_ADMIN_ACCESS_TOKEN = 'fixture-admin-access-token';
-export const FIXTURE_ROTATED_ACCESS_TOKEN = 'fixture-rotated-access-token';
 
 /**
- * The suspended account's token. Recognised, and therefore refused with **403, not 401**.
+ * The access tokens a rotation hands back - **one per principal, and that is the point**.
+ *
+ * A rotation replaces the credential without changing who holds it: `AuthService.issue_token_pair`
+ * is called with the account the presented refresh token belongs to. One shared rotated token,
+ * mapped to the author, therefore made a refresh *change identity* - a reader or an administrator who
+ * rotated came back as the author, and every assertion made after that rotation was about the wrong
+ * principal. Three tokens, three accounts, no identity movement.
+ */
+export const FIXTURE_ROTATED_ACCESS_TOKEN = 'fixture-author-rotated-access-token';
+export const FIXTURE_READER_ROTATED_ACCESS_TOKEN = 'fixture-reader-rotated-access-token';
+export const FIXTURE_ADMIN_ROTATED_ACCESS_TOKEN = 'fixture-admin-rotated-access-token';
+
+/**
+ * The suspended account's access token. Recognised, and therefore refused with **403, not 401**.
  *
  * The distinction is the contract's, not this module's: `get_current_active_user` resolves the
  * credential first and *then* rejects a deactivated account, so the answer says the credential was
  * genuine and the account is not usable - which no fresh token can fix, and which a client must
  * therefore not attempt a rotation for. Reachable only because this token exists; with an
  * accept-anything resolver it was not reachable at all.
+ *
+ * On an OPTIONAL-authentication read the same token resolves to **anonymous** instead, which is a
+ * different rule rather than an inconsistency - see {@link optionalPrincipal}.
  */
 export const FIXTURE_SUSPENDED_ACCESS_TOKEN = 'fixture-suspended-access-token';
+
+/**
+ * The suspended account's refresh token, and the only way to reach refresh's own refusal for it.
+ *
+ * `POST /auth/refresh` answers a token whose owner has been **deactivated or removed** with the same
+ * **401** it answers a token that was never issued: `AuthService.rotate_refresh_token` raises
+ * `UnauthorizedError(_INVALID_REFRESH_TOKEN)` for all of them, deliberately, because naming the
+ * failed check tells an attacker which one to fix. It never emits 403 on this route - so the 403 this
+ * module used to answer here was a status the client could never actually receive, and a spec written
+ * against it would have encoded a refusal that does not exist.
+ */
+export const FIXTURE_SUSPENDED_REFRESH_TOKEN = 'fixture-suspended-refresh-token';
 
 /**
  * A syntactically plausible token that names no account, for driving the refusal deliberately.
@@ -485,15 +555,35 @@ export const fixtureAdminTokenPair: TokenPair = {
 };
 
 /**
- * The pair `POST /auth/refresh` answers with.
+ * The pair `POST /auth/refresh` answers a rotating AUTHOR with.
  *
  * Both members differ from every pair above, which is the whole point: a test can prove the client
  * replaced its held credentials rather than merely re-read them, and can prove the refresh token
  * itself rotated rather than being reissued unchanged.
+ *
+ * It is the author's pair specifically. See {@link fixtureReaderRotatedTokenPair} and
+ * {@link fixtureAdminRotatedTokenPair} for the other two, and {@link rotatedPairsByAccountId} for the
+ * mapping that keeps a rotation from moving the principal.
  */
 export const fixtureRotatedTokenPair: TokenPair = {
   access_token: FIXTURE_ROTATED_ACCESS_TOKEN,
-  refresh_token: 'fixture-rotated-refresh-token',
+  refresh_token: 'fixture-author-rotated-refresh-token',
+  token_type: 'bearer',
+  expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
+};
+
+/** The pair a rotating READER receives. Distinct from the author's, because the principal is. */
+export const fixtureReaderRotatedTokenPair: TokenPair = {
+  access_token: FIXTURE_READER_ROTATED_ACCESS_TOKEN,
+  refresh_token: 'fixture-reader-rotated-refresh-token',
+  token_type: 'bearer',
+  expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
+};
+
+/** The pair a rotating ADMINISTRATOR receives, so an admin spec keeps its authority across a rotation. */
+export const fixtureAdminRotatedTokenPair: TokenPair = {
+  access_token: FIXTURE_ADMIN_ROTATED_ACCESS_TOKEN,
+  refresh_token: 'fixture-admin-rotated-refresh-token',
   token_type: 'bearer',
   expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
 };
@@ -1091,16 +1181,22 @@ export const fixtureLikeSummary: LikeSummary = {
 };
 
 /**
- * Aggregate counts for the administrative overview.
+ * Aggregate counts for the administrative overview, **derived from the collections they count**.
  *
- * Consistent with the stored fixtures: four accounts, seven posts, five comments, three categories.
- * A spec that renders four stat tiles and asserts the figures reads them from here.
+ * `AdminService.get_stats` issues four `SELECT count(*)` statements over `users`, `posts`, `comments`
+ * and `categories`, each unfiltered - every lifecycle state, every moderation state, deactivated
+ * accounts included. So the honest fixture is the length of each stored collection, not a literal
+ * beside it: written out by hand, `category_count` said three while four categories were stored, and
+ * an overview screen asserting the tile against the taxonomy it also renders could not be right about
+ * both.
+ *
+ * Deriving them also means adding a fixture cannot silently invalidate this object.
  */
 export const fixtureAdminStats: AdminStats = {
-  user_count: 4,
-  post_count: 7,
-  comment_count: 5,
-  category_count: 3,
+  user_count: storedAccounts.length,
+  post_count: fixturePosts.length,
+  comment_count: fixtureComments.length,
+  category_count: fixtureCategories.length,
 };
 
 /* -------------------------------------------------------------------------------------------------
@@ -1149,32 +1245,74 @@ function pathParam(value: string | readonly string[] | undefined): string {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The bearer credential the request presents, or `undefined` when it presents none.
+ * What the request presented in `Authorization`, as three outcomes rather than two.
  *
- * Syntax only - a header that is absent, that names another scheme, or whose token is blank yields
- * nothing, exactly as `HTTPBearer` refuses those three before any lookup. Whether the token *names*
- * an account is the next question, and {@link accountsByAccessToken} is where it is answered.
+ * `app.core.dependencies._bearer_token` separates exactly these cases, and the separation is the
+ * whole reason it exists as its own dependency:
+ *
+ * - **`absent`** - no header at all. The only anonymous request there is.
+ * - **`unusable`** - a header that is present and cannot be used: another scheme, a `Bearer` with
+ *   nothing after it, or a raw token pasted with no scheme. The service answers **401** for all
+ *   three, on the optional-authentication reads as much as on the protected ones.
+ * - **`bearer`** - a syntactically usable credential. Whether it *names* an account is the next
+ *   question, and {@link accountsByAccessToken} is where that is answered.
+ *
+ * Collapsing the first two into one value is the defect: a component holding a stale or malformed
+ * credential would be served the public projection forever, with nothing in the response to tell it
+ * the session had lapsed - which is precisely the signal `src/lib/api/client.ts` keys its
+ * single-flight rotation on.
  */
-function bearerToken(request: Request): string | undefined {
+type PresentedCredential =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unusable' }
+  | { readonly kind: 'bearer'; readonly token: string };
+
+const CREDENTIAL_ABSENT: PresentedCredential = { kind: 'absent' };
+const CREDENTIAL_UNUSABLE: PresentedCredential = { kind: 'unusable' };
+
+/**
+ * Parse `Authorization` the way the service parses it, scheme name included.
+ *
+ * **The scheme match is case-insensitive**, because RFC 7235 declares `auth-scheme` case-insensitive
+ * and the service honours that: it folds the parsed scheme with `.lower()` before comparing, so
+ * `bearer`, `Bearer` and `BEARER` are one scheme. Matching `'Bearer '` by prefix, as this module did,
+ * made a client that spelled it unconventionally look anonymous rather than authenticated.
+ *
+ * The split is on the FIRST space, matching `fastapi.security.utils.get_authorization_scheme_param`,
+ * which yields `("", "")` for a value with no space in it - so a raw token with no scheme is
+ * `unusable` rather than treated as the credential itself.
+ */
+function presentedCredential(request: Request): PresentedCredential {
   const header = request.headers.get(AUTHORIZATION_HEADER);
-  if (header === null || !header.startsWith(BEARER_PREFIX)) {
-    return undefined;
+  if (header === null) {
+    return CREDENTIAL_ABSENT;
   }
-  const token = header.slice(BEARER_PREFIX.length).trim();
-  return token === '' ? undefined : token;
+  const separator = header.indexOf(' ');
+  if (separator === -1) {
+    return CREDENTIAL_UNUSABLE;
+  }
+  const scheme = header.slice(0, separator);
+  const token = header.slice(separator + 1).trim();
+  if (scheme.toLowerCase() !== BEARER_SCHEME || token === '') {
+    return CREDENTIAL_UNUSABLE;
+  }
+  return { kind: 'bearer', token };
 }
 
 /**
  * Which account a presented access token names. A token absent from this map names nobody.
  *
- * The rotated token names the author, because it is what `POST /auth/refresh` hands back to a caller
- * who signed in as the author - a rotation replaces the credential without changing the principal.
+ * **Each rotated token names the account that rotated it**, never a single shared principal: a
+ * rotation replaces the credential and leaves the identity where it was, so a reader who refreshes
+ * and then calls `GET /auth/me` must still be the reader.
  */
 const accountsByAccessToken: ReadonlyMap<string, UserMe> = new Map([
   [FIXTURE_AUTHOR_ACCESS_TOKEN, fixtureAuthorAccount],
   [FIXTURE_READER_ACCESS_TOKEN, fixtureReaderAccount],
   [FIXTURE_ADMIN_ACCESS_TOKEN, fixtureAdminAccount],
   [FIXTURE_ROTATED_ACCESS_TOKEN, fixtureAuthorAccount],
+  [FIXTURE_READER_ROTATED_ACCESS_TOKEN, fixtureReaderAccount],
+  [FIXTURE_ADMIN_ROTATED_ACCESS_TOKEN, fixtureAdminAccount],
   [FIXTURE_SUSPENDED_ACCESS_TOKEN, fixtureSuspendedAccount],
 ]);
 
@@ -1185,33 +1323,79 @@ const tokenPairsByEmail: ReadonlyMap<string, TokenPair> = new Map([
   [fixtureAdminAccount.email, fixtureAdminTokenPair],
 ]);
 
-/** Every refresh token this module has issued, so an unissued one can be refused. */
+/**
+ * Every refresh token this module has issued, so an unissued one can be refused.
+ *
+ * Each rotated refresh token is here too, mapped to the same account as the token it replaced, which
+ * is what makes a second rotation by the same principal answerable rather than a 401.
+ *
+ * The suspended account's token is present **on purpose**: it is the only way to reach the refusal
+ * `rotate_refresh_token` gives a token whose owner is no longer usable, and that refusal is a 401
+ * like every other - see {@link FIXTURE_SUSPENDED_REFRESH_TOKEN}.
+ */
 const accountsByRefreshToken: ReadonlyMap<string, UserMe> = new Map([
   [fixtureTokenPair.refresh_token, fixtureAuthorAccount],
   [fixtureReaderTokenPair.refresh_token, fixtureReaderAccount],
   [fixtureAdminTokenPair.refresh_token, fixtureAdminAccount],
   [fixtureRotatedTokenPair.refresh_token, fixtureAuthorAccount],
+  [fixtureReaderRotatedTokenPair.refresh_token, fixtureReaderAccount],
+  [fixtureAdminRotatedTokenPair.refresh_token, fixtureAdminAccount],
+  [FIXTURE_SUSPENDED_REFRESH_TOKEN, fixtureSuspendedAccount],
 ]);
 
 /**
- * Resolve the calling principal where authentication is OPTIONAL.
+ * The pair each principal receives when it rotates, keyed by account.
  *
- * `undefined` means "treat as anonymous", and three different requests reach it: one with no
- * credential, one with a credential that names nobody, and one belonging to a **deactivated**
- * account. The third is the contract's own rule rather than a simplification -
- * `get_current_user_optional` resolves a suspended account as anonymous, which is why a suspended
- * author is shown the public view of their own thread and refused their own drafts.
- *
- * Where authentication is REQUIRED, use {@link authenticate}: the three cases stop being equivalent
- * there, because a deactivated account earns 403 rather than 401.
+ * The account comes from {@link accountsByRefreshToken} - the presented token decides whose rotation
+ * this is - and this map decides what that principal gets back. An account absent from it has no
+ * rotation fixture, which the resolver reports as a 401 rather than substituting somebody else's
+ * pair; the suspended account is deliberately absent, because its refusal comes first anyway.
  */
-function optionalPrincipal(request: Request): UserMe | undefined {
-  const token = bearerToken(request);
-  if (token === undefined) {
+const rotatedPairsByAccountId: ReadonlyMap<string, TokenPair> = new Map([
+  [USER_ID_AUTHOR, fixtureRotatedTokenPair],
+  [USER_ID_READER, fixtureReaderRotatedTokenPair],
+  [USER_ID_ADMIN, fixtureAdminRotatedTokenPair],
+]);
+
+/**
+ * Resolve the calling principal where authentication is OPTIONAL - in three outcomes, not two.
+ *
+ * `get_current_user_optional` treats the three kinds of request asymmetrically, and this function
+ * reproduces that asymmetry exactly:
+ *
+ * - **`undefined` - anonymous.** Reached by a request with **no `Authorization` header**, and by a
+ *   usable credential naming a **deactivated** account. The second is the contract's own rule rather
+ *   than a simplification: the operation is public, so a suspended reader may still read what anyone
+ *   with no account reads, and narrowing them to anonymous *before the value leaves this function* is
+ *   what stops a suspended author being shown their own drafts by `canViewPost`.
+ * - **a `Response` - 401.** Reached by a credential that is present and cannot be used: a scheme
+ *   other than `Bearer`, an empty `Bearer`, a raw token with no scheme, or a token that names no
+ *   account. **This is not quietly downgraded to anonymous**, and that is the finding: the client
+ *   owns refresh-on-401, so a 401 is the signal that makes it rotate and retry. Swallowing it leaves
+ *   a reader holding a lapsed token, permanently served the public projection, with no route to
+ *   recovering the session - and every spec asserting that a bogus or stale credential is refused
+ *   would receive a success shape and pass.
+ * - **the account** - a usable credential for an active account.
+ *
+ * Callers narrow with {@link isRefusal} and return the refusal, exactly as they do for
+ * {@link authenticate}. Where authentication is REQUIRED, use that instead: the deactivated case
+ * stops being anonymous there and earns 403.
+ */
+function optionalPrincipal(request: Request): UserMe | Response | undefined {
+  const credential = presentedCredential(request);
+  if (credential.kind === 'absent') {
     return undefined;
   }
-  const account = accountsByAccessToken.get(token);
-  return account !== undefined && account.is_active ? account : undefined;
+  if (credential.kind === 'unusable') {
+    return unauthorized(request);
+  }
+  const account = accountsByAccessToken.get(credential.token);
+  if (account === undefined) {
+    return unauthorized(request);
+  }
+  // Narrowed to anonymous BEFORE the value leaves this function, so no visibility predicate
+  // downstream can be handed an inactive principal even by mistake.
+  return account.is_active ? account : undefined;
 }
 
 /**
@@ -1232,11 +1416,14 @@ function optionalPrincipal(request: Request): UserMe | undefined {
  * type-check without it.
  */
 function authenticate(request: Request): UserMe | Response {
-  const token = bearerToken(request);
-  if (token === undefined) {
+  const credential = presentedCredential(request);
+  // An absent header and an unusable one answer identically here - which check failed is not a
+  // caller's business - but they are still parsed apart, because `optionalPrincipal` needs the
+  // distinction and both resolvers read the same parse.
+  if (credential.kind !== 'bearer') {
     return unauthorized(request);
   }
-  const account = accountsByAccessToken.get(token);
+  const account = accountsByAccessToken.get(credential.token);
   if (account === undefined) {
     return unauthorized(request);
   }
@@ -1269,8 +1456,14 @@ function authenticateAdmin(request: Request): UserMe | Response {
   return principal;
 }
 
-/** Narrow an authentication outcome to the refusal half. */
-function isRefusal(outcome: UserMe | Response): outcome is Response {
+/**
+ * Narrow an authentication outcome to the refusal half.
+ *
+ * Accepts `undefined` as well as an account, so the one predicate serves both {@link authenticate}
+ * and {@link optionalPrincipal} - and so an optional-authentication resolver cannot forget the
+ * refusal branch: the anonymous value survives the narrowing and the refusal does not.
+ */
+function isRefusal(outcome: UserMe | Response | undefined): outcome is Response {
   return outcome instanceof Response;
 }
 
@@ -1294,36 +1487,115 @@ function readQuery(params: URLSearchParams, key: string): string | undefined {
   return trimmed === '' ? undefined : trimmed;
 }
 
-/** Read a query parameter constrained to the post lifecycle set. */
-function readQueryPostStatus(params: URLSearchParams, key: string): PostStatus | undefined {
-  const value = readQuery(params, key);
-  return POST_STATUS_VALUES.find((candidate) => candidate === value);
+/**
+ * The strict query readers, and why the lenient ones below them are not enough.
+ *
+ * A query parameter declared as an enum, a `bool` or a `uuid.UUID` is validated by Pydantic before a
+ * route function is entered, so a value outside the type is a **422 naming the parameter** - not a
+ * filter that was accepted and then quietly dropped. The readers immediately below answer `undefined`
+ * for anything they do not recognise, and `undefined` at a call site means "no filter", so
+ * `?status=PUBLSIHED` returned the unfiltered listing with a 200 and `?is_active=maybe` returned every
+ * account. A component that builds one of those values from a control had no way to observe its own
+ * typo.
+ *
+ * These three collect the rejection instead, in Pydantic's own `type`/`message` vocabulary, so a
+ * consumer switching on `ValidationErrorItem.type` behaves under test as it will in production.
+ */
+
+/** Render a closed set the way Pydantic renders it in an `enum` message: `'A', 'B' or 'C'`. */
+function describeAllowed(allowed: readonly string[]): string {
+  const quoted = allowed.map((member) => `'${member}'`);
+  const last = quoted[quoted.length - 1];
+  if (last === undefined) {
+    return '';
+  }
+  return quoted.length === 1 ? last : `${quoted.slice(0, -1).join(', ')} or ${last}`;
 }
 
-/** Read a query parameter constrained to the moderation set. */
-function readQueryCommentStatus(params: URLSearchParams, key: string): CommentStatus | undefined {
+/** Read a query parameter constrained to a closed set, collecting the 422 an outsider earns. */
+function readQueryEnum<T extends string>(
+  params: URLSearchParams,
+  key: string,
+  allowed: readonly T[],
+  errors: ValidationErrorItem[],
+): T | undefined {
   const value = readQuery(params, key);
-  return COMMENT_STATUS_VALUES.find((candidate) => candidate === value);
-}
-
-/** Read a query parameter constrained to the role set. */
-function readQueryUserRole(params: URLSearchParams, key: string): UserRole | undefined {
-  const value = readQuery(params, key);
-  return USER_ROLE_VALUES.find((candidate) => candidate === value);
+  if (value === undefined) {
+    return undefined;
+  }
+  const member = allowed.find((candidate) => candidate === value);
+  if (member === undefined) {
+    errors.push({
+      field: key,
+      message: `Input should be ${describeAllowed(allowed)}`,
+      type: 'enum',
+    });
+    return undefined;
+  }
+  return member;
 }
 
 /**
- * Read a query parameter that carries a boolean.
+ * The strings Pydantic's lax boolean mode accepts, folded to lower case.
  *
- * The client serialises a boolean query value with `String(value)`, so `true` and `false` arrive as
- * those two words and nothing else is a boolean.
+ * Restated from Pydantic's own set rather than narrowed to `true`/`false`, because a query parameter
+ * is a string and `?mine=1` is a request this API answers. Anything outside the set is
+ * `bool_parsing`.
  */
-function readQueryBoolean(params: URLSearchParams, key: string): boolean | undefined {
+const TRUE_LITERALS: readonly string[] = ['1', 'on', 't', 'true', 'y', 'yes'];
+const FALSE_LITERALS: readonly string[] = ['0', 'off', 'f', 'false', 'n', 'no'];
+
+/** Read a boolean query parameter as Pydantic reads one, collecting the 422 a non-boolean earns. */
+function readQueryBooleanStrict(
+  params: URLSearchParams,
+  key: string,
+  errors: ValidationErrorItem[],
+): boolean | undefined {
   const value = readQuery(params, key);
-  if (value === 'true') {
+  if (value === undefined) {
+    return undefined;
+  }
+  const folded = value.toLowerCase();
+  if (TRUE_LITERALS.includes(folded)) {
     return true;
   }
-  return value === 'false' ? false : undefined;
+  if (FALSE_LITERALS.includes(folded)) {
+    return false;
+  }
+  errors.push({
+    field: key,
+    message: 'Input should be a valid boolean, unable to interpret input',
+    type: 'bool_parsing',
+  });
+  return undefined;
+}
+
+/**
+ * Read a `uuid.UUID` query parameter, collecting the 422 a malformed identifier earns.
+ *
+ * `author_id` on the administrative post listing and `post_id` on the moderation queue are both
+ * `uuid.UUID | None`, so a value that is not one is refused before anything is filtered - not read as
+ * "no filter", which answered the whole unfiltered listing to a caller who had asked for one row's
+ * worth of it.
+ */
+function readQueryUuid(
+  params: URLSearchParams,
+  key: string,
+  errors: ValidationErrorItem[],
+): string | undefined {
+  const value = readQuery(params, key);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!UUID_PATTERN.test(value)) {
+    errors.push({
+      field: key,
+      message: 'Input should be a valid UUID, invalid character',
+      type: 'uuid_parsing',
+    });
+    return undefined;
+  }
+  return value;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1751,6 +2023,41 @@ function slugify(title: string): string {
 }
 
 /**
+ * Derive a slug and step past any that is already taken, the way `app.core.slug.unique_slug` does.
+ *
+ * **A slug is unique by database constraint, so a creation route cannot answer with one that is
+ * already in use** - and both create paths in this module did. Filing a second post or category whose
+ * title derives an existing slug returned that same slug with a 201, which is a response the service
+ * cannot produce: `PostService.create` and `CategoryService.create` read the slug family, hand it to
+ * `unique_slug`, and take the first free suffix - `-2`, then `-3`, and so on. A component that built a
+ * canonical URL from the answer was therefore handed one that resolves to somebody else's row.
+ *
+ * Deterministic and pure: the suffix depends only on the title and the taken set, both of which come
+ * from the frozen fixtures, so the same request always answers the same slug and this module keeps the
+ * statelessness `server.resetHandlers()` requires of it.
+ *
+ * @param title - The submitted title or name.
+ * @param taken - Every slug already in the family's namespace.
+ * @returns The first slug in the sequence `base`, `base-2`, `base-3`, ... that nothing holds.
+ */
+function allocateSlug(title: string, taken: readonly string[]): string {
+  const base = slugify(title);
+  const held = new Set(taken.map((slug) => slug.toLowerCase()));
+  if (!held.has(base)) {
+    return base;
+  }
+  // Bounded by the size of the taken set plus one: with N slugs held, one of the first N+1 candidates
+  // is necessarily free, so this terminates without a guard on the loop.
+  for (let suffix = 2; suffix <= held.size + 2; suffix += 1) {
+    const candidate = `${base}-${String(suffix)}`;
+    if (!held.has(candidate)) {
+      return candidate;
+    }
+  }
+  return `${base}-${String(held.size + 2)}`;
+}
+
+/**
  * How strongly a post answers a search term.
  *
  * Weighted, because the service weights a title match above a body match with `setweight` before
@@ -1765,32 +2072,109 @@ function relevanceScore(post: PostDetail, term: string): number {
   return titleWeight + excerptWeight + contentWeight;
 }
 
-/** Recency ordering: newest publication first, falling back to creation for an unpublished post. */
+/**
+ * Trigram similarity between a title and a term, approximating `pg_trgm`'s `similarity()`.
+ *
+ * The repository's ordering uses it as the SECOND key whenever a term is present - `similarity(title,
+ * :term) DESC` - and it is the only key that meaningfully orders a row matched solely by the
+ * typo-tolerant fallback, whose `ts_rank` against a query it does not satisfy is zero. Approximated
+ * rather than reproduced exactly: this is the Jaccard ratio over the two trigram sets, which is the
+ * shape `pg_trgm` computes, and it is enough to make "the closer title leads" observable without
+ * claiming to be the extension's arithmetic to the digit.
+ */
+function trigramSimilarity(title: string, term: string): number {
+  const trigrams = (value: string): ReadonlySet<string> => {
+    const padded = `  ${value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()} `;
+    const found = new Set<string>();
+    for (let index = 0; index + 3 <= padded.length; index += 1) {
+      found.add(padded.slice(index, index + 3));
+    }
+    return found;
+  };
+  const left = trigrams(title);
+  const right = trigrams(term);
+  if (left.size === 0 || right.size === 0) {
+    return 0;
+  }
+  let shared = 0;
+  for (const gram of right) {
+    if (left.has(gram)) {
+      shared += 1;
+    }
+  }
+  const union = left.size + right.size - shared;
+  return union === 0 ? 0 : shared / union;
+}
+
+/**
+ * The tiebreaker every listing in the service ends on: `posts.id` **descending**.
+ *
+ * Not decoration, and not interchangeable with any other tiebreaker. `published_at` is not unique - a
+ * seed run or a bulk publish stamps many rows from one transaction clock - and neither is a rank, so
+ * without a *total* order two rows with equal keys can be returned by both page one and page two
+ * while a third is returned by neither. The primary key breaks every remaining tie, which is what
+ * makes page two provably disjoint from page one.
+ */
+function byIdDescending(left: PostDetail, right: PostDetail): number {
+  if (left.id === right.id) {
+    return 0;
+  }
+  return left.id < right.id ? 1 : -1;
+}
+
+/**
+ * Recency ordering: newest publication first, falling back to creation for an unpublished post.
+ *
+ * The fallback stands in for `NULLS LAST` on `published_at`, which the repository applies only when a
+ * listing admits drafts. It does **not** tiebreak on the title: `_build_ordering` has no title clause
+ * anywhere, so ordering two rows that share a publication instant alphabetically invented a sequence
+ * the service cannot produce - and one that is stable, which made the overlapping-pagination defect
+ * the real tiebreaker exists to prevent impossible to observe.
+ */
 function byRecency(left: PostDetail, right: PostDetail): number {
   const leftAt = left.published_at ?? left.created_at;
   const rightAt = right.published_at ?? right.created_at;
   if (leftAt === rightAt) {
-    return left.title.localeCompare(right.title);
+    return byIdDescending(left, right);
   }
   return leftAt < rightAt ? 1 : -1;
 }
 
 /**
- * Relevance ordering: strongest match first, then most-viewed, then most recent.
+ * The ordering a searched listing gets, as `_build_ordering` composes it.
+ *
+ * Two clause lists, chosen by the requested sort, and both of them end on the primary key:
+ *
+ * - `relevance` → **rank, similarity, recency, id**. Best match first, ties broken by how close the
+ *   title is, then by recency.
+ * - `recent` → **recency, rank, similarity, id**. Newest first, with rank and similarity deciding
+ *   only between posts that share a publication instant.
+ *
+ * **`view_count` appears in neither, and that is the correction.** Nothing in this product advances
+ * that column and the plan states outright that there is deliberately no `"popular"` sort, so ranking
+ * ties by engagement invented an ordering the service has no equivalent of - and it did so in the one
+ * place a home-feed spec would read as authoritative.
  *
  * Only ever applied WITH a term - see {@link resolveFeedSort} - because with nothing to rank against
- * every post scores zero and the sequence would collapse onto whatever the tiebreakers decided.
+ * every post scores zero and the sequence would collapse onto the tiebreakers alone.
  */
-function byRelevance(term: string) {
+function byTermOrdering(term: string, sort: FeedSort) {
   return (left: PostDetail, right: PostDetail): number => {
-    const scoreDelta = relevanceScore(right, term) - relevanceScore(left, term);
-    if (scoreDelta !== 0) {
-      return scoreDelta;
+    const rank = relevanceScore(right, term) - relevanceScore(left, term);
+    const similarity = trigramSimilarity(right.title, term) - trigramSimilarity(left.title, term);
+    const recency = byRecency(left, right);
+
+    const clauses =
+      sort === 'relevance' ? [rank, similarity, recency] : [recency, rank, similarity];
+    for (const clause of clauses) {
+      if (clause !== 0) {
+        return clause;
+      }
     }
-    if (right.view_count !== left.view_count) {
-      return right.view_count - left.view_count;
-    }
-    return byRecency(left, right);
+    return byIdDescending(left, right);
   };
 }
 
@@ -1843,16 +2227,29 @@ interface FeedQuery {
    * which is the widening the service refuses.
    */
   readonly ownedBy: string | undefined;
-  readonly status: string | undefined;
+  /** The lifecycle state the workspace is narrowed to, parsed against the closed set. */
+  readonly status: PostStatus | undefined;
 }
 
 /**
  * Read the feed's own parameters, leaving `page` and `page_size` to `readPageRequest`.
  *
- * `sort` is a CLOSED set. `app.schemas.post.PostSortOption` is `Literal["recent", "relevance"]`, so a
- * third value is a 422 naming the parameter - not silently read as `recent` because it was not the
- * string `relevance`. The difference matters to a component that builds the value: a typo in an
- * ordering control produced a perfectly ordered page and no signal at all.
+ * **Every one of them is a typed parameter, so every one of them can be a 422.** Three were being
+ * read as raw strings and compared, which meant a value outside the type became a *filter that was
+ * silently not applied*:
+ *
+ * - `sort` is `Literal["recent", "relevance"]`. A third value is a 422 naming the parameter, not a
+ *   quiet fall back to recency - a typo in an ordering control produced a perfectly ordered page and
+ *   no signal at all.
+ * - `mine` is `bool`. `?mine=maybe` is `bool_parsing`, **not** the public feed: answering the public
+ *   feed to a workspace request is exactly the substitution the route refuses for a missing
+ *   credential, and it looks to an author like their drafts were deleted.
+ * - `status` is `PostStatus | None`. `?status=PUBLSIHED` is `enum`, not "every state" and not an
+ *   empty page: an empty page reads as "you have no drafts", which is a different and untrue answer.
+ *
+ * `mine` is resolved to the principal's username rather than kept as a flag, because the workspace's
+ * scope *is* the principal - see {@link FeedQuery.ownedBy}. The caller has already established that a
+ * credential was presented, so `principal` is only ever `undefined` here when `mine` is false.
  */
 function readFeedQuery(
   params: URLSearchParams,
@@ -1863,11 +2260,22 @@ function readFeedQuery(
   if (sort !== undefined && !POST_SORT_OPTIONS.includes(sort)) {
     errors.push({
       field: 'sort',
-      message: `Input should be ${POST_SORT_OPTIONS.map((option) => `'${option}'`).join(' or ')}`,
+      message: `Input should be ${describeAllowed(POST_SORT_OPTIONS)}`,
       type: 'literal_error',
     });
   }
   const term = readQuery(params, 'q');
+  const wantsOwn = readQueryBooleanStrict(params, 'mine', errors);
+  const status = readQueryEnum(params, 'status', POST_STATUS_VALUES, errors);
+  // The window is read here as well, so ONE request reports every parameter it got wrong: FastAPI
+  // validates the whole request and answers with each rejected field, and a caller that sent both a
+  // bad `sort` and a bad `page` must not have to fix them one round trip at a time. `pageResponse`
+  // re-reads the same two values when it windows the result, which is a pure read of the same query
+  // string and cannot disagree with this one.
+  const pageWindow = readPageRequest(params);
+  if (!pageWindow.ok) {
+    errors.push(...pageWindow.errors);
+  }
   return resolved(
     {
       term,
@@ -1878,33 +2286,37 @@ function readFeedQuery(
       // degrades to recency), while the check above keeps an unrecognised value a 422 rather than a
       // silent fall back to recency.
       sort: resolveFeedSort(term, sort),
-      ownedBy: readQuery(params, 'mine') === 'true' ? principal?.username : undefined,
-      status: readQuery(params, 'status'),
+      ownedBy: wantsOwn === true ? principal?.username : undefined,
+      status,
     },
     errors,
   );
 }
 
 /**
- * Compose the feed: scope to what this viewer may see, filter, then order.
+ * Compose the feed: scope to what this caller asked for, filter, then order.
  *
  * Filtering precedes ordering because ranking a row that the filter removes would change nothing
  * and cost something - and because `total` must count what survives the filter, not what survives
  * the ranking.
  *
- * The scope comes from {@link visiblePostsFor} rather than from the published set, and it is resolved
- * with the AUTHOR FILTER in hand, because the two decide the answer together: an author sees their own
- * drafts on `?author=<self>` and not on the unscoped feed.
+ * **There are exactly two scopes, and no viewer widens either of them.**
+ *
+ * - The **public feed** is `status = PUBLISHED` for every caller - anonymous, reader, author and
+ *   administrator alike. `?author=<self>` does not widen it: an author asking the public feed for
+ *   their own posts is answered with their published ones, because one URL is one result set. The
+ *   route's own description says so, and a draft appears here for nobody.
+ * - The **workspace**, reached only by `mine=true` with a credential, replaces that scope outright:
+ *   every lifecycle state, but only the principal's own rows, narrowed further by `status` when it
+ *   was sent.
  *
  * @param query - The parsed parameters.
- * @param viewer - The resolved principal, or `undefined` for an anonymous caller.
  * @param scopedAuthor - The account `?author=` named, when it named one this module knows.
  */
 function composeFeed(query: FeedQuery, scopedAuthor: UserMe | undefined): readonly PostDetail[] {
   // The workspace scope replaces the public one outright: every lifecycle state, but only the
   // principal's own rows. The public branch is published-only for EVERY caller - an administrator
-  // and an author included - which is why there is no credential test on it at all, and why
-  // `visiblePostsFor` is not consulted here.
+  // and an author included - which is why there is no credential test on it at all.
   const owner = query.ownedBy?.toLowerCase();
   let rows =
     owner === undefined
@@ -1927,7 +2339,10 @@ function composeFeed(query: FeedQuery, scopedAuthor: UserMe | undefined): readon
   if (scopedAuthor !== undefined) {
     rows = rows.filter((post) => post.author.username === scopedAuthor.username);
   }
-  return [...rows].sort(query.sort === 'relevance' ? byRelevance(term ?? '') : byRecency);
+  // With a term, both orderings are the repository's four-clause lists; with none, recency then the
+  // primary key. `sort` is already resolved against the presence of the term by `resolveFeedSort`, so
+  // there is no `relevance`-with-no-term branch left to take here.
+  return [...rows].sort(term === undefined ? byRecency : byTermOrdering(term, query.sort));
 }
 
 /**
@@ -2163,6 +2578,83 @@ function readOptionalText(
     return null;
   }
   return rejectLength(stripped, field, bounds, errors) ? undefined : stripped;
+}
+
+/**
+ * Read a member that is optional but **not nullable and not blankable**, collecting its rejections.
+ *
+ * The distinction from {@link readOptionalText} is a schema fact, not a nicety. That reader folds a
+ * blank string to `null` because `app.schemas.user.OptionalBio` and `OptionalAvatarUrl` each declare
+ * `BeforeValidator(_blank_to_none)` - their columns are nullable, so "" and `NULL` are one state.
+ * `DisplayName` declares **no such validator**, because `users.display_name` is `TEXT NOT NULL`: a
+ * cleared control cannot mean "remove the name" when there is no state for that to produce, so `""`
+ * and `"   "` are measured after stripping and reported as **too short**.
+ *
+ * Reading it with the folding reader turned a blank submission into a successful no-op that answered
+ * 200 with the name the account already had - a form clearing its only required field, told it
+ * succeeded.
+ *
+ * An explicit `null` is *not* handled here: the two schemas that use this reader reject null with
+ * their own message (`UserUpdate.reject_null_display_name`), so the call site raises that itself and
+ * this reader is reached only for a present, non-null value.
+ */
+function readRequiredTextIfPresent(
+  body: Record<string, unknown>,
+  field: string,
+  bounds: LengthBounds,
+  errors: ValidationErrorItem[],
+): string | undefined {
+  if (!(field in body)) {
+    return undefined;
+  }
+  const value = body[field];
+  if (typeof value !== 'string') {
+    errors.push({ field, message: 'Input should be a valid string', type: 'string_type' });
+    return undefined;
+  }
+  // Stripped first, exactly as `strip_whitespace=True` strips before the length rules run.
+  const stripped = value.trim();
+  return rejectLength(stripped, field, bounds, errors) ? undefined : stripped;
+}
+
+/**
+ * Read an optional `UUID | null` member, refusing anything that is not one.
+ *
+ * `app.schemas.comment.CommentCreate.parent_id` is `uuid.UUID | None`, and the difference between
+ * that and a nullable *string* is the finding: read with the blank-folding text reader, `""` became
+ * `null` and a reply whose parent identifier the client failed to supply was silently accepted as a
+ * **root comment** - posted at the top of the thread instead of beneath the comment it answered, with
+ * a 201 to say it worked. Pydantic answers a blank or malformed identifier with a 422 naming the
+ * member, and so does this.
+ *
+ * `null` and absence both remain meaningful and distinct: absent leaves the member unset, `null` is
+ * an explicit "this is a root comment".
+ */
+function readOptionalUuid(
+  body: Record<string, unknown>,
+  field: string,
+  errors: ValidationErrorItem[],
+): string | null | undefined {
+  if (!(field in body)) {
+    return undefined;
+  }
+  const value = body[field];
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== 'string') {
+    errors.push({ field, message: 'Input should be a valid UUID', type: 'uuid_type' });
+    return undefined;
+  }
+  if (!UUID_PATTERN.test(value.trim())) {
+    errors.push({
+      field,
+      message: 'Input should be a valid UUID, invalid character',
+      type: 'uuid_parsing',
+    });
+    return undefined;
+  }
+  return value.trim();
 }
 
 /** Read an optional absolute `http(s)` URL member, refusing every other scheme and every relative form. */
@@ -2566,7 +3058,15 @@ const authHandlers = [
     }
     // The password is bounded but NEVER echoed, quoted or reported back beyond the rule it broke.
     requireString(body, 'password', BOUNDS.password, errors);
-    const displayName = readOptionalText(body, 'display_name', BOUNDS.displayName, errors);
+    // Optional but not blankable, exactly as on `PATCH /users/me`: `UserRegister.display_name` is
+    // `Annotated[str, StringConstraints(min_length=1, strip_whitespace=True)] | None` with no
+    // blank-folding validator, and its own description says a whitespace-only value is rejected
+    // rather than stored blank. Omitting it - or sending null - is what asks for the username to be
+    // used instead; sending `"  "` is a 422.
+    const displayName =
+      body['display_name'] === null
+        ? null
+        : readRequiredTextIfPresent(body, 'display_name', BOUNDS.displayName, errors);
     const [first, ...rest] = errors;
     if (first !== undefined) {
       return validationProblem(
@@ -2634,6 +3134,15 @@ const authHandlers = [
    * merely assumed. A token this module never issued is refused with 401 and the bearer challenge,
    * which is what makes the client's "rotation failed, abandon the session" path reachable from the
    * default handler set rather than only from an override.
+   *
+   * **The pair is the PRESENTING principal's.** `rotate_refresh_token` resolves the token's owner and
+   * issues that account a new pair, so a reader who rotates stays the reader. Answering one shared
+   * pair - the author's - meant a rotation silently switched identity mid-spec.
+   *
+   * **Every refusal on this route is a 401**, including a token whose owner has been deactivated or
+   * removed: the service raises one `UnauthorizedError` for "never issued", "already spent",
+   * "expired" and "owner unusable" alike, because naming the failed check tells an attacker which one
+   * to fix. There is no 403 branch here to reproduce.
    */
   http.post('*/api/v1/auth/refresh', async ({ request }) => {
     const submitted = await readRefreshToken(request);
@@ -2641,13 +3150,12 @@ const authHandlers = [
       return validationProblem(request, submitted.errors);
     }
     const account = accountsByRefreshToken.get(submitted.value);
-    if (account === undefined) {
+    // One refusal for all four causes: unissued, and owner deactivated, are the two reachable here.
+    if (account === undefined || !account.is_active) {
       return unauthorized(request);
     }
-    if (!account.is_active) {
-      return forbidden(request, DEACTIVATED_ACCOUNT_DETAIL);
-    }
-    return ok(fixtureRotatedTokenPair);
+    const rotated = rotatedPairsByAccountId.get(account.id);
+    return rotated === undefined ? unauthorized(request) : ok(rotated);
   }),
 
   /**
@@ -2716,7 +3224,10 @@ const userHandlers = [
         type: 'string_type',
       });
     }
-    const displayName = readOptionalText(body, 'display_name', BOUNDS.displayName, errors);
+    // NOT the blank-folding reader: `DisplayName` carries no `_blank_to_none` validator, because
+    // `users.display_name` is NOT NULL. A blank submission is too short, not a no-op. `bio` and
+    // `avatar_url` below DO fold, because their columns are nullable and their aliases say so.
+    const displayName = readRequiredTextIfPresent(body, 'display_name', BOUNDS.displayName, errors);
     const bio = readOptionalText(body, 'bio', BOUNDS.bio, errors);
     const avatarUrl = readOptionalUrl(body, 'avatar_url', errors);
     const [first, ...rest] = errors;
@@ -2853,16 +3364,37 @@ const postCollectionHandlers = [
    */
   http.get('*/api/v1/posts', ({ request }) => {
     const params = searchParams(request);
+    // Resolved FIRST, and its refusal returned before any parameter is read: an unusable credential
+    // is rejected during dependency resolution in the service, which happens before the query
+    // parameters this route declares are validated.
     const principal = optionalPrincipal(request);
-    const wantsOwn = readQuery(params, 'mine') === 'true';
+    if (isRefusal(principal)) {
+      return principal;
+    }
+
+    // PARSED FIRST, and this order is the service's rather than a preference. Every parameter this
+    // route declares is validated by the framework before the route function is entered, so a
+    // malformed `mine`, `status`, `sort`, `page` or `page_size` is a 422 that never reaches the mode
+    // rules below - which are ordinary statements inside the function body. Applying a mode rule to
+    // an unparsed string is what let `?mine=maybe` be read as "not mine" and answered with the
+    // public feed.
+    const query = readFeedQuery(params, principal);
+    if (!query.ok) {
+      return validationProblem(request, query.errors);
+    }
 
     // The three mode rules, in the order the service applies them. Each refuses rather than
     // ignores, because a dashboard answered with the public feed looks to its owner like their
     // drafts were deleted, and a filter that was accepted and dropped looks like it was applied.
+    //
+    // `mine` is re-read as a parsed boolean rather than taken from `query.value.ownedBy`: that
+    // member is `undefined` both for "did not ask" and for "asked with no credential", and those two
+    // are a 200 and a 401.
+    const wantsOwn = readQueryBooleanStrict(params, 'mine', []) === true;
     if (wantsOwn && principal === undefined) {
       return unauthorized(request);
     }
-    if (wantsOwn && readQuery(params, 'author') !== undefined) {
+    if (wantsOwn && query.value.authorUsername !== undefined) {
       return feedModeProblem(
         request,
         'author',
@@ -2870,18 +3402,13 @@ const postCollectionHandlers = [
           'at another author.',
       );
     }
-    if (!wantsOwn && readQuery(params, 'status') !== undefined) {
+    if (!wantsOwn && query.value.status !== undefined) {
       return feedModeProblem(
         request,
         'status',
         'The public feed answers published posts only, so narrowing it by lifecycle state is ' +
           'either a no-op or a request for another author\u2019s unpublished work.',
       );
-    }
-
-    const query = readFeedQuery(params, principal);
-    if (!query.ok) {
-      return validationProblem(request, query.errors);
     }
 
     // `?author=` is RESOLVED before anything is filtered, so a name the service does not know is a
@@ -2945,7 +3472,12 @@ const postCollectionHandlers = [
     const draft: PostDetail = {
       id: CREATED_POST_ID,
       title: title ?? '',
-      slug: slugify(title ?? ''),
+      // Collision-safe: a title that derives a slug an existing post holds gets the next free suffix,
+      // because `posts.slug` is uniquely constrained and the service allocates around it.
+      slug: allocateSlug(
+        title ?? '',
+        fixturePosts.map((post) => post.slug),
+      ),
       excerpt: excerpt ?? null,
       cover_image_url: coverImageUrl ?? null,
       status: 'DRAFT',
@@ -3015,6 +3547,9 @@ const postSubResourceHandlers = [
    */
   http.get('*/api/v1/posts/:postId/likes', ({ request, params }) => {
     const viewer = optionalPrincipal(request);
+    if (isRefusal(viewer)) {
+      return viewer;
+    }
     const post = findPostById(pathParam(params.postId));
     if (post === undefined || !canViewPost(post, viewer)) {
       return notFound(request, 'No post is stored under that identifier.');
@@ -3036,6 +3571,9 @@ const postSubResourceHandlers = [
    */
   http.get('*/api/v1/posts/:postId/comments', ({ request, params }) => {
     const viewer = optionalPrincipal(request);
+    if (isRefusal(viewer)) {
+      return viewer;
+    }
     const post = findPostById(pathParam(params.postId));
     if (post === undefined || !canViewPost(post, viewer)) {
       return notFound(request, 'No post is stored under that identifier.');
@@ -3084,7 +3622,10 @@ const postSubResourceHandlers = [
     const errors: ValidationErrorItem[] = [];
     rejectExtraMembers(parsed.value, COMMENT_CREATE_MEMBERS, errors);
     const text = requireString(parsed.value, 'body', BOUNDS.commentBody, errors);
-    const parentId = readOptionalText(parsed.value, 'parent_id', BOUNDS.url, errors);
+    // A UUID, not a bounded string: `CommentCreate.parent_id` is `uuid.UUID | None`, so a blank or
+    // malformed identifier is a 422 naming the member rather than a comment quietly posted at the top
+    // of the thread instead of beneath the one it replies to.
+    const parentId = readOptionalUuid(parsed.value, 'parent_id', errors);
     const [first, ...rest] = errors;
     if (first !== undefined) {
       return validationProblem(request, [first, ...rest], 'The submitted comment is not valid.');
@@ -3184,9 +3725,13 @@ const postResourceHandlers = [
    * module would have passed against a component that leaked one.
    */
   http.get('*/api/v1/posts/:slug', ({ request, params }) => {
+    const viewer = optionalPrincipal(request);
+    if (isRefusal(viewer)) {
+      return viewer;
+    }
     const slug = pathParam(params.slug);
     const post = findPostBySlug(slug);
-    if (post === undefined || !canViewPost(post, optionalPrincipal(request))) {
+    if (post === undefined || !canViewPost(post, viewer)) {
       return notFound(request, `No published post is available at "${slug}".`);
     }
     return ok(post);
@@ -3279,6 +3824,41 @@ function categoriesByName(): readonly CategoryPublic[] {
   return [...fixtureCategories].sort((left, right) => left.name.localeCompare(right.name));
 }
 
+/** Detail for the pre-checked collision on the unique `categories.name`, quoted from the service. */
+const CATEGORY_NAME_TAKEN_DETAIL = 'A category with that name already exists.';
+
+/**
+ * Whether another category already holds this name, case-insensitively.
+ *
+ * `categories.name` is uniquely constrained and `CategoryService` pre-checks it on **create and
+ * update alike** - `update` asks the question again and raises the same 409, because a rename onto a
+ * taken name is the same collision as a creation onto one. The mock enforced it on create only, so a
+ * rename that the service refuses came back 200 with two categories apparently sharing a name.
+ *
+ * @param name - The submitted name.
+ * @param excludingId - The category being renamed, so re-submitting its own name is not a collision.
+ */
+function nameIsTaken(name: string, excludingId: string | undefined): boolean {
+  const wanted = name.trim().toLowerCase();
+  return fixtureCategories.some(
+    (category) => category.id !== excludingId && category.name.toLowerCase() === wanted,
+  );
+}
+
+/**
+ * Whether any stored post is filed under this category - the question `is_in_use` answers.
+ *
+ * **Not `post_count`.** That member counts PUBLISHED posts only, because the join condition that
+ * produces it carries `status = PUBLISHED` for a public filter control. `CategoryRepository.is_in_use`
+ * is an `EXISTS` over `post_categories` with **no status predicate at all**, so a draft or an archived
+ * post keeps a category undeletable while `post_count` reports zero. Keying the delete on the count
+ * therefore permitted a delete the service refuses - and the association cascades, so "permitted"
+ * would have meant silently unfiling the term from every post that used it.
+ */
+function categoryIsInUse(categoryId: string): boolean {
+  return fixturePosts.some((post) => post.categories.some((entry) => entry.id === categoryId));
+}
+
 const categoryHandlers = [
   /** Every category with its published-post count, un-paginated by contract and name-ordered. */
   http.get('*/api/v1/categories', () => ok(categoriesByName())),
@@ -3321,6 +3901,14 @@ const commentHandlers = [
    *
    * An `APPROVED` comment returns to `PENDING`; a `REJECTED` one is left rejected, because an edit
    * must not lift a rejection or a rejected author could republish by re-saving.
+   *
+   * **`{}` is a valid no-op, not a 422.** `CommentUpdate` declares its single member optional and the
+   * service applies `model_dump(exclude_unset=True)`, so an omitted `body` means "leave it alone" -
+   * which is what makes this a genuine partial update rather than the whole-object replacement the
+   * retired `PUT /items/{item_id}` performed. Reading the member as required refused a request the
+   * service accepts, and refused it with "Field required" against a member the caller was entitled to
+   * omit. A member that IS present is still validated: `{"body": ""}` is too short, and
+   * `{"body": null}` is a type error, because the column is NOT NULL.
    */
   http.patch('*/api/v1/comments/:commentId', async ({ request, params }) => {
     const principal = authenticate(request);
@@ -3343,14 +3931,24 @@ const commentHandlers = [
     }
     const errors: ValidationErrorItem[] = [];
     rejectExtraMembers(parsed.value, COMMENT_UPDATE_MEMBERS, errors);
-    const text = requireString(parsed.value, 'body', BOUNDS.commentBody, errors);
+    // Validated only when the key is present, which is what makes `{}` the no-op the schema declares.
+    const text =
+      'body' in parsed.value
+        ? requireString(parsed.value, 'body', BOUNDS.commentBody, errors)
+        : undefined;
     const [first, ...rest] = errors;
     if (first !== undefined) {
       return validationProblem(request, [first, ...rest], 'The submitted comment is not valid.');
     }
+    // Nothing sent means nothing written: the stored body, the stored moderation state and the
+    // stored `updated_at` all stand, because a no-op that advanced the timestamp or re-queued an
+    // approved comment for moderation would be a write dressed up as leaving things alone.
+    if (text === undefined) {
+      return ok(comment);
+    }
     const edited: CommentPublic = {
       ...comment,
-      body: sanitiseText(text ?? comment.body),
+      body: sanitiseText(text),
       status: comment.status === VISIBLE_COMMENT_STATUS ? PENDING_COMMENT_STATUS : comment.status,
       updated_at: FIXTURE_PUBLISHED_AT,
     };
@@ -3403,26 +4001,61 @@ const adminHandlers = [
     return isRefusal(principal) ? principal : ok(fixtureAdminStats);
   }),
 
-  /** Every account, filterable by free text over handle, address and display name, by role and by
-   * active state. Discloses the address and the role, which the public projection never does. */
+  /**
+   * Every account, filterable by free text over handle and address, by role and by active state.
+   * Discloses the address and the role, which the public projection never does.
+   *
+   * **The term is matched against `username` and `email`, and nothing else.** `UserRepository` builds
+   * `username ILIKE :pattern OR email ILIKE :pattern` over those two columns only; including
+   * `display_name` here made the mock find rows the service does not, so a search spec could pass
+   * against a listing that comes back empty in production.
+   *
+   * `role` and `is_active` are typed parameters, so a value outside `UserRole` or outside Pydantic's
+   * boolean vocabulary is a **422 naming the parameter** rather than a filter accepted and dropped -
+   * which is how `?is_active=maybe` came to answer with every account, deactivated ones included.
+   */
   http.get('*/api/v1/admin/users', ({ request }) => {
     const principal = authenticateAdmin(request);
     if (isRefusal(principal)) {
       return principal;
     }
     const params = searchParams(request);
+    const errors: ValidationErrorItem[] = [];
     const term = readQuery(params, 'q');
-    const role = readQueryUserRole(params, 'role');
-    const isActive = readQueryBoolean(params, 'is_active');
+    const role = readQueryEnum(params, 'role', USER_ROLE_VALUES, errors);
+    const isActive = readQueryBooleanStrict(params, 'is_active', errors);
+    const [first, ...rest] = errors;
+    if (first !== undefined) {
+      return validationProblem(request, [first, ...rest]);
+    }
     const rows = storedAccounts
-      .filter((account) => matchesTerm(term, account.username, account.email, account.display_name))
+      .filter((account) => matchesTerm(term, account.username, account.email))
       .filter((account) => role === undefined || account.role === role)
       .filter((account) => isActive === undefined || account.is_active === isActive)
       .map(toAdminUser);
     return pageResponse(rows, request);
   }),
 
-  /** Change an account's role or active state. Both members are optional and applied when present. */
+  /**
+   * Change an account's role or active state. Both members are optional and applied when present.
+   *
+   * **THE LOCKOUT GUARD.** `AdminService.update_user` refuses three moves an administrator makes
+   * against *their own* row, each with a **409**, and it refuses them after resolving the row and
+   * before assigning anything, so a refused request leaves the account exactly as it was:
+   *
+   * - a `role` that was sent and is not `ADMIN` - self-demotion;
+   * - `is_active: false` - self-deactivation;
+   * - (and self-deletion, on the route below).
+   *
+   * Three moves are deliberately NOT refused, and modelling them as refusals would be as wrong as
+   * omitting the guard: an **empty patch** is a successful no-op (a management form submitted without
+   * edits is legitimate), re-sending **`ADMIN`** is a no-op because the actor already holds it, and
+   * `is_active: true` is a request to stay active rather than a lockout.
+   *
+   * The guard is the server's rule and `UserRowActions` deliberately does not duplicate it - it relies
+   * on this refusal arriving - so a mock that let an administrator demote, suspend or delete itself
+   * made the one path that protects an installation from being locked out untestable.
+   */
   http.patch('*/api/v1/admin/users/:userId', async ({ request, params }) => {
     const principal = authenticateAdmin(request);
     if (isRefusal(principal)) {
@@ -3444,6 +4077,17 @@ const adminHandlers = [
     if (first !== undefined) {
       return validationProblem(request, [first, ...rest]);
     }
+    if (account.id === principal.id) {
+      // `role !== undefined` is the test for "was sent", exactly as the service uses
+      // `payload.role is not None`; and `isActive === false` rather than a falsy test, because
+      // `undefined` means the member was omitted.
+      if (role !== undefined && role !== ADMIN_ROLE) {
+        return conflict(request, SELF_DEMOTION_DETAIL);
+      }
+      if (isActive === false) {
+        return conflict(request, SELF_DEACTIVATION_DETAIL);
+      }
+    }
     const updated: AdminUser = {
       ...toAdminUser(account),
       role: role ?? account.role,
@@ -3453,29 +4097,52 @@ const adminHandlers = [
     return ok(updated);
   }),
 
-  /** Remove an account. 204; their posts, comments, likes and tokens go with it by cascade. */
+  /**
+   * Remove an account. 204; their posts, comments, likes and tokens go with it by cascade.
+   *
+   * The third lockout guard: deleting **your own** account is a 409, because an administrator who
+   * removed themselves would take their authority with them and no route remains to restore it.
+   */
   http.delete('*/api/v1/admin/users/:userId', ({ request, params }) => {
     const principal = authenticateAdmin(request);
     if (isRefusal(principal)) {
       return principal;
     }
-    return findAccountById(pathParam(params.userId)) === undefined
-      ? notFound(request, 'No account is stored under that identifier.')
-      : noContent();
+    const account = findAccountById(pathParam(params.userId));
+    if (account === undefined) {
+      return notFound(request, 'No account is stored under that identifier.');
+    }
+    return account.id === principal.id ? conflict(request, SELF_DELETION_DETAIL) : noContent();
   }),
 
-  /** Every post across ALL three lifecycle states - the one listing that ignores public scoping. */
+  /**
+   * Every post across ALL three lifecycle states - the one listing that ignores public scoping.
+   *
+   * **The term is matched against `title`, `excerpt` and `content`.** The service ranks this listing
+   * with the same full-text search the public feed uses, and that vector is built from those three
+   * members - so a term that appears only in an article's body finds it. The slug is not searched: it
+   * is a derived address, not authored text, and matching it made the mock find rows on a value no
+   * operator types.
+   *
+   * `status` and `author_id` are typed parameters, so an unrecognised lifecycle state or a malformed
+   * identifier is a 422 rather than an unfiltered listing.
+   */
   http.get('*/api/v1/admin/posts', ({ request }) => {
     const principal = authenticateAdmin(request);
     if (isRefusal(principal)) {
       return principal;
     }
     const params = searchParams(request);
+    const errors: ValidationErrorItem[] = [];
     const term = readQuery(params, 'q');
-    const status = readQueryPostStatus(params, 'status');
-    const authorId = readQuery(params, 'author_id');
+    const status = readQueryEnum(params, 'status', POST_STATUS_VALUES, errors);
+    const authorId = readQueryUuid(params, 'author_id', errors);
+    const [first, ...rest] = errors;
+    if (first !== undefined) {
+      return validationProblem(request, [first, ...rest]);
+    }
     const rows = fixturePosts
-      .filter((post) => matchesTerm(term, post.title, post.slug, post.excerpt))
+      .filter((post) => matchesTerm(term, post.title, post.excerpt, post.content))
       .filter((post) => status === undefined || post.status === status)
       .filter((post) => authorId === undefined || post.author.id === authorId)
       .sort(byRecency)
@@ -3529,18 +4196,32 @@ const adminHandlers = [
       : noContent();
   }),
 
-  /** The moderation queue: every comment in every state, roots and replies alike, flattened. */
+  /**
+   * The moderation queue: every comment in every state, roots and replies alike, flattened.
+   *
+   * **The term is matched against the body, and only the body.** `CommentRepository` applies a single
+   * `body ILIKE :pattern`; searching the author's handle as well made the mock answer a moderator's
+   * search for a phrase with every comment a matching *person* wrote, which is a different query.
+   *
+   * `status` and `post_id` are typed, so an unrecognised moderation state or a malformed identifier is
+   * a 422 rather than the whole queue.
+   */
   http.get('*/api/v1/admin/comments', ({ request }) => {
     const principal = authenticateAdmin(request);
     if (isRefusal(principal)) {
       return principal;
     }
     const params = searchParams(request);
+    const errors: ValidationErrorItem[] = [];
     const term = readQuery(params, 'q');
-    const status = readQueryCommentStatus(params, 'status');
-    const postId = readQuery(params, 'post_id');
+    const status = readQueryEnum(params, 'status', COMMENT_STATUS_VALUES, errors);
+    const postId = readQueryUuid(params, 'post_id', errors);
+    const [first, ...rest] = errors;
+    if (first !== undefined) {
+      return validationProblem(request, [first, ...rest]);
+    }
     const rows = fixtureComments
-      .filter((comment) => matchesTerm(term, comment.body, comment.author.username))
+      .filter((comment) => matchesTerm(term, comment.body))
       .filter((comment) => status === undefined || comment.status === status)
       .filter((comment) => postId === undefined || comment.post_id === postId)
       .map(toAdminComment);
@@ -3593,14 +4274,17 @@ const adminHandlers = [
   // array that read answers with. A mock for a route the API does not publish is how a component
   // comes to depend on one.
 
-  /** Create a category. 201, with the slug derived from the submitted name and no posts in it yet. */
-
   /**
    * Create a category. 201, with the slug derived from the submitted name and no posts in it yet.
    *
    * `id` and `slug` are server-owned and are therefore `extra_forbidden` rather than ignored: a client
    * that believed it had chosen a canonical URL, and had not, would generate links that never resolve.
-   * A name already in the taxonomy is a 409.
+   *
+   * A name already in the taxonomy is a **409** - `categories.name` is uniquely constrained and the
+   * service pre-checks it. A *slug* collision is not: the service derives the slug from the name and
+   * allocates around whatever is taken, so "Machine Learning" filed beside an existing
+   * `machine-learning` succeeds with a suffixed address, and that resolved value comes back in the
+   * response for the client to link to.
    */
   http.post('*/api/v1/admin/categories', async ({ request }) => {
     const principal = authenticateAdmin(request);
@@ -3624,17 +4308,19 @@ const adminHandlers = [
     if (first !== undefined) {
       return validationProblem(request, [first, ...rest]);
     }
-    const taken = fixtureCategories.some(
-      (category) => category.name.toLowerCase() === (name ?? '').toLowerCase(),
-    );
-    if (taken) {
-      return conflict(request, 'A category with that name already exists.');
+    if (nameIsTaken(name ?? '', undefined)) {
+      return conflict(request, CATEGORY_NAME_TAKEN_DETAIL);
     }
     const category: CategoryPublic = {
       id: CREATED_CATEGORY_ID,
       name: name ?? '',
-      slug: slugify(name ?? ''),
+      slug: allocateSlug(
+        name ?? '',
+        fixtureCategories.map((existing) => existing.slug),
+      ),
       description: description ?? null,
+      // A category created a moment ago has no post filed under it: `post_categories` rows are
+      // written by the post lifecycle and nothing on this path writes one.
       post_count: 0,
       created_at: INSTANT_CREATED_RESOURCE,
     };
@@ -3646,6 +4332,10 @@ const adminHandlers = [
    *
    * The slug is retained on a rename, for the same reason a post's is: it is the address the
    * taxonomy is linked and crawled under, and renaming a label is not a reason to break that.
+   *
+   * **A rename onto a name another category holds is a 409**, the same refusal a creation earns:
+   * `CategoryService.update` re-asks the uniqueness question rather than trusting that only creation
+   * can collide. Re-submitting the category's *own* name is not a collision and is a plain no-op.
    */
   http.patch('*/api/v1/admin/categories/:categoryId', async ({ request, params }) => {
     const principal = authenticateAdmin(request);
@@ -3676,6 +4366,9 @@ const adminHandlers = [
     if (first !== undefined) {
       return validationProblem(request, [first, ...rest]);
     }
+    if (name !== undefined && nameIsTaken(name, category.id)) {
+      return conflict(request, CATEGORY_NAME_TAKEN_DETAIL);
+    }
     const updated: CategoryPublic = {
       ...category,
       name: name ?? category.name,
@@ -3684,7 +4377,12 @@ const adminHandlers = [
     return ok(updated);
   }),
 
-  /** Remove a category. 204, unless posts are still filed under it, which is a 409. */
+  /**
+   * Remove a category. 204, unless a post is still filed under it, which is a 409.
+   *
+   * The guard is keyed on the ASSOCIATIONS, not on `post_count` - see {@link categoryIsInUse} for why
+   * those are different questions and why using the count permitted a delete the service refuses.
+   */
   http.delete('*/api/v1/admin/categories/:categoryId', ({ request, params }) => {
     const principal = authenticateAdmin(request);
     if (isRefusal(principal)) {
@@ -3694,11 +4392,7 @@ const adminHandlers = [
     if (category === undefined) {
       return notFound(request, 'No category is stored under that identifier.');
     }
-    // `category_service` refuses a term `post_categories` still references, and tells the operator to
-    // re-file the posts first. `post_count` is the fixture's stand-in for that reference count.
-    return category.post_count > 0
-      ? conflict(request, 'This category still has posts filed under it. Re-file them first.')
-      : noContent();
+    return categoryIsInUse(category.id) ? conflict(request, CATEGORY_IN_USE_DETAIL) : noContent();
   }),
 ];
 

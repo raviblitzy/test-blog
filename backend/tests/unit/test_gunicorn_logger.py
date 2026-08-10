@@ -10,22 +10,33 @@ worst possible split: a log pipeline that parses JSON drops exactly the lines de
 process's own lifecycle, so a restart loop or a failed bind becomes invisible in the one place an
 operator looks.
 
-:class:`~app.core.logging.StructlogGunicornLogger` is what ``backend/Dockerfile`` names on the
-command line to fix that, and the fix is entirely a matter of ORDER: gunicorn's own ``setup`` must
-run (it is what honours ``--log-level`` and ``--capture-output`` and leaves the class's bookkeeping
-intact), and this service's :func:`~app.core.logging.configure_logging` must run *after* it, taking
-the handlers back and restoring propagation on ``gunicorn.error`` so the arbiter's records reach the
-structured handler. Reversing those two lines silently reinstates the plain-text handler and the
-defect returns, looking exactly like a working configuration in code review.
+:class:`~app.core.logging.StructlogGunicornLogger` is what fixes that, and the fix is entirely a
+matter of ORDER: gunicorn's own ``setup`` must run (it is what honours ``--log-level`` and
+``--capture-output`` and leaves the class's bookkeeping intact), and this service's
+:func:`~app.core.logging.configure_logging` must run *after* it, taking the handlers back and
+restoring propagation on ``gunicorn.error`` so the arbiter's records reach the structured handler.
+Reversing those two lines silently reinstates the plain-text handler and the defect returns, looking
+exactly like a working configuration in code review.
+
+What this module owns, and what its sibling owns
+------------------------------------------------
+This module owns the **record**: given that the class is constructed, what comes out of it. Its
+sibling ``test_gunicorn_logging.py`` owns the **wiring**: that ``backend/gunicorn.conf.py``
+publishes this class as ``logger_class``, that constructing whatever the config publishes leaves
+``gunicorn.error`` routed through the service's handler, that a ``logger_class`` is the only hook
+early enough, and that the image ships and names that config file while passing no competing
+``--logger-class`` flag. The split is deliberate: this file can fail because the record's shape
+regressed, that one can fail because the selection regressed, and reading which failed says which
+happened.
 
 Why this is a unit test and not only a runtime check
 ---------------------------------------------------
 The behaviour was verified end to end in a real Gunicorn run - thirty JSON lines, zero plain-text
 lines, arbiter records on ``gunicorn.error``, nothing on ``gunicorn.access`` - and that measurement
-is what proves the class is wired correctly in the image. What a runtime check cannot do is *fail a
-merge*: it is not part of any gate. So the observable outcomes are pinned here, against gunicorn's
-real ``Logger`` base rather than a stand-in, driven through a configuration double shaped like the
-subset of ``gunicorn.config.Config`` that :meth:`gunicorn.glogging.Logger.setup` actually reads.
+is what proves the class behaves in the image. What a runtime check cannot do is *fail a merge*: it
+is not part of any gate. So the observable outcomes are pinned here, against gunicorn's real
+``Logger`` base rather than a stand-in, driven through a configuration double shaped like the subset
+of ``gunicorn.config.Config`` that :meth:`gunicorn.glogging.Logger.setup` actually reads.
 
 What is asserted
 ----------------

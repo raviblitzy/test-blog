@@ -212,8 +212,10 @@ _ENV_FILES: Final[tuple[Path, Path]] = (_REPO_ROOT / ".env", _BACKEND_DIR / ".en
 # "forbid": these three are dropped, and every other unrecognised key in an env file stops
 # the process. A name added to .env.example's FRONTEND block must be added here too, or the
 # service will refuse to start with it present - which is the mechanism, not an obstacle:
-# the configuration contract is fourteen keys, and growing it is a deliberate act in two
-# files rather than a value that quietly starts being read.
+# the configuration contract is exactly this model's declared fields plus this set, and
+# growing it is a deliberate act in two files rather than a value that quietly starts being
+# read. The count is deliberately not written here - `Settings.model_fields` and this frozen
+# set are the declaration, and a numeral in a comment beside them would be a second one.
 # ---------------------------------------------------------------------------------------
 _FRONTEND_ENV_KEYS: Final[frozenset[str]] = frozenset(
     {

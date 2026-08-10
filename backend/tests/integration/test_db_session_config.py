@@ -66,22 +66,45 @@ dependent on execution order.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Final
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.pool import NullPool
 
+from app.core.config import settings
 from app.db.session import (
     SESSION_TIME_ZONE,
     STATEMENT_TIMEOUT_MILLISECONDS,
     STATEMENT_TIMEOUT_SECONDS,
     TCP_KEEPALIVE_ARGS,
     engine,
+    migration_connect_args,
     safe_connect_args,
 )
+
+MIGRATIONS_ENV_PATH: Final[Path] = Path(__file__).resolve().parents[2] / "migrations" / "env.py"
+"""The Alembic environment module, read as text so its engine wiring can be asserted.
+
+Resolved from this file rather than from the working directory, because the suite is run from
+``backend/`` and from the repository root alike and a relative path would pass in one and fail in
+the other.
+"""
+
+STATEMENT_TIMEOUT_KEYWORD: Final[str] = "statement_timeout"
+"""The libpq setting a migration connection must not carry."""
+
+NO_STATEMENT_CEILING: Final[str] = "0"
+"""How PostgreSQL reports ``statement_timeout`` when the session imposes none.
+
+``SHOW statement_timeout`` renders the unset value as ``0`` rather than as an empty string or a
+unit-suffixed zero, so this is the value a migration connection must report.
+"""
 
 SHOW_STATEMENT_TIMEOUT: Final[str] = "SHOW statement_timeout"
 """How the server is asked what ceiling it is applying to this session."""
@@ -238,6 +261,130 @@ class TestConnectionSettings:
                 f"{keyword!r} is declared in TCP_KEEPALIVE_ARGS but is not what the engine "
                 f"connects with, so a silently dead connection is not bounded"
             )
+
+
+class TestMigrationConnectionContract:
+    """The migration engine carries every shared invariant and **no** statement ceiling.
+
+    The request path's ten-second ceiling is generous for a route and fatal for a migration:
+    ``0002`` builds seven GIN and trigram indexes and ``0004`` builds three B-trees, and over a
+    populated relation an ordinary build can exceed ten seconds - at which point PostgreSQL
+    cancels it with :data:`SQLSTATE_QUERY_CANCELED`, the revision fails, and the upgrade rolls
+    back on the container's start-up path before the service answers anything.
+
+    That failure is invisible to every other gate in this repository, which is why these
+    assertions exist. A fresh database builds every index in milliseconds, so no migration test
+    against an empty schema can see the ceiling; and "no ceiling" leaves no trace in a migration
+    that succeeds. The guarantee therefore has to be asserted directly, in three independent
+    ways: the factory declares no ceiling, the server confirms the resulting session has none,
+    and ``migrations/env.py`` is actually wired to that factory rather than to the request-path
+    one.
+    """
+
+    def test_the_migration_factory_declares_no_statement_ceiling(self) -> None:
+        """The defect in one assertion: no value in the mapping may mention the setting."""
+        # Every entry is searched, not just `options`, because the setting can be spelled either
+        # as a `-c` entry inside the option string or as a libpq keyword of its own - and a future
+        # edit could reintroduce it by either route.
+        args = migration_connect_args()
+        offenders = {
+            keyword: value
+            for keyword, value in args.items()
+            if STATEMENT_TIMEOUT_KEYWORD in keyword or STATEMENT_TIMEOUT_KEYWORD in value
+        }
+        assert offenders == {}, (
+            f"migration_connect_args() carries {STATEMENT_TIMEOUT_KEYWORD!r} in {offenders!r}; a "
+            f"populated-table index build in revision 0002 or 0004 would be cancelled with "
+            f"{SQLSTATE_QUERY_CANCELED} and abort the upgrade"
+        )
+
+    def test_the_migration_factory_keeps_every_other_invariant(self) -> None:
+        """Omitting the ceiling must not have omitted the invariants no workload may decline."""
+        args = migration_connect_args()
+
+        # UTC, because `0003` INSERTs rows and every timestamp column in this schema is
+        # `timestamptz`: a migration writing under the server's local zone would store instants the
+        # application then reads as UTC.
+        assert args["options"] == f"-c timezone={SESSION_TIME_ZONE}"
+
+        # The connect bound matters more on this engine than on any other - the run sits on the
+        # container's start-up path, where libpq's 130-second default is the difference between a
+        # legible failure and a stalled deployment.
+        assert args["connect_timeout"] == safe_connect_args()["connect_timeout"]
+
+        # And the keepalive group, which is what bounds a vanished peer during a long index
+        # build - precisely the failure the omitted server-side ceiling would otherwise have caught.
+        for keyword, value in TCP_KEEPALIVE_ARGS.items():
+            assert args.get(keyword) == value
+
+    def test_the_two_factories_differ_only_by_the_ceiling(self) -> None:
+        """One contract, two workloads: the split must not have become a second contract."""
+        # Asserted as a relationship rather than by restating either mapping, so adding a shared
+        # invariant to `_connection_invariants` needs no change here, while adding one to only the
+        # request path - where it would silently stop applying to migrations - fails this.
+        request_path = safe_connect_args()
+        migration = migration_connect_args()
+
+        assert set(request_path) == set(migration)
+        assert {
+            keyword: value for keyword, value in request_path.items() if keyword != "options"
+        } == {keyword: value for keyword, value in migration.items() if keyword != "options"}
+        assert request_path["options"] == (
+            f"{migration['options']} -c {STATEMENT_TIMEOUT_KEYWORD}"
+            f"={STATEMENT_TIMEOUT_MILLISECONDS}"
+        )
+
+    def test_the_alembic_environment_is_wired_to_the_migration_factory(self) -> None:
+        """A correct factory that nothing calls is not a guarantee.
+
+        Asserted over the parsed module rather than over its text, because the text mentions
+        ``safe_connect_args`` in the comment explaining why it is *not* used - so a substring
+        search would answer the opposite of the question. What matters is which name is
+        **called**.
+        """
+        tree = ast.parse(MIGRATIONS_ENV_PATH.read_text(encoding="utf-8"))
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+
+        assert "migration_connect_args" in called, (
+            "backend/migrations/env.py no longer calls migration_connect_args(), so its engine's "
+            "connection contract is whatever it now passes instead"
+        )
+        assert "safe_connect_args" not in called, (
+            "backend/migrations/env.py calls safe_connect_args(), which imposes the request "
+            "path's statement ceiling on every migration connection"
+        )
+
+    async def test_a_migration_session_reports_no_ceiling_to_the_server(self) -> None:
+        """The server's own view, which is the only formulation that can fail if libpq ignored us.
+
+        Reading the mapping back proves the expression, not the effect - the same reasoning the
+        module docstring gives for asserting through ``SHOW`` everywhere else. This opens a real
+        connection with the migration arguments and asks PostgreSQL what it is applying.
+        """
+        # A throwaway NullPool engine so nothing is left pooled for the rest of the session, and
+        # `create_async_engine` rather than Alembic's synchronous `create_engine` only because this
+        # module is async: the connect arguments are driver-agnostic and both spellings reach the
+        # same psycopg 3 driver, which is the property `migration_connect_args` documents.
+        probe = create_async_engine(
+            settings.DATABASE_URL,
+            poolclass=NullPool,
+            connect_args=migration_connect_args(),
+        )
+        try:
+            async with probe.connect() as connection:
+                applied = await connection.scalar(text(SHOW_STATEMENT_TIMEOUT))
+                # No ceiling at all, so an index build is bounded by nothing but its own work.
+                assert applied == NO_STATEMENT_CEILING
+                assert applied not in accepted_timeout_spellings(STATEMENT_TIMEOUT_MILLISECONDS)
+
+                # The shared invariant survived the split, asked of the same session.
+                assert await connection.scalar(text(SHOW_TIME_ZONE)) == SESSION_TIME_ZONE
+        finally:
+            await probe.dispose()
 
 
 class TestStatementCancellation:

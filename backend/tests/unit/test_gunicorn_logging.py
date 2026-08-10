@@ -21,6 +21,13 @@ things have to hold, and each fails independently:
 3. **The image actually uses it.** A configuration file that is not copied into the image, or is
    copied but never named, is indistinguishable from no configuration file at all - and the only
    symptom is a log stream that quietly goes back to being half plain text.
+4. **Nothing outranks it.** A ``--logger-class`` flag on the ``CMD`` beats the configuration file
+   outright, so the file's assignment would become decoration. The image shipped that arrangement
+   with a *second, identical* implementation defined in the config file, which was therefore never
+   constructed in the container while looking - here included - like live, tested code.
+
+This module asserts the wiring; ``test_gunicorn_logger.py`` asserts what the selected class then
+puts in the log. Keeping them apart means a failure names which of the two regressed.
 
 Why the observable state and not the call
 -----------------------------------------
@@ -68,6 +75,58 @@ GUNICORN_CONFIG_PATH: Final[Path] = BACKEND_ROOT / "gunicorn.conf.py"
 
 DOCKERFILE_PATH: Final[Path] = BACKEND_ROOT / "Dockerfile"
 """The production entry point that must ship the file above and name it."""
+
+_ASGI_TARGET: Final[str] = "app.main:app"
+"""What distinguishes the service's ``CMD`` from the health probe's, both of which start a line."""
+
+
+def _dockerfile_command() -> str:
+    """Return the image's service ``CMD`` instruction, comments excluded, as one line.
+
+    Three details of the file's shape make this a parse rather than a substring search, and each of
+    them would produce a test that passed for the wrong reason.
+
+    *Comments are excluded.* An assertion about which flags the command *passes* must not be
+    satisfiable - or defeated - by prose that merely mentions one, and the comments beside this
+    ``CMD`` explain at length which flag was removed and why.
+
+    *The instruction spans lines.* It is a JSON array written across several backslash-continued
+    lines, so it is reassembled here.
+
+    *``CMD`` appears twice, and only one of them is an instruction.* The image's ``HEALTHCHECK`` is
+    written with its own continuation, so the probe's ``CMD [...]`` sits at the start of a line too.
+    A scanner that took the first line beginning with ``CMD`` would return the health probe, which
+    passes any assertion about gunicorn flags vacuously. So a line starts an instruction only when
+    the previous non-comment line did not continue, and the block returned is the one that names the
+    ASGI application.
+
+    Returns:
+        The service ``CMD`` instruction with continuations joined and whitespace collapsed.
+
+    Raises:
+        AssertionError: If exactly one such instruction is not found - which would mean the image
+            has no entry point, or more than one, and every assertion built on this would otherwise
+            be answering a different question.
+    """
+    instructions: list[list[str]] = []
+    continuing = False
+    for raw in DOCKERFILE_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            continue
+        if continuing:
+            instructions[-1].append(line.removesuffix("\\").strip())
+        elif line.startswith("CMD"):
+            instructions.append([line.removesuffix("\\").strip()])
+        continuing = (continuing or line.startswith("CMD")) and line.endswith("\\")
+
+    commands = [" ".join(parts) for parts in instructions if _ASGI_TARGET in " ".join(parts)]
+    assert len(commands) == 1, (
+        f"expected exactly one CMD naming {_ASGI_TARGET!r} in backend/Dockerfile, found "
+        f"{len(commands)}"
+    )
+    return commands[0]
+
 
 ARBITER_LOGGER_NAME: Final[str] = "gunicorn.error"
 """Where every arbiter line goes. Gunicorn sets ``propagate = False`` on it during its own setup,
@@ -256,6 +315,34 @@ class TestProductionEntryPointUsesTheConfig:
         command = DOCKERFILE_PATH.read_text()
         assert '"--config", "gunicorn.conf.py"' in command
         assert '"gunicorn", "app.main:app"' in command
+
+    def test_the_dockerfile_command_declares_no_competing_logger_class(self) -> None:
+        """The config file must be the ONLY place ``logger_class`` is chosen.
+
+        A ``--logger-class`` flag on the command line outranks the configuration file, so the two
+        together are not belt and braces - they are two selections of which only the flag can win.
+        The image shipped exactly that arrangement: the flag named
+        ``app.core.logging.StructlogGunicornLogger`` while this config file assigned a second,
+        identical implementation of its own, so the config class was never constructed in the
+        container even though it read as live code and had tests that appeared to cover the
+        container's behaviour.
+
+        Consolidating it left nothing observable to fail on - one implementation and one selection
+        behave exactly like two that happen to agree - which is precisely why the *absence* of the
+        flag is asserted here. Re-adding it would silently move the decision back out of the file
+        that documents it, and the sibling assertions above would all keep passing.
+
+        The bare flag name is searched for rather than a full argument pair, because the point is
+        that the command declines to choose at all, whatever it might have named. The search is
+        confined to the ``CMD`` instruction itself: the surrounding comments describe the
+        arrangement and its history on purpose, and a whole-file search would make that
+        documentation unwritable.
+        """
+        command = _dockerfile_command()
+        assert "--logger-class" not in command, (
+            "backend/Dockerfile's CMD passes --logger-class, which overrides the logger_class "
+            f"gunicorn.conf.py publishes; the selection must be made in one place only: {command}"
+        )
 
 
 class TestConfigureLoggingRemainsIdempotent:

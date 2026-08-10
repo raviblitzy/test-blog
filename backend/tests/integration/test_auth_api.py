@@ -107,13 +107,18 @@ from typing import Any, Final
 
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
-from sqlalchemy import delete, event, func, select
+from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import settings
-from app.core.exceptions import UnauthorizedError
+from app.core.exceptions import ForbiddenError, UnauthorizedError
 from app.core.rate_limit import limiter
-from app.core.security import create_access_token, hash_refresh_token, refresh_token_expires_at
+from app.core.security import (
+    create_access_token,
+    decode_access_token,
+    hash_refresh_token,
+    refresh_token_expires_at,
+)
 from app.models import RefreshToken, User, UserRole
 from app.repositories import RefreshTokenRepository, UserRepository
 from app.schemas.admin import AdminUserUpdate
@@ -125,6 +130,7 @@ from app.schemas.auth import (
     REFRESH_TOKEN_MAX_LENGTH,
     USERNAME_MAX_LENGTH,
     USERNAME_MIN_LENGTH,
+    LoginRequest,
 )
 from app.services.admin_service import AdminService
 from app.services.auth_service import AuthService
@@ -371,7 +377,20 @@ def _serialised(payload: object) -> str:
     ``dict.keys()`` only sees the top level. A credential that leaked into a nested object, or
     under a member this module does not know to name, would pass a key-set assertion and fail
     this one - which is why the confidentiality checks use both.
+
+    :data:`_CORRELATION_KEY` is **excluded**, and that is a correctness requirement rather than a
+    tidy-up. Every caller of this function asserts an *absence* - "the rejected value is never
+    echoed" - and ``request_id`` is thirty-two characters of server-generated random hex that
+    echoes nothing a caller sent. Searching it turns a confidentiality assertion into a coin
+    flip whenever the marker is short: a two-character marker such as the ``username`` one code
+    point under its floor appears somewhere in a random 32-character hex string roughly one run
+    in nine, which is exactly how this module came to fail intermittently on a value it had
+    correctly withheld. Dropping the one member that cannot leak keeps every assertion's meaning
+    and removes the false positive; a marker that reaches ``detail``, ``instance``, ``errors`` or
+    any nested member is still found.
     """
+    if isinstance(payload, dict):
+        payload = {key: value for key, value in payload.items() if key != _CORRELATION_KEY}
     return json.dumps(payload, default=str)
 
 
@@ -927,7 +946,12 @@ class TestCredentialFieldBoundaries:
         assert await _count_users_matching(db_session, email=str(body["email"])) == 0
         # The rejected value is never echoed, whatever it was: an over-long password is still a
         # password, and a problem document is the one part of a failure that gets logged.
-        assert value not in _serialised(payload)
+        #
+        # Searched WITHOUT the correlation identifier. `request_id` is 32 random hex characters, so
+        # a short submitted value made of hex digits - `aa`, one code point under the username floor
+        # - occurs inside it by chance roughly one run in nine, and this assertion then failed on a
+        # coincidence in a value the handler generated rather than on anything it echoed.
+        assert value not in _serialised(_without_correlation(payload))
 
     async def test_the_sign_in_ceiling_never_turns_a_long_password_into_a_different_answer(
         self,
@@ -2589,6 +2613,218 @@ class TestTokenRevocationSerialisation:
                     if identifier is not None:
                         await cleanup.execute(delete(User).where(User.id == identifier))
                 await cleanup.commit()
+
+    async def test_a_sign_in_blocked_on_the_lock_refuses_once_the_deactivation_commits(
+        self, engine: AsyncEngine
+    ) -> None:
+        """A session is never issued for an account deactivated while the password was verified.
+
+        The class above covers a deactivation racing a *rotation*. This is the other side of the
+        same protocol and it was the one left uncovered: a deactivation racing an **issuance**.
+
+        The interleaving. ``authenticate`` reads the account and verifies the password, which
+        costs tens of milliseconds of deliberate argon2id work; an administrator commits
+        ``is_active = false`` inside that window; ``issue_token_pair`` then takes the account lock
+        and mints. The refusal has to come from the locked row, and *both* halves of that were
+        missing: the method checked only that the locked row still existed, and the locked read
+        did not carry ``populate_existing``, so even a check against it would have read the
+        attributes ``authenticate`` had loaded before the suspension. The account received a
+        signed access token that nothing can withdraw before it expires, plus a committed refresh
+        row to renew it with.
+
+        Why this test is deterministic. Nothing waits for a scheduler. The administrator's
+        session takes ``FOR UPDATE`` on the account row and holds it, which is the exact state an
+        in-flight administrative write is in; the sign-in's own lock request then *must* block, and
+        that blocking is asserted before the suspension is committed. When it is released the
+        sign-in reads the committed row, and the outcome assertions fail closed - if the lock were
+        not taken, or the check not re-made, the task would have completed with a token pair.
+
+        The answer must also be the ordinary one. ``403`` with the same detail a steadily
+        suspended account receives, not a distinguishable variant: a race a caller can tell apart
+        from a steady state is a race a caller can detect and time. So the steady-state refusal is
+        obtained from the same session afterwards and the two details are compared, rather than a
+        message being restated here.
+        """
+        maker = self._sessions(engine)
+        owner_id: uuid.UUID | None = None
+
+        try:
+            async with maker() as setup:
+                owner = await factories.create_user(setup, role=UserRole.AUTHOR)
+                await setup.commit()
+                owner_id = owner.id
+                owner_email = str(owner.email)
+
+            async with maker() as suspending, maker() as signing_in:
+                # The administrator's write, held mid-flight: the account row locked and
+                # `is_active` false, committed to nothing yet. Invisible to every other
+                # transaction, which is what makes the window below real rather than contrived.
+                locked = await UserRepository(suspending).get_by_id(owner_id, for_update=True)
+                assert locked is not None
+                locked.is_active = False
+                await suspending.flush()
+
+                credentials = LoginRequest.model_validate(
+                    {"email": owner_email, "password": DEFAULT_PASSWORD}
+                )
+                service = AuthService(signing_in)
+
+                # `login`, not `issue_token_pair` - so the caller-specific error mapping is under
+                # test too, and so this exercises the composition the route actually calls.
+                # `authenticate` inside it reads an ACTIVE account, correctly: the suspension is
+                # uncommitted. Then the lock request blocks.
+                signing = asyncio.create_task(service.login(credentials))
+
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(signing), timeout=1.0)
+
+                await suspending.commit()
+
+                with pytest.raises(ForbiddenError) as raised:
+                    await signing
+                raced_detail = raised.value.detail
+
+                # The steady state, from the same session: an account that was already suspended
+                # when the credential was presented. `authenticate` refuses it before any lock is
+                # taken, and the two answers must be the same answer.
+                with pytest.raises(ForbiddenError) as steady:
+                    await service.authenticate(credentials)
+                assert raced_detail == steady.value.detail, (
+                    "the racing refusal is distinguishable from the steady-state one, so a caller "
+                    "can detect that it won the window"
+                )
+
+            async with maker() as verify:
+                issued = list(
+                    await verify.scalars(
+                        select(RefreshToken).where(RefreshToken.user_id == owner_id)
+                    )
+                )
+
+            assert issued == [], (
+                "a refresh row was committed for an account an administrator had already "
+                "deactivated, so the session can be renewed indefinitely from a suspended account"
+            )
+        finally:
+            if owner_id is not None:
+                async with maker() as cleanup:
+                    await cleanup.execute(delete(User).where(User.id == owner_id))
+                    await cleanup.commit()
+
+    async def test_the_access_token_carries_the_role_the_locked_row_holds(
+        self, engine: AsyncEngine
+    ) -> None:
+        """A role changed while the password was verified reaches the token, not the stale one.
+
+        The same window as the test above, with the administrator changing ``role`` instead of
+        ``is_active`` - and the consequence is the mirror image. ``role`` travels inside the
+        signed access token, and an access token is recorded nowhere, so a value minted from the
+        pre-lock instance cannot be corrected until it expires: a demotion committed in this
+        window would leave a ``READER`` holding an ``AUTHOR`` claim, and the claim is what a
+        client shapes its interface from.
+
+        This is why :meth:`~app.services.auth_service.AuthService.issue_token_pair` mints from the
+        locked row rather than from its argument, and it is asserted separately from the
+        deactivation case because a fix that re-checked ``is_active`` while still reading
+        ``user.role`` would pass that test and fail this one.
+        """
+        maker = self._sessions(engine)
+        owner_id: uuid.UUID | None = None
+
+        try:
+            async with maker() as setup:
+                owner = await factories.create_user(setup, role=UserRole.AUTHOR)
+                await setup.commit()
+                owner_id = owner.id
+                owner_email = str(owner.email)
+
+            async with maker() as promoting, maker() as signing_in:
+                locked = await UserRepository(promoting).get_by_id(owner_id, for_update=True)
+                assert locked is not None
+                locked.role = UserRole.READER
+                await promoting.flush()
+
+                credentials = LoginRequest.model_validate(
+                    {"email": owner_email, "password": DEFAULT_PASSWORD}
+                )
+                signing = asyncio.create_task(AuthService(signing_in).login(credentials))
+
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(signing), timeout=1.0)
+
+                await promoting.commit()
+                tokens = await signing
+
+            claims = decode_access_token(tokens.access_token)
+            assert claims.subject == owner_id
+            assert claims.role == UserRole.READER.value, (
+                "the access token carries the role the account held before the administrator's "
+                "change committed, and nothing can withdraw it before it expires"
+            )
+        finally:
+            if owner_id is not None:
+                async with maker() as cleanup:
+                    await cleanup.execute(delete(User).where(User.id == owner_id))
+                    await cleanup.commit()
+
+    async def test_a_locked_read_reports_committed_state_rather_than_the_loaded_instance(
+        self, engine: AsyncEngine
+    ) -> None:
+        """The repository guarantee both tests above rest on, asserted on its own.
+
+        ``SELECT ... FOR UPDATE`` genuinely re-issues the statement, so it is easy to believe the
+        row it returns is fresh. It is not, by itself: measured on SQLAlchemy 2.0.51, a loader
+        leaves an already-loaded instance's attributes untouched and *discards* the values the
+        statement returned unless the read carries ``populate_existing``. The lock is then real
+        while the decision behind it is stale, and nothing in the emitted SQL shows it - which is
+        precisely how a service that checked the right attribute at the right moment could still
+        have been wrong.
+
+        Asserted here rather than only through the two flows above, because it belongs to
+        :meth:`~app.repositories.base.UUIDPrimaryKeyRepository.get_by_id` and governs every
+        read-check-write in this codebase - the publish transition, comment moderation, the
+        administrative role and status changes - not just token issuance.
+        """
+        maker = self._sessions(engine)
+        owner_id: uuid.UUID | None = None
+
+        try:
+            async with maker() as setup:
+                owner = await factories.create_user(setup, role=UserRole.AUTHOR)
+                await setup.commit()
+                owner_id = owner.id
+
+            async with maker() as reader:
+                users = UserRepository(reader)
+
+                # The unlocked read a service performs before it decides anything - here it is
+                # `get_by_id`, in the sign-in path it is `get_by_email`. Either way the instance is
+                # now in this unit of work's identity map with `is_active` loaded as true.
+                stale = await users.get_by_id(owner_id)
+                assert stale is not None
+                assert stale.is_active is True
+
+                async with maker() as suspending:
+                    await suspending.execute(
+                        update(User).where(User.id == owner_id).values(is_active=False)
+                    )
+                    await suspending.commit()
+
+                # The locked read. It must report the committed value, and it must do so ON THE
+                # SAME INSTANCE - a caller holding the earlier reference has to see the update too,
+                # or the guarantee would depend on which variable a service happened to use.
+                relocked = await users.get_by_id(owner_id, for_update=True)
+                assert relocked is not None
+                assert relocked is stale
+                assert relocked.is_active is False, (
+                    "a FOR UPDATE read returned the attributes this session had already loaded, so "
+                    "every read-check-write in the codebase can decide on pre-lock state"
+                )
+        finally:
+            if owner_id is not None:
+                async with maker() as cleanup:
+                    await cleanup.execute(delete(User).where(User.id == owner_id))
+                    await cleanup.commit()
 
 
 class TestRateLimitingIsDisabledUnderTest:

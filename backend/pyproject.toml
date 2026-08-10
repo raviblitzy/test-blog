@@ -362,15 +362,18 @@ skip-magic-trailing-comma = false
 #   mypy --config-file backend/pyproject.toml backend/app     # from the root
 #
 # The first two are equivalent and are THE gate: `files` names both `app` and
-# `tests`, so a bare `mypy` checks 82 source files. The third and fourth check the
-# 64 application files alone, which is a narrower scope rather than a different
-# outcome - useful when only application code has moved.
+# `tests`, so a bare `mypy` checks the application and test trees together. The
+# third and fourth check the application tree alone, which is a narrower scope
+# rather than a different outcome - useful when only application code has moved.
+# Neither scope is stated here as a file count: the count moves whenever a module
+# is added, and a stale numeral in a comment is worse than no numeral at all. The
+# authoritative figure is the one mypy prints at the end of the run it just did.
 #
 # A bare `mypy backend/app` from the repository root is NOT equivalent: it finds
 # no configuration, runs on mypy's permissive defaults, and fails on the one
 # untyped third-party import the overrides below account for
 # (`Library stubs not installed for "bleach"  [import-untyped]`). Use one of the
-# three forms above.
+# four forms above.
 #
 # `files` and `mypy_path` below make the first form completely self-sufficient,
 # which is what the root Makefile's `typecheck-backend` target relies on.

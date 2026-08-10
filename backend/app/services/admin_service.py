@@ -94,7 +94,7 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import is_admin
+from app.core.dependencies import PageParams, is_admin
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.core.logging import get_logger, log_safe_text
 from app.core.pagination import Page, build_page
@@ -162,36 +162,6 @@ _SELF_DELETION: Final[str] = (
 
 _FIELD_ROLE: Final[str] = "role"
 _FIELD_IS_ACTIVE: Final[str] = "is_active"
-
-
-def _offset(page: int, page_size: int) -> int:
-    """Translate a 1-based page and its size into the SQL ``OFFSET`` a repository wants.
-
-    The arithmetic :attr:`~app.core.dependencies.PageParams.offset` performs, restated for
-    callers that pass the page and its size as plain integers rather than the dependency
-    object. Four listing methods need it, so it is written once here: repeating
-    ``(page - 1) * page_size`` four times is four chances to write ``page * page_size`` and
-    lose the first row of every page.
-
-    Stating it as a function rather than reaching for ``PageParams`` keeps every method on this
-    service callable from a unit test with no request, and from the seed, with no dependency
-    object to fabricate.
-
-    Args:
-        page: The 1-based page requested. Bounded to ``>= 1`` by ``PageParams`` long before it
-            arrives here, so the result is never negative on any request-driven path.
-        page_size: Rows per page. Bounded to ``1..100`` by ``PageParams``.
-
-    Returns:
-        Rows to skip to reach the requested page: zero for the first page.
-
-    Examples:
-        >>> _offset(1, 20)
-        0
-        >>> _offset(3, 20)
-        40
-    """
-    return (page - 1) * page_size
 
 
 def _publication_instant() -> datetime:
@@ -438,15 +408,23 @@ class AdminService:
         """
         self._require_admin(actor)
 
+        # The window arithmetic has exactly one definition, in `PageParams` - the same object
+        # the route's own dependency resolves to. Constructed here from plain integers because
+        # this service is also called from a unit test and from the seed, neither of which has a
+        # request to resolve a dependency against. The field bounds are FastAPI query metadata
+        # and are inert in plain Python, so an out-of-range page passes through to be answered
+        # with an empty page rather than rejected.
+        window = PageParams(page=page, page_size=page_size)
+
         rows, total = await self._users.list_users(
             q=q,
             role=role,
             is_active=is_active,
-            limit=page_size,
-            offset=_offset(page, page_size),
+            limit=window.limit,
+            offset=window.offset,
         )
         items = [AdminUser.model_validate(row) for row in rows]
-        return build_page(items, total, page, page_size)
+        return build_page(items, total, window.page, window.page_size)
 
     async def update_user(
         self,
@@ -759,6 +737,14 @@ class AdminService:
         """
         self._require_admin(actor)
 
+        # The window arithmetic has exactly one definition, in `PageParams` - the same object
+        # the route's own dependency resolves to. Constructed here from plain integers because
+        # this service is also called from a unit test and from the seed, neither of which has a
+        # request to resolve a dependency against. The field bounds are FastAPI query metadata
+        # and are inert in plain Python, so an out-of-range page passes through to be answered
+        # with an empty page rather than rejected.
+        window = PageParams(page=page, page_size=page_size)
+
         # `None` is the repository's spelling for "every lifecycle state", and it is passed rather
         # than an exhaustive tuple because the two are equivalent in rows and NOT equivalent in
         # plan - see the note above. A single-status tab still passes its one state, which is an
@@ -774,11 +760,11 @@ class AdminService:
             # association would be one extra statement and one extra entity per row for a column
             # this table never renders. `content` and `search_vector` are not fetched either.
             projection="admin",
-            limit=page_size,
-            offset=_offset(page, page_size),
+            limit=window.limit,
+            offset=window.offset,
         )
         items = [AdminPost.model_validate(row) for row in rows]
-        return build_page(items, total, page, page_size)
+        return build_page(items, total, window.page, window.page_size)
 
     async def set_post_status(
         self,
@@ -1012,17 +998,25 @@ class AdminService:
         """
         self._require_admin(actor)
 
+        # The window arithmetic has exactly one definition, in `PageParams` - the same object
+        # the route's own dependency resolves to. Constructed here from plain integers because
+        # this service is also called from a unit test and from the seed, neither of which has a
+        # request to resolve a dependency against. The field bounds are FastAPI query metadata
+        # and are inert in plain Python, so an out-of-range page passes through to be answered
+        # with an empty page rather than rejected.
+        window = PageParams(page=page, page_size=page_size)
+
         statuses = None if status is None else (status,)
 
         rows, total = await self._comments.list_moderation_queue(
             statuses=statuses,
             q=q,
             post_id=post_id,
-            limit=page_size,
-            offset=_offset(page, page_size),
+            limit=window.limit,
+            offset=window.offset,
         )
         items = [AdminComment.model_validate(row) for row in rows]
-        return build_page(items, total, page, page_size)
+        return build_page(items, total, window.page, window.page_size)
 
     async def set_comment_status(
         self,

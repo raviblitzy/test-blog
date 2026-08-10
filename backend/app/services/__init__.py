@@ -38,7 +38,8 @@ The ten names this package publishes
 * :class:`~app.services.admin_service.AdminService` - the single administrator-only surface over
   users, posts, comments and categories, plus the aggregate overview counts (R11).
 * :class:`~app.services.health_service.HealthService` - the readiness verdict behind
-  ``GET /readyz``: one round trip, a five-way classification of whatever went wrong, and the
+  ``GET /readyz``: one round trip, a classification of whatever went wrong drawn from
+  :data:`~app.services.health_service.ReadinessFailureClass`, and the
   disclosure rule that keeps a driver's host, port, database and user out of both the response
   and the log. The one member that settles no *domain* rule, and it is here because the
   layering rule has no exemption for a probe - see its module docstring.
@@ -172,10 +173,16 @@ nothing configured and no database running::
     from app import services
 
     assert [name for name in services.__all__ if not hasattr(services, name)] == []
-    assert len(services.__all__) == 9
+    assert set(services.__all__) == set(dir(services)) & set(services.__all__)
 
 A name in the list that does not resolve is not a lint finding; it is an ``ImportError`` the first
 time anything imports this package, which means it is a start-up failure of the whole service.
+
+The second half is deliberately expressed as a relationship rather than as a count. A literal
+``len(...) == n`` here would be a second declaration of the export set, drifting the first time a
+service was added or withdrawn - which is exactly what happened to the number that used to be
+written here. ``backend/tests/integration/test_openapi_contract.py`` carries the one enumeration
+that is asserted rather than asserted-about.
 """
 
 # The import edge runs ONE WAY: this file imports all eight siblings, and no sibling may ever

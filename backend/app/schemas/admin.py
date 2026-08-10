@@ -1,9 +1,11 @@
 """The administrative contract: what an administrator may see, and what an administrator may change.
 
-Fourteen operations live beneath ``/api/v1/admin`` - the four management surfaces the user named
-("an admin dashboard for managing users, posts, comments, and categories"), each with a listing, a
-state mutation and a deletion, plus a creation for the one family that has no self-service path,
-plus the overview screen. This module declares every payload they carry, and nothing else.
+Beneath ``/api/v1/admin`` live the four management surfaces the user named ("an admin dashboard
+for managing users, posts, comments, and categories") and the overview screen. Users, posts and
+comments each carry a listing, a state mutation and a deletion; categories carry a creation, an
+update and a deletion instead, because their listing is the public
+``GET /api/v1/categories`` rather than a privileged duplicate of it. This module declares every
+payload they carry, and nothing else.
 
 Because the framework choice was resolved to FastAPI there is no framework-provided administration
 console to inherit, so the dashboard is an explicit route group over an explicit API namespace.

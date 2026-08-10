@@ -277,7 +277,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Final
 
-from sqlalchemy import ColumnElement, Select, func, literal, select
+from sqlalchemy import ColumnElement, Select, func, literal, select, true
 from sqlalchemy.orm import QueryableAttribute, aliased, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -1147,6 +1147,136 @@ class CommentRepository(UUIDPrimaryKeyRepository[Comment]):
         result = await self.session.execute(select(func.max(ancestry.c.depth)))
         depth: int | None = result.scalar_one_or_none()
         return depth
+
+    async def has_visible_ancestry(
+        self,
+        comment_id: uuid.UUID,
+        *,
+        post_id: uuid.UUID,
+        statuses: Sequence[CommentStatus] | None,
+        max_depth: int = MAX_THREAD_DEPTH,
+    ) -> bool:
+        """Report whether a comment and **every ancestor above it** are visible to one caller.
+
+        The gate behind :meth:`list_for_post`'s continuation window, and the reason it exists is a
+        disclosure. That window pages one comment's direct replies, filtering the children by
+        *their own* status - which is correct for the children and says nothing about the parent.
+        A caller who learned the identifier of a ``PENDING`` or ``REJECTED`` comment could
+        therefore ask for its window and receive the ``APPROVED`` replies underneath it, while the
+        recursive thread that produced those identifiers correctly prunes everything beneath a
+        hidden ancestor. This method is what makes the two agree: the window may expose exactly
+        what the thread would have exposed, and nothing else.
+
+        Ancestry rather than the parent alone, because the thread prunes at *any* hidden
+        generation. A visible comment whose own parent is hidden is unreachable in the thread, so
+        its window must be unreachable too; checking only the named row would close one instance
+        of the leak and leave the one a level up.
+
+        It renders as::
+
+            WITH RECURSIVE ancestry AS (
+                SELECT id, parent_id, status, 1 AS depth
+                  FROM comments WHERE id = :comment_id AND post_id = :post_id
+                UNION ALL
+                SELECT a.id, a.parent_id, a.status, ancestry.depth + 1
+                  FROM comments AS a, ancestry
+                 WHERE a.id = ancestry.parent_id AND ancestry.depth <= :max_depth
+            )
+            SELECT bool_and(status = ANY(:statuses)), bool_or(parent_id IS NULL) FROM ancestry
+
+        Args:
+            comment_id: The comment whose window is being asked for.
+            post_id: The post the window is being read on. Part of the anchor rather than checked
+                afterwards, so a comment belonging to another post is reported exactly like a
+                comment that does not exist - keyword-only, because transposing two UUIDs would
+                type-check and ask a different question.
+            statuses: The moderation states this caller may see, as
+                ``app.services.comment_service._visible_comment_statuses`` decided them. ``None``
+                means every state, which is what an administrator and a post's own author get, and
+                then the status half of this test is trivially satisfied - correctly, because
+                there is nothing they may not see.
+            max_depth: How far the ascent climbs. Defaults to :data:`MAX_THREAD_DEPTH`, which is
+                exactly enough: the thread descends that many generations below a root, so any
+                comment the thread could have surfaced reaches its root within this many steps.
+                A chain longer than that is refused rather than partially checked - see below.
+
+        Returns:
+            ``True`` only when the row exists on that post, when it **and** every ancestor up to
+            the root carry a visible status, and when the ascent actually reached that root.
+            ``False`` otherwise, including for an identifier that matches nothing.
+
+        Note:
+            **It fails closed, three times over.** ``bool_and`` over an empty expression yields one
+            row holding ``NULL``, so an identifier that matches nothing - or one on another post -
+            returns ``None`` and becomes ``False`` here rather than an exception the caller has to
+            remember to handle. A ``NULL`` status is impossible (the column is ``NOT NULL``) but
+            would also collapse to ``False`` rather than to visible. And the root test is what
+            covers the one case the bound could otherwise hide: if a hand-written chain runs deeper
+            than *max_depth*, the ascent stops before the root and ``bool_or(parent_id IS NULL)``
+            is false, so the window is refused rather than admitted on a partially verified chain.
+            ``app.db.seed``, the test factories and a data migration can all write comments without
+            passing through the request path's depth rule, which is why that case is real.
+
+            **It selects columns, not entities.** No ``Comment`` is hydrated and nothing enters the
+            session's identity map, so this check cannot leave an ancestor behind for a later read
+            to find - and it cannot be satisfied by a stale instance either.
+
+            **The access path is the primary key at every step** - ``a.id = ancestry.parent_id`` -
+            so the ascent is one index probe per generation inside a single statement, bounded by
+            *max_depth* however deep the data goes.
+
+            **It takes no lock**, and that is consistent rather than an omission: the listing
+            statements it gates take none either, and the row this ascent starts from has already
+            been locked ``FOR SHARE`` by the caller - see
+            ``app.services.comment_service.CommentService._parent_window_is_visible``, which holds
+            that lock and the owning post's for the rest of the transaction. A recursive term
+            cannot carry ``FOR SHARE`` in PostgreSQL in any case.
+        """
+        anchor = select(
+            Comment.id.label("id"),
+            Comment.parent_id.label("parent_id"),
+            Comment.status.label("status"),
+            literal(1).label("depth"),
+        ).where(Comment.id == comment_id, Comment.post_id == post_id)
+        ancestry = anchor.cte("ancestry", recursive=True)
+
+        ancestor = aliased(Comment, name="ancestor")
+        ancestry = ancestry.union_all(
+            select(
+                ancestor.id.label("id"),
+                ancestor.parent_id.label("parent_id"),
+                ancestor.status.label("status"),
+                (ancestry.c.depth + 1).label("depth"),
+            ).where(
+                ancestor.id == ancestry.c.parent_id,
+                # One step past the deepest generation the thread itself carries, which is all
+                # that is needed to reach the root of anything the thread could have surfaced.
+                ancestry.c.depth <= max_depth,
+            )
+        )
+
+        # The visibility test, applied to the CTE's own status column rather than through
+        # `_status_criteria`: that helper builds predicates over the mapped entity for a statement
+        # that selects entities, and this expression is an aggregate over projected columns.
+        # `true()` for the every-state case keeps `bool_and` well-formed with no predicate, instead
+        # of a branch that would have to assemble a different statement.
+        visible = true() if statuses is None else ancestry.c.status.in_(statuses)
+
+        result = await self.session.execute(
+            select(
+                func.bool_and(visible),
+                # Did the ascent terminate at a root, or run out of budget on the way? Only the
+                # first is a fully verified chain.
+                func.bool_or(ancestry.c.parent_id.is_(None)),
+            )
+        )
+        # Bound to annotated locals because both aggregates are `Any` to the type checker, and
+        # binding them here is what keeps the declared return type honest without a cast. `None`
+        # from either - an empty ancestry - is the refusal.
+        row = result.one()
+        all_visible: bool | None = row[0]
+        reached_root: bool | None = row[1]
+        return bool(all_visible) and bool(reached_root)
 
     async def get_with_author(
         self, comment_id: uuid.UUID, *, for_update: bool = False

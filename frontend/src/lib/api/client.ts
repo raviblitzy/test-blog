@@ -442,7 +442,7 @@ export type OptionalAuthRequestOptions = Omit<RequestOptions, 'anonymousFallback
  * Options for a route that **requires** a credential, where anonymity is unrepresentable.
  *
  * Everything a reader has to be signed in to do: `POST /auth/logout`, `GET /auth/me`,
- * `PATCH /users/me`, every post and comment mutation, like and unlike, and all fourteen
+ * `PATCH /users/me`, every post and comment mutation, like and unlike, and all thirteen
  * administrative operations. Sending one of these without a credential cannot succeed, so the option
  * that would do it is removed rather than documented as a mistake.
  *

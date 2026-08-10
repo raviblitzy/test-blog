@@ -23,8 +23,22 @@ Why ``logger_class`` and not ``on_starting``
 So an ``on_starting`` hook is already too late for the first line, and for the ``Listening at:``
 and ``Using worker:`` lines that a very early failure would be diagnosed from. Constructing the
 logger, by contrast, happens before anything at all has been logged, which makes
-:class:`StructlogArbiterLogger` the one hook that closes the window completely rather than
-narrowing it.
+:data:`logger_class` the one hook that closes the window completely rather than narrowing it.
+
+One implementation, selected in one place
+-----------------------------------------
+This file **imports** the logger class rather than defining one.
+:class:`~app.core.logging.StructlogGunicornLogger` is the implementation, it lives beside
+:func:`~app.core.logging.configure_logging` whose ordering contract it depends on, and this file's
+whole contribution is to name it as ``logger_class``.
+
+That is a correction, not a preference. There used to be a second, identical implementation here
+*and* a ``--logger-class`` flag on the Dockerfile's ``CMD`` naming the one in ``app.core.logging``.
+A command-line setting outranks a configuration file in Gunicorn, so the class defined here was
+never constructed in the shipped image: it read as live, it had tests of its own, and every one of
+them exercised code the container could not reach. Two implementations of one hook is one too many
+whichever wins - the loser drifts, and a reader cannot tell from either file which is in force. So
+the definition has one home and the selection has one home, and they are not the same file.
 
 ``post_fork`` is deliberately absent for the same kind of reason: it runs in the child, *after* the
 child has logged ``Booting worker with pid``, and by then the child has inherited an already
@@ -50,14 +64,13 @@ and nothing else.
 Where this file sits in the quality gates
 -----------------------------------------
 ``ruff check`` and ``ruff format`` cover it, because they run over the whole of ``backend/``. The
-type-check gate does not: ``[tool.mypy] files = ["app"]`` in ``backend/pyproject.toml`` scopes it to
-the application package, and this file sits outside it for the same reason
-``backend/migrations/`` does - it is deployment configuration executed by a tool, not application
-source. That scoping is also what keeps ``strict = true`` honest: ``gunicorn`` publishes no type
-information, so a subclass of its logger resolves to a subclass of ``Any``, and pulling this file
-into the gate would mean either a stub dependency or relaxing ``disallow_subclassing_any`` for
-everything. ``cfg`` is therefore annotated :class:`~typing.Any` deliberately, and nothing here
-reads it.
+type-check gate does not: ``[tool.mypy] files = ["app", "tests"]`` in ``backend/pyproject.toml``
+scopes it to the application package and the suite, and this file sits outside both for the same
+reason ``backend/migrations/`` does - it is deployment configuration executed by a tool, not
+application source. The class it selects **is** inside that gate, which is another reason for the
+implementation to live in ``app.core.logging``: the subclass-of-``Any`` problem that ``gunicorn``'s
+missing type information creates is handled there, once, rather than by keeping a second copy
+outside the gate.
 
 Its behaviour is nevertheless tested rather than assumed:
 ``backend/tests/unit/test_gunicorn_logging.py`` asserts the observable outcome - that constructing
@@ -78,57 +91,29 @@ It is the same set of variables either way, so nothing new is required of a depl
 
 from __future__ import annotations
 
-from typing import Any
+from app.core.logging import StructlogGunicornLogger
 
-from gunicorn.glogging import Logger
-
-from app.core.logging import configure_logging
-
-__all__ = ["StructlogArbiterLogger", "logger_class"]
+__all__ = ["logger_class"]
 
 
-class StructlogArbiterLogger(Logger):
-    """Gunicorn's own logger, with this service's structured configuration applied on top.
-
-    Subclassed rather than replaced. Gunicorn's :class:`~gunicorn.glogging.Logger` owns a great
-    deal more than formatting - the ``--log-level`` mapping, ``--capture-output``'s file descriptor
-    redirection, syslog handling, the access-line atoms, ``reopen_files`` for log rotation - and
-    every one of those must keep working. So ``super().setup()`` runs in full and unmodified, and
-    only then is the log *shape* replaced.
-    """
-
-    def setup(self, cfg: Any) -> None:
-        """Let Gunicorn configure itself, then hand the whole process to ``configure_logging``.
-
-        Order is the entire point. ``super().setup`` attaches Gunicorn's own plain-text handler to
-        ``gunicorn.error``, sets ``propagate = False`` on it and on ``gunicorn.access``, and - if
-        one was supplied - applies ``logconfig_dict``. :func:`~app.core.logging.configure_logging`
-        then installs this service's single root handler and calls its own delegation pass, which
-        detaches those handlers, restores ``propagate`` so the record reaches the root handler
-        exactly once, and silences ``gunicorn.access`` because
-        ``app.middleware.request_context`` already writes one access record per request with the
-        request identifier bound. Both logger names are already in that module's delegated set, so
-        this file adds no logger configuration of its own and none should be added to it.
-
-        Reversing the two calls would leave Gunicorn's handler attached and ``propagate`` off,
-        which is exactly the state being fixed.
-
-        Args:
-            cfg: The Gunicorn configuration object, passed straight through to the base
-                implementation. Nothing here reads it: the log shape is this service's decision and
-                comes from ``LOG_LEVEL`` and ``ENVIRONMENT``, not from a Gunicorn setting.
-        """
-        super().setup(cfg)
-        configure_logging()
-
-
-logger_class = StructlogArbiterLogger
-"""The ``--logger-class`` Gunicorn will instantiate, given as the class itself.
+logger_class = StructlogGunicornLogger
+"""The logger class Gunicorn will instantiate, given as the class itself.
 
 A class object rather than the usual dotted string, which ``gunicorn.config.validate_class``
-accepts directly and ``gunicorn.util.load_class`` returns unchanged. That is deliberate: a dotted
-path would have to name an importable module, which would mean either a second file existing only
-to hold six lines or this file importing itself by the name Gunicorn happens to exec it under
-(``__config__``). Naming the class keeps the definition and its registration in one place and
-removes any chance of the two drifting.
+accepts directly and ``gunicorn.util.load_class`` returns unchanged. That matters here: a dotted
+path would be a second spelling of the same selection, and a second spelling is exactly what this
+file was corrected to remove.
+
+:class:`~app.core.logging.StructlogGunicornLogger` is where the behaviour is documented and tested,
+and the reason it belongs there rather than here is the ordering contract it depends on:
+``super().setup(cfg)`` must run first - it is what honours ``--log-level`` and ``--capture-output``
+and leaves Gunicorn's own bookkeeping intact - and :func:`~app.core.logging.configure_logging` must
+run second, taking the handlers back and restoring propagation on ``gunicorn.error``. Reversing
+those two lines silently reinstates the plain-text handler and looks like working configuration in
+review, which is why the class and the function it calls in a fixed order live in one module.
+
+This assignment is the *whole* of this file's contribution, and it is the only place the selection
+is made: ``backend/Dockerfile``'s ``CMD`` names ``--config gunicorn.conf.py`` and deliberately
+passes no ``--logger-class``, because a command-line setting outranks a configuration file and two
+places to look is how the two came to disagree.
 """

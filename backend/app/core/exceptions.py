@@ -1467,10 +1467,17 @@ def _route_leaves(routes: Iterable[object]) -> Iterator[object]:
 
     ``app.routes`` is not flat. FastAPI 0.141.1 represents every ``include_router`` call as one
     opaque entry that resolves its children - and their prefixes, tags and dependencies - only
-    when asked, so this application's six top-level entries stand for forty operations: the four
-    documentation routes are ordinary Starlette routes, while the versioned aggregate and the
-    health router are inclusions whose members are reachable only through them. A walk that read
-    ``methods`` off the top level would see the documentation routes and nothing else.
+    when asked, so a handful of top-level entries stand for the whole matchable surface. Two of
+    them are inclusions - the versioned aggregate and the health router - and between them they
+    expand to every service operation this API serves: those beneath ``/api/v1`` plus the two
+    unversioned probes. The documentation routes beside them are ordinary Starlette routes, and
+    how many there are is environment-dependent rather than fixed: ``/openapi.json`` is always
+    served, while ``/docs``, its OAuth2 redirect and ``/redoc`` are withdrawn in production. No
+    total is stated here for either reason - the count varies by environment, and a numeral in a
+    docstring is a second declaration of something the route table already states.
+    ``backend/tests/integration/test_openapi_contract.py`` holds the single authoritative
+    enumeration, asserted against ``app.openapi()``. A walk that read ``methods`` off the top
+    level would see the documentation routes and nothing else.
 
     An inclusion is recognised by behaviour rather than by class - the presence of a callable
     that yields its members with their effective paths already applied - so this survives the

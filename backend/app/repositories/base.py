@@ -594,10 +594,19 @@ class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
                 When ``True``, emit ``SELECT ... FOR UPDATE`` so the row is locked for the rest
                 of this transaction, and read it from the database even if this unit of work
                 already holds a copy - a lock over a cached instance would be no lock at all.
-                Verified against SQLAlchemy 2.0.51: passing ``with_for_update`` re-issues the
-                statement with ``FOR UPDATE`` appended and populates the *same* identity-map
-                instance, so the caller's object reference stays valid and its attributes are
-                the committed ones.
+
+                ``populate_existing=True`` travels with the lock, and it is **not** decoration.
+                Measured against SQLAlchemy 2.0.51 in ``Session._get_impl``: passing
+                ``with_for_update`` does skip the identity-map short circuit, so the ``FOR
+                UPDATE`` statement is genuinely issued - but without this option the loader
+                leaves an already-loaded instance's attributes exactly as they were and
+                *discards* the committed values the statement just returned. The lock would then
+                be real while the row read through it was stale, which is the worst of the three
+                possible outcomes: a caller that had loaded the row earlier in the same unit of
+                work would take a lock and then decide on pre-lock data, with nothing in the
+                emitted SQL to show it. With the option set, the same identity-map instance is
+                overwritten in place, so the caller's object reference stays valid **and** every
+                attribute on it is the committed one.
 
                 Ask for it whenever the value read is about to decide a write - the
                 read-check-write sequences behind delete, publish and moderation - because
@@ -624,8 +633,18 @@ class UUIDPrimaryKeyRepository[ModelT: Base](BaseRepository[ModelT]):
         """
         # `with_for_update` takes None rather than False for "no lock": passing False would
         # still be a request for a lock clause SQLAlchemy has to render.
+        #
+        # `populate_existing` is tied to `for_update` rather than always on, because the two
+        # modes want opposite things. A locked read is about to decide a write, so it must see
+        # committed state and overwrite whatever this unit of work already holds. An unlocked
+        # read is a render, and forcing it to overwrite would discard a pending in-session
+        # modification the caller has not flushed yet - so the identity map stays authoritative
+        # there, which is also what makes the no-round-trip path above possible.
         return await self.session.get(
-            self.model, entity_id, with_for_update=True if for_update else None
+            self.model,
+            entity_id,
+            with_for_update=True if for_update else None,
+            populate_existing=for_update,
         )
 
     async def add(self, entity: ModelT) -> ModelT:

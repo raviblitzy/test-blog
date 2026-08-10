@@ -1620,6 +1620,217 @@ class TestReplyBreadth:
         assert response.status_code == 422, response.text
         assert_field_error(response.json(), "parent")
 
+    @pytest.mark.parametrize("hidden_state", [CommentStatus.PENDING, CommentStatus.REJECTED])
+    async def test_a_hidden_parent_discloses_none_of_its_approved_replies(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+        hidden_state: CommentStatus,
+    ) -> None:
+        """The window is authorised on the parent, not only filtered on the children.
+
+        The sibling test above proves the *children* are filtered by their own moderation state.
+        This is the other half, and it was the gap: the parent a caller names was never authorised
+        at all. So a caller who learned the identifier of a ``PENDING`` or ``REJECTED`` comment
+        could ask for its window and be handed the ``APPROVED`` replies underneath it - content the
+        nested thread deliberately withholds, because the recursive descent stops at a hidden
+        ancestor and never reaches them.
+
+        Both halves of the envelope are asserted. ``items`` empty is not enough: a ``total`` of one
+        beside an empty list would report that a reply exists without returning it, which answers
+        the same question the leak did. And the answer must stay a ``200`` empty page rather than
+        becoming a ``404`` or a ``403``, because either status would confirm that the identifier
+        addresses a real comment and turn this endpoint into an oracle for enumerating hidden ones.
+
+        Parametrised over both non-public states rather than one, because the rule is "not in the
+        visible set" and a fix that tested for ``REJECTED`` specifically would leave the other open.
+        """
+        post = await visible_post(db_session, author_user)
+        hidden_parent = await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            status=hidden_state,
+            body="Held back by moderation.",
+        )
+        await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            parent=hidden_parent,
+            status=CommentStatus.APPROVED,
+            body="Approved answer under a hidden comment.",
+        )
+
+        response = await client.get(_thread_path(post.id), params={"parent": str(hidden_parent.id)})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["items"] == [], (
+            "the approved replies of a comment this caller may not see were returned through the "
+            "continuation window"
+        )
+        assert body["total"] == 0, (
+            "`total` reports that replies exist beneath a comment the caller may not see, which "
+            "discloses the same fact the items would have"
+        )
+
+    async def test_a_hidden_grandparent_closes_the_window_on_its_visible_child(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """Pruning is by ancestry, so the window has to be too.
+
+        ``APPROVED`` root -> ``PENDING`` reply -> ``APPROVED`` reply is the shape that defeats a
+        parent-only check. The middle comment is hidden, so the nested thread returns the root and
+        nothing below it: the grandchild is unreachable there even though it is approved. If the
+        window only asked about the comment named in the request, naming the *grandchild's parent*
+        would be refused while naming the grandchild itself would still serve whatever hangs off
+        it - the same disclosure one generation down.
+
+        So visibility is decided over the whole chain to the root, and this asserts the case a
+        parent-only fix would pass.
+        """
+        post = await visible_post(db_session, author_user)
+        root = await factories.create_comment(
+            db_session, post=post, author=reader_user, status=CommentStatus.APPROVED
+        )
+        hidden_middle = await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            parent=root,
+            status=CommentStatus.PENDING,
+            body="Awaiting review.",
+        )
+        visible_grandchild = await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            parent=hidden_middle,
+            status=CommentStatus.APPROVED,
+            body="Approved, but beneath a hidden ancestor.",
+        )
+        await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            parent=visible_grandchild,
+            status=CommentStatus.APPROVED,
+            body="Approved, two hidden generations up.",
+        )
+
+        # The control: the nested thread already prunes at the hidden generation, so nothing under
+        # `hidden_middle` is reachable the ordinary way - the behaviour the window must match.
+        thread = await client.get(_thread_path(post.id))
+        assert thread.status_code == 200, thread.text
+        assert [item["id"] for item in thread.json()["items"]] == [str(root.id)]
+        assert thread.json()["items"][0]["replies"] == []
+
+        # The window on the approved grandchild, whose own status is visible and whose ancestry is
+        # not.
+        response = await client.get(
+            _thread_path(post.id), params={"parent": str(visible_grandchild.id)}
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["items"] == [], (
+            "the window served the replies of an approved comment that sits beneath a hidden "
+            "ancestor, which the nested thread correctly refuses to reach"
+        )
+        assert body["total"] == 0
+
+    async def test_the_post_author_still_reaches_every_window_on_their_own_thread(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+        auth_headers_for: Callable[[User], dict[str, str]],
+    ) -> None:
+        """The gate is a visibility rule, not a new restriction, so a wider caller is unaffected.
+
+        A post's own author sees every moderation state in their own thread - that is what
+        ``_visible_comment_statuses`` grants them, and it is the useful behaviour: they are the
+        person who notices a reader waiting on approval. The window must therefore stay open to
+        them on exactly the comments the nested thread shows them, including a ``PENDING`` parent.
+
+        Without this the fix would be indistinguishable from having narrowed the window for
+        everybody, which is the failure mode a security check most easily hides.
+        """
+        post = await visible_post(db_session, author_user)
+        pending_parent = await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            status=CommentStatus.PENDING,
+            body="Awaiting the author's attention.",
+        )
+        reply = await factories.create_comment(
+            db_session,
+            post=post,
+            author=reader_user,
+            parent=pending_parent,
+            status=CommentStatus.APPROVED,
+            body="An answer the author may read.",
+        )
+
+        response = await client.get(
+            _thread_path(post.id),
+            params={"parent": str(pending_parent.id)},
+            headers=auth_headers_for(author_user),
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert [item["id"] for item in body["items"]] == [str(reply.id)], (
+            "the continuation window was closed to the post's own author, who is entitled to every "
+            "moderation state in their own thread"
+        )
+        assert body["total"] == 1
+
+    async def test_a_parent_on_another_post_discloses_nothing(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        author_user: User,
+        reader_user: User,
+    ) -> None:
+        """Membership of the addressed post is part of the gate, not a separate concern.
+
+        A visible comment on article A, named in a window request against article B, must be
+        answered exactly like an identifier that matches nothing - otherwise the endpoint reports
+        which article a comment belongs to, one guess at a time.
+        """
+        elsewhere = await visible_post(db_session, author_user)
+        here = await visible_post(db_session, author_user)
+        foreign_parent = await factories.create_comment(
+            db_session, post=elsewhere, author=reader_user, status=CommentStatus.APPROVED
+        )
+        await factories.create_comment(
+            db_session,
+            post=elsewhere,
+            author=reader_user,
+            parent=foreign_parent,
+            status=CommentStatus.APPROVED,
+            body="A reply on the other article.",
+        )
+
+        response = await client.get(
+            _thread_path(here.id), params={"parent": str(foreign_parent.id)}
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["items"] == []
+        assert body["total"] == 0
+
 
 class TestModerationVisibility:
     """Which moderation states each caller sees - the implicit prerequisite of AAP 0.1.3.

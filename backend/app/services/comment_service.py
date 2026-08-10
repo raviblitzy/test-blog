@@ -120,12 +120,11 @@ which is why every method materialises its response *before* committing rather t
 """
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Final
 
 import bleach
-from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -503,34 +502,6 @@ def _sanitize_body(raw: str) -> str:
             ],
         )
     return trimmed
-
-
-async def _sanitize_body_off_loop(raw: str) -> str:
-    """Run :func:`_sanitize_body` in a worker thread, leaving the event loop free.
-
-    Sanitisation is a full HTML parse over untrusted reader input, which is pure CPU work, and
-    commenting is the highest-frequency write in the product: every reader on every article can
-    reach it, where authoring is a handful of people. Spending that parse on the event loop is
-    therefore the case where a burst is most likely and the stall most visible - a loop busy
-    cleaning one comment is serving neither the thread it belongs to nor anything else.
-
-    ``run_in_threadpool`` is FastAPI's own mechanism for running synchronous work off the loop,
-    so no dependency is added and cancellation behaves as it does everywhere else: a client that
-    disconnects mid-sanitisation cancels the awaiting task while the worker finishes, so the
-    bounded pool is never leaked to abandoned work.
-
-    Args:
-        raw: The submitted comment text.
-
-    Returns:
-        The cleaned body, exactly what :func:`_sanitize_body` returns.
-
-    Raises:
-        AppValidationError: Nothing visible survived. Raised inside the worker and propagated
-            here unchanged, because ``run_in_threadpool`` re-raises the exception in the awaiting
-            task - so the rejection reaches the route exactly as it did when the call was direct.
-    """
-    return await run_in_threadpool(_sanitize_body, raw)
 
 
 def _visible_comment_statuses(post: Post, viewer: User | None) -> tuple[CommentStatus, ...]:
@@ -969,9 +940,24 @@ class CommentService:
         # answered with an empty page rather than rejected.
         window = PageParams(page=page, page_size=page_size)
 
+        # Bound once and used twice - by the gate below and by the listing - so the window cannot
+        # be authorised against one set of moderation states and then filled from another.
+        statuses = _visible_comment_statuses(post, viewer)
+
+        # THE continuation-window gate. The repository filters the children by their own status,
+        # which is right for the children and says nothing about the parent the caller named, so
+        # without this a caller holding the identifier of a hidden comment could read the approved
+        # replies beneath it. Answered with an empty page rather than an error, exactly as a
+        # nonexistent parent is: see `_parent_window_is_visible` for why the two must be
+        # indistinguishable, and note that `total` is zero as well as `items` being empty.
+        if parent_id is not None and not await self._parent_window_is_visible(
+            parent_id, post=post, statuses=statuses
+        ):
+            return build_page([], 0, window.page, window.page_size)
+
         rows, total = await self._comments.list_for_post(
             post.id,
-            statuses=_visible_comment_statuses(post, viewer),
+            statuses=statuses,
             # Passed straight through. The repository turns it into one predicate on the same
             # statement rather than a second query, so the continuation window inherits the
             # ordering, the counting and - critically - the moderation filter of the default one.
@@ -982,6 +968,86 @@ class CommentService:
 
         items = [CommentPublic.model_validate(row) for row in rows]
         return build_page(items, total, window.page, window.page_size)
+
+    async def _parent_window_is_visible(
+        self,
+        parent_id: uuid.UUID,
+        *,
+        post: Post,
+        statuses: Sequence[CommentStatus],
+    ) -> bool:
+        """Decide whether this caller may page the replies of the comment they named.
+
+        The authority behind :meth:`list_for_post`'s ``parent_id``, and the answer to a question
+        the repository cannot answer for itself: its statement filters the *children* by their own
+        moderation state, so the parent named in the request was never authorised at all. An
+        anonymous caller who learned the identifier of a ``PENDING`` or ``REJECTED`` comment could
+        ask for its window and be handed the ``APPROVED`` replies underneath it - a disclosure of
+        content the recursive thread deliberately prunes, since it stops descending at a hidden
+        ancestor.
+
+        Three conditions, and all three are the same condition asked at different scopes:
+
+        1. **the row exists on this post** -
+           :meth:`~app.repositories.comment_repository.CommentRepository.get_parent` resolves the
+           identifier and the post membership in one statement, so a comment belonging to another
+           article is refused here rather than paged as though it belonged to this thread;
+        2. **its own moderation state is visible to this caller** - decided by
+           :func:`_visible_comment_statuses`, the same predicate the listing and the reply-parent
+           check use, so the read surface and the write surface cannot disagree;
+        3. **every ancestor above it is visible too** -
+           :meth:`~app.repositories.comment_repository.CommentRepository.has_visible_ancestry`,
+           because the thread prunes at any hidden generation, so an approved comment under a
+           hidden parent is unreachable there and must be unreachable here. Skipped for a root,
+           which has no ancestors and therefore nothing to verify.
+
+        The lock, and why a read path takes one
+        --------------------------------------
+        ``get_parent`` is called with ``for_share=True``, so the parent row is held for the rest of
+        this transaction and is re-read rather than served from the identity map. That matches what
+        :meth:`_load_visible_post` already does to the owning post on this very path: under
+        ``READ COMMITTED`` an unlocked gate answers about the row as it *was*, and a concurrent
+        ``PATCH /api/v1/admin/comments/{id}/status`` could hide the parent between this decision
+        and the statement it authorises. The order is the global one - ``posts`` then ``comments``,
+        never the reverse - and the post's shared lock is already held by the time this runs, which
+        is what keeps it deadlock-free against ``post_service.delete``.
+
+        Args:
+            parent_id: The identifier the caller asked to page the replies of.
+            post: The post whose thread is being read, already resolved and share-locked by
+                :meth:`_load_visible_post`. Only ``id`` and ``author_id`` are read, both mapped
+                columns.
+            statuses: The moderation states this caller may see, resolved once by the caller so the
+                gate and the listing cannot drift apart.
+
+        Returns:
+            ``True`` when the window may be served, ``False`` when the caller must receive an empty
+            page.
+
+        Note:
+            **The refusal must be indistinguishable from an empty result.** A ``404`` here would
+            confirm that the identifier addresses a real comment, and a ``403`` would confirm that
+            it addresses one the caller may not see - either of which turns this endpoint into an
+            oracle for enumerating hidden comments by identifier. So the caller returns a page with
+            no items *and* a ``total`` of zero, which is precisely what a comment nobody has
+            answered looks like. :meth:`list_for_post` already documented that contract for a
+            parent that does not exist; this extends it to one the caller may not see.
+        """
+        # Locked and re-read, not fetched from the identity map - the moderation state on this row
+        # is about to authorise a read of rows underneath it.
+        parent = await self._comments.get_parent(parent_id, post_id=post.id, for_share=True)
+        if parent is None or parent.status not in statuses:
+            return False
+
+        if parent.parent_id is None:
+            # A root: there is nothing above it to hide it, and the ascent would be one statement
+            # confirming what `parent_id IS NULL` already says. Every continuation window on a
+            # top-level comment - the common case - therefore costs no extra round trip.
+            return True
+
+        return await self._comments.has_visible_ancestry(
+            parent.id, post_id=post.id, statuses=statuses
+        )
 
     # -----------------------------------------------------------------------------------
     # Writes

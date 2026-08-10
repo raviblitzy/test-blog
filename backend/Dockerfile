@@ -122,8 +122,10 @@ RUN python -m venv /opt/venv \
 #                 import-time and lifespan calls to configure_logging cannot reach it and every
 #                 arbiter line - boot, signals, shutdown - stays plain text in an otherwise JSON
 #                 stream. Measured in this image's own invocation: 9 of 30 lines plain without
-#                 this file, 0 of 30 with it. It supplies a --logger-class that reconfigures
-#                 logging inside the arbiter before its first line is written; the file itself
+#                 this file, 0 of 30 with it. It publishes the logger_class that reconfigures
+#                 logging inside the arbiter before its first line is written, and it is the ONLY
+#                 place that selection is made - the CMD below deliberately passes no competing
+#                 flag, because a command-line setting would outrank this file. The file itself
 #                 documents why a logger class rather than an on_starting hook is the only
 #                 placement that closes the window.
 #   pyproject.toml  DELIBERATE, and the one inclusion that looks wrong at first glance. It is
@@ -250,6 +252,11 @@ USER blog
 # differently. Tune without rebuilding via gunicorn's own GUNICORN_CMD_ARGS, or by overriding
 # the container's command from whatever starts it.
 #
+# Two is the SHIPPED DEFAULT; the supported maximum is app.db.session.MAX_WORKERS_PER_REPLICA,
+# which is 4. That module's connection budget is sized against the maximum rather than against
+# this default, so raising the count to four needs no code change and no re-derivation - the
+# import-time assertion in that module is what fails if anyone goes past it.
+#
 # --no-control-socket because gunicorn 26 otherwise opens a control socket under $HOME on every
 # boot. The `blog` account below does have a writable home, so the default would work as
 # shipped - but the moment anyone runs this image with `--user 65534:65534` or under a read-only
@@ -264,35 +271,40 @@ USER blog
 # lines, so the container log stream is the only place logs live - no files, no rotation, no
 # writable volume required.
 #
-# --logger-class is what makes the log stream structured END TO END, and it is a correctness
-# requirement of this image rather than a preference. The arbiter - the process this CMD starts -
-# binds the socket, forks the workers and handles signals WITHOUT ever importing app.main, so the
-# `configure_logging()` call on the application's import path cannot reach it. Measured here
-# before this flag existed: 9 plain-text lines per container lifecycle, every one from the
-# arbiter (`Starting gunicorn`, `Listening at:`, `Using worker:`, two `Booting worker with pid:`,
-# `Handling signal: term`, two `Worker … was sent SIGTERM!`, `Shutting down: Master`), while every
-# worker-side line including all request records was already JSON. A JSON-only collector treats
-# each of those as unparsed, so the boot and shutdown of every container is exactly the window an
-# operator cannot query.
+# The ARBITER'S own log lines are structured by `logger_class`, and that setting is made in
+# gunicorn.conf.py rather than here. It is a correctness requirement of this image rather than a
+# preference: the arbiter - the process this CMD starts - binds the socket, forks the workers and
+# handles signals WITHOUT ever importing app.main, so the `configure_logging()` call on the
+# application's import path cannot reach it. Measured before the hook existed: 9 plain-text lines
+# per container lifecycle, every one from the arbiter (`Starting gunicorn`, `Listening at:`,
+# `Using worker:`, two `Booting worker with pid:`, `Handling signal: term`, two
+# `Worker … was sent SIGTERM!`, `Shutting down: Master`), while every worker-side line including
+# all request records was already JSON. A JSON-only collector treats each of those as unparsed, so
+# the boot and shutdown of every container is exactly the window an operator cannot query.
+# `app.core.logging.StructlogGunicornLogger`, which gunicorn.conf.py publishes as `logger_class`,
+# closes it - measured after: 0 plain-text lines.
 #
-# `app.core.logging.StructlogGunicornLogger` closes it: gunicorn's `Arbiter.setup` constructs
-# `cfg.logger_class(cfg)` before the arbiter logs its first line, and `Application.load_config`
-# has already put this WORKDIR on sys.path, so the dotted path resolves in the arbiter process.
-# The class calls gunicorn's own `setup()` and then `configure_logging()`, which detaches the
-# plain-text handler gunicorn attached to `gunicorn.error` and lets those records reach the one
-# structlog handler instead - measured after: 0 plain-text lines. `gunicorn.access` stays
-# silenced by that same call, so `--access-logfile -` above remains correct and inert:
-# app.middleware.request_context is the single owner of the access record, and the flag is kept
-# so that nothing falls back to gunicorn's default access sink if that ever changes.
+# There is deliberately NO `--logger-class` flag here, and its absence is the fix rather than an
+# omission. This CMD used to pass one naming that same class while gunicorn.conf.py assigned a
+# second, identical implementation of its own; a command-line setting outranks a configuration
+# file, so the config-file class was never constructed in the shipped image even though it had
+# tests that appeared to cover the container's behaviour. One hook needs one selection point, and
+# --config below is it.
+#
+# `gunicorn.access` is silenced by the same `configure_logging()` call, so `--access-logfile -`
+# above remains correct and inert: app.middleware.request_context is the single owner of the
+# access record, and the flag is kept so that nothing falls back to gunicorn's default access sink
+# if that ever changes.
+#
 # --config names ./gunicorn.conf.py explicitly even though gunicorn would discover that exact
-# path in the working directory by itself. The redundancy is the point: an explicit --config that
-# names a missing file is a hard startup error, whereas discovery of a missing file is silent and
-# the only symptom is a log stream that quietly goes back to being half plain text. A COPY
-# dropped from the payload above should break the container, not degrade its observability.
+# path in the working directory by itself. The redundancy carries real weight now that the file is
+# the only place `logger_class` is set: an explicit --config that names a missing file is a hard
+# startup error, whereas discovery of a missing file is silent and the only symptom is a log
+# stream that quietly goes back to being half plain text. A COPY dropped from the payload above
+# should break the container, not degrade its observability.
 CMD ["gunicorn", "app.main:app", \
   "--config", "gunicorn.conf.py", \
   "--worker-class", "uvicorn.workers.UvicornWorker", \
-  "--logger-class", "app.core.logging.StructlogGunicornLogger", \
   "--workers", "2", \
   "--bind", "0.0.0.0:8000", \
   "--no-control-socket", \

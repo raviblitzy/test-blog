@@ -84,8 +84,9 @@ protect is the *stored* one, which is what makes every consumer of ``GET /api/v1
 safe rather than only the renderer in this repository.
 
 Both passes are CPU-bound over a body of up to a hundred thousand characters, so neither runs on
-the event loop: :func:`_sanitize_content_off_loop` and :func:`_sanitize_excerpt_off_loop` are what
-the write paths call.
+the event loop: every write path hands them to :func:`~app.core.security.run_cpu_bound`, which
+offloads to a worker thread through a shared :class:`~anyio.CapacityLimiter` so an authoring burst
+queues for a slot instead of occupying every thread the process has.
 """
 
 import html
@@ -97,7 +98,6 @@ from types import MappingProxyType
 from typing import Final
 
 import bleach
-from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1256,53 +1256,6 @@ def _sanitize_title(raw: str) -> str:
     return current
 
 
-async def _sanitize_content_off_loop(raw: str) -> str:
-    """Run :func:`_sanitize_content` in a worker thread, leaving the event loop free.
-
-    Sanitisation is pure CPU over a string that ``app.schemas.post.PostContent`` bounds at a
-    hundred thousand characters, and it is two passes: a set of regular-expression rewrites and
-    a full HTML parse. On the event loop that is time no other request can use - a handful of
-    concurrent article submissions would stall the feed, the comment threads and the readiness
-    probe together, which turns an ordinary authoring burst into a availability problem.
-
-    ``run_in_threadpool`` is FastAPI's own mechanism for running synchronous work off the loop -
-    the same one it uses for a synchronous route handler - so no dependency is added and
-    cancellation behaves as it does everywhere else in the application: a client that
-    disconnects mid-sanitisation cancels the awaiting task while the worker is allowed to
-    finish, so the bounded pool is never leaked to abandoned work.
-
-    Offloaded unconditionally rather than above a size threshold. A thread hop costs tens of
-    microseconds against the several database round trips this request already makes, so a
-    threshold would buy nothing measurable while leaving the small-input path doing exactly what
-    this function exists to stop.
-
-    Args:
-        raw: The submitted body.
-
-    Returns:
-        The sanitised body, exactly what :func:`_sanitize_content` returns.
-    """
-    return await run_in_threadpool(_sanitize_content, raw)
-
-
-async def _sanitize_excerpt_off_loop(raw: str) -> str | None:
-    """Run :func:`_sanitize_excerpt` in a worker thread, for the reason on its sibling.
-
-    Args:
-        raw: The submitted excerpt.
-
-    Returns:
-        The stripped text, or ``None`` when nothing survives.
-
-    Note:
-        The excerpt is bounded far tighter than the body, so this hop is about consistency as
-        much as capacity: both text members of a submission are cleaned the same way, off the
-        loop, so no future widening of the excerpt's bound can reintroduce a stall that nobody
-        thinks to look for.
-    """
-    return await run_in_threadpool(_sanitize_excerpt, raw)
-
-
 def _omit_blank(value: str | None) -> str | None:
     """Fold a whitespace-only filter argument to ``None``, so it narrows nothing.
 
@@ -1845,7 +1798,10 @@ class PostService:
         post = await self._posts.get_for_update(post_id, with_relations=with_relations)
         if post is None:
             raise NotFoundError(_POST_NOT_FOUND)
-        ensure_can_author(actor)
+        # Only ownership remains: the role gate above already refused a READER before a row was
+        # read, and nothing between the two can have changed the principal - `actor` is the
+        # resolved request principal, not a row this method re-fetched. Repeating
+        # `ensure_can_author(actor)` here asked the same question of the same object twice.
         ensure_can_modify(actor, post.author_id)
         return post
 

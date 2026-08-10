@@ -84,7 +84,8 @@ it treats these two paths specifically: ``QUIET_ACCESS_LOG_PATHS`` downgrades th
 at ``error`` with its status, its path, its duration and the bound ``request_id``.
 
 That record says the probe failed; it cannot say **why**, and the difference matters
-operationally. The classified failure record that closes the gap - a five-way classification, the
+operationally. The classified failure record that closes the gap - a classification drawn from
+``ReadinessFailureClass``, the
 exception class name, the originating driver class name and the SQLSTATE where the driver supplied
 one, and deliberately never the driver's own message - is emitted by
 ``app.services.health_service``, immediately before it raises, because that is the layer that
@@ -314,8 +315,9 @@ async def readiness(db: DbSession) -> ReadinessResponse:
 
     One call and one construction, which is the whole of a route's job here.
     :meth:`~app.services.health_service.HealthService.check_readiness` owns everything a verdict
-    actually requires - the statement, the five-way classification of whatever went wrong, the one
-    classified log record and the 503 domain error - and this handler owns only what belongs to the
+    actually requires - the statement, the classification of whatever went wrong from
+    :data:`~app.services.health_service.ReadinessFailureClass`, the one classified log record and
+    the 503 domain error - and this handler owns only what belongs to the
     API tier: resolving the session dependency, and turning "returned normally" into the declared
     response model.
 

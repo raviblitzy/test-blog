@@ -14,11 +14,11 @@ To ``posts``, the three objects behind the home feed's search:
 * ``ix_posts_search_vector`` - a GIN index over that column, the feed's primary search path.
 * ``ix_posts_title_trgm`` - a GIN trigram index over ``title``, the typo-tolerant fallback.
 
-Then five more trigram indexes, one per pattern predicate the repositories issue:
+Then six more trigram indexes, one per pattern predicate the repositories issue:
 ``ix_users_username_trgm`` and ``ix_users_email_trgm`` for the administrative user search;
-``ix_categories_slug_trgm`` for the slug-family scan behind category slug de-duplication;
-``ix_comments_body_trgm`` for the moderation queue's body search; and ``ix_posts_slug_trgm`` for
-the post slug-family scan.
+``ix_categories_name_trgm`` and ``ix_categories_slug_trgm`` for the category search and for the
+slug-family scan behind category slug de-duplication; ``ix_comments_body_trgm`` for the
+moderation queue's body search; and ``ix_posts_slug_trgm`` for the post slug-family scan.
 
 Between them they turn ``GET /api/v1/posts?q=...`` from a scan into an index lookup, which is
 what makes free-text relevance search one of the composed capabilities of the home feed
@@ -338,10 +338,17 @@ def upgrade() -> None:
         postgresql_ops={"email_text": "gin_trgm_ops"},
     )
     op.create_index(
-        # One predicate uses this: the anchored `slug LIKE 'base%'` family scan that slug
-        # de-duplication runs before every category insert and rename. `categories.name` gets no
-        # trigram index of its own, because no query matches a pattern against it - the taxonomy
-        # has one read, `GET /api/v1/categories`, and it returns every term unfiltered.
+        # `categories.name` is TEXT, so the operator class goes straight on the column.
+        "ix_categories_name_trgm",
+        "categories",
+        ["name"],
+        postgresql_using="gin",
+        postgresql_ops={"name": "gin_trgm_ops"},
+    )
+    op.create_index(
+        # Two predicates share this one: the administrative category search's containment match,
+        # and the anchored `slug LIKE 'base%'` family scan that slug de-duplication runs before
+        # every category insert and rename.
         "ix_categories_slug_trgm",
         "categories",
         [sa.literal_column("(slug::text)").label("slug_text")],
@@ -389,6 +396,7 @@ def downgrade() -> None:
     op.drop_index("ix_posts_slug_trgm", table_name="posts")
     op.drop_index("ix_comments_body_trgm", table_name="comments")
     op.drop_index("ix_categories_slug_trgm", table_name="categories")
+    op.drop_index("ix_categories_name_trgm", table_name="categories")
     op.drop_index("ix_users_email_trgm", table_name="users")
     op.drop_index("ix_users_username_trgm", table_name="users")
 

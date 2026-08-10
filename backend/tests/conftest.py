@@ -229,8 +229,9 @@ this schema:
 So the session-scoped :func:`database_schema` fixture creates the database if it is absent
 and then runs ``alembic upgrade head`` programmatically, with ``script_location`` set
 explicitly from :data:`__file__` so the run does not depend on the working directory. The
-chain is currently ``0001 → 0002 → 0003``; the fixture asks for ``head`` and never names a
-revision, so a fourth revision is picked up with no change here.
+fixture asks for ``head`` and never names a revision, so a revision added to the chain is
+picked up with no change here - and because the fixture reuses a database it finds already
+present, it also walks an existing one forward from whatever revision it is stamped at.
 
 **The database is never empty.** Revision ``0003_seed_reference_categories`` inserts eight
 reference categories - Engineering, Architecture, Backend, Frontend, Databases, DevOps,

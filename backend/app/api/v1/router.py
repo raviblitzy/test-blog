@@ -36,7 +36,7 @@ path families that live under different parents: the thread reached through the 
 it (``/posts/{post_id}/comments``) and the comment addressed by its own identifier
 (``/comments/{comment_id}``). Both are included below, under different prefixes, and merging
 them is an application-wide start-up failure rather than a tidy-up. Seven modules, eight
-includes, thirty-eight operations.
+includes, and every operation this service versions.
 
 .. important::
    **Read this before mounting or importing.** Three ways to get this wrong, all of them quiet
@@ -73,7 +73,7 @@ service is on the ``admin`` include below. That placement is load-bearing, not s
 ``app.api.v1.routers.admin`` constructs a bare router specifically so the gate can live on the
 mount: a gate on the mount covers every operation beneath it, including one added long after
 this file was written by someone who never read this paragraph, so the guarantee becomes a
-property of the composition instead of fourteen separate acts of remembering. Declaring it in
+property of the composition instead of one act of remembering per route. Declaring it in
 both places would document the same requirement twice in ``/openapi.json`` and protect nothing
 further.
 
@@ -135,9 +135,9 @@ silently re-route every route in the service.
 # API has exactly one error shape for every failure at every status code and exactly one
 # media type for it - and that helper is the single place either is decided.
 #
-# `app.api.v1.routers.admin` declares the same pair on each of its fourteen routes; the
-# wording below is deliberately consistent with it rather than a second, competing
-# description of the same condition.
+# `app.api.v1.routers.admin` declares the same pair on each of its own routes; the wording
+# below is deliberately consistent with it rather than a second, competing description of the
+# same condition.
 # ---------------------------------------------------------------------------------------
 
 _ADMIN_GATE_RESPONSES: Final[ProblemResponses] = {
@@ -155,9 +155,9 @@ _ADMIN_GATE_RESPONSES: Final[ProblemResponses] = {
 }
 """401 and 403, declared on the include that gates the administrative namespace.
 
-Both apply uniformly to all fourteen operations beneath the mount, because the gate does. The
-pair is declared once, on the include, for the same reason the gate itself is: a per-route
-declaration holds only for as long as every future author remembers it.
+Both apply uniformly to every operation beneath the mount, because the gate does - including
+any added later. The pair is declared once, on the include, for the same reason the gate itself
+is: a per-route declaration holds only for as long as every future author remembers it.
 """
 
 
@@ -172,9 +172,15 @@ declaration holds only for as long as every future author remembers it.
 api_router = APIRouter(prefix=API_V1_PREFIX)
 """Every versioned operation in the service, behind one prefix, ready to mount.
 
-Thirty-eight operations, composed from eight includes over the seven domain modules in
-``app.api.v1.routers``. ``app.api.v1.routers.health`` is not among them by design: its two
-probes are mounted unprefixed by ``app.main``, which brings the served total to forty.
+Composed from eight includes over the seven domain modules in ``app.api.v1.routers``.
+``app.api.v1.routers.health`` is not among them by design: its two probes are mounted
+unprefixed by ``app.main``, so the served total is this router's operations plus those two.
+
+The exact counts are deliberately not written here, because a numeral in a docstring is a
+second declaration of something the route table already states and the two drift apart the
+moment an operation is added or withdrawn.
+``backend/tests/integration/test_openapi_contract.py`` holds the single authoritative
+enumeration, asserted against ``app.openapi()``.
 
 Mounted as ``app.include_router(api_router)`` - bare, with no further ``prefix=``.
 """
@@ -220,9 +226,10 @@ api_router.include_router(comments.router, prefix="/comments", tags=["comments"]
 # 2 operations: list the taxonomy with post counts, and read one category by slug.
 api_router.include_router(categories.router, prefix="/categories", tags=["categories"])
 
-# 14 operations: the aggregate counts for the overview screen, plus thirteen management
-# operations across four entities - listing, state mutation and deletion for users, posts,
-# comments and categories.
+# The administrative surface: the aggregate counts for the overview screen, plus the
+# management operations across four entities - listing, state mutation and deletion for users,
+# posts and comments, and creation, update and deletion for categories, whose listing is the
+# public one rather than a privileged duplicate of it.
 #
 # THE ADMINISTRATOR GATE. This is the single router-level application of `require_admin` in
 # the service, and the only include on this router that carries `dependencies=`. It covers
