@@ -1,0 +1,451 @@
+# ==========================================================================================
+# docker-compose.yml - one-command local orchestration for the blog platform.
+#
+# This is the project's ONLY deployment artifact. There is no Kubernetes manifest, no Helm
+# chart and no infrastructure-as-code tree, because Compose covers the two things that are
+# actually needed - a developer's machine and continuous integration - and a second
+# orchestration description is a second thing to keep true.
+#
+# THREE SERVICES, AND DELIBERATELY NO FOURTH
+#
+#   db        PostgreSQL 18.4, the system of record. Replaces the module-level Python list
+#             the retired /items API used, which lost every row on restart and answered
+#             identical requests differently under two workers.
+#   backend   the FastAPI service tier, built from backend/Dockerfile. Applies migrations,
+#             then serves the versioned REST surface under /api/v1.
+#   frontend  the Next.js presentation tier, built from frontend/Dockerfile. Server-renders
+#             content so a crawler sees an article without executing client JavaScript.
+#
+# No cache, no search engine, no reverse proxy, no object store, no metrics backend. Rate
+# limiting is in-process, full-text search is PostgreSQL's own weighted tsvector, and each of
+# those absences is a decision recorded in the plan rather than an omission. Adding a service
+# here is a change to the architecture, not to a configuration file.
+#
+# ------------------------------------------------------------------------------------------
+# START IT
+#
+#     cp .env.example .env
+#     # ...then change exactly one value in .env - see THE ONE EDIT below
+#     docker compose up --build
+#
+#     frontend   http://localhost:3000
+#     API        http://localhost:8000/api/v1     (/docs, and the probes /healthz, /readyz)
+#     database   PGPASSWORD="${POSTGRES_PASSWORD:-blog}" psql -h localhost \
+#                  -p "${POSTGRES_HOST_PORT:-5432}" -U "${POSTGRES_USER:-blog}" \
+#                  -d "${POSTGRES_DB:-blog}"
+#
+# THE ONE EDIT `cp` DOES NOT DO FOR YOU
+#
+# `SEED_ADMIN_PASSWORD` must be replaced before the backend will start. That is not this
+# file's rule and it cannot be worked around here: backend/app/core/config.py compares the
+# value against the placeholder .env.example publishes and rejects it IN EVERY STAGE, because
+# the one administrator account this project creates for itself must not be the one credential
+# an attacker already knows. Verified by running that settings model against a freshly copied
+# file - it refuses with "SEED_ADMIN_PASSWORD is a documented placeholder or a variation of
+# one". Generate one and put it in .env:
+#
+#     openssl rand -base64 24
+#
+# The other published placeholder, `JWT_SECRET_KEY`, is accepted while `ENVIRONMENT` is
+# development or test, so a copied file needs no second edit to boot.
+#
+# AFTERWARDS - the commands this stack is meant to make possible
+#
+#     docker compose exec backend python -m app.db.seed    # admin + demo posts (idempotent)
+#     docker compose exec backend alembic downgrade base   # the reversibility check,
+#     docker compose exec backend alembic upgrade head     #   up / down / up, in situ
+#     docker compose exec backend alembic check            # and no model drift
+#     docker compose exec db psql -U "${POSTGRES_USER:-blog}" -d "${POSTGRES_DB:-blog}" -c '\dt'
+#     docker compose exec db createdb -U "${POSTGRES_USER:-blog}" blog_test
+#
+# The last two spell the role and database as shell expansions rather than as literals, so they
+# stay correct under the overrides below; unset, each expands to the same `blog` default this
+# file gives the container. The test database is separate on purpose - the suite derives a
+# sibling name from DATABASE_URL and refuses to run against the working database.
+#
+# Migrations are applied by the backend's start command rather than baked into the image, so
+# every one of those remains re-runnable against a live stack. backend/Dockerfile copies
+# alembic.ini and migrations/ for exactly this purpose and states that applying them "belongs
+# to whatever starts the service".
+#
+# ------------------------------------------------------------------------------------------
+# CONFIGURATION COMES ONLY FROM THE ENVIRONMENT
+#
+# No secret, connection string or origin list is written into this file. The twelve backend
+# variables arrive through `env_file: .env` - none of their values is restated here, so this
+# file cannot drift from .env.example, which is the contract. The three public presentation
+# variables arrive by name and by name only: the frontend gets those three and nothing else,
+# because handing it the whole file would hand a process that needs none of them the signing
+# key, the database credential and the administrator password.
+#
+# Exactly six values below carry a default: the three the PostgreSQL container needs to
+# initialise, and the three host ports. They are container-only settings, so .env.example
+# deliberately does not carry them, and their defaults here are the same obviously-local
+# placeholders it documents for `DATABASE_URL` - `blog` / `blog` / `blog` on 5432. They are
+# not credentials. One further database setting, the initdb locale, is a literal rather than a
+# default, because it is a determinism constant and not a thing a deployment varies.
+#
+# THE OVERRIDES A PARALLEL CHECKOUT NEEDS
+#
+# (.env.example points here for these.) Two checkouts of this repository on one machine
+# collide on the project name, on the data volume and on all three host ports. Override them
+# in the SHELL:
+#
+#     COMPOSE_PROJECT_NAME=blog-alt \
+#     POSTGRES_HOST_PORT=55432 BACKEND_HOST_PORT=58000 FRONTEND_HOST_PORT=53000 \
+#       docker compose up -d
+#
+# In the shell, and NOT by adding them to .env - that matters. Compose would read them there
+# happily, but .env is shared with a backend run directly on the host, and that settings model
+# reads the FILE with `extra="forbid"`: an unrecognised key stops the process. (A containerised
+# backend never sees the file - `env_file` sets process environment variables - which is why
+# the trap is invisible until someone runs `uvicorn` on the host.)
+#
+# Two couplings to respect when moving a port, because a port lives in two places:
+#   * BACKEND_HOST_PORT must match the port inside `NEXT_PUBLIC_API_BASE_URL`.
+#   * FRONTEND_HOST_PORT must match `NEXT_PUBLIC_SITE_URL` and the `CORS_ALLOW_ORIGINS`
+#     entries, or the browser's own requests are refused by the API.
+#
+# ------------------------------------------------------------------------------------------
+# NETWORKING - two vantage points, and they do not agree by accident
+#
+# Every service joins the project's default network (`blog_default` unless the project name is
+# overridden). No network is declared below because a named one would only restate that, and
+# on that network each service is addressable by its SERVICE NAME:
+#
+#     db:5432        from the backend       (this is why DATABASE_URL is overridden per-service)
+#     backend:8000   from the frontend      (available for debugging; see the frontend service)
+#
+# Those names do not resolve in a reader's browser, and the published ports do not resolve
+# inside the network. Where one address has to satisfy both - the API base URL, which is a
+# single closed-contract key read by the browser AND by the Next.js server process - the
+# resolution is documented on the frontend service, which is where it is implemented.
+#
+# WHAT THIS FILE DELIBERATELY DOES NOT DO
+#
+#   * No `version:` key. It has been obsolete for years and current Compose warns about it.
+#   * No init-SQL mount. `citext`, `pg_trgm` and `unaccent` are created by migration
+#     0001_initial_blog_schema, which owns them; a second place that creates extensions is a
+#     second place that can disagree about which ones exist.
+#   * No `command:` on the database. app/db/session.py sizes its connection budget against
+#     `max_connections = 100` and says that is "what docker-compose.yml's db service therefore
+#     provides unconfigured" - so it stays unconfigured.
+#   * No floating image tag, no SQLite fallback, no in-memory persistence, and nowhere the
+#     string `main:app` appears without the `app.` prefix: `uvicorn main:app` is the launch
+#     defect this project corrects, against a module that never existed.
+# ==========================================================================================
+
+# A stable project name, so containers are `blog-db-1`, `blog-backend-1`, `blog-frontend-1`
+# and the volume is `blog_db_data` rather than being named after whatever the checkout
+# directory happens to be called. `COMPOSE_PROJECT_NAME` and `-p` both outrank this, which is
+# what makes the parallel-checkout override above work.
+name: blog
+
+services:
+  # ----------------------------------------------------------------------------------------
+  # db - PostgreSQL 18.4, the system of record for all seven relations.
+  # ----------------------------------------------------------------------------------------
+  db:
+    # EXACT patch version. Not `postgres:latest`, not `postgres:18`: the schema was verified
+    # against 18.4 - generated tsvector columns, trigram similarity, citext identity, the
+    # built-in gen_random_uuid() that needs no extension on 18 - and a floating tag would let
+    # the one component holding the data move underneath all of it.
+    image: postgres:18.4
+
+    # The database should come back with the machine; it is the only service here holding
+    # state worth keeping.
+    restart: unless-stopped
+
+    environment:
+      # The image needs these three to initialise. Interpolated with the same local
+      # placeholders .env.example documents in DATABASE_URL, so `docker compose up -d db` and
+      # that URL agree with no editing. Override them in the shell for anything but local use.
+      POSTGRES_USER: ${POSTGRES_USER:-blog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-blog}
+      POSTGRES_DB: ${POSTGRES_DB:-blog}
+      # Read ONCE, when an empty volume is initialised, and never again. UTF-8 with the C
+      # collation is deterministic: byte ordering is identical on every host, so `ORDER BY
+      # title` returns one answer everywhere and a test that asserts an order does not pass
+      # on one machine and fail on another. A linguistic locale would make that host-dependent.
+      # A literal rather than an interpolated value, deliberately: this is a correctness
+      # constant of the same kind as the image tag above, not a setting a deployment varies -
+      # and changing it after a volume has been initialised does nothing whatsoever.
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
+
+    ports:
+      # Published so a developer can attach psql - which is how the plan's `EXPLAIN` check
+      # against the seeded feed query is run - and so a backend started on the host, outside
+      # this stack, reaches the same database.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+
+    volumes:
+      # PostgreSQL 18 MOVED ITS DATA DIRECTORY. The image sets
+      # PGDATA=/var/lib/postgresql/18/docker and declares the volume one level up, at
+      # /var/lib/postgresql - verified with `docker inspect postgres:18.4`. Mounting the
+      # pre-18 /var/lib/postgresql/data instead would appear to work and silently persist
+      # nothing, taking every seeded post, category and the administrator account with it on
+      # the next `docker compose down`.
+      - db_data:/var/lib/postgresql
+
+    healthcheck:
+      # The image ships no health check, and this one is load-bearing rather than cosmetic:
+      # the backend gates its first migration on it.
+      #
+      # `-h 127.0.0.1` forces the probe over TCP. Left to the Unix socket, pg_isready answers
+      # during the entrypoint's initialisation window - when a temporary server is listening
+      # on the socket alone to run bootstrap steps - and reports a database ready that no
+      # client can yet connect to. That window is exactly where a flaky first migration comes
+      # from. The configured role and database are named for the same reason: readiness has to
+      # mean "the role and database this stack uses are there", not merely "a server answers".
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "${POSTGRES_USER:-blog}", "-d", "${POSTGRES_DB:-blog}", "-q"]
+      # Tight interval because something waits on it; the generous start period covers first
+      # initialisation (initdb, then a restart) without those attempts counting as failures.
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ----------------------------------------------------------------------------------------
+  # backend - the FastAPI service tier: migrations, then the /api/v1 surface.
+  # ----------------------------------------------------------------------------------------
+  backend:
+    build:
+      # The context is backend/, NOT the repository root. That is a property of
+      # backend/Dockerfile: every COPY in it names a path relative to backend/, deliberately,
+      # so that a developer's .venv/, caches, tests and local env file cannot reach a layer.
+      # A build launched from the repository root fails on its first COPY.
+      context: ./backend
+      dockerfile: Dockerfile
+
+    # Bounded rather than endless. A crash here is almost always a migration that cannot
+    # apply or code that cannot import, and `unless-stopped` would retry that forever,
+    # scrolling the one error message that explains it out of `docker compose logs`.
+    restart: on-failure:3
+
+    depends_on:
+      db:
+        # HEALTH, not existence. `service_started` returns as soon as the container is
+        # created, which is well before PostgreSQL accepts connections, and the first
+        # `alembic upgrade head` would then race initialisation and fail with a connection
+        # refusal that looks like a configuration error.
+        condition: service_healthy
+
+    # Migrations, then the server, chained with `&&` in ONE command so the order is guaranteed
+    # rather than merely intended: a migration that fails takes the container down instead of
+    # leaving a half-migrated database serving traffic.
+    #
+    # `app.main:app`, never `main:app`. The old README documented `uvicorn main:app` against a
+    # module that has never existed - the project's one non-functional feature - and the
+    # repository-root app.py shim is no use here either: it resolves only when the process
+    # working directory is the repository root, which it never is inside this image. The
+    # image's WORKDIR is /srv/backend, where app/, migrations/ and alembic.ini sit side by
+    # side, which is what lets both the alembic and the uvicorn halves resolve with no
+    # PYTHONPATH and no --chdir.
+    #
+    # `exec` hands PID 1 to uvicorn, so Docker's SIGTERM reaches the server rather than a
+    # shell that would swallow it. `--host 0.0.0.0` is what makes the port mapping below
+    # reachable; bound to loopback, the published port would connect to nothing.
+    #
+    # This OVERRIDES the image's production command, which is Gunicorn supervising two Uvicorn
+    # workers. That is the right default for the image and the wrong one here: `--reload` is
+    # the point of a development stack, and it needs the single-process reloader. Multiple
+    # workers are correct now that the system of record is PostgreSQL - the constraint the
+    # in-memory design imposed is gone - so a deployment that wants them simply drops this
+    # override and lets the image's own command run. Migrations must still be applied first.
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+    env_file:
+      # The whole backend contract, by reference. Every one of the twelve variables reaches
+      # the container and not one value is copied here, so there is nothing to drift.
+      # Required: if .env is absent Compose stops before building anything and says which file
+      # it wanted, which is a better first experience than a container that starts and then
+      # dies naming a missing variable. `cp .env.example .env` is the fix.
+      #
+      # The three NEXT_PUBLIC_ keys in that file arrive here too, harmlessly: the settings
+      # model tolerates exactly those three by name. Its `extra="forbid"` rule applies to env
+      # FILES it reads itself, and there is no .env inside this image at all.
+      - .env
+
+    environment:
+      # THE ONE OVERRIDE, and the single most common Compose failure if it is missing.
+      # .env documents a host-oriented URL - localhost:5432 - because that is correct for a
+      # backend run on the host. Inside this network the database is the service name `db`,
+      # and `localhost` is this container's own loopback, where nothing listens. Composed from
+      # the same POSTGRES_* variables the db service initialises with, so the credential and
+      # the database name cannot disagree between the two services. The scheme stays
+      # `postgresql+psycopg://`: psycopg 3 is the one driver here, serving both the async
+      # application engine and the synchronous engine Alembic drives.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-blog}:${POSTGRES_PASSWORD:-blog}@db:5432/${POSTGRES_DB:-blog}
+
+    ports:
+      # Published because the browser calls the API directly - NEXT_PUBLIC_API_BASE_URL names
+      # this port - and because it is where /docs, /openapi.json and the two probes are read.
+      - "${BACKEND_HOST_PORT:-8000}:8000"
+
+    volumes:
+      # Read-only source mounts, so `--reload` above reloads the code being EDITED rather than
+      # the copy baked into the image. Narrow on purpose: they cover the application package
+      # and the migration tree and nothing else, so the virtual environment at /opt/venv is
+      # untouched and no host artifact shadows an installed dependency. `:ro` keeps the
+      # property the image establishes - the runtime user can read and execute the code tree
+      # and cannot write to it - so a request handler still cannot rewrite the code that
+      # serves the next request, and nothing in the container can modify a tracked file.
+      #
+      # Mounting migrations/ has a second use: a revision generated on the host is applied by
+      # restarting this service, with no rebuild.
+      #
+      # Caveat worth knowing before it is mistaken for a bug: on Docker Desktop file events do
+      # not always cross a bind mount, so the reloader can go quiet there. `docker compose
+      # restart backend` is the fallback, and dropping these two lines costs only reloading.
+      - ./backend/app:/srv/backend/app:ro
+      - ./backend/migrations:/srv/backend/migrations:ro
+
+    healthcheck:
+      # LIVENESS, and `/healthz` rather than `/readyz` on purpose. `/healthz` answers 200 from
+      # the process alone and touches no database. `/readyz` issues a query and answers 503
+      # when the database is unreachable - which is correct for deciding whether to send
+      # traffic, and wrong for a container health check, because a health check drives restart
+      # policy and this one would kill a perfectly healthy service every time PostgreSQL
+      # blinked. Both probes exist, deliberately unversioned, precisely so they can differ.
+      #
+      # Probed with the interpreter because this base image ships neither curl nor wget, so a
+      # shell-out to either would report `unhealthy` forever while the service was fine.
+      # urlopen raises on a non-2xx status or a refused connection, so only a real 200 exits 0.
+      #
+      # Re-declared here rather than inherited from the image, for one reason: the frontend
+      # gates its start on this result, and the image's 30s interval after a 20s start period
+      # would add most of a minute to a cold start. The image keeps its own probe for anyone
+      # running the container without Compose; this is the same endpoint by the same mechanism,
+      # timed for a stack that waits on it.
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      # Generous, because the start period has to cover `alembic upgrade head` against a
+      # freshly initialised database before the server binds its port at all.
+      retries: 5
+      start_period: 60s
+
+  # ----------------------------------------------------------------------------------------
+  # frontend - the Next.js presentation tier: server-rendered content plus client islands.
+  # ----------------------------------------------------------------------------------------
+  frontend:
+    build:
+      # Context is frontend/, NOT the repository root, for the same reason the backend's is
+      # backend/: every COPY in frontend/Dockerfile names a path, which is what keeps
+      # node_modules/, a previous .next/ build, the browser cache and the local env file out
+      # of the image.
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # REQUIRED AT BUILD TIME, and that is correctness rather than convenience. Next.js
+        # rewrites `process.env.NEXT_PUBLIC_*` into the compiled output while it compiles, so
+        # these three are INLINED and no amount of run-time injection repairs an image built
+        # without them: re-pointing a built image at a different API or canonical origin is a
+        # rebuild, not a restart. The tier's own modules throw when one is missing or
+        # malformed, and the root layout, sitemap, crawl policy and social card are all
+        # evaluated during prerender, so an omitted argument fails the BUILD, naming the
+        # variable - which is far better than shipping a bundle quietly aimed at somebody
+        # else's host.
+        #
+        # No default is given, on purpose. .env.example is the single place their documented
+        # values live; repeating one here would create a second copy that drifts, and
+        # frontend/Dockerfile declines to restate them for exactly the same reason. `:?` makes
+        # an unset value a clear Compose error instead of a puzzling build failure.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:?run cp .env.example .env first}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:?run cp .env.example .env first}
+        NEXT_PUBLIC_SITE_NAME: ${NEXT_PUBLIC_SITE_NAME:?run cp .env.example .env first}
+
+    restart: on-failure:3
+
+    depends_on:
+      backend:
+        # Health, not existence, so the first server-side render does not fire at a port
+        # nothing is listening on yet. The backend reports healthy only after its migrations
+        # have applied and its server has bound, so this gate covers both.
+        #
+        # It is a gate on START ORDER and nothing more. A backend that falls over later must
+        # not take the site down with it, and it does not: a failed read degrades to an empty
+        # state, and the sitemap route publishes what it managed to gather.
+        condition: service_healthy
+
+    environment:
+      # EXACTLY the three public presentation variables, listed by name rather than pulled in
+      # with `env_file`. This tier has no use for the signing key, the database credential or
+      # the administrator password, and least privilege applies to a developer's own machine
+      # too - .env.example makes the same point about copying the whole file into
+      # frontend/.env.local.
+      #
+      # Declared at run time as well as at build time so the image is self-describing: an
+      # operator can read which values a given image was built with. Changing one here does
+      # NOT change what the tier serves - see the build arguments above.
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:?run cp .env.example .env first}
+      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:?run cp .env.example .env first}
+      NEXT_PUBLIC_SITE_NAME: ${NEXT_PUBLIC_SITE_NAME:?run cp .env.example .env first}
+
+    extra_hosts:
+      # THE ONE GENUINELY SUBTLE LINE IN THIS FILE. Read it before changing anything above.
+      #
+      # `NEXT_PUBLIC_API_BASE_URL` is read from two vantage points by ONE key: a browser
+      # fetching from a client island, and this container's Node process rendering a Server
+      # Component, a route handler or the sitemap. src/lib/api/client.ts and .env.example both
+      # refuse a second, server-only address - the configuration contract is closed at fifteen
+      # keys, and a fourth NEXT_PUBLIC_ name would additionally stop the BACKEND from starting,
+      # since it tolerates exactly three by exact spelling. A shared origin in front of both
+      # tiers is what a real deployment uses to satisfy that, and a reverse proxy here would be
+      # the fourth service this stack must not have.
+      #
+      # So the value stays the one .env documents - http://localhost:8000/api/v1 - which is
+      # correct in the browser, and this line is what makes it correct in here too: Docker adds
+      # the host's gateway address to /etc/hosts under the name `localhost`, so a request for
+      # localhost:8000 leaves the container, arrives at the backend's PUBLISHED host port and
+      # is forwarded to the backend container. Measured on the pinned node:24.19.0-slim base:
+      # glibc returns ::1, 127.0.0.1 and the gateway for that name, both `fetch` and
+      # `http.request` step past the two refused loopback addresses, and the call completes in
+      # tens of milliseconds.
+      #
+      # Consequences, so nobody has to rediscover them:
+      #   * The backend's host port MUST match the port inside NEXT_PUBLIC_API_BASE_URL.
+      #     Moving BACKEND_HOST_PORT without editing that URL breaks server rendering AND the
+      #     browser, in the same way, for the same reason.
+      #   * Nothing else in this container resolves `localhost` by name - the image's own health
+      #     probe uses the literal 127.0.0.1 and the server binds 0.0.0.0 - so overriding the
+      #     name costs nothing here.
+      #   * `backend:8000` also works from this container, for debugging. It is deliberately
+      #     NOT the configured value: a browser cannot resolve it, so server rendering would
+      #     succeed while every client island failed - a half-broken page that looks like an
+      #     application bug.
+      #   * A deployment that publishes the API at one routable address needs neither this line
+      #     nor any of the above. It is local-stack plumbing, not architecture.
+      - "localhost:host-gateway"
+
+    ports:
+      # The site itself. NEXT_PUBLIC_SITE_URL and the CORS_ALLOW_ORIGINS entries both name this
+      # port, so it is the one to keep in step if it moves.
+      - "${FRONTEND_HOST_PORT:-3000}:3000"
+
+    # No `healthcheck:` here, and the asymmetry with the backend is deliberate. The image
+    # already declares one - a Node request to 127.0.0.1:3000 that passes on any non-5xx - and
+    # nothing in this stack gates on the result, so re-declaring it could only produce a copy
+    # to drift. `docker compose ps` reports the image's verdict.
+    #
+    # No source bind mount either. This image ships a compiled standalone server, not a dev
+    # server, so mounting src/ over it would shadow the build and serve nothing; a broken mount
+    # is worse than no mount. Iterating on components is `npm run dev` on the host against this
+    # stack's API, which is what the published backend port is for.
+    #
+    # One expected consequence of building this tier as its own service, so it is not mistaken
+    # for a fault: the build runs before any backend exists, so the routes that read the API
+    # while prerendering - the sitemap in particular - ship with whatever they could gather,
+    # which on a cold `up --build` is nothing. They are revalidating routes, not frozen ones, so
+    # they self-correct on their own window; src/app/sitemap.ts documents that trade directly and
+    # names this file as the reason it must degrade rather than fail. Pages that read at request
+    # time - the feed, a profile - are unaffected and serve live data from the first request.
+
+volumes:
+  # Named, so the database survives `docker compose down` and a developer's seeded posts,
+  # categories and administrator account are still there afterwards. `docker compose down -v`
+  # is the deliberate way to discard them; nothing else does.
+  db_data:
